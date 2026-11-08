@@ -4,7 +4,7 @@
  * run's terminal state reads as an activity.
  */
 import type { ActivityStatus } from '../activity/index.ts';
-import { canViewerRead, type Viewer } from '../shared/index.ts';
+import { canViewerRead, type ActivityId, type Viewer, type WorkerRunId } from '../shared/index.ts';
 import type { WorkerOutcome, WorkerRun, WorkerRunStatus } from './types.ts';
 
 const TRANSITIONS: Readonly<Record<WorkerRunStatus, readonly WorkerRunStatus[]>> = {
@@ -31,6 +31,16 @@ export function isTerminalWorker(status: WorkerRunStatus): boolean {
  */
 export function canViewWorkerRun(viewer: Viewer, run: Pick<WorkerRun, 'source'>): boolean {
   return canViewerRead(viewer, run.source.audience);
+}
+
+const RUN_PREFIX = 'worker_run:';
+
+/**
+ * The activity that mirrors a run's lifecycle. Only the runner settles it: its
+ * status and outcome are the run's, never what the worker or a turn wrote.
+ */
+export function workerActivityId(runId: WorkerRunId): ActivityId {
+  return `activity:${runId.startsWith(RUN_PREFIX) ? runId.slice(RUN_PREFIX.length) : runId}` as ActivityId;
 }
 
 /** The lifecycle status a terminal outcome maps to. */

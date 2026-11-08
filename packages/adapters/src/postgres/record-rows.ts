@@ -6,7 +6,7 @@
  */
 import type pg from 'pg';
 import { conflict, invalid, notFound, ok, type Result } from '../core.ts';
-import { guarded, records } from './database.ts';
+import { guarded, records, type UniqueConflicts } from './database.ts';
 
 export interface RecordTable {
   readonly table: string;
@@ -18,8 +18,19 @@ export interface RecordTable {
 /** Column → value for the non-key columns a write keeps in step with the record. */
 export type Columns = Readonly<Record<string, unknown>>;
 
-/** Inserts the record; an existing key returns the stored record with `created: false`. */
-export function insertOnce<T>(pool: pg.Pool, spec: RecordTable, id: string, record: T, columns: Columns): Promise<Result<{ readonly record: T; readonly created: boolean }>> {
+/**
+ * Inserts the record; an existing key returns the stored record with
+ * `created: false`. `unique` names the conflict for any other unique index
+ * the table enforces.
+ */
+export function insertOnce<T>(
+  pool: pg.Pool,
+  spec: RecordTable,
+  id: string,
+  record: T,
+  columns: Columns,
+  unique?: UniqueConflicts,
+): Promise<Result<{ readonly record: T; readonly created: boolean }>> {
   return guarded<{ readonly record: T; readonly created: boolean }>(async () => {
     const names = Object.keys(columns);
     const placeholders = names.map((_, i) => `$${String(i + 3)}`);
@@ -32,12 +43,12 @@ export function insertOnce<T>(pool: pg.Pool, spec: RecordTable, id: string, reco
     const found = await pool.query(`SELECT record FROM ${spec.table} WHERE ${spec.key} = $1`, [id]);
     const existing = records<T>(found.rows)[0];
     return existing === undefined ? conflict('stale_revision', `${spec.what} ${id} raced a removal`) : ok({ record: existing, created: false });
-  });
+  }, unique);
 }
 
 /** Inserts the record; an existing key is an `already_exists` conflict. */
-export async function insertNew<T>(pool: pg.Pool, spec: RecordTable, id: string, record: T, columns: Columns): Promise<Result<T>> {
-  const inserted = await insertOnce(pool, spec, id, record, columns);
+export async function insertNew<T>(pool: pg.Pool, spec: RecordTable, id: string, record: T, columns: Columns, unique?: UniqueConflicts): Promise<Result<T>> {
+  const inserted = await insertOnce(pool, spec, id, record, columns, unique);
   if (!inserted.ok) return inserted;
   return inserted.value.created ? ok(record) : conflict('already_exists', `${spec.what} ${id} already exists`);
 }

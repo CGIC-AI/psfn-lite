@@ -52,7 +52,11 @@ const blockColumns = (block: FreeTimeBlock) => ({ state: block.state, activity_i
 
 export function createPostgresFreeTimeBlocks(pool: pg.Pool): FreeTimeBlockPort {
   return {
-    create: (block) => insertNew(pool, BLOCKS, block.id, block, { lane: block.lane, revision: block.revision, invited_at: block.invitedAt, ...blockColumns(block) }),
+    // The one-open-block index raises a unique violation outside ON CONFLICT (block_id); it reads as an open invitation.
+    create: (block) =>
+      insertNew(pool, BLOCKS, block.id, block, { lane: block.lane, revision: block.revision, invited_at: block.invitedAt, ...blockColumns(block) }, {
+        free_time_blocks_one_open: 'turn_already_open',
+      }),
     get: (id) => getOne<FreeTimeBlock>(pool, BLOCKS, id),
     recent: (lane, limit) =>
       guarded(async () => {

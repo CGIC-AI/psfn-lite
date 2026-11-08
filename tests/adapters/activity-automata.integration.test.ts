@@ -99,6 +99,9 @@ describe.skipIf(dockerTestsOptedOut('activity-automata'))('activity and automata
     after.clock.advance(WORKER_LEASE_MS + 1);
     const recovered = await tick(after, selfAgain);
     expect(recovered.workers.ok && recovered.workers.value).toMatchObject({ requeued: [spawned.run.id] });
+    const requeued = await second.stores.workerRuns.get(spawned.run.id);
+    expect(requeued.ok && requeued.value).toMatchObject({ status: 'queued', reason: 'lease_expired_requeued', attempts: 1, lease: null });
+    // Its conversation never comes back to drive it, so after the grace window it settles instead of waiting forever.
     for (let i = 0; i < 10; i += 1) {
       after.clock.advance(30 * 60_000);
       await tick(after, selfAgain);
@@ -113,7 +116,9 @@ describe.skipIf(dockerTestsOptedOut('activity-automata'))('activity and automata
     ]);
     expect(status.find((s) => s.lane === 'idle')?.recent.map((b) => b.state)).toEqual(['rested']);
     const run = await second.stores.workerRuns.get(spawned.run.id);
-    expect(run.ok && run.value).toMatchObject({ status: 'queued', reason: 'lease_expired_requeued', attempts: 1, lease: null });
+    expect(run.ok && run.value).toMatchObject({ status: 'failed', outcome: 'failed', reason: 'not_resumed', attempts: 1, lease: null });
+    const activity = await second.stores.activities.get(spawned.run.activityId);
+    expect(activity.ok && activity.value.status).toBe('failed');
   });
 
   it('enforces the store contracts under real transactions', async () => {
@@ -170,7 +175,12 @@ describe.skipIf(dockerTestsOptedOut('activity-automata'))('activity and automata
     // A block can only point at an activity that exists.
     expect(kindOf(await stores.freeTimeBlocks.update({ ...block, activityId: 'activity:missing' as ActivityId, revision: 2 }, 1))).toBe('unavailable');
     expect(kindOf(await stores.freeTimeBlocks.update({ ...block, lane: 'quiet_hours', revision: 2 }, 1))).toBe('unavailable');
+    // One open block across every lane: a second invitation, even on the other lane, is refused by the index.
+    const second = await stores.freeTimeBlocks.create({ ...block, id: 'free_time_block-y', lane: 'quiet_hours', invitedAt: '2030-01-01T00:01:00.000Z' });
+    expect(second.ok || second.error).toMatchObject({ kind: 'conflict', reason: 'turn_already_open' });
+    expect(kindOf(await stores.freeTimeBlocks.create(block))).toBe('conflict');
     expect((await stores.freeTimeBlocks.update({ ...block, state: 'lapsed', revision: 2 }, 1)).ok).toBe(true);
+    expect((await stores.freeTimeBlocks.create({ ...block, id: 'free_time_block-y', invitedAt: '2030-01-01T00:02:00.000Z' })).ok).toBe(true);
 
     for (const n of [1, 2, 3]) {
       await w.must(primary, 'concern', 'reminder_create', { kind: 'check_in', title: `t${String(n)}`, content: 'c', dueAt: `2030-01-0${String(n)}T12:00:00.000Z` });

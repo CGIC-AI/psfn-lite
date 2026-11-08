@@ -67,6 +67,9 @@ export function fakeHosts() {
 }
 
 export const WORKER_LEASE_MS = 60_000;
+/** A queued run nothing drives for this long settles as `not_resumed`. */
+export const WORKER_RESUME_GRACE_MS = 15 * 60_000;
+export const SCHEDULER_IN_FLIGHT_MS = 10 * 60_000;
 
 export async function activityWorld<A extends ActivityPorts, M extends MemoryPorts>(
   activityPorts: A,
@@ -92,6 +95,8 @@ export async function activityWorld<A extends ActivityPorts, M extends MemoryPor
     owner: options.owner ?? 'host-a',
     workerLeaseMs: WORKER_LEASE_MS,
     workerMaxAttempts: 2,
+    workerResumeGraceMs: WORKER_RESUME_GRACE_MS,
+    schedulerInFlightMs: SCHEDULER_IN_FLIGHT_MS,
     handlers: {
       ...createContinuityHandlers({ sessions: base.sessions, contacts: base.contacts, orientation: base.orientation, values: base.values }),
       ...createSelfStateHandlers({ emotion: selfState.emotion, concerns: selfState.concerns, followUps: selfState.followUps }),

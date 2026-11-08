@@ -385,6 +385,8 @@ export function createFreeTimeService(deps: FreeTimeDeps): FreeTimeService {
         failure: null,
         revision: 1,
       });
+      // Another pass opened a block between this gate and the write: the store keeps one open block, so nothing is asked twice.
+      if (!created.ok && created.error.kind === 'conflict' && created.error.reason === 'turn_already_open') return ok({ lane, kind: 'skipped', reason: 'invitation_open' });
       if (!created.ok) return created;
       const invited = await deps.turns.run({ scope, purpose: 'free_time', prompt: invitationPrompt(created.value), reference: { kind: 'free_time_block', id: created.value.id } });
       const after = await deps.blocks.get(created.value.id);

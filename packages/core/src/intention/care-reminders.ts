@@ -12,8 +12,11 @@ export type CareReminderKind = (typeof CARE_REMINDER_KINDS)[number];
 export const CARE_REMINDER_SCHEDULES = ['once', 'daily'] as const;
 export type CareReminderSchedule = (typeof CARE_REMINDER_SCHEDULES)[number];
 /**
- * `delivering` is recorded before the host is asked to deliver. One found
- * still delivering later becomes `delivery_unknown` and is not sent again.
+ * `delivering` is recorded, with its start time, before the host is asked to
+ * deliver. A delivery whose outcome is ambiguous (the host could not say, or
+ * the marker outlived the in-flight window after a crash) is never sent
+ * again: a one-off reminder becomes `delivery_unknown`; a daily one counts
+ * the unknown occurrence and moves on to the next day.
  */
 export const CARE_REMINDER_STATES = ['pending', 'delivering', 'delivered', 'delivery_unknown', 'dismissed'] as const;
 export type CareReminderState = (typeof CARE_REMINDER_STATES)[number];
@@ -35,6 +38,10 @@ export interface CareReminder {
   readonly createdAt: string;
   readonly deliveries: number;
   readonly lastDeliveredAt: string | null;
+  /** When the in-flight delivery was marked; null unless `delivering`. */
+  readonly deliveryStartedAt: string | null;
+  /** Occurrences whose delivery outcome is unknown; none of them was retried. */
+  readonly unknownDeliveries: number;
   readonly revision: number;
 }
 

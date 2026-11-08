@@ -5,9 +5,11 @@
  */
 import {
   conflict,
+  denied,
   invalid,
   notFound,
   ok,
+  OPEN_FREE_TIME_BLOCK_STATES,
   unavailable,
   type CareReminder,
   type CareReminderPort,
@@ -119,6 +121,8 @@ export class FakeFreeTimeBlocks implements FreeTimeBlockPort {
   readonly blocks = new Map<string, FreeTimeBlock>();
   create(block: FreeTimeBlock) {
     if (this.blocks.has(block.id)) return done(conflict('already_exists', `block ${block.id}`));
+    const open = (b: FreeTimeBlock) => (OPEN_FREE_TIME_BLOCK_STATES as readonly string[]).includes(b.state);
+    if (open(block) && [...this.blocks.values()].some(open)) return done(conflict('turn_already_open', 'another free-time block is open'));
     this.blocks.set(block.id, block);
     return done(ok(block));
   }
@@ -214,13 +218,24 @@ export class FakeCareReminders implements CareReminderPort {
   }
 }
 
+/**
+ * Channel delivery. `fail` refuses definitely (nothing sent); `ambiguous`
+ * sends and then reports a timeout, as a host would after a transport error;
+ * `hold` parks each delivery until the test releases it.
+ */
 export class FakeReminderDelivery implements ReminderDeliveryPort {
   readonly delivered: CareReminder[] = [];
+  /** Every call, whatever its outcome. */
+  readonly calls: CareReminder[] = [];
   fail = false;
-  deliver(reminder: CareReminder): Promise<Result<void>> {
-    if (this.fail) return done(unavailable('channel', 'delivery refused'));
+  ambiguous = false;
+  hold: Promise<void> | null = null;
+  async deliver(reminder: CareReminder): Promise<Result<void>> {
+    this.calls.push(reminder);
+    if (this.fail) return denied('blocked_contact', 'the channel refused the message');
+    if (this.hold !== null) await this.hold;
     this.delivered.push(reminder);
-    return done(ok(undefined));
+    return this.ambiguous ? unavailable('channel', 'timeout after send') : ok(undefined);
   }
 }
 

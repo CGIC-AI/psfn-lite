@@ -47,8 +47,12 @@ export interface RestStatePort {
 
 /**
  * One free-time opportunity. It is recorded before the companion is asked,
- * so a crash or a second scheduler sees it and never invites twice.
+ * and the store holds at most one open block (invited, chosen or executing)
+ * across every lane, so a crash or a concurrent scheduler pass cannot invite
+ * twice.
  */
+export const OPEN_FREE_TIME_BLOCK_STATES = ['invited', 'chosen', 'executing'] as const;
+
 export const FREE_TIME_BLOCK_STATES = ['invited', 'chosen', 'executing', 'completed', 'rested', 'deferred', 'lapsed', 'failed', 'interrupted'] as const;
 export type FreeTimeBlockState = (typeof FREE_TIME_BLOCK_STATES)[number];
 
@@ -71,7 +75,10 @@ export interface FreeTimeBlock {
 }
 
 export interface FreeTimeBlockPort {
-  /** An existing id is an `already_exists` conflict. */
+  /**
+   * An existing id is an `already_exists` conflict. A block created while
+   * another one is open (any lane) is a `turn_already_open` conflict.
+   */
   create(block: FreeTimeBlock): Promise<Result<FreeTimeBlock>>;
   get(id: string): Promise<Result<FreeTimeBlock>>;
   /** The lane's most recent blocks, newest invitation first. */

@@ -71,9 +71,14 @@ export interface ApprovalPort {
 }
 
 /**
- * Channel delivery of a due care reminder, owned by the host. Return ok only
- * once delivered and an error only when it was not; core marks the reminder
- * before asking, so a crash in between is never delivered twice.
+ * Channel delivery of a due care reminder, owned by the host. Return ok once
+ * delivered. Return `denied`, `invalid` or `not_found` only when the message
+ * definitely did not go out; the reminder is then tried again on a later
+ * tick. Any other failure, `unavailable` in particular (a timeout or a
+ * transport error after sending may have begun), is read as "may have
+ * landed": the delivery is recorded as unknown and never retried. Core marks
+ * the reminder before asking, so a crash in between is not delivered twice
+ * either.
  */
 export interface ReminderDeliveryPort {
   deliver(reminder: CareReminder): Promise<Result<void>>;

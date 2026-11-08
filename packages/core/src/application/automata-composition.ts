@@ -48,6 +48,14 @@ export interface ActivityStackDeps {
   readonly owner: string;
   readonly workerLeaseMs: number;
   readonly workerMaxAttempts: number;
+  /** How long a queued worker run may wait to be driven before it settles as `not_resumed`. */
+  readonly workerResumeGraceMs: number;
+  /**
+   * How long a scheduler in-flight marker (a reminder being delivered, a
+   * scheduled prompt or template run) may stand before it is read as left by
+   * a crash. Longer than any one delivery or internal turn takes.
+   */
+  readonly schedulerInFlightMs: number;
   /**
    * Every other domain's handlers (continuity, self-state, memory). Workers
    * dispatch through the same dispatcher as the companion, so the stack
@@ -76,9 +84,10 @@ export interface ActivityStack {
  */
 export function createActivityStack(deps: ActivityStackDeps): Result<ActivityStack> {
   const { clock, ids } = deps;
+  if (!Number.isInteger(deps.schedulerInFlightMs) || deps.schedulerInFlightMs < 1) return invalid('schedulerInFlightMs must be a positive integer');
   const locate = currentTurnOf({ catalog: deps.catalog, ledger: deps.ledger });
   const activity = createActivityService({ log: deps.activities, clock, ids });
-  const reminders = createCareReminderService({ reminders: deps.careReminders, catalog: deps.catalog, delivery: deps.reminderDelivery, clock });
+  const reminders = createCareReminderService({ reminders: deps.careReminders, catalog: deps.catalog, delivery: deps.reminderDelivery, clock, inFlightMs: deps.schedulerInFlightMs });
   const schedule = createScheduleService({
     prompts: deps.scheduledPrompts,
     templates: deps.reflectionTemplates,
@@ -86,6 +95,7 @@ export function createActivityStack(deps: ActivityStackDeps): Result<ActivitySta
     model: deps.model,
     journal: deps.journal,
     clock,
+    inFlightMs: deps.schedulerInFlightMs,
   });
   const freeTime = createFreeTimeService({
     blocks: deps.freeTimeBlocks,
@@ -116,6 +126,7 @@ export function createActivityStack(deps: ActivityStackDeps): Result<ActivitySta
     owner: deps.owner,
     leaseMs: deps.workerLeaseMs,
     maxAttempts: deps.workerMaxAttempts,
+    resumeGraceMs: deps.workerResumeGraceMs,
   });
   if (!runner.ok) return runner;
   const automata = createAutomataService({ runner: runner.value, runs: deps.workerRuns, effects: deps.workerEffects, clock });
