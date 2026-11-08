@@ -37,7 +37,7 @@ export interface MemoryExtraction {
 /**
  * Background memory extraction over canonical history (donor
  * `src/faculties/memory/extraction/orchestrator.ts`, `llm-pass.ts`,
- * `speaker-routing.ts`, `contact-tracking-extraction-gate.ts`). It runs in a
+ * `speaker-routing.ts`, and `src/core/contacts/tracking-gate.ts`). It runs in a
  * companion-internal maintenance turn over the entries after the session's
  * extraction watermark. The model only proposes; the runtime binds each
  * memory's subject to the attributed speaker of the named source turn, marks
