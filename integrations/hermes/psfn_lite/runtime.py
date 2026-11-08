@@ -19,7 +19,7 @@ from .lifecycle import INTERNAL_JOB_ENV, Driver, host_instance
 
 logger = logging.getLogger(__name__)
 
-HOOKS = ("pre_llm_call", "post_llm_call", "post_tool_call", "on_session_end", "subagent_start")
+HOOKS = ("pre_llm_call", "pre_tool_call", "post_llm_call", "post_tool_call", "on_session_end", "on_session_finalize", "subagent_start")
 
 _lock = threading.RLock()
 _drivers = {}
@@ -67,6 +67,8 @@ def driver(home: str = None) -> Driver:
         client = BridgeClient(config.bridge_url, config.credential(), config.timeout_seconds)
         built = Driver(config, Ledger(home, bridge_url=config.bridge_url), client, instance=host_instance(), internal_job=os.environ.get(INTERNAL_JOB_ENV) == "1", notify=notify)
         _drivers[home] = built
+        # Turns an exited process of this profile left open are settled before this process prepares any.
+        built.delivery.recover()
         if config.internal_turns is not None and os.environ.get(INTERNAL_HOST_ENV) == "1" and not built.internal_job:
             host = InternalTurnHost(config, client, home, notify)
             host.start()
@@ -74,8 +76,28 @@ def driver(home: str = None) -> Driver:
         return built
 
 
+def _tool_gate_refusal(tool_name, error) -> dict:
+    """pre_tool_call when the plugin is not usable: Lite's tools are blocked, never let through (Hermes runs a tool no hook blocks)."""
+    try:
+        prefix = Config.load(hermes_home()).tool_prefix
+    except (ConfigError, OSError):
+        prefix = "mcp__"  # which MCP server is Lite's is unknown, so every MCP tool is blocked
+    if not isinstance(tool_name, str) or not tool_name.startswith(prefix):
+        return None
+    logger.error("psfn_lite blocked %s: the plugin is not usable (%s)", tool_name, error)
+    return {"action": "block", "message": f"PSFN Lite tools are blocked: the psfn_lite plugin is not usable in this Hermes profile ({error})."}
+
+
 def _hook(name: str):
     def call(**kwargs):
+        if name == "pre_tool_call":
+            try:
+                issues = profile_issues()
+                if issues:
+                    raise ConfigError("psfn_lite refuses to drive Lite turns: " + "; ".join(issues))
+                return driver().pre_tool_call(**kwargs)
+            except Exception as error:  # a hook that raises lets the tool run, so every failure blocks
+                return _tool_gate_refusal(kwargs.get("tool_name"), error)
         try:
             # The hooks are registered whether or not the provider started, so they refuse on their own
             # when the profile would also keep Hermes's memory or compact without a checkpoint.

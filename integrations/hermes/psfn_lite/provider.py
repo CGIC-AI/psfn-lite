@@ -75,7 +75,11 @@ class PsfnLiteProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         if isinstance(new_session_id, str) and new_session_id:
+            parent = kwargs.get("parent_session_id") or self._session_id
             self._session_id = new_session_id
+            # Only a compression continues the conversation; /new (reset) starts another one.
+            if self._driver is not None and isinstance(parent, str) and not kwargs.get("reset"):
+                self._driver.session_switch(new_session_id, parent)
 
     def on_pre_compress(self, messages) -> str:
         if self._driver is None:
