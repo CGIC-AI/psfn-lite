@@ -8,7 +8,7 @@ import {
 } from '../../../system/capabilities/requirements.js';
 import { buildAutonomousActionMemoryContext } from '../../../faculties/memory/types.js';
 import type { MemoryWriter } from '../../../faculties/memory/writer.js';
-import type { RuntimeServiceHealthStatus } from '../../../operator/tool-health/types.js';
+import type { RuntimeServiceHealthStatus } from '../../../shared/contracts/runtime-service-health.js';
 import { toErrorMessage } from '../../../shared/utils/errors.js';
 import type { AdaptiveToolRuntimeState } from '../adaptive-tools-telemetry.js';
 import {

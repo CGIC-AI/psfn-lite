@@ -1,4 +1,5 @@
 # Donor files carried TEMPORARILY (scaffolding the closure or its tests import, test-support, fixtures). Each leaves when its seam is cut (plan Step B); the build must end with none of the scaffolding ones.
+# Kind `promoted`: a donor file outside the Step A0 closure that a seam cut kept unchanged as core (it is self-contained and serves a kept path); it stays at its donor path and is no longer scaffolding. See extraction/cuts.tsv.
 # kind	file
 scaffolding	src/app/agent/control-plane.ts
 scaffolding	src/app/agent/icp-autonomy-candidate-dispatcher.ts
@@ -657,7 +658,7 @@ scaffolding	src/persistence/system-owner-fleet-migration.ts
 scaffolding	src/persistence/system-owner-fleet-owner-validation.ts
 scaffolding	src/persistence/workspaces/shared-workspace-bounds.ts
 scaffolding	src/persistence/workspaces/shared-workspace-reader.ts
-scaffolding	src/primitives/images/attachment-claim-guard.ts
+promoted	src/primitives/images/attachment-claim-guard.ts
 scaffolding	src/primitives/images/comfyui-mcp.ts
 scaffolding	src/primitives/images/comfyui.ts
 scaffolding	src/primitives/images/delivery-selection.ts
@@ -671,12 +672,12 @@ scaffolding	src/primitives/images/openrouter-image.ts
 scaffolding	src/primitives/images/ops.ts
 scaffolding	src/primitives/images/reference-store.ts
 scaffolding	src/primitives/images/remote-fetch.ts
-scaffolding	src/primitives/images/request-context.ts
+promoted	src/primitives/images/request-context.ts
 scaffolding	src/primitives/images/service.ts
 scaffolding	src/primitives/images/tool-routing.ts
 scaffolding	src/primitives/images/tools.ts
 scaffolding	src/primitives/images/types.ts
-scaffolding	src/primitives/images/vision-policy.ts
+promoted	src/primitives/images/vision-policy.ts
 scaffolding	src/primitives/llm/decision/jev-transport.ts
 scaffolding	src/primitives/llm/discovery.ts
 scaffolding	src/primitives/llm/work-spec-wire.ts

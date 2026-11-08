@@ -37,7 +37,7 @@ import type { CapabilityTier, CoreSubstrateConfig } from '../../system/config/ru
 import type { ContactStorePort } from '../contacts/contact-store-port.js';
 import { resolveIcpAutonomyCandidateSchedulerOrigin } from '../icp/candidate-scheduler-origin.js';
 import type { ContactTrackingGate } from '../contacts/tracking-gate.js';
-import type { ImageVisionReviewer } from '../../primitives/images/types.js';
+import type { ImageVisionReviewer } from '../../shared/contracts/image-vision-review.js';
 import type { VisionIntakeImageScreenerPort } from './substrate-agent/vision-attachments.js';
 import type { LLMProviderPort, MemoryProvider, MemoryExtractor, ScratchpadProvider, WikiRetrievalPort } from './contracts.js';
 import {
@@ -226,7 +226,7 @@ import { BackgroundWorkHandoffRecoveryRuntime } from './background-work/handoff-
 import type { ObserverEvalSidecarRuntime } from '../eval/observer-sidecar/types.js';
 import type { FatigueBudgetPort } from './fatigue/fatigue-budget.js';
 import type { IcpFatigueRegulationReservationPort } from './fatigue/regulation-reservation.js';
-import type { RuntimeServiceHealthStatus } from '../../operator/tool-health/types.js';
+import type { RuntimeServiceHealthStatus } from '../../shared/contracts/runtime-service-health.js';
 import type { IntakeFirewallMode } from '../../system/config/intake-policy-config.js';
 import type { ViewerCeiling } from '../session/viewer-ceiling.js';
 

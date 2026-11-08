@@ -32,7 +32,7 @@ import type { MetacognitiveFlag } from '../../self-model/metacognition.js';
 import type { ContextBudgetTurnCharacteristics } from '../../../shared/context-budget.js';
 import type { ConversationScopeSpeaker } from '../../session/conversation-scope.js';
 import type { CapturedSessionReads } from '../../session/manager/captured-session-owner.js';
-import type { ImageVisionReviewer } from '../../../primitives/images/types.js';
+import type { ImageVisionReviewer } from '../../../shared/contracts/image-vision-review.js';
 import type { VisionIntakeImageScreenerPort } from './vision-attachments.js';
 import type { ObserverEvalSidecarRuntime } from '../../eval/observer-sidecar/types.js';
 import type { FatigueBudgetPort } from '../fatigue/fatigue-budget.js';

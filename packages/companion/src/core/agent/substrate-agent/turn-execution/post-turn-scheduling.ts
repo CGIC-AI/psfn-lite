@@ -2,7 +2,7 @@ import type { AgentMessage } from '../../../../boundary/pi-agent/index.js';
 import {
   collectGeneratedImageAttachments,
   type GeneratedImageGalleryContext,
-} from '../../../../primitives/images/generated-media.js';
+} from '../generated-media-stub.js';
 import { emitCompanionArtifactCreatedEvents } from '../../../../channels/backplane/companion-relay/artifact-emission.js';
 import type {
   AgentResponse,
