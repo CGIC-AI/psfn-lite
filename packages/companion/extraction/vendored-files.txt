@@ -1,5 +1,5 @@
 # Donor files carried TEMPORARILY (scaffolding the closure or its tests import, test-support, fixtures). Each leaves when its seam is cut (plan Step B); the build must end with none of the scaffolding ones.
-# Kind `promoted`: a donor file outside the Step A0 closure that a seam cut kept unchanged as core (it is self-contained and serves a kept path); it stays at its donor path and is no longer scaffolding. See extraction/cuts.tsv.
+# Kind `promoted`: a donor file outside the Step A0 closure that a seam cut kept as core (it is self-contained and serves a kept path); it stays at its donor path and is no longer scaffolding. Unchanged unless a cut in extraction/cuts.tsv edits it (B2: core/cogsec/intake/derived-content.ts imports redirected to the ports; core/cogsec/memory-candidacy.ts split, seam 3.5).
 # kind	file
 scaffolding	src/app/agent/control-plane.ts
 scaffolding	src/app/agent/icp-autonomy-candidate-dispatcher.ts
