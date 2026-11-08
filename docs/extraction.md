@@ -20,7 +20,9 @@ batches B1-B7); the donor's code, docs and history are the spec.
 |---|---|
 | A0 baseline | Recorded (below). |
 | A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding; typechecks with the donor compiler options; the extracted tests reproduce the baseline in a clean full run (Equivalence, below). |
-| B1-B7 seam cuts | Not started. No donor behaviour has been changed yet. |
+| B1 seam cuts (3.7, 3.8, 3.13, 3.14, 3.16, 3.18) | Done (Seam cuts, below). |
+| B2 seam cuts (3.4, 3.5, 3.6) | In progress. |
+| B3-B7 | Not started. |
 
 ## Closure (Step A0)
 
@@ -203,7 +205,7 @@ the core called it).
 |---|---|---|
 | `src/test-support/postgres-test-harness.ts:108` | `profile: process.env.PSFN_POSTGRES_TEST_PROFILE_OVERRIDE?.trim() \|\| 'tmpfs-v3-max-connections'` | Container names derive from the profile; without an override the harness reuses (and resets) warm containers that other checkouts own. Test infrastructure only. |
 
-No donor test file was modified.
+Donor test files are modified only by deleting `it()` blocks (Deleted and modified tests, below).
 
 ### Test configuration differences (Lite vs donor)
 
@@ -247,14 +249,48 @@ containers and no `/tmp/lc-*` directories were left.
 
 ## Deleted and modified tests
 
+Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
+(file, full test name or `*`, reason, seam). Deleting an `it()` block is the
+only edit to a donor test file; no assertion was changed.
+
 | Test | Reason | Seam |
 |---|---|---|
 | `src/core/identity/importer.test.ts` (7 tests) | Character card importer cut; `@character-foundry` not allowed | card importer, `core/identity/importer.ts:12` |
+| `src/core/agent/substrate-agent/turn-execution-runtime.test.ts` > `handleMessageForTurn generated media delivery`: "turns successful media tool results into response attachments for chat egress", "queues high-sensitivity generated media instead of sending it to a public audience", "recovers response attachments from tracked paid deliverables when the turn transcript misses the tool result" (3 tests) | They assert that image tool results become reply attachments (and the sensitivity gating of those attachments); the image tools and generated-media collection are cut. The fourth test in that block (no-reply drops a paid deliverable, no attachments) still passes and stays. | 3.13 |
 
 ## Seam cuts
 
-None yet (Step B). Each cut will be recorded here with file:line, cut type and
-behaviour change.
+Every cut has a row in `packages/companion/extraction/cuts.tsv` (seam, site
+file:line, cut type, detail, behaviour change). `node
+packages/companion/extraction/remaining-seams.mjs [--summary]` lists the core
+tree's remaining imports of vendored scaffolding; Step B7 ends with it empty.
+Core for that check = the Step A0 closure, plus donor files **promoted** to
+core (kind `promoted` in `vendored-files.txt`: self-contained files a cut kept
+unchanged at their donor paths), plus the Lite files the cuts add.
+
+Cut types: **redirect** (the same donor function or type, imported from the
+closure module that already defines it); **type copy** (type-only declarations
+copied verbatim into a new closure file); **promote** (a self-contained donor
+file kept unchanged at its path); **move verbatim** (donor functions copied
+unchanged into a closure file, without the scaffolding around them); **stub**
+(a scaffolding value replaced by its result for the single host);
+**delete call path**.
+
+### B1 (3.7, 3.8, 3.13, 3.14, 3.16, 3.18)
+
+Remaining seam statements: 171 before, 150 after.
+
+| Seam | Cut | Behaviour change |
+|---|---|---|
+| 3.7 lifecycle | None needed: `system/lifecycle/{turn-contention,outbound-reply-dedupe,notifications}.ts` are already closure files at their donor paths and import only core. The five other lifecycle files stay vendored (no core importer). The notification port is 3.2 (B3). | none |
+| 3.8 keyring | Redirect `persistence/journals/hmac-boundary.ts:1-2`, `primitives/llm/client-request-capability.ts:34-37`, `system/config/runtime-config-contracts.ts:7` from `boundary/custody/credential-vault.ts` to `shared/contracts/credential-contracts.ts`, which defines the same port and resolvers (the vault module re-exports them, `credential-vault.ts:39-49`). | none: the keyring still reads `GATEWAY_SESSION_HMAC_KEYS` / `_KEY` / `_ACTIVE_VERSION` from the environment when no vault is passed. The names are kept, not renamed. |
+| 3.13 images | Type copy of the vision-review port into `shared/contracts/image-vision-review.ts` (5 sites). Promote `primitives/images/{request-context,vision-policy,attachment-claim-guard}.ts` (self-contained; the claim guard runs on text turns). Stub `generated-media.ts` with `core/agent/substrate-agent/generated-media-stub.ts` (4 verbatim declarations; the three collectors return `[]`). `runtime-config-contracts.ts:1` (image config fields) is deferred to the config cut (B5). | A reply never carries an image-tool attachment and the paid-image warnings never log: the image tools are cut, so no turn has an image tool result. Text turns unchanged. 3 tests deleted. |
+| 3.14 telemetry, charge | Move verbatim: the pure provider-cost parsers the API embedding provider uses (`faculties/memory/embedding.ts:18-21`) into `shared/telemetry/provider-cost-extraction.ts` (copied from `boundary/gateway/llm-cost-capture.ts:32-66,72-162`, diff-checked). Telemetry sinks, run-charge and charge policy are closure-internal optional ports, so there is nothing else to cut here. | none. The operator ruling to cut charge and capability tiers is not a closure seam (both are inside the closure); it is carried to B5 and the closure recompute. |
+| 3.16 observer | Superseded by the operator ruling (EmoSim / felt impulse KEEP): `core/eval/observer-sidecar` is a closure seed, so no dispatch call is deleted. | none |
+| 3.18 Garden | Type copy of `RuntimeServiceHealthStatus` into `shared/contracts/runtime-service-health.ts` (3 sites). `emitGardenQueueChanged` is in the composition root `app/agent/scheduler-runtime.ts:57` (B6). | none |
+
+Promoted files bring no tests: their donor tests were not in the Step A0
+selection, so the baseline does not include them.
 
 ## Package changes
 

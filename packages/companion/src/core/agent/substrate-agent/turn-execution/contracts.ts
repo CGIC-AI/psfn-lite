@@ -8,7 +8,7 @@ import type {
   DurableRunChargeRecorder,
 } from '../../../../shared/telemetry/run-charge.js';
 import type { ComposeContext } from '../../../identity/prompt-types.js';
-import type { ImageVisionReviewer } from '../../../../primitives/images/types.js';
+import type { ImageVisionReviewer } from '../../../../shared/contracts/image-vision-review.js';
 import type { VisionIntakeImageScreenerPort } from '../vision-attachments.js';
 import type { SessionManager } from '../../../session/manager.js';
 import type { CapturedSessionReads } from '../../../session/manager/captured-session-owner.js';

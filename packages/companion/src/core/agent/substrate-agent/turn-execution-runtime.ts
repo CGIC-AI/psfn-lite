@@ -68,7 +68,7 @@ import {
   readGeneratedImageSensitivityClassifications,
   summarizeChargedImageDeliverables,
   summarizePendingPaidImageDeliverables,
-} from '../../../primitives/images/generated-media.js';
+} from './generated-media-stub.js';
 import {
   classifyArtifactSensitivity,
   type ArtifactSensitivitySource,
