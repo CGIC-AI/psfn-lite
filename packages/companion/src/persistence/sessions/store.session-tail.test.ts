@@ -350,56 +350,6 @@ describe('SessionStore session tail integration (psfn-framework-hgw3.5)', () => 
     expect(tail.rowsAtEpoch('ch-enqueue-bind', 0).map(row => sessionTailRowId(row))).toEqual([id]);
   });
 
-  it('the second fence still lands when a step AFTER the journal rewrite throws (exception-safe post bump)', async () => {
-    const caseId = 'cogsec_20260701T000000Z_postfence';
-    const dirtyId = appendMessage(store, 'ch-postfence', 'user', 'payload to tombstone', 1_000);
-    await store.flushSessionTailWrites();
-
-    const eventStore = new CogSecEventStore(join(dir, 'cogsec-events.json'));
-    eventStore.createEvent({
-      caseId,
-      type: 'content_poisoning',
-      severity: 'high',
-      sourceChannelId: 'ch-postfence',
-      safeAgentSummary: 'Unsafe instruction-like content was sealed and removed from active cognition.',
-    });
-
-    const bumpsBefore = tail.calls.bumpEpoch;
-    // Event bookkeeping runs AFTER the journal rewrite landed; its failure
-    // must NOT leave the stale-epoch repopulation race open.
-    await expect(store.applyCogSecTombstones({
-      channelId: 'ch-postfence',
-      caseId,
-      eventStore: {
-        getEvent: id => eventStore.getEvent(id),
-        updateEvent: () => {
-          throw new Error('event bookkeeping failed after the rewrite');
-        },
-      },
-      forensicArchive: {
-        sealArtifact: () => ({
-          ref: `${caseId}/fixture-artifact`,
-          artifactId: 'fixture-artifact',
-          caseId,
-          kind: 'l0_rows',
-          sha256: 'sha256:fixture',
-          byteLength: 1,
-          createdAt: '2026-07-01T00:00:00.000Z',
-        }),
-      },
-      messageIds: [dirtyId],
-    })).rejects.toThrow(/event bookkeeping failed/);
-
-    // The rewrite itself was durable (tombstone landed in the journal)...
-    expect(store.getRecent('ch-postfence', 10).map(entry => entry.content))
-      .toEqual([`[CogSec redaction: ${caseId}]`]);
-    // ...so BOTH fences must have run: pre-rewrite and (exception-safe)
-    // post-rewrite. Without the post fence a sibling's stale repopulation
-    // could resurrect the pre-rewrite tail under the bumped epoch.
-    expect(tail.calls.bumpEpoch - bumpsBefore).toBe(2);
-    expect(tail.epochs.get('ch-postfence')).toBe(2);
-  });
-
   it('a corrupt tail (duplicate ids) fails closed to the journal path', async () => {
     const id = appendMessage(store, 'ch-corrupt', 'user', 'original copy', 1_000);
     await store.flushSessionTailWrites();

@@ -24,7 +24,6 @@ import type { SessionEntry } from './types.js';
 import { INTAKE_FIREWALL_NOTICE_TEMPLATES } from '../cogsec/intake-firewall-notice-templates.js';
 import type { IntakeScreeningService } from '../../shared/contracts/intake-screening-port.js';
 import type { IntakeSinkGate } from '../../shared/contracts/intake-sink-gate-port.js';
-import { renderMarkedContent } from '../cogsec/intake/marking.js';
 import {
   INTAKE_SCREENING_METADATA_KEY,
   parseIntakeScreeningMetadata,
@@ -33,9 +32,6 @@ import {
 const log = createComponentLogger('IntakeSinkGating');
 
 const METADATA_KEY_MARKER = `"${INTAKE_SCREENING_METADATA_KEY}"`;
-// Bound synchronous prompt-assembly marking across the whole context. Entries
-// beyond the budget keep their provenance wrapper but use the reduced form.
-const PROMPT_ASSEMBLY_MARKING_WORK_LIMIT_CHARS = 256 * 1024;
 
 export type SelfAuthoredMutationSink =
   | 'persona_mutation'
@@ -209,7 +205,10 @@ export interface PromptAssemblyGateSummary {
   withheldEntryIds: number[];
   /** Entries whose gate verdict was deny (includes shadow-mode would-denies). */
   deniedEntryIds: number[];
-  /** Entries whose content was wrapped/interleaved by data marking (enforce mode; htm9.13). */
+  /**
+   * Entries whose content was wrapped/interleaved by data marking (enforce
+   * mode; htm9.13). Always empty in Lite: data marking is cut (seam 3.4).
+   */
   markedEntryIds: number[];
 }
 
@@ -233,7 +232,6 @@ export function applyPromptAssemblySinkGate(
   };
   if (!gate) return { entries, summary };
 
-  let remainingMarkingWorkChars = PROMPT_ASSEMBLY_MARKING_WORK_LIMIT_CHARS;
   const mutatedRef: { entries: SessionEntry[] | null } = { entries: null };
   const withholdEntry = (index: number, entry: SessionEntry): void => {
     if (gate.mode !== 'enforce') return;
@@ -279,33 +277,8 @@ export function applyPromptAssemblySinkGate(
       continue;
     }
 
-    // htm9.13: light-touch data marking, applied at READ time so the marker
-    // never exists in persisted content and inbound re-scans only ever see
-    // forged markers. Enforce mode applies the plan; shadow mode audits it.
-    if (screening.marking && screening.marking.intensity !== 'none' && !screening.withheld) {
-      if (gate.mode !== 'enforce') {
-        log.debug('Shadow mode: data-marking plan computed but not applied', {
-          channelId: context.channelId,
-          entryId: entry.id,
-          intensity: screening.marking.intensity,
-        });
-        continue;
-      }
-      const sourceRef = screening.envelopes[0]?.envelopeId;
-      const forceReducedForm = entry.content.length > remainingMarkingWorkChars;
-      if (!forceReducedForm) {
-        remainingMarkingWorkChars -= entry.content.length;
-      }
-      mutatedRef.entries ??= [...entries];
-      mutatedRef.entries[index] = {
-        ...entry,
-        content: renderMarkedContent(entry.content, screening.marking, {
-          ...(sourceRef ? { sourceRef: `intake-envelope:${sourceRef}` } : {}),
-          ...(forceReducedForm ? { forceReducedForm: true } : {}),
-        }),
-      };
-      summary.markedEntryIds.push(entry.id);
-    }
+    // Lite extraction (seam 3.4): read-time data marking (htm9.13) is cut, so
+    // an allowed entry passes through unmarked and markedEntryIds stays empty.
   }
 
   if (summary.withheldEntryIds.length > 0) {

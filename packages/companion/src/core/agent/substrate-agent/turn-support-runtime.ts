@@ -3,26 +3,8 @@ import { createComponentLogger } from '../../../shared/logger.js';
 import type { EventBus, EventMap } from '../../../shared/event-bus.js';
 import type { CapturedSessionReads } from '../../session/manager/captured-session-owner.js';
 import type { TrustLevel } from '../../../system/trust/types.js';
-import type { DisclosureLineage } from '../../cogsec/disclosure/contracts.js';
-import {
-  buildContextSourceManifest,
-  contextSourceManifestContentDigest,
-  type ContextSourceManifestBlockInput,
-} from '../../cogsec/disclosure/context-source-manifest.js';
-import {
-  buildCustodySnapshot,
-  custodySnapshotContentDigest,
-  type CustodySnapshotStorePort,
-} from '../../cogsec/disclosure/custody-snapshot.js';
-import type { ToolResultCustodyEdge } from '../../../shared/contracts/tool-result-custody.js';
 import { normalizeChannelPrivacy } from '../../../system/trust/context-envelope.js';
-import type { AgentResponse, CorrelationMetadata, InferredPostTurnAction, IntentionalNoReplyMetadata, MessagePromptOverrideMode, ObservabilityCallType, ParentTurnContinuationStop, RuntimeFallbackProvenance, SubstrateMessage, TurnCustodySnapshotAbsenceReason, TurnCustodySnapshotOutcome, TurnID, TurnRecord, TurnUsage } from '../../../shared/contracts/runtime.js';
-import {
-  emitHealthEvent,
-  hashHealthEventSubject,
-  processObserverId,
-  resolveHealthEventOwner,
-} from '../../../shared/contracts/health-event.js';
+import type { AgentResponse, CorrelationMetadata, InferredPostTurnAction, IntentionalNoReplyMetadata, MessagePromptOverrideMode, ObservabilityCallType, ParentTurnContinuationStop, RuntimeFallbackProvenance, SubstrateMessage, TurnID, TurnRecord, TurnUsage } from '../../../shared/contracts/runtime.js';
 import type { TurnObservabilityRecord } from '../../turns/observability.js';
 import type { TurnSnapshot } from '../../turns/snapshot.js';
 import type { EmotionStateSnapshot } from '../../emotion/state.js';
@@ -92,11 +74,6 @@ export interface TurnSupportRuntimeOptions {
   /** Configured companion identity, used as the fallback companion scope on
    *  ordinary human-ingress turn correlations (icpCorrelation still wins). */
   companionId?: string;
-  /**
-   * Durable per-turn custody snapshot sink (psfn-framework-ccgdz.1). Absent,
-   * the folded disclosure lineage stays in-process exactly as before.
-   */
-  custodySnapshotStore?: CustodySnapshotStorePort;
 }
 
 export class TurnSupportRuntime {
@@ -108,7 +85,6 @@ export class TurnSupportRuntime {
   private readonly hashPromptText: (text: string) => string;
   private readonly resolveContextWindow: () => number;
   private readonly companionId?: string;
-  private readonly custodySnapshotStore: CustodySnapshotStorePort | null;
   private introspectionTurnSensitivityDecisions: IntrospectionTurnSensitivityDecisions | null = null;
 
   private activeTurnCorrelation: CorrelationMetadata | null = null;
@@ -139,160 +115,6 @@ export class TurnSupportRuntime {
     this.companionId = typeof options.companionId === 'string' && options.companionId.trim().length > 0
       ? options.companionId.trim()
       : undefined;
-    this.custodySnapshotStore = options.custodySnapshotStore ?? null;
-  }
-
-  /**
-   * Project one lost custody snapshot into the health plane.
-   *
-   * A log line is not an incident. The turn deliberately does not fail on a
-   * custody write, so without this a store that is down loses every turn's
-   * durable proof and nothing ever escalates. The event is content-free — the
-   * only subject is a digest of the FAILURE MODE, never the turn — so repeated
-   * failures accumulate into one episode that the repeated-failure detector
-   * opens as a single incident rather than one per turn.
-   *
-   * Fire-and-forget with a logged catch, like every other health emitter in an
-   * error path: a telemetry fault must never mask the fault being reported, and
-   * it must never fail the turn either.
-   */
-  private emitCustodySnapshotHealthEvent(
-    mode: TurnCustodySnapshotAbsenceReason,
-  ): void {
-    void emitHealthEvent(this.eventBus, {
-      owner: resolveHealthEventOwner(this.companionId),
-      severity: 'degraded',
-      code: 'custody_snapshot_write_failed',
-      provenance: {
-        process: 'agent',
-        component: 'persistence',
-        observerId: processObserverId(),
-        subjectHash: hashHealthEventSubject(`custody_snapshot:${mode}`),
-      },
-      observedAtMs: Date.now(),
-    }).catch((error: unknown) => {
-      log.error('Custody snapshot health event emission failed', {
-        error: toErrorMessage(error),
-      });
-    });
-  }
-
-  /**
-   * Persist this turn's folded disclosure lineage as a durable custody snapshot
-   * (psfn-framework-ccgdz.1) and return its resolvable reference — the
-   * lineage's own `generationContextRef` (`turn:<turnId>`), so no identifier is
-   * minted here.
-   *
-   * Record-first: the turn runtime calls this immediately after the fold and
-   * before the reply is composed, so the record exists before anything can be
-   * delivered on the strength of it.
-   *
-   * Failure is VISIBLE, not thrown. The lineage-consuming egress guard already
-   * fails closed on its own terms; converting a custody-store outage into a
-   * turn failure would silence the companion for a write that only records what
-   * already happened. So a failure returns a NAMED absence instead of a ref —
-   * mirroring the intake firewall's `receiptAbsence`, because a bare undefined
-   * cannot tell an unwired deployment apart from a store that refused — and
-   * announces itself on the health plane so repeats become one incident.
-   */
-  async recordTurnCustodySnapshot(input: {
-    lineage: DisclosureLineage;
-    turnId: TurnID;
-    requestId: string;
-    toolResultEdges?: ReadonlyMap<string, ToolResultCustodyEdge>;
-  }): Promise<TurnCustodySnapshotOutcome> {
-    const store = this.custodySnapshotStore;
-    // Not a fault: this deployment wires no custody store, so nothing was
-    // attempted and nothing is owed to an operator.
-    if (!store) return { absenceReason: 'no_custody_store' };
-    try {
-      const snapshot = buildCustodySnapshot({
-        lineage: input.lineage,
-        turnId: input.turnId,
-        requestId: input.requestId,
-        ...(input.toolResultEdges ? { toolResultEdges: input.toolResultEdges } : {}),
-      });
-      const outcome = await store.record(snapshot);
-      if (outcome === 'diverged') {
-        // Two folds disagreed on one generation context — a recovered turn that
-        // reconstructed a different admitted-source set, or a genuine turn-id
-        // collision. The FIRST snapshot stands because it is the fold that
-        // produced the delivered reply, so THIS turn may not point at it as
-        // though it were its own proof; it records the divergence instead.
-        log.error('Custody snapshot diverged from the stored record for this turn', {
-          turnId: input.turnId,
-          requestId: input.requestId,
-          generationContextRef: snapshot.generationContextRef,
-          rejectedContentSha256: custodySnapshotContentDigest(snapshot),
-        });
-        this.emitCustodySnapshotHealthEvent('diverged');
-        return { absenceReason: 'diverged' };
-      }
-      return { ref: snapshot.generationContextRef };
-    } catch (error) {
-      log.error('Custody snapshot write failed; this turn has no durable custody record', {
-        turnId: input.turnId,
-        requestId: input.requestId,
-        error: toErrorMessage(error),
-      });
-      this.emitCustodySnapshotHealthEvent('write_failed');
-      return { absenceReason: 'write_failed' };
-    }
-  }
-
-  /**
-   * Persist this turn's per-block context source manifest
-   * (psfn-framework-ccgdz.4) and return its resolvable reference — the same
-   * `turn:<turnId>` key the custody snapshot uses, so no identifier is minted.
-   *
-   * Failure is VISIBLE, not thrown, for the same reason the snapshot's is: this
-   * records what already happened, and turning a store outage into a turn
-   * failure would silence the companion. An absent ref means the manifest is
-   * missing — which is exactly what a reader must conclude, instead of the
-   * synthesized display string this replaced, which resolved to nothing while
-   * looking like a reference.
-   */
-  async recordTurnContextManifest(input: {
-    turnId: TurnID;
-    requestId: string;
-    blocks: readonly ContextSourceManifestBlockInput[];
-  }): Promise<string | undefined> {
-    const store = this.custodySnapshotStore;
-    if (!store) return undefined;
-    try {
-      const manifest = buildContextSourceManifest({
-        turnId: input.turnId,
-        blocks: input.blocks,
-      });
-      const outcome = await store.recordContextManifest(manifest);
-      if (outcome === 'diverged') {
-        // Two prompt assemblies disagreed on one generation context. The first
-        // stands because it describes the prompt that produced the delivered
-        // reply; a recovered turn legitimately re-assembles, so this is
-        // reported rather than treated as corruption — but never silently.
-        // 8nq3h: the ref below is STILL returned, unlike the custody
-        // snapshot's. `generationContextRef` is the deterministic
-        // `turn:<turnId>` key, so it resolves — but to the FIRST stored
-        // manifest, i.e. a sibling fold of this same turn rather than the
-        // assembly this call described. That caveat is documented on
-        // `TurnRecord.contextManifestRef`; a reader needing fold-exact proof
-        // uses `custodySnapshotRef`, whose absence on divergence is the claim.
-        log.warn('Context source manifest diverged from the stored record for this turn', {
-          turnId: input.turnId,
-          requestId: input.requestId,
-          generationContextRef: manifest.generationContextRef,
-          rejectedContentSha256: contextSourceManifestContentDigest(manifest),
-        });
-      }
-      return manifest.generationContextRef;
-    } catch (error) {
-      log.error('Context source manifest write failed; this turn has no durable context manifest', {
-        turnId: input.turnId,
-        requestId: input.requestId,
-        error: toErrorMessage(error),
-      });
-      return undefined;
-    }
   }
 
   setIntrospectionTurnSensitivityDecisions(

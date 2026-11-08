@@ -71,12 +71,7 @@ import { runAutoCompaction, shouldCompact } from './compaction-service.js';
 import { MASKED_TOOL_OBSERVATION_CONTENT } from '../tool-observation.js';
 import { applyFocusCompactionRanges, type FocusCompactionRange } from '../focus-knowledge.js';
 import { buildPromptSectionTelemetryList } from '../../identity/prompt-sections.js';
-import type { CogSecEvent } from '../../cogsec/events.js';
 import { getRequestContext } from '../../../primitives/llm/request-context.js';
-import {
-  buildCogSecEventNoticeBlock,
-  listAgentVisibleCogSecEvents,
-} from '../../cogsec/safe-log.js';
 import {
   assembleSessionHistoryForContext,
   buildSessionHistoryMessages,
@@ -415,7 +410,6 @@ interface BuildSessionContextParams {
   turnBudgetCharacteristics?: ContextBudgetTurnCharacteristics;
   compactionMode?: 'deferred' | 'foreground';
   pendingCompaction?: boolean;
-  cogSecEvents?: readonly CogSecEvent[];
   /**
    * Intake sink gate (htm9.3). When present, entries carrying persisted
    * intake-screening metadata are checked against the prompt_assembly sink
@@ -640,17 +634,10 @@ export async function buildSessionContext(params: BuildSessionContextParams): Pr
   const continuitySectionText = continuityBlock
     ? continuityBlock
     : '';
-  const cogSecNoticeChannelIds = sourceChannelId === params.channelId
-    ? [params.channelId]
-    : [params.channelId, sourceChannelId];
-  const cogSecVisibleEvents = listAgentVisibleCogSecEvents(params.cogSecEvents ?? [], {
-    channelIds: cogSecNoticeChannelIds,
-    limit: 5,
-  });
-  const cogSecNoticeSectionText = buildCogSecEventNoticeBlock(params.cogSecEvents ?? [], {
-    channelIds: cogSecNoticeChannelIds,
-    limit: 5,
-  });
+  // Lite extraction (seam 3.4): the CogSec event log is cut, so no safe
+  // notices exist to render. The section stays in the layout empty, exactly as
+  // the donor renders it when no events are passed.
+  const cogSecNoticeSectionText = '';
   const orientationSectionText = params.turnSessionContext.orientation?.fired
     ? params.turnSessionContext.orientation.noteText?.trim() ?? ''
     : '';
@@ -930,7 +917,6 @@ export async function buildSessionContext(params: BuildSessionContextParams): Pr
         detailLoss: 'likely',
         emotionalTexture: 'unknown',
         safeAsPartnerSpeech: false,
-        sourceSpanCount: cogSecVisibleEvents.length || undefined,
         notes: ['Safe CogSec notice; sealed material remains outside companion runtime.'],
       }),
     },

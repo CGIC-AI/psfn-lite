@@ -14,12 +14,6 @@ import type { SessionManager } from '../../../session/manager.js';
 import type { CapturedSessionReads } from '../../../session/manager/captured-session-owner.js';
 import type { TurnToolResultCustodyRecord } from '../turn-tool-result-custody.js';
 import type { DisclosureLineage } from '../../../cogsec/disclosure/contracts.js';
-import type {
-  ActiveTurnEgressCustody,
-  EgressDeliveryRecorder,
-} from '../../../cogsec/disclosure/index.js';
-import type { ToolResultCustodyEdge } from '../../../../shared/contracts/tool-result-custody.js';
-import type { ContextSourceManifestBlockInput } from '../../../cogsec/disclosure/context-source-manifest.js';
 import type { MetacognitiveFlag } from '../../../self-model/metacognition.js';
 import type { InternalState } from '../../../self-model/state.js';
 import type { SkillsRuntime } from '../../../../faculties/skills/runtime.js';
@@ -39,7 +33,6 @@ import type {
   ParentTurnContinuationStop,
   ResponseStyle,
   SubstrateMessage,
-  TurnCustodySnapshotOutcome,
   TurnID,
   TurnRecord,
   TurnUsage,
@@ -314,41 +307,6 @@ export interface TurnExecutionRuntime {
    */
   setCurrentTurnDisclosureLineage: (lineage: DisclosureLineage) => void;
   getCurrentTurnDisclosureLineage: () => DisclosureLineage | undefined;
-  /**
-   * Persist the folded lineage as a durable custody snapshot
-   * (psfn-framework-ccgdz.1) and return its resolvable ref (`turn:<turnId>`),
-   * or a NAMED absence reason when no custody store is wired, the write failed,
-   * or the stored snapshot disagreed with this fold. Never throws: a
-   * custody-store outage must not convert into a turn failure.
-   */
-  recordTurnCustodySnapshot: (input: {
-    lineage: DisclosureLineage;
-    turnId: TurnID;
-    requestId: string;
-    toolResultEdges?: ReadonlyMap<string, ToolResultCustodyEdge>;
-  }) => Promise<TurnCustodySnapshotOutcome>;
-  /**
-   * Persist the assembled prompt plan's per-block source manifest
-   * (psfn-framework-ccgdz.4) and return its resolvable ref (`turn:<turnId>`),
-   * or undefined when no store is wired or the write failed visibly. Never
-   * throws, for the same reason the snapshot write does not.
-   */
-  recordTurnContextManifest: (input: {
-    turnId: TurnID;
-    requestId: string;
-    blocks: readonly ContextSourceManifestBlockInput[];
-  }) => Promise<string | undefined>;
-  /**
-   * Publish this turn's egress custody state (psfn-framework-ccgdz.6). It is
-   * called TWICE: once with the correlation alone before generation starts, so
-   * a model-invoked egress inside the tool loop can key its delivery record to
-   * this turn, and again with the durable proof once the record-first snapshot
-   * write settles, so a post-fold deliverer can cite it. `null` clears it (fail
-   * closed: no proof published means no proof claimed).
-   */
-  setCurrentTurnEgressCustody: (custody: ActiveTurnEgressCustody | null) => void;
-  /** Durable egress delivery-record sink; null when no custody store is wired. */
-  getEgressDeliveryRecorder: () => EgressDeliveryRecorder | null;
   buildRuntimeContext: (
     message: SubstrateMessage,
     resolvedUserName: string,

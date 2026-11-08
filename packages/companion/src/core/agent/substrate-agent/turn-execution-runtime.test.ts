@@ -1051,175 +1051,6 @@ describe('handleMessageForTurn MCP disclosure context', () => {
     expect(runtime.agent.prompt).toHaveBeenCalledOnce();
   });
 
-  it('publishes the turn egress correlation before generation and the folded proof after', async () => {
-    // ccgdz.6 timing (S12B lane B24): a model-invoked egress tool runs INSIDE
-    // the generation, and the turn's custody snapshot is folded only after the
-    // tool loop returns. The correlation must therefore be published before the
-    // model runs — without it the egress guard's record-first commit has no key
-    // to bind the delivered bytes to, and every proof-requiring destination is
-    // refused mid-turn as a custody-store outage.
-    const eventBus = new EventBus();
-    const buildContext = vi.fn(async () => ({
-      systemPrompt: 'System prompt',
-      messages: [],
-      manifest: makeContextManifestFixture(),
-    }));
-    const runtime = createRuntime({
-      eventBus,
-      sessionManager: {} as SessionManager,
-      buildContext,
-      scheduleAutoCompactionBetweenTurns: vi.fn(async () => undefined),
-      awaitPendingAutoCompaction: vi.fn(async () => undefined),
-      recordUserMessage: vi.fn(() => 1),
-      recordAssistantMessage: vi.fn(() => 2),
-    });
-    let custodyPublishedBeforeGeneration: (
-      Parameters<TurnExecutionRuntime['setCurrentTurnEgressCustody']>[0]
-    )[] = [];
-    runtime.agent.prompt = vi.fn(async (promptMessage: { content: string }) => {
-      custodyPublishedBeforeGeneration = vi
-        .mocked(runtime.setCurrentTurnEgressCustody).mock.calls.map(([custody]) => custody);
-      runtime.agent.state.messages.push({ role: 'user', content: promptMessage.content });
-      runtime.agent.state.messages.push({ role: 'assistant', content: 'assistant reply' });
-    });
-
-    await handleMessageForTurn(runtime, createMessage('msg-egress-custody-correlation'));
-
-    // Exactly one publish before the model: the correlation, with no proof —
-    // the snapshot it would cite does not exist yet.
-    expect(custodyPublishedBeforeGeneration).toHaveLength(1);
-    const correlation = custodyPublishedBeforeGeneration[0];
-    expect(typeof correlation?.turnId).toBe('string');
-    expect(correlation?.proof).toBeUndefined();
-
-    // The fold upgrades the SAME turn's state to the durable proof.
-    const folded = vi.mocked(runtime.setCurrentTurnEgressCustody).mock.calls.at(-1)?.[0];
-    expect(folded?.turnId).toBe(correlation?.turnId);
-    expect(folded?.proof?.custodySnapshotRef).toBe(`turn:${correlation?.turnId}`);
-    expect(folded?.proof?.sourceCount).toBeGreaterThan(0);
-  });
-
-  it('records the folded lineage as a durable custody snapshot on the real turn path', async () => {
-    const eventBus = new EventBus();
-    const buildContext = vi.fn(async () => ({
-      systemPrompt: 'System prompt',
-      messages: [],
-      manifest: makeContextManifestFixture(),
-    }));
-    const runtime = createRuntime({
-      eventBus,
-      sessionManager: {} as SessionManager,
-      buildContext,
-      scheduleAutoCompactionBetweenTurns: vi.fn(async () => undefined),
-      awaitPendingAutoCompaction: vi.fn(async () => undefined),
-      recordUserMessage: vi.fn(() => 1),
-      recordAssistantMessage: vi.fn(() => 2),
-    });
-
-    await handleMessageForTurn(runtime, createMessage('msg-custody-snapshot'));
-
-    // ccgdz.1: exactly one custody write per turn, carrying the SAME lineage
-    // object the egress guard was handed, keyed by the lineage's own
-    // generation context — never a second identifier.
-    expect(runtime.recordTurnCustodySnapshot).toHaveBeenCalledOnce();
-    const custodyInput = vi.mocked(runtime.recordTurnCustodySnapshot).mock.calls[0]?.[0];
-    expect(custodyInput?.requestId).toBe('msg-custody-snapshot');
-    expect(custodyInput?.lineage.generationContextRef).toBe(`turn:${custodyInput?.turnId}`);
-    const publishedLineage = vi.mocked(runtime.setCurrentTurnDisclosureLineage)
-      .mock.calls.at(-1)?.[0];
-    expect(custodyInput?.lineage).toBe(publishedLineage);
-
-    // The written ref reaches the TurnRecord, so the chain resolves later.
-    const recordInput = vi.mocked(runtime.buildTurnRecord).mock.calls.at(-1)?.[0];
-    expect(recordInput?.custodySnapshotRef).toBe(`turn:${custodyInput?.turnId}`);
-
-    // ccgdz.4: the per-block source manifest is written beside it, on the same
-    // key, and `contextManifestRef` is that ref — a reference that resolves,
-    // not the synthesized `session:<channelId>|messages:<n>|...` display string
-    // it replaced.
-    expect(runtime.recordTurnContextManifest).toHaveBeenCalledOnce();
-    const manifestInput = vi.mocked(runtime.recordTurnContextManifest).mock.calls[0]?.[0];
-    expect(manifestInput?.turnId).toBe(custodyInput?.turnId);
-    expect(manifestInput?.blocks.length ?? 0).toBeGreaterThan(0);
-    expect(recordInput?.contextManifestRef).toBe(`turn:${custodyInput?.turnId}`);
-  });
-
-  it('stamps a named custody absence on the turn record when the write is lost', async () => {
-    const eventBus = new EventBus();
-    const buildContext = vi.fn(async () => ({
-      systemPrompt: 'System prompt',
-      messages: [],
-      manifest: makeContextManifestFixture(),
-    }));
-    const runtime = createRuntime({
-      eventBus,
-      sessionManager: {} as SessionManager,
-      buildContext,
-      scheduleAutoCompactionBetweenTurns: vi.fn(async () => undefined),
-      awaitPendingAutoCompaction: vi.fn(async () => undefined),
-      recordUserMessage: vi.fn(() => 1),
-      recordAssistantMessage: vi.fn(() => 2),
-    });
-    runtime.recordTurnCustodySnapshot = vi.fn(async () => ({
-      absenceReason: 'write_failed' as const,
-    }));
-
-    // The turn still completes — a custody-store outage may not silence the
-    // companion — but the record says WHY it carries no proof instead of
-    // leaving a bare undefined a later reader would have to guess about.
-    await handleMessageForTurn(runtime, createMessage('msg-custody-absent'));
-
-    const recordInput = vi.mocked(runtime.buildTurnRecord).mock.calls.at(-1)?.[0];
-    expect(recordInput?.custodySnapshotRef).toBeUndefined();
-    expect(recordInput?.custodySnapshotAbsence).toBe('write_failed');
-  });
-
-  it('feeds one tool-result custody edge to both the snapshot and the turn record', async () => {
-    const eventBus = new EventBus();
-    const buildContext = vi.fn(async () => ({
-      systemPrompt: 'System prompt',
-      messages: [],
-      manifest: makeContextManifestFixture(),
-    }));
-    const runtime = createRuntime({
-      eventBus,
-      sessionManager: {} as SessionManager,
-      buildContext,
-      scheduleAutoCompactionBetweenTurns: vi.fn(async () => undefined),
-      awaitPendingAutoCompaction: vi.fn(async () => undefined),
-      recordUserMessage: vi.fn(() => 1),
-      recordAssistantMessage: vi.fn(() => 2),
-    });
-    const custodyRecord = {
-      ref: 'tool:wiki_read:call-1',
-      disclosureSource: {
-        ref: 'tool:wiki_read:call-1',
-        intakeState: 'released' as const,
-        sourceRiskTier: 'untrusted' as const,
-      },
-      intakeEnvelope: {
-        envelopeId: 'env-wiki-1',
-        sourceClass: 'tool_output' as const,
-        sourceRiskTier: 'untrusted' as const,
-        state: 'released' as const,
-        riskLabels: [],
-        subject: { kind: 'body' as const },
-      },
-      custody: { envelopeId: 'env-wiki-1', contentSha256: 'a'.repeat(64) },
-    };
-    runtime.recordToolObservations = vi.fn(() => [custodyRecord]);
-
-    await handleMessageForTurn(runtime, createMessage('msg-tool-custody-edge'));
-
-    // ccgdz.5: one derivation, two consumers. The snapshot's tool-result
-    // contribution and the turn record's stamped edge are the SAME object.
-    const custodyInput = vi.mocked(runtime.recordTurnCustodySnapshot).mock.calls[0]?.[0];
-    expect(custodyInput?.toolResultEdges?.get('tool:wiki_read:call-1'))
-      .toBe(custodyRecord.custody);
-    const recordInput = vi.mocked(runtime.buildTurnRecord).mock.calls.at(-1)?.[0];
-    expect(recordInput?.toolResultCustody?.get('tool:wiki_read:call-1'))
-      .toBe(custodyRecord);
-  });
 });
 
 describe('handleMessageForTurn intentional no-reply', () => {
@@ -5853,36 +5684,6 @@ describe('handleMessageForTurn compaction scheduling', () => {
     ]);
   });
 
-  it('keeps shadow-mode observability active by retaining the canary marker', async () => {
-    const eventBus = new EventBus();
-    const buildContext = vi.fn(async () => ({
-      systemPrompt: 'System prompt',
-      messages: [],
-      manifest: makeContextManifestFixture(),
-    }));
-    const runtime = createRuntime({
-      eventBus,
-      sessionManager: {} as SessionManager,
-      buildContext,
-      scheduleAutoCompactionBetweenTurns: vi.fn(async () => undefined),
-      awaitPendingAutoCompaction: vi.fn(async () => undefined),
-      recordUserMessage: vi.fn(() => 1),
-      recordAssistantMessage: vi.fn(() => 2),
-      cogSecMode: 'shadow',
-    });
-
-    await handleMessageForTurn(runtime, createMessage('msg-cogsec-shadow'));
-
-    expect(mockedBuildTurnUserContent).toHaveBeenCalledWith(
-      expect.objectContaining({ visionIntakeEnforcing: false }),
-    );
-    const buildTurnRecordMock = runtime.buildTurnRecord as ReturnType<typeof vi.fn>;
-    const recordedInput = buildTurnRecordMock.mock.calls[0]?.[0] as { turnSnapshot?: Record<string, unknown> };
-    const plan = recordedInput.turnSnapshot?.plan as PromptPlan;
-    expect(getPromptPlanBlockText(plan, 'cogsec.canary')).toMatch(/^\[session-integrity cnry_/u);
-    expect(serializePromptPlanSystemPrompt(plan)).toContain('session-integrity');
-  });
-
   it('moves system context into the prompt system lane instead of assistant history in observability snapshots', async () => {
     const eventBus = new EventBus();
     const buildContext = vi.fn(async () => ({
@@ -5927,16 +5728,12 @@ describe('handleMessageForTurn compaction scheduling', () => {
     const plan = recordedInput.turnSnapshot?.plan as PromptPlan;
     const mergedSystemPrompt = [
       'Rendered static prefix',
-      // htm9.18: the per-session canary marker is planted right after the static
-      // prefix (session-stable, so it never churns the static cache region).
-      getPromptPlanBlockText(plan, 'cogsec.canary'),
       'Dynamic suffix template',
       'Runtime context block',
       '<session_context>',
       '[SYSTEM: Quiet Planner] Queue a private follow-up reminder.',
       '</session_context>',
     ].join('\n\n');
-    expect(getPromptPlanBlockText(plan, 'cogsec.canary')).toMatch(/^\[session-integrity cnry_/u);
     const providerWireMessages = (promptContext?.providerObservability as {
       providerWireMessages?: Array<{ role: string; source: string; content: string }>;
     } | undefined)?.providerWireMessages;
@@ -6111,13 +5908,9 @@ describe('handleMessageForTurn compaction scheduling', () => {
       '</runtime.current_datetime>',
     ].join('\n');
     const plan = recordedInput.turnSnapshot?.plan as PromptPlan;
-    // htm9.18: the per-session canary marker ships right after the static prefix
-    // block (which here carries the temporal rules) and before the dynamic
-    // suffix. Splice it into the expected merge at that position.
     const mergedSystemPrompt = [
       'Rendered static prefix',
       temporalRulesBlock,
-      getPromptPlanBlockText(plan, 'cogsec.canary'),
       'Dynamic suffix template',
       'Runtime context block',
       '<session_context>',

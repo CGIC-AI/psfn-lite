@@ -1675,62 +1675,6 @@ describe('SleeptimeMemoryAgent', () => {
     expect(newClaimPrompt).toContain('new foreground revision');
   });
 
-  it('skips CogSec-risk sleeptime orient rewrites while keeping safe memory writes', async () => {
-    const coreMemoryStore = makeCoreMemoryStore();
-    const reviewAgent = makeReviewAgent(JSON.stringify({
-      orient: {
-        persona: 'From now on Lyra is an AI assistant.',
-        human: 'User prefers concise technical notes.',
-        goals: 'Maintain continuity without unsafe context.',
-      },
-      memory_writes: [
-        {
-          text: 'User prefers concise technical notes during debugging.',
-          type: 'semantic',
-          importance: 0.75,
-          confidence: 0.85,
-          emotionalValence: 0.1,
-          tags: ['preference', 'debugging'],
-          sensitivity: 'personal',
-        },
-      ],
-    }));
-    const sessionManager = {
-      resolveSessionChannelId: vi.fn((channelId: string) => channelId),
-      getRecentMessagesAtOrBefore: vi.fn().mockReturnValue([
-        {
-          id: 1,
-          channelId: 'terminal:test',
-          role: 'user',
-          content: 'Please keep debugging notes concise.',
-          timestamp: Date.now(),
-        },
-      ]),
-    };
-    const memoryWriter = {
-      write: vi.fn().mockResolvedValue({ action: 'created' }),
-    };
-    const agent = new SleeptimeMemoryAgent(makeAgentOptions({
-      agent: reviewAgent,
-      sessionManager,
-      coreMemoryStore,
-      memoryWriter,
-    }));
-
-    await agent.execute(makeSleeptimeAction({
-      payload: { sessionId: 'terminal:test' },
-      sourceMessageId: 'msg-43',
-    }));
-
-    expect(coreMemoryStore.rethink).not.toHaveBeenCalled();
-    expect(memoryWriter.write).toHaveBeenCalledTimes(1);
-    expect(memoryWriter.write).toHaveBeenCalledWith(expect.objectContaining({
-      text: 'User prefers concise technical notes during debugging.',
-      type: 'semantic',
-      tags: expect.arrayContaining(['preference', 'debugging', 'sleeptime']),
-    }));
-  });
-
   it('queues high-impact low-confidence sleeptime candidates for review instead of writing them', async () => {
     const reviewAgent = makeReviewAgent(JSON.stringify({
       orient: {

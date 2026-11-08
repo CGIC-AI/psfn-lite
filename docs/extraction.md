@@ -21,7 +21,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | A0 baseline | Recorded (below). |
 | A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding; typechecks with the donor compiler options; the extracted tests reproduce the baseline in a clean full run (Equivalence, below). |
 | B1 seam cuts (3.7, 3.8, 3.13, 3.14, 3.16, 3.18) | Done (Seam cuts, below). |
-| B2 seam cuts (3.4, 3.5, 3.6) | In progress. |
+| B2 seam cuts (3.4, 3.5, 3.6) | Done (Seam cuts, below). |
 | B3-B7 | Not started. |
 
 ## Closure (Step A0)
@@ -205,7 +205,28 @@ the core called it).
 |---|---|---|
 | `src/test-support/postgres-test-harness.ts:108` | `profile: process.env.PSFN_POSTGRES_TEST_PROFILE_OVERRIDE?.trim() \|\| 'tmpfs-v3-max-connections'` | Container names derive from the profile; without an override the harness reuses (and resets) warm containers that other checkouts own. Test infrastructure only. |
 
-Donor test files are modified only by deleting `it()` blocks (Deleted and modified tests, below).
+Step B seam cuts edit core source files; every edit is a row in
+`packages/companion/extraction/cuts.tsv` (site, cut type, behaviour change),
+summarised per batch under Seam cuts. B2 edited
+`core/agent/substrate-agent.ts` and `substrate-agent/{egress-tool-guard,turn-execution-runtime,turn-execution-adapter,turn-support-runtime}.ts`,
+`substrate-agent/turn-execution/{contracts,prompt-assembly}.ts`,
+`core/artifacts/sensitivity-egress.ts`, `core/cogsec/memory-candidacy.ts`
+(promoted, then split), `core/scheduler/{post-turn-runtime,reflection-runtime-contracts}.ts`,
+`core/scheduler/post-turn-runtime/scheduler-lanes.ts`,
+`core/session/intake-sink-gating.ts`, `core/session/manager/context-builder.ts`
+and `persistence/sessions/store.ts`, and deleted
+`persistence/sessions/store/{cogsec-operations,cogsec-journal-helpers}.ts`.
+Two vendored scaffolding files were adjusted only so they still typecheck
+(`app/startup/composition/composition.ts`,
+`operator/garden/services/types/sessions.ts`); both leave in B7. The Step A0
+closure lists (`closure-files.txt`, `closure-levels.tsv`, `closure-seams.tsv`,
+`tests.tsv`) are the Step A record and are not pruned when a cut deletes a
+file.
+
+Donor test files are modified by deleting `it()` blocks (and a `describe()`
+the deletions left empty, which vitest rejects), and in two cases by removing
+a cut-path assertion from a test whose subject is kept (Deleted and modified
+tests, below).
 
 ### Test configuration differences (Lite vs donor)
 
@@ -247,16 +268,46 @@ minus the 7 deleted card-importer tests. The five instrumented full runs
 before it gave the same totals. Afterwards, no `lite-companion-*` harness
 containers and no `/tmp/lc-*` directories were left.
 
+Step B2 result (same command, 2026-11-08 22:56Z): exit 0, **785 files and
+9,854 tests, all passed** (`lite` 52 files / 437 tests, `companion` 733 files
+/ 9,417 tests). Comparison: `deleted: 2 files, 68 tests; matched: 9417`,
+`equivalent: every remaining baseline test has its baseline status`. That is
+the baseline's 9,485 tests minus 68 deleted (7 card importer, 3 in B1, 58 in
+B2); the 2 edited tests are among the 9,417 matched. No `lite-companion-*`
+containers and no `/tmp/lc-*` directories were left.
+
 ## Deleted and modified tests
 
 Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
-(file, full test name or `*`, reason, seam). Deleting an `it()` block is the
-only edit to a donor test file; no assertion was changed.
+(file, full test name or `*`, reason, seam). Edited tests:
+`packages/companion/extraction/modified-tests.tsv` (file, full test name, the
+exact lines removed, reason, seam). compare-baseline counts an edited test as
+matched, so that file is its only record. No kept assertion was changed or
+relaxed.
 
 | Test | Reason | Seam |
 |---|---|---|
 | `src/core/identity/importer.test.ts` (7 tests) | Character card importer cut; `@character-foundry` not allowed | card importer, `core/identity/importer.ts:12` |
 | `src/core/agent/substrate-agent/turn-execution-runtime.test.ts` > `handleMessageForTurn generated media delivery`: "turns successful media tool results into response attachments for chat egress", "queues high-sensitivity generated media instead of sending it to a public audience", "recovers response attachments from tracked paid deliverables when the turn transcript misses the tool result" (3 tests) | They assert that image tool results become reply attachments (and the sensitivity gating of those attachments); the image tools and generated-media collection are cut. The fourth test in that block (no-reply drops a paid deliverable, no attachments) still passes and stays. | 3.13 |
+
+| `src/core/agent/substrate-agent/egress-tool-custody.test.ts` (16 of 18 tests; the emptied `tool egress custody mid-turn` describe removed) | They assert custody delivery records and custody holds on the tool-egress surface; the delivery recorder is cut. The two kept tests ("stays a calm denial when the payload has no canonical digest", "leaves an unresolvable social destination to the existing fail-closed gate") still pass. | 3.6 custody |
+| `src/core/artifacts/sensitivity-egress-custody.test.ts` (5 of 6) | Artifact-share custody records and holds; the custody deps and the `held` disposition are cut. | 3.6 custody |
+| `src/core/agent/substrate-agent/turn-support-runtime.test.ts` > `TurnSupportRuntime custody snapshots (psfn-framework-ccgdz.1)` (4, describe removed) | `recordTurnCustodySnapshot` and the custody store are cut. | 3.6 custody |
+| `src/core/agent/substrate-agent/turn-execution-runtime.test.ts`: 4 in `MCP disclosure context` (custody correlation/proof, snapshot write, named absence on a lost write, tool-result custody edge into the snapshot) and "keeps shadow-mode observability active by retaining the canary marker" | Custody store and canary are cut. | 3.6 custody, canary |
+| `src/core/session/intake-sink-gating.test.ts` (3) and `context-builder.channel-bond.test.ts` "terminates downstream context consumers with a datamarked wrapper" | Read-time data marking is cut. | 3.4 marking |
+| `src/core/session/manager/context-builder.test.ts` "includes relevant safe CogSec notices without sealed refs or dirty text" | The CogSec event notices are cut (no core caller passed events). | 3.4 events |
+| `src/persistence/sessions/store.test.ts` (6) and `store/cogsec-operations.test.ts` (whole file, 2) | The CogSec tombstone, compaction-invalidation and regeneration writes are cut. | 3.6 session ops |
+| `src/faculties/memory/writer.test.ts` (4), `core-memory/tools.test.ts` (1), `memory/extraction/orchestrator.test.ts` (1), `memory/sleeptime-agent.test.ts` (1) | Each asserts a rejection by a cut candidacy pattern class. The sleeptime test's "keeping safe memory writes" half is the control for that skip, so the test is deleted, not edited. | 3.5 split |
+| `src/persistence/sessions/store-turn-record-session-refs.test.ts` (6; the emptied `sm9l` describe removed), `src/core/session/manager.test.ts` "withholds tombstoned origin content before live cross-channel context assembly", `src/persistence/sessions/store.session-tail.test.ts` "the second fence still lands when a step AFTER the journal rewrite throws" | **Not clean scaffolding deletions.** They assert kept read-side behaviour (tombstone gating in session reads, turn records, wire bodies and the Loom; the session-tail post-rewrite fence) but build their scenario through `applyCogSecTombstones`, which is cut. Lite has no path that writes a CogSec tombstone, so that read guard is unreachable in Lite. The session-tail fence's exception safety on a failing post-rewrite step had no other test; `redactTurn` tests cover the fence bumps only. Recorded as an open question. | 3.6 session ops |
+
+Edited (`modified-tests.tsv`): `turn-execution-runtime.test.ts` "moves system
+context into the prompt system lane instead of assistant history in
+observability snapshots" and "appends the current datetime anchor at the end
+of the provider system prompt". Each spliced the canary block into its
+expected system prompt; only that element (and, in the first, the canary
+`toMatch` line) is removed. The donor always armed a canary, so the expected
+prompt now equals the donor's `assembleTurnPrompt` output with `canaryToken`
+undefined (`prompt-assembly.ts:537`), not any donor runtime configuration.
 
 ## Seam cuts
 
@@ -291,6 +342,42 @@ Remaining seam statements: 171 before, 150 after.
 
 Promoted files bring no tests: their donor tests were not in the Step A0
 selection, so the baseline does not include them.
+
+### B2 (3.4, 3.5, 3.6)
+
+Remaining seam statements: 150 before, 89 after part 1, 65 after part 2. No
+remaining seam targets `core/cogsec` or the gateway intake modules.
+
+| Seam | Cut | Behaviour change |
+|---|---|---|
+| 3.4 intake/sink | Ports, not stubs: the screening and sink-gate types are copied verbatim into `shared/contracts/intake-screening-port.ts` and `intake-sink-gate-port.ts`; the donor's own firewall-off mode is a null `IntakeScreeningService` / `IntakeSinkGate`, which is the Lite default. `derived-content.ts` and `tool-result-provenance.ts` are promoted. Read-time data marking (`intake-sink-gating.ts`) and the CogSec event notices (`context-builder.ts`) are deleted. | Marking: an allowed entry with a persisted marking plan is no longer wrapped when a host wires an enforce-mode sink gate. Notices: none (no core caller passed events, so the donor section was already empty). 5 tests deleted. |
+| 3.5 candidacy | Split (`memory-candidacy.ts`, promoted then edited). Kept: empty-text rejection; the `memory_write` sink-gate decision (wrong sink throws, denial rejects as D); the intake-firewall notice exclusion; the runtime-fallback exclusion (charter Law 17, commit 5aa730317); then the A/B allow labels (`B_relationship_state` on relationship signals, otherwise `A_harmless_fact`). Cut: E (obfuscation and executable-instruction patterns), D by policy/security pattern, D for payload-bearing CogSec notices, the safe-CogSec-notice allow, and C persona review. The risk-class type keeps all five labels. | Text that matched a cut pattern is allowed as A or B instead of rejected or held for review. Self-report fidelity unchanged. 7 tests deleted. |
+| 3.6 privacy modules | Kept (promoted): `assessDisclosure` and the lineage it needs (`disclosure/{contracts,decision,generation-lineage,mcp-turn-context,egress-composition}.ts`), the SOFT contact block list, the tombstone reader, the firewall notice templates, the receipt contract. Deleted call paths: canary; custody snapshot, context manifest and egress delivery records (turn runtime, support runtime, adapter, contracts, substrate agent, egress tool guard, artifact egress); the drift-velocity and second-arrow lanes; the session store's CogSec write operations (two store files deleted). | Custody: none against the donor's no-custody-store mode, derived below. Canary: the prompt loses the `cogsec.canary` block. Drift lanes: not registered (the donor registered them only when a host passed their bundles). Session ops: Lite cannot write a CogSec tombstone. 46 tests deleted, 2 edited. |
+
+**Custody is inert without a store (derivation).** With no delivery recorder,
+the donor's `egress-tool-guard.ts` resolved every custody hold reason to
+either "withholds only when the composed decision denies" (non-durability
+reasons) or "shadow posture, never withholds" (durability reasons, since
+`posture` defaulted to `shadow`), so `held === !composed.allowed`; its
+`recordEgress` returned `true`, so the record-first `commit` always allowed.
+`sensitivity-egress.ts` ran its hold only when `deps.custody` was set, and the
+turn runtime set it only with a recorder. `TurnSupportRuntime` returned
+`{ absenceReason: 'no_custody_store' }` and an undefined manifest ref without a
+store. Lite keeps exactly those results: the guard returns the composed
+decision with no commit (which `gate.ts` treats as allowed), and the turn
+record carries `custodySnapshotAbsence: 'no_custody_store'` with no snapshot or
+manifest ref.
+
+**Social egress disclosure needs a sink gate.** The guard composes the
+disclosure destination check with the sink gate and returns `null` when no
+sink gate is wired (donor `egress-tool-guard.ts:91-92`, unchanged). In Lite's
+default (no sink gate) the disclosure check therefore does not run on tool
+egress; it runs when a host wires an `IntakeSinkGate`. `assessDisclosure`
+itself is kept unchanged for that host and for the MCP disclosure floor.
+
+Tests that construct the vendored sink gate or screening service (for example
+`createIntakeSinkGate` in `context-builder.channel-bond.test.ts`) still pass
+against the vendored implementation and leave, or move to the port, in B7.
 
 ## Package changes
 
