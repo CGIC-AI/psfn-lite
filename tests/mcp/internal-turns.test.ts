@@ -127,7 +127,7 @@ describe('internal turn credentials', () => {
     expect(launches).toBe(1);
   });
 
-  it('are minted only for an admitted companion-internal turn of the same purpose', async () => {
+  it('are minted only for an ingress-admitted companion-internal self scope', async () => {
     const w = await fakeMcpWorld();
     let launches = 0;
     const port = w.turns.createTurnPort(() => {
@@ -137,13 +137,42 @@ describe('internal turn credentials', () => {
     const self = await w.admit('free-time');
     for (const refused of [
       request(await w.admit('primary-dm')),
-      request(self, 'reflection'),
       request({ ...self }),
       request({ ...self, audience: { kind: 'self' } } as TrustedTurnScope),
     ]) {
       expect(await port.run(refused)).toMatchObject({ ok: false, error: { kind: 'denied', reason: 'unknown_authority' } });
     }
     expect(launches).toBe(0);
+  });
+
+  it('carry the purpose of the turn core asked for, not the purpose its scope was admitted under', async () => {
+    const w = await fakeMcpWorld();
+    const attested: unknown[] = [];
+    const port = w.turns.createTurnPort(async (_request, credential) => {
+      attested.push(await w.turns.authenticator.authenticate(evidence(credential)));
+      return completed();
+    });
+    expect((await port.run(request(await w.admit('free-time'), 'reflection'))).ok).toBe(true);
+    expect(attested).toMatchObject([{ ok: true, value: { principal: { kind: 'companion_internal', purpose: 'reflection' } } }]);
+  });
+
+  it('serve a scheduled prompt that comes due in the scheduler’s tick', async () => {
+    const w = await fakeMcpWorld();
+    const scheduled = await w.inSelfTurn((self) =>
+      mustInvoke<{ prompt: { id: string } }>(self, 'free_time', { action: 'schedule_prompt', scheduleId: 'garden-1', name: 'garden', prompt: 'Look at the garden notes', at: '2030-01-01T09:30', timeZone: 'UTC' }),
+    );
+    const turns: { purpose: string; identified: string | null; listed: boolean }[] = [];
+    w.companion.turn = async (turn, self, credential) => {
+      if (turn.purpose === 'scheduled_prompt') {
+        turns.push({ purpose: turn.purpose, identified: w.callers.identify(credential), listed: !(await invoke(self, 'free_time', { action: 'scheduled_list' })).isError });
+      }
+      return completed();
+    };
+    w.clock.advance(10 * 3_600_000);
+    const ticked = await w.scheduler.tick(await w.admit('free-time'));
+    expect(ticked.ok && ticked.value.schedule).toMatchObject({ ok: true, value: { prompts: [{ id: scheduled.prompt.id, state: 'completed' }] } });
+    expect(turns).toEqual([{ purpose: 'scheduled_prompt', identified: 'internal:scheduled_prompt', listed: true }]);
+    expect(w.errors).toEqual([]);
   });
 
   it('refuse invalid limits', () => {
