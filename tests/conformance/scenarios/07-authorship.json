@@ -44,7 +44,7 @@
     },
     {
       "do": "turn", "id": "after", "on": "a", "say": "and what did you do just now?",
-      "hides": ["Thinking about bread made me calm.", "Free time is open", "\n[system note: maintenance]"],
+      "hides": ["Thinking about bread made me calm.", "Free time is open"],
       "speech": ["and what did you do just now?"],
       "reply": "I had a quiet moment."
     },
