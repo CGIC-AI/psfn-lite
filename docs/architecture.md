@@ -75,7 +75,14 @@ adapter.
   never shows a reply the ledger did not record. A failed append is returned as a
   failure and repaired by retrying the same outcome or replaying the request; a
   different outcome after settlement is a conflict. The archive rejects an entry
-  id that already exists with different content.
+  id that already exists with different content. A replayed request re-appends
+  its turn's entries before the ownership check, so a successor that is refused
+  as `turn_ownership` still repairs the history. Before opening a new turn,
+  `prepareTurn` re-appends the entries of the session's last settled turn
+  (`TurnLedgerPort.lastSettled`) and opens nothing if that fails. A crash
+  between ledger settlement and the history append is therefore repaired by
+  whichever harness opens the next turn, and only the latest settlement can lag
+  history.
   Each open turn carries a lease (`turnLeaseMs`, required). While the lease runs
   only the owning harness instance may settle the turn, and a live owner hands
   over through `abortTurn`. After it expires, a successor with a scope for the
@@ -120,10 +127,18 @@ adapter.
   survivor in one transaction. Raising trust to trusted or above, family and
   partner relationships, and linking an identity onto a high-tier contact
   become approval proposals. Every write is audited with its author.
+  Tracking consent also gates the dossier, not only ingress. For a contact
+  whose consent is pending, denied or revoked, `note`, `link_identity`,
+  `set_trust`, `propose_trust`, `set_relationship`, `propose_relationship`,
+  `set_channel_privacy` and `set_machine_intelligence` are denied as
+  `untracked_contact`, and `lookup` withholds its notes. Block and unblock stay
+  available, because blocking protects and does not profile.
 - **Identity** (`createOrientationService`, `createIdentityAdministration`,
   `createValuesService`). Orientation blocks are kept per conversation with
   compare-and-set revisions, and limits reject instead of truncating. Prompt
-  layers and the persona card are append-only versions. Protected layers
+  layers and the persona card are append-only versions. A worker reads a
+  conversation's blocks only when its grant admits that conversation's
+  disclosure class (`canViewerRead`), the same rule as for its history. Protected layers
   (base, operator) and protected persona fields become proposals, which apply
   only if the version and checksum have not moved. Values append revisions.
   The North Star holds at most three active items, and every item version is
@@ -160,7 +175,8 @@ never references the adapters.
 - **Storage layout** (`resolveStorageLayout`). The roots are canonical
   history, the agent workspace, and optionally credentials and backups. Each
   root is resolved through symlinks, and the layout is rejected if any two
-  roots are equal or nested. Only a resolved layout opens the archive. As a
+  roots are equal or nested. Only a resolved layout opens the archive or a
+  backup store, and backup sets live only directly under `backupRoot`. As a
   result, a workspace cleanup or a harness reset cannot reach lived history,
   and history never sits beside credentials. Database connection strings are
   passed in by the host. They are never stored in a root and never appear in
@@ -177,7 +193,10 @@ never references the adapters.
     verification for any other reason is refused as `unavailable`, and the
     other sessions keep working.
   - Locking: an exclusive lock file guards the root. A lock left by a dead
-    process is taken over.
+    process is taken over. So is a lock carrying this process's own pid that
+    this process does not hold, which is what a restarted container leaves
+    when the app is pid 1 again. A second open in the same process is still
+    refused.
 - **Structured state** (`openPostgresState`) uses Postgres with pgvector.
   - Migrations: versioned `NNNN_name.sql` files run under an advisory lock,
     one transaction each. Checksums are recorded in `schema_migrations` and
@@ -201,11 +220,28 @@ never references the adapters.
     together with the schema version. It leaves out the projection, which is
     rebuilt after restore.
   - Writing: each file in a set is written atomically and exclusively, so a
-    set is never partially overwritten.
+    set is never partially overwritten. `openFileBackupStore(layout, setName)`
+    requires a resolved layout with a `backupRoot` and a single-segment set
+    name, and it refuses a set directory that resolves anywhere else (for
+    example through a planted symlink). A full copy of private state can
+    therefore never land in the workspace or beside history.
+  - Consistency: every component is fingerprinted before the first export and
+    again after the last one. A write that lands between two components'
+    exports fails the backup as `stale_revision`. Without this, a set could
+    hold a ledger turn whose history is missing.
+  - Time zones: the state component pins `TimeZone` to UTC in every snapshot
+    and import transaction, so its fingerprint does not depend on the
+    server's, database's or role's zone.
   - Restore: every digest is verified before anything is written. Restore
     targets only an empty history root and an empty database at the same
-    schema version. Each component is then proven by recomputing its
-    fingerprint.
+    schema version. Each component proves the backup fingerprint before its
+    content becomes durable. The state component recomputes it inside the
+    import transaction and rolls back on a mismatch. The history component
+    verifies every backed-up chain and the fingerprint before it installs the
+    first session. A failed import leaves that target empty and the restore
+    retryable. Core then recomputes each fingerprint once more. The two
+    components are still separate stores, so an I/O failure in the second
+    after the first committed leaves the first restored.
   - A component that changes during the backup fails it, and the writers must
     be quiesced before retrying.
 
