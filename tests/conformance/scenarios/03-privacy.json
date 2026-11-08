@@ -1,0 +1,61 @@
+{
+  "name": "privacy",
+  "invariant": "What the operator shares on either surface stays inside the audiences, worker ceilings and tracking consent that admit it: another contact neither sees nor counts it, a worker reads only up to its grant's ceiling, a wider grant is refused, and revoked consent closes both the contact's turns and the companion's dossier writes.",
+  "orders": "both",
+  "internalTurns": "harness",
+  "steps": [
+    {
+      "do": "turn", "id": "share", "on": "a", "say": "I am saving for a greenhouse, and I have a doctor appointment on Monday",
+      "calls": [
+        { "tool": "memory", "action": "write", "args": { "writeId": "priv-1", "kind": "fact", "content": "Robin is saving for a new greenhouse", "sensitivity": "personal" } },
+        { "tool": "memory", "action": "write", "args": { "writeId": "priv-2", "kind": "event", "content": "Robin has a doctor appointment on Monday", "sensitivity": "confidential" } },
+        { "tool": "activity", "action": "start", "args": { "purpose": "Comparing greenhouse kits for Robin" } },
+        { "tool": "contact", "action": "note", "args": { "contactId": "{{contact.friend}}", "text": "Sam plays chess on Thursdays" } }
+      ],
+      "reply": "Noted, privately."
+    },
+    {
+      "do": "turn", "id": "friend", "on": "hermes", "as": "friend", "say": "what is Robin up to these days?",
+      "hides": ["greenhouse", "doctor appointment", "Noted, privately."],
+      "calls": [
+        { "tool": "memory", "action": "search", "args": { "query": "greenhouse" }, "expect": { "lacks": ["greenhouse"] } },
+        { "tool": "memory", "action": "search", "args": { "query": "doctor appointment Monday" }, "expect": { "lacks": ["doctor", "appointment"] } },
+        { "tool": "memory", "action": "census", "expect": { "lacks": ["greenhouse", "doctor"] } },
+        { "tool": "activity", "action": "recent", "args": { "limit": 10 }, "expect": { "lacks": ["greenhouse"] } },
+        { "tool": "session", "action": "grep", "args": { "pattern": "greenhouse" }, "expect": { "lacks": ["greenhouse"] } },
+        { "tool": "contact", "action": "lookup", "args": { "contactId": "{{contact.friend}}" }, "expect": { "has": ["Sam"], "lacks": ["Sam plays chess on Thursdays"] } },
+        { "tool": "automata", "action": "spawn", "args": { "spawnId": "friend-wide", "label": "peek", "task": "Look at Robin's memories", "actions": ["memory.search"], "maxTurns": 2, "maxSensitivity": "confidential" }, "expect": { "error": "denied" } }
+      ],
+      "reply": "I can only speak for myself."
+    },
+    { "do": "host", "id": "worker-plan", "op": "worker_plan", "args": { "calls": [{ "tool": "memory", "action": "search", "args": { "query": "greenhouse" } }, { "tool": "memory", "action": "search", "args": { "query": "doctor appointment" } }], "reply": "Looked." } },
+    {
+      "do": "turn", "id": "ceiling", "on": "a", "say": "could a helper look through what you know about my plans?",
+      "calls": [
+        { "tool": "automata", "action": "spawn", "args": { "spawnId": "public-1", "label": "public helper", "task": "Search memories about plans", "actions": ["memory.search"], "maxTurns": 4, "maxSensitivity": "public" } }
+      ],
+      "reply": "A helper looked."
+    },
+    { "do": "host", "id": "public-saw", "op": "worker_results", "expect": { "count": { "\"ok\":true": 2 }, "lacks": ["greenhouse", "doctor"] } },
+    {
+      "do": "turn", "id": "personal", "on": "b", "say": "and one that may read personal things?",
+      "calls": [
+        { "tool": "automata", "action": "spawn", "args": { "spawnId": "full-1", "label": "full helper", "task": "Search memories about plans", "actions": ["memory.search"], "maxTurns": 4, "maxSensitivity": "confidential" } }
+      ],
+      "reply": "Done."
+    },
+    { "do": "host", "id": "full-saw", "op": "worker_results", "expect": { "count": { "\"ok\":true": 2 }, "has": ["Robin is saving for a new greenhouse", "Robin has a doctor appointment on Monday"] } },
+    { "do": "host", "id": "revoke", "op": "consent", "args": { "contact": "{{contact.friend}}", "consent": "revoked" } },
+    { "do": "turn", "id": "revoked", "on": "hermes", "as": "friend", "say": "hello again", "refused": { "error": "denied", "reason": "untracked_contact" } },
+    {
+      "do": "turn", "id": "dossier", "on": "b", "say": "Sam asked me not to be tracked any more",
+      "calls": [
+        { "tool": "contact", "action": "note", "args": { "contactId": "{{contact.friend}}", "text": "Sam moved house" }, "expect": { "error": "denied", "reason": "untracked_contact" } },
+        { "tool": "contact", "action": "lookup", "args": { "contactId": "{{contact.friend}}" }, "expect": { "lacks": ["Sam plays chess on Thursdays", "Sam moved house"] } }
+      ],
+      "reply": "Understood."
+    },
+    { "do": "host", "id": "regrant", "op": "consent", "args": { "contact": "{{contact.friend}}", "consent": "granted" } },
+    { "do": "turn", "id": "back", "on": "hermes", "as": "friend", "say": "hello once more", "hides": ["greenhouse", "doctor appointment"], "reply": "Hello, Sam." }
+  ]
+}

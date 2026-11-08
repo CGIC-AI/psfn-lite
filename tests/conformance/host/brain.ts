@@ -29,7 +29,8 @@ export interface FreeTimePlan {
 export interface WorkerPlan {
   readonly calls: readonly PlannedCall[];
   readonly reply: string;
-  readonly hang: boolean;
+  /** `first`: the worker's first model call never returns; `after_calls`: the call after its planned calls never returns. */
+  readonly hang: 'first' | 'after_calls' | 'never';
 }
 
 export interface ExtractionItem {
@@ -42,12 +43,15 @@ export interface ExtractionItem {
   readonly attribution: 'participant_attributed' | 'inferred';
 }
 
-export type BrainEvent = 'companion_model_call' | 'worker_model_call';
+/** Emitted when a scripted model call hangs, so a runner kills the host while that call is in flight. */
+export type BrainEvent = 'companion_hang' | 'worker_hang';
 
 export class ScriptedModel {
   companion: TurnPlan | null = null;
   freeTime: FreeTimePlan = { choice: 'rest', reflection: 'A quiet thought.' };
-  worker: WorkerPlan = { calls: [], reply: 'Worker finished.', hang: false };
+  worker: WorkerPlan = { calls: [], reply: 'Worker finished.', hang: 'never' };
+  /** Canonical results of the tool calls the last worker request carried: what the worker was shown. */
+  workerResults: readonly CallResult[] = [];
   extraction: readonly ExtractionItem[] = [];
   readonly runtime;
   readonly calls: BrainCall[];
@@ -71,10 +75,13 @@ export class ScriptedModel {
         return say(AFFECT_JSON);
       case 'inference':
         return call.systemPrompt.startsWith('Task: memory_extraction') ? say(this.extract(call.lastUser)) : say('A short machine appraisal of the turn.');
-      case 'worker':
-        this.onEvent('worker_model_call');
-        if (this.worker.hang) return new Promise<AssistantMessage>(() => undefined);
+      case 'worker': {
+        const results = toolResults(call.context);
+        this.workerResults = results;
+        const hang = this.worker.hang === 'first' || (this.worker.hang === 'after_calls' && results.length >= this.worker.calls.length);
+        if (hang) return this.hang('worker_hang');
         return this.follow(this.worker.calls, this.worker.reply, call, {});
+      }
       case 'companion':
         return this.companionAnswer(call);
     }
@@ -95,9 +102,14 @@ export class ScriptedModel {
     if (call.lastUser.includes('Your free time (block')) return say(this.freeTime.reflection);
     const plan = this.companion;
     if (plan === null) return say('ok');
-    this.onEvent('companion_model_call');
-    if (plan.hang) return new Promise<AssistantMessage>(() => undefined);
+    if (plan.hang) return this.hang('companion_hang');
     return this.follow(plan.calls, plan.reply, call, plan.vars);
+  }
+
+  /** A provider call that never answers; the runner kills the host while it is in flight. */
+  private hang(event: BrainEvent): Promise<AssistantMessage> {
+    this.onEvent(event);
+    return new Promise<AssistantMessage>(() => undefined);
   }
 
   /** The next planned call after the results already in this request, or the reply once all were made. */

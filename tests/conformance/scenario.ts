@@ -86,6 +86,8 @@ export const HOST_OPS = [
   'maintain',
   'consent',
   'worker_plan',
+  'worker_results',
+  'inventory',
   'dispatch',
   'history',
   'backup_restore',
@@ -254,7 +256,7 @@ export function checkText(expect: Pick<ResultExpect, 'has' | 'lacks' | 'count'> 
   for (const s of expect?.lacks ?? []) if (text.includes(s)) issues.push(`${at}: must not contain ${JSON.stringify(s)}`);
   for (const [s, n] of Object.entries(expect?.count ?? {})) {
     const found = text.split(s).length - 1;
-    if (found !== n) issues.push(`${at}: expected ${String(n)} of ${JSON.stringify(s)}, found ${String(found)}`);
+    if (found !== n) issues.push(`${at}: expected ${String(n)} of ${JSON.stringify(s)}, found ${String(found)} in ${text.slice(0, 1200)}`);
   }
   return issues;
 }

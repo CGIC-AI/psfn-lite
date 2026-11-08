@@ -8,7 +8,7 @@
  * is the HostState (JSON). The process answers with one line
  * {"event":"ready", ...}, then one line per request:
  *   {"id": n, "op": "...", "args": {...}} -> {"id": n, "ok": true, "value": ..., "state": {...}}
- * Brain events ({"event":"companion_model_call"} or "worker_model_call") are
+ * Brain events ({"event":"companion_hang"} or "worker_hang", when a scripted call hangs) are
  * written as they happen. It closes the runtime and exits when stdin ends or
  * on the "close" op. Storage and databases belong to the runner.
  */
@@ -71,7 +71,11 @@ async function serve(host: ConformanceHost, op: string, args: Record<string, unk
     case 'consent':
       return host.consent(args as { contact: string; consent: 'granted' | 'pending' | 'denied' | 'revoked' });
     case 'worker_plan':
-      return host.workerPlan(args as { calls?: PlannedCall[]; reply?: string; hang?: boolean });
+      return host.workerPlan(args as { calls?: PlannedCall[]; reply?: string; hang?: 'first' | 'after_calls' | 'never' });
+    case 'worker_results':
+      return host.workerResults();
+    case 'inventory':
+      return host.inventory();
     case 'dispatch':
       return host.dispatch(args as { as: 'operator' | 'self'; tool: string; action: string; args?: Record<string, unknown> });
     case 'history':
