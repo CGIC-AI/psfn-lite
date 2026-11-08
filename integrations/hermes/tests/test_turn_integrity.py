@@ -213,3 +213,19 @@ def test_lite_tools_are_blocked_while_the_profile_is_not_usable(profile, bridge,
     # Which MCP server is Lite's is unknown without the plugin's config, so every MCP tool is blocked.
     (profile / "psfn-lite.json").write_text("{")
     assert gate("mcp__other__thing") is not None and gate("terminal") is None
+
+
+def test_only_a_compression_switch_links_sessions_so_a_branch_never_settles_the_original_turn(profile, bridge):
+    provider = load_provider()
+    provider.initialize("orig", hermes_home=str(profile), platform="cli")
+    fire("pre_llm_call", **turn(session="orig", turn_id="orig:1"))
+    # A /branch fork keeps its own conversation: its turn leaves the original's running turn alone.
+    provider.on_session_switch("branch", parent_session_id="orig", reset=False, reason="branch")
+    fire("pre_llm_call", **turn(session="branch", turn_id="branch:1"))
+    assert bridge.bodies("settle") == []
+    # A compression continues the conversation: a turn under the new id settles the one Hermes never ended.
+    provider._session_id = "orig"
+    provider.on_session_switch("orig-2", parent_session_id="orig", reset=False, reason="compression")
+    fire("pre_llm_call", **turn(session="orig-2", turn_id="orig-2:2"))
+    [settle] = bridge.bodies("settle")
+    assert settle["turnId"] == "turn-1" and settle["outcome"]["error"]["code"] == "hermes_turn_unfinished"

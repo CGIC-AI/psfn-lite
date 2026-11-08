@@ -10,6 +10,7 @@ prove the session's turns so the uncompressed transcript is kept.
 """
 
 import logging
+import sqlite3
 
 from agent.memory_provider import PRE_COMPRESS_CHECKPOINT_API_VERSION, MemoryProvider
 
@@ -39,14 +40,14 @@ class PsfnLiteProvider(MemoryProvider):
     def is_available(self) -> bool:
         try:
             runtime.driver()
-        except (ConfigError, ValueError, OSError):
+        except (ConfigError, ValueError, OSError, sqlite3.Error):
             return False
         return True
 
     def unavailable_reason(self) -> str:
         try:
             runtime.driver()
-        except (ConfigError, ValueError, OSError) as error:
+        except (ConfigError, ValueError, OSError, sqlite3.Error) as error:
             return f"{error}; see {CONFIG_FILE} in the psfn_lite plugin README"
         return ""
 
@@ -77,8 +78,9 @@ class PsfnLiteProvider(MemoryProvider):
         if isinstance(new_session_id, str) and new_session_id:
             parent = kwargs.get("parent_session_id") or self._session_id
             self._session_id = new_session_id
-            # Only a compression continues the conversation; /new (reset) starts another one.
-            if self._driver is not None and isinstance(parent, str) and not kwargs.get("reset"):
+            # Only a compression continues the conversation; /new starts another one and /branch forks one
+            # that may stay live beside it, so neither is linked.
+            if self._driver is not None and isinstance(parent, str) and kwargs.get("reason") == "compression" and not kwargs.get("reset"):
                 self._driver.session_switch(new_session_id, parent)
 
     def on_pre_compress(self, messages) -> str:

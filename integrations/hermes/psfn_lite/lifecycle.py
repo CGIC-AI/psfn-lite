@@ -91,7 +91,7 @@ class Driver:
                 self._subagents.add(child_session_id)
 
     def session_switch(self, new_session_id: str, parent_session_id: str) -> None:
-        """A compression rotated the session id; the provider forwards Hermes's notification."""
+        """A compression rotated the session id; the provider forwards only that reason of Hermes's notification."""
         if new_session_id and parent_session_id and new_session_id != parent_session_id:
             with self._lock:
                 self._link(new_session_id, parent_session_id)
@@ -100,11 +100,12 @@ class Driver:
         # Subagents, the review fork and cron or flush agents never drive Lite, in an internal-turn process too.
         if not self._root(session_id, parent_session_id, platform):
             return None
-        if parent_session_id and session_id and parent_session_id != session_id:
-            with self._lock:
-                self._link(session_id, parent_session_id)
+        # Sessions are linked only by a compression (on_session_switch) or a turn seen under a rotated id;
+        # Hermes gives a root agent no parent session id, and a branch is another conversation.
         if not self.internal_job and not self.config.binds(platform or "", sender_id or ""):
-            self._fail("unbound_sender", session_id, None, f"platform {platform!r} sender is not bound to PSFN Lite", record=False)
+            # Logged and reported, not carried: an unbound conversation never gets Lite context to show it in.
+            logger.error("psfn_lite unbound_sender for session %s: platform %r sender is not bound to PSFN Lite", session_id, platform)
+            self._notify(f"PSFN Lite ignored a turn from platform {platform!r}: its sender is not bound to PSFN Lite")
             return {"context": block(_NOTE, "This conversation is not bound to the companion's PSFN Lite continuity: nothing from it is recorded there, no continuity context is shown, and the PSFN Lite tools are blocked in it.")}
         if not isinstance(turn_id, str) or not turn_id or not isinstance(session_id, str) or not session_id:
             self._fail("prepare", session_id or "", None, "Hermes gave the turn no session or turn id")
