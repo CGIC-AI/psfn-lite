@@ -6,7 +6,7 @@ const SCRATCHPAD_TOOL = 'src/faculties/memory/tools/scratchpad.ts';
 const SCRATCHPAD_VISIBILITY = 'src/faculties/memory/scratchpad-visibility.ts';
 const WORKER_GOVERNANCE = 'src/faculties/subagents/memory-governance.ts';
 
-function memoryRead(name: string, summary: string): ActionDescriptor {
+function memoryRead(name: string, summary: string, inference: ActionDescriptor['inference'] = 'none'): ActionDescriptor {
   return {
     name,
     summary,
@@ -15,7 +15,7 @@ function memoryRead(name: string, summary: string): ActionDescriptor {
     admission: 'public',
     restrictions: ['visibility_gated'],
     workers: 'allowed',
-    inference: 'none',
+    inference,
     donor: { kind: 'donor', paths: [MEMORY_TOOL, VISIBILITY] },
   };
 }
@@ -39,7 +39,7 @@ export const memoryTool = defineTool({
   domain: 'memory',
   summary: 'Durable typed memory and same-day scratchpad notes, filtered by audience.',
   actions: [
-    memoryRead('search', 'Text search over visible current memories.'),
+    memoryRead('search', 'Hybrid lexical and semantic search over visible current memories, reporting each mode.', 'may_call_model'),
     memoryRead('get', 'One visible memory with provenance.'),
     memoryRead('shared_background', 'Visible overlap between the companion and a visible contact.'),
     memoryRead('census', 'Counts of visible memories by kind; counts are themselves audience-filtered.'),
