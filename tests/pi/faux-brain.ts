@@ -20,7 +20,8 @@ export interface BrainCall {
   readonly toolResults: readonly string[];
 }
 
-export type Brain = (call: BrainCall) => AssistantMessage;
+/** A brain may answer later (a slow or hanging provider); pi-ai's faux provider awaits the promise. */
+export type Brain = (call: BrainCall) => AssistantMessage | Promise<AssistantMessage>;
 
 export const AFFECT_JSON = '{"vad":{"valence":0.5,"arousal":0.2,"dominance":0.1},"discrete":{"warmth":0.7},"confidence":0.9}';
 
@@ -42,7 +43,7 @@ export function fauxRuntime(brain: Brain, options: { readonly tokensPerSecond?: 
   const models = createModels();
   models.setProvider(faux.provider);
   const calls: BrainCall[] = [];
-  const respond = (context: Context): AssistantMessage => {
+  const respond = (context: Context): AssistantMessage | Promise<AssistantMessage> => {
     faux.appendResponses([respond]);
     const messages = context.messages;
     const lastUserMessage = [...messages].reverse().find((m) => m.role === 'user');
@@ -69,7 +70,7 @@ export const callTool = (tool: string, action: string, args: Record<string, unkn
 export const providerError = (message: string) => fauxAssistantMessage([], { stopReason: 'error', errorMessage: message });
 
 /** Answers the estimator and inference tasks; the rest is the test's script. */
-export function withDefaults(script: (call: BrainCall) => AssistantMessage): Brain {
+export function withDefaults(script: (call: BrainCall) => AssistantMessage | Promise<AssistantMessage>): Brain {
   return (call) => {
     if (call.kind === 'estimator') return say(AFFECT_JSON);
     if (call.kind === 'inference') return say('A short machine appraisal of the turn.');
