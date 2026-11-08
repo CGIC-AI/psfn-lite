@@ -1,10 +1,17 @@
 /**
  * Versioned SQL migrations. Files named `NNNN_name.sql` beside this module are
- * applied in order, each in its own transaction, under an advisory lock so
- * concurrent starts cannot race. Every applied migration's checksum is
- * recorded and re-verified on each run: an edited, missing or unknown applied
- * migration stops startup instead of running against a schema the code does
- * not describe.
+ * applied in version order, each in its own transaction, under an advisory
+ * lock so concurrent starts cannot race. Every applied migration's checksum is
+ * recorded and re-verified on each run, matched by version: an edited or
+ * unknown applied migration stops startup instead of running against a schema
+ * the code does not describe.
+ *
+ * Parallel lanes reserve migration numbers, so a lower number can land after
+ * a higher one has been applied (a database at [1, 3] meets code that knows
+ * [1, 2, 3]). The missing migration is then applied, so such a database moves
+ * forward instead of being stranded. That is safe only because reserved-lane
+ * migrations touch disjoint tables; a migration that depends on another must
+ * take a higher number than it.
  */
 import { createHash } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
@@ -45,8 +52,13 @@ export function loadMigrations(dir: URL = MIGRATIONS_DIR): Migration[] {
       };
     })
     .sort((a, b) => a.version - b.version);
+  // Versions are unique and increasing from 0001. Parallel lanes reserve numbers, so a gap
+  // can exist until the earlier lane lands; applied migrations are matched by version.
   migrations.forEach((migration, index) => {
-    if (migration.version !== index + 1) throw new Error(`migrations must be numbered contiguously from 0001; found ${String(migration.version)}`);
+    const previous = index === 0 ? 0 : (migrations[index - 1]?.version ?? 0);
+    if (migration.version <= previous || (index === 0 && migration.version !== 1)) {
+      throw new Error(`migrations must start at 0001 with unique increasing numbers; found ${String(migration.version)}`);
+    }
   });
   return migrations;
 }
@@ -73,7 +85,8 @@ export async function migrate(pool: pg.Pool, migrations: readonly Migration[] = 
       const applied = await readApplied(client);
       const drift = verifyApplied(applied, migrations);
       if (!drift.ok) return drift;
-      for (const migration of migrations.slice(applied.length)) {
+      const done = new Set(applied.map((m) => m.version));
+      for (const migration of migrations.filter((m) => !done.has(m.version))) {
         await client.query('BEGIN');
         try {
           await client.query(migration.sql);
@@ -119,10 +132,11 @@ async function readApplied(client: pg.ClientBase): Promise<AppliedMigration[]> {
 }
 
 function verifyApplied(applied: readonly AppliedMigration[], migrations: readonly Migration[]): Result<void> {
-  for (const [index, row] of applied.entries()) {
-    const known = migrations[index];
-    if (known?.version !== row.version) {
-      return unavailable('postgres_migrations', `database has migration ${String(row.version)} that this code does not know`);
+  const byVersion = new Map(migrations.map((m) => [m.version, m]));
+  for (const row of applied) {
+    const known = byVersion.get(row.version);
+    if (known?.name !== row.name) {
+      return unavailable('postgres_migrations', `database has migration ${String(row.version)}_${row.name} that this code does not know`);
     }
     if (known.checksum !== row.checksum) {
       return unavailable('postgres_migrations', `applied migration ${String(row.version)}_${row.name} was modified after it ran`);
