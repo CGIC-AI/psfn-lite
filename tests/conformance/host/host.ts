@@ -25,7 +25,7 @@ import {
   type LiteTickReport,
 } from '../../../apps/standalone/src/index.ts';
 import { openLiteStorage } from '../../../apps/standalone/src/storage.ts';
-import { TOOL_INVENTORY, createContinuityBackup, type ContactId, type Result, type SessionId, type TrustedTurnScope } from '../../../packages/core/src/index.ts';
+import { TOOL_INVENTORY, createContinuityBackup, type ContactId, type EmbeddingPort, type Result, type SessionId, type TrustedTurnScope } from '../../../packages/core/src/index.ts';
 import { createDisabledEmbeddings } from '../../../packages/pi/src/index.ts';
 import { FixedClock } from '../../core/fakes.ts';
 import { liteConfigDocument } from '../../standalone/lite-config.ts';
@@ -78,6 +78,19 @@ export interface Ready {
 const envName = (principal: string) => `LITE_CONFORMANCE_${principal.toUpperCase().replace(/-/g, '_')}`;
 const MIDDAY_MS = Date.parse('2030-01-01T12:00:00.000Z');
 
+/**
+ * The embedding capability the runtime is given. The conformance default is
+ * none (every embed is `unavailable`, writes stay pending), as in a
+ * standalone configuration without a provider. The benchmarks supply a
+ * counting port and the dimensions of its space.
+ */
+export interface HostEmbeddings {
+  readonly port: EmbeddingPort;
+  readonly space: { readonly name: string; readonly dimensions: number };
+}
+
+const NO_EMBEDDINGS: HostEmbeddings = { port: createDisabledEmbeddings(), space: { name: 'test-space', dimensions: 3 } };
+
 export class ConformanceHost {
   private runtime: LiteRuntime | null = null;
   private readonly clock: FixedClock;
@@ -86,7 +99,11 @@ export class ConformanceHost {
   private state: HostState;
   private turns = 0;
 
-  constructor(state: HostState, onEvent: (event: BrainEvent) => void) {
+  constructor(
+    state: HostState,
+    onEvent: (event: BrainEvent) => void,
+    private readonly embeddings: HostEmbeddings = NO_EMBEDDINGS,
+  ) {
     this.state = state;
     this.clock = new FixedClock(new Date(state.clockMs === 0 ? MIDDAY_MS : state.clockMs));
     this.model = new ScriptedModel(onEvent);
@@ -106,6 +123,8 @@ export class ConformanceHost {
     const credentials = this.state.credentials ?? (Object.fromEntries(Object.keys(CONFORMANCE_BINDINGS).map((p) => [p, randomBytes(32).toString('base64url')])) as Record<Principal, string>);
     const document = {
       ...liteConfigDocument(roots),
+      // The provider stays "disabled" in the document: the host supplies the embedding port itself.
+      embedding: { space: this.embeddings.space, provider: { kind: 'disabled' } },
       harness: { turnLeaseMs: 60_000, maxModelCalls: 16, maxToolResultChars: 200_000, historyEntries: 50, selfStateItems: 10 },
       mcp: {
         host: '127.0.0.1',
@@ -132,7 +151,7 @@ export class ConformanceHost {
           clock: this.clock,
           ids: randomIds,
           model: this.model.runtime,
-          embeddings: createDisabledEmbeddings(),
+          embeddings: this.embeddings.port,
           channel: { reply: () => Promise.resolve({ ok: true, value: undefined }), reminder: () => Promise.resolve({ ok: true, value: undefined }) },
           instance: `conformance-${String(this.state.generation)}-${randomBytes(3).toString('hex')}`,
           onDiagnostic: (d) => this.diagnostics.push(d),
@@ -275,7 +294,7 @@ export class ConformanceHost {
       await openLiteStorage({
         storage: { historyRoot: roots.history, workspaceRoot: roots.workspace, backupRoot: roots.backups },
         databaseUrl: this.state.spareDatabaseUrl,
-        space: { name: 'test-space', dimensions: 3 },
+        space: this.embeddings.space,
         onIdleError: (error) => this.diagnostics.push({ kind: 'pool_idle_error', message: error.message }),
       }),
     );

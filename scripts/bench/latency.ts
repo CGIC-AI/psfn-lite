@@ -2,8 +2,11 @@
  * Lite's own turn latency and memory: wall time of participant turns on the
  * Pi harness (Postgres, the JSONL archive, context assembly, governed tool
  * dispatch, post-turn emotion), of idle scheduler ticks, and the process's
- * resident set size, with a scripted model that answers at once. It measures
- * Lite's overhead per turn, not a provider's latency.
+ * resident set size, with a scripted model and an embedding port that answer
+ * at once (the bench host's 1,536-dimension hashed embedder, so memory
+ * writes and searches do their pgvector work). It measures Lite's overhead
+ * per turn, not a provider's latency. The separate idle-RSS process is the
+ * conformance host process, which has no embedding provider.
  *
  * Run: tsx scripts/bench/latency.ts [--turns N] [--json]
  * Needs Docker (a throwaway labelled pgvector container).
@@ -90,7 +93,7 @@ async function main(argv: readonly string[]): Promise<void> {
   if (!Number.isInteger(turns) || turns < 1) throw new Error('--turns must be a positive integer');
   const rssAtStart = process.memoryUsage().rss;
   const opened = performance.now();
-  const result = await withLiteHost(async (host) => {
+  const result = await withLiteHost(async (host, embeddings) => {
     const openMs = performance.now() - opened;
     const rssOpen = process.memoryUsage().rss;
     let n = 0;
@@ -105,6 +108,7 @@ async function main(argv: readonly string[]): Promise<void> {
     const plain: number[] = [];
     for (let i = 0; i < turns; i += 1) plain.push(await timed([]));
     const withTools: number[] = [];
+    const embeddingsBeforeTools = embeddings.requests;
     for (let i = 0; i < Math.max(1, Math.floor(turns / 5)); i += 1) {
       withTools.push(
         await timed([
@@ -114,6 +118,7 @@ async function main(argv: readonly string[]): Promise<void> {
         ]),
       );
     }
+    const embeddingRequestsInToolTurns = embeddings.requests - embeddingsBeforeTools;
     const rssAfterTurns = process.memoryUsage().rss;
     const ticks: number[] = [];
     host.advance(1);
@@ -126,6 +131,8 @@ async function main(argv: readonly string[]): Promise<void> {
       openMs: Math.round(openMs),
       turnMs: stats(plain),
       turnWithThreeToolCallsMs: stats(withTools),
+      embeddingRequestsInToolTurns,
+      embeddingRequestsTotal: embeddings.requests,
       idleTickMs: stats(ticks),
       rssMiB: { processStart: mib(rssAtStart), runtimeOpen: mib(rssOpen), afterTurns: mib(rssAfterTurns), peak: mib(process.resourceUsage().maxRSS * 1024) },
       heapUsedMiB: mib(process.memoryUsage().heapUsed),

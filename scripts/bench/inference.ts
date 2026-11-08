@@ -1,6 +1,7 @@
 /**
  * Model calls Lite makes, counted by the scripted model (each call is one
- * provider request): over a simulated idle day of scheduler ticks under the
+ * chat-model request), and embedding requests, counted by the bench host's
+ * embedding port: over a simulated idle day of scheduler ticks under the
  * baseline policies, and per workload (a participant turn, a turn with tool
  * calls, maintenance after a conversation ends, a worker, a free-time block).
  *
@@ -26,11 +27,11 @@ export interface IdleDay {
 
 /** A day of one-minute ticks with nobody talking; every free-time invitation is answered with `choice`. */
 async function idleDay(choice: string): Promise<IdleDay> {
-  return withLiteHost(async (host) => {
+  return withLiteHost(async (host, embeddings) => {
     let ticksWithCalls = 0;
     const blocks: Record<string, number> = {};
     const skipped: Record<string, number> = {};
-    const calls = await callsDuring(host, async () => {
+    const calls = await callsDuring(host, embeddings, async () => {
       for (let i = 0; i < DAY_TICKS; i += 1) {
         host.advance(TICK_MINUTES);
         const report = await host.tick({ choice, reflection: 'A quiet thought about the garden.' });
@@ -53,24 +54,24 @@ const TOOL_TURN: readonly PlannedCall[] = [
 ];
 
 async function workloads(): Promise<Record<string, Record<string, number>>> {
-  return withLiteHost(async (host) => {
+  return withLiteHost(async (host, embeddings) => {
     const out: Record<string, Record<string, number>> = {};
     let n = 0;
     const turn = (calls: readonly PlannedCall[]) => host.piTurn({ say: `message ${String((n += 1))}`, calls, reply: 'Noted.', hang: false, vars: {}, key: `bench-${String(n)}` });
-    out['participant turn, no tool calls'] = await callsDuring(host, () => turn([]));
-    out['participant turn, 3 tool calls'] = await callsDuring(host, () => turn(TOOL_TURN));
+    out['participant turn, no tool calls'] = await callsDuring(host, embeddings, () => turn([]));
+    out['participant turn, 3 tool calls'] = await callsDuring(host, embeddings, () => turn(TOOL_TURN));
     host.workerPlan({ calls: [{ tool: 'memory', action: 'search', args: { query: 'tomatoes' } }, { tool: 'memory', action: 'search', args: { query: 'beds' } }], reply: 'Looked.' });
-    out['participant turn spawning a worker (2 worker tool calls)'] = await callsDuring(host, () =>
+    out['participant turn spawning a worker (2 worker tool calls)'] = await callsDuring(host, embeddings, () =>
       turn([{ tool: 'automata', action: 'spawn', args: { spawnId: 'bench-w', label: 'helper', task: 'Look up the tomato notes', actions: ['memory.search'], maxTurns: 4, maxSensitivity: 'public' } }]),
     );
     host.advance(31);
-    out['maintenance after the conversation ended (3 turns, nothing extracted)'] = await callsDuring(host, () => host.maintain([]));
-    out['maintenance with nothing new'] = await callsDuring(host, () => host.maintain([]));
+    out['maintenance after the conversation ended (3 turns, nothing extracted)'] = await callsDuring(host, embeddings, () => host.maintain([]));
+    out['maintenance with nothing new'] = await callsDuring(host, embeddings, () => host.maintain([]));
     host.advance(181);
-    out['one free-time block, reflection chosen'] = await callsDuring(host, () => host.tick({ choice: 'reflect', reflection: 'Tomatoes and sun.' }));
+    out['one free-time block, reflection chosen'] = await callsDuring(host, embeddings, () => host.tick({ choice: 'reflect', reflection: 'Tomatoes and sun.' }));
     host.advance(181);
-    out['one free-time block, rest chosen'] = await callsDuring(host, () => host.tick({ choice: 'rest' }));
-    out['tick while resting (nothing due)'] = await callsDuring(host, () => host.tick({ choice: 'rest' }));
+    out['one free-time block, rest chosen'] = await callsDuring(host, embeddings, () => host.tick({ choice: 'rest' }));
+    out['tick while resting (nothing due)'] = await callsDuring(host, embeddings, () => host.tick({ choice: 'rest' }));
     return out;
   });
 }
@@ -84,8 +85,9 @@ async function main(json: boolean): Promise<void> {
     return;
   }
   const kinds = ['companion', 'estimator', 'inference', 'worker'];
-  const row = (label: string, calls: Record<string, number>) => `| ${label} | ${kinds.map((k) => String(calls[k] ?? 0)).join(' | ')} | ${String(kinds.reduce((s, k) => s + (calls[k] ?? 0), 0))} |`;
-  const lines = [`| workload | ${kinds.join(' | ')} | total |`, `|---|${kinds.map(() => '---:').join('|')}|---:|`];
+  const row = (label: string, calls: Record<string, number>) =>
+    `| ${label} | ${kinds.map((k) => String(calls[k] ?? 0)).join(' | ')} | ${String(kinds.reduce((s, k) => s + (calls[k] ?? 0), 0))} | ${String(calls['embedding'] ?? 0)} (${String(calls['embedded texts'] ?? 0)} texts) |`;
+  const lines = [`| workload | ${kinds.join(' | ')} | model total | embedding requests |`, `|---|${kinds.map(() => '---:').join('|')}|---:|---:|`];
   for (const day of days) lines.push(row(`idle day, ${String(day.ticks)} ticks, invitations answered "${day.choice}" (${String(day.ticksWithCalls)} ticks made calls; blocks ${JSON.stringify(day.blocks)})`, day.calls));
   for (const [label, calls] of Object.entries(per)) lines.push(row(label, calls));
   process.stdout.write(`${lines.join('\n')}\n\nskip reasons per idle day: ${JSON.stringify(days.map((d) => ({ choice: d.choice, skipped: d.skipped })))}\n`);
