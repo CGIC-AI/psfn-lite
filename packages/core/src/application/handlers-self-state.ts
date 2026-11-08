@@ -11,8 +11,8 @@ const REVISION = { min: 1, max: 1_000_000 } as const;
 /**
  * Handlers for the `emotion` and `concern` tools, keyed as the inventory names
  * them. Hosts merge this with `createContinuityHandlers` before building the
- * dispatcher. `concern.reminder_create` has no handler: there is no reminder
- * store, so dispatch reports it as unavailable.
+ * dispatcher. `concern.reminder_create` is served by the care reminder store
+ * (`reminderHandlers`), which `createActivityStack` merges in.
  */
 export function createSelfStateHandlers(services: {
   readonly emotion: EmotionService;

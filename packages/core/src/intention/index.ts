@@ -37,4 +37,19 @@ export {
   validateConcernTransition,
 } from './concerns.ts';
 export { MAX_FOLLOW_UP_CHARS, followUpId, normalizeDueAt, normalizeFollowUpContent } from './follow-ups.ts';
+export {
+  CARE_REMINDER_KINDS,
+  CARE_REMINDER_SCHEDULES,
+  CARE_REMINDER_STATES,
+  MAX_REMINDER_TEXT_CHARS,
+  MAX_REMINDER_TITLE_CHARS,
+  careReminderId,
+  normalizeReminderText,
+  type CareReminder,
+  type CareReminderCursor,
+  type CareReminderKind,
+  type CareReminderPort,
+  type CareReminderSchedule,
+  type CareReminderState,
+} from './care-reminders.ts';
 export { concernTool } from './tool.ts';

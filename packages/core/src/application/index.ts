@@ -13,8 +13,12 @@ export type {
   CallerAuthenticatorPort,
   EmbeddingPort,
   HostAttestation,
+  InternalTurnPort,
+  InternalTurnRequest,
+  InternalTurnResult,
   ModelMessage,
   ModelPort,
+  ReminderDeliveryPort,
   WorkAttribution,
 } from './host-ports.ts';
 export { createTrustedIngress, type TrustedIngress } from './ingress.ts';
@@ -82,3 +86,4 @@ export { syncTranscriptProjection } from './transcript-projection.ts';
 export { createValuesService, type ValuesService } from './values-service.ts';
 export * from './self-state.ts';
 export * from './memory-index.ts';
+export * from './automata-index.ts';

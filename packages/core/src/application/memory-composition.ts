@@ -1,4 +1,5 @@
 import type { ContactStorePort } from '../contacts/index.ts';
+import type { AuthoredReflectionPort } from '../emotion/index.ts';
 import type { EpisodeStorePort } from '../episodes/index.ts';
 import type { JournalNotePort, LetterPort, ReflectionPort } from '../journals/index.ts';
 import type { MemoryDeletionPort, MemoryStorePort, ScratchpadPort, SessionCursorPort } from '../memory/index.ts';
@@ -17,6 +18,7 @@ import { createEmbeddingBackfill, createMemoryMaintenance } from './memory-maint
 import { validateSpace } from './memory-scope.ts';
 import { createMemoryService } from './memory-service.ts';
 import { createMemoryWriter } from './memory-writer.ts';
+import { createReflectionReader } from './reflection-reader.ts';
 import { createScratchpadService } from './scratchpad-service.ts';
 
 /** The ports the memory, episode and journal stack needs. Each service still takes only its own subset. */
@@ -54,6 +56,8 @@ export function createMemoryStack(deps: MemoryStackDeps): Result<{
   readonly administration: ReturnType<typeof createMemoryAdministration>;
   readonly letterAdministration: ReturnType<typeof createLetterAdministration>;
   readonly journal: ReturnType<typeof createJournalService>;
+  /** The self-model's read of reflection records, for `createSelfStateContext`. */
+  readonly reflections: AuthoredReflectionPort;
 }> {
   const space = validateSpace(deps.embedding.space);
   if (!space.ok) return space;
@@ -104,5 +108,6 @@ export function createMemoryStack(deps: MemoryStackDeps): Result<{
     administration: createMemoryAdministration({ store: deps.memories, deletions: deps.deletions, clock }),
     letterAdministration: createLetterAdministration({ letters: deps.letters, clock }),
     journal,
+    reflections: createReflectionReader(deps.reflections),
   });
 }

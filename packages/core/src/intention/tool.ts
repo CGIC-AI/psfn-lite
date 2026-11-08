@@ -70,7 +70,7 @@ export const concernTool = defineTool({
     followUpWrite('follow_up_activate', 'Activate a visible follow-up now.', ['foreground_only']),
     {
       name: 'reminder_create',
-      summary: 'Create a care reminder; fails as unavailable while no reminder store is configured.',
+      summary: 'Create a once or daily care reminder for a visible conversation; the scheduler delivers it through the host.',
       access: 'write',
       privacy: 'conversation_scoped',
       admission: 'public',
