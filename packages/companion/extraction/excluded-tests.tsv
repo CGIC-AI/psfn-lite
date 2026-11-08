@@ -1,0 +1,13 @@
+# donor test file in a closure directory, not selected	reason
+src/core/agent/fatigue/social-pot-no-scripted-phrasing.test.ts	directory test with no direct import of a closure file
+src/core/emotion/emosim-proactivity-boundary.test.ts	directory test with no direct import of a closure file
+src/core/emotion/partner-affect/shadow-isolation.test.ts	directory test with no direct import of a closure file
+src/core/eval/observer-sidecar/emosim-build-pin.test.ts	directory test with no direct import of a closure file
+src/core/identity/identity-confirmation-flow.test.ts	imports admin-ui/src/lib/components/identity-confirmation-flow.ts (operator Garden UI), outside src/
+src/persistence/postgres/fleet-maintenance-coordinator.integration.test.ts	directory test with no direct import of a closure file
+src/persistence/postgres/migrations-facade.test.ts	directory test with no direct import of a closure file
+src/persistence/postgres/model-usage-store-phase-boundary.test.ts	directory test with no direct import of a closure file
+src/primitives/llm/autonomous-workspec-enforcement.test.ts	directory test with no direct import of a closure file
+src/primitives/llm/preemption-protected-setter-enforcement.test.ts	directory test with no direct import of a closure file
+src/shared/companion-display-surfaces.test.ts	directory test with no direct import of a closure file
+src/system/config/system-config-repository.test.ts	directory test with no direct import of a closure file
