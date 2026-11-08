@@ -1,0 +1,69 @@
+import { globalIgnores } from 'eslint/config';
+import tsParser from '@typescript-eslint/parser';
+import tsPlugin from '@typescript-eslint/eslint-plugin';
+
+const UNUSED_VARS = [
+  'error',
+  {
+    args: 'all',
+    argsIgnorePattern: '^_',
+    caughtErrors: 'all',
+    caughtErrorsIgnorePattern: '^_',
+    ignoreRestSiblings: true,
+    varsIgnorePattern: '^_',
+  },
+];
+
+export default [
+  globalIgnores([
+    '**/node_modules/**',
+    '**/dist/**',
+    '**/coverage/**',
+    '.beads/**',
+    'data/**',
+    'runtime/**',
+    'workspace/**',
+    'logs/**',
+    'backups/**',
+    '.agents/**',
+    '.claude/**',
+    '.codex/**',
+  ]),
+  {
+    linterOptions: {
+      reportUnusedDisableDirectives: 'error',
+    },
+  },
+  {
+    files: ['**/*.mjs', '**/*.js'],
+    languageOptions: {
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+    },
+    rules: {
+      'no-unused-vars': UNUSED_VARS,
+    },
+  },
+  {
+    files: ['**/*.ts'],
+    languageOptions: {
+      parser: tsParser,
+      ecmaVersion: 'latest',
+      sourceType: 'module',
+      parserOptions: {
+        project: './tsconfig.json',
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    plugins: {
+      '@typescript-eslint': tsPlugin,
+    },
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/no-unused-vars': UNUSED_VARS,
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+      '@typescript-eslint/no-unnecessary-condition': 'error',
+    },
+  },
+];
