@@ -873,7 +873,10 @@ Host ports implemented over Pi:
   model turn starts through `WorkerSession.beginTurn`, so core enforces the
   turn budget and delivers new guidance (injected as labelled steering).
   Effects are keyed per attempt and by a digest of the tool call id (provider
-  ids may hold characters core refuses in a key). Cancellation aborts the
+  ids may hold characters core refuses in a key). A recovered attempt re-runs
+  the model and gets new tool call ids, so recovery is at-least-once for a
+  write without its own idempotency key (`scratchpad_add` runs again;
+  `memory.write` with a `writeId` is replayed). Cancellation aborts the
   loop. On shutdown the host refuses new attempts and aborts running ones,
   each reported as `cancelled` with reason `host_shutdown`.
 - `ModelPort` and `AffectEstimatorPort`: machine tasks over the same model.

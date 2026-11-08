@@ -26,6 +26,8 @@ and delivery; the core retains privacy, authorship, and continuity authority.
 - [Lite charter](docs/charter.md)
 - [Development and validation contract](docs/development.md)
 - [Source provenance](docs/provenance.md)
+- [Continuity conformance](docs/conformance.md)
+- [Measured footprint](docs/footprint.md)
 
 Work is tracked in Beads, not Markdown task lists. In this checkout run
 `bd prime` and `bd ready --json`. New clones require local Beads setup; Git
