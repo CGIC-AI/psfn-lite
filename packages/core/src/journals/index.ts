@@ -1,10 +1,15 @@
 export type {
   JournalNote,
-  JournalPort,
+  JournalNotePort,
   JournalProvenance,
   Letter,
+  LetterEvent,
+  LetterParty,
+  LetterPort,
   LetterState,
   ReflectionEntry,
-  ReflectionReadPort,
+  ReflectionPort,
 } from './types.ts';
+export { LETTER_STATES } from './types.ts';
+export { archiveLetter, journalReadable, letterVisibleTo, mergeProvenance, parseJournalPath, placeLetter, readLetter, writerProvenance } from './rules.ts';
 export { journalTool } from './tool.ts';

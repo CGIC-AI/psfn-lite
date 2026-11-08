@@ -85,7 +85,7 @@ Durable typed memory and same-day scratchpad notes, filtered by audience.
 
 | Action | Access | Privacy | Admission | Restrictions | Workers | Inference | Donor |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `search` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/tools/visibility.ts` |
+| `search` | read | audience_scoped | public | visibility_gated | allowed | may call model | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/tools/visibility.ts` |
 | `get` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/tools/visibility.ts` |
 | `shared_background` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/tools/visibility.ts` |
 | `census` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/tools/visibility.ts` |
@@ -123,7 +123,7 @@ Lived episodes and arcs; machine drafts stay distinct from companion-authored me
 
 | Action | Access | Privacy | Admission | Restrictions | Workers | Inference | Donor |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `search` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/retrieval/episode-search.ts`<br>`src/faculties/memory/retrieval/episodic.ts` |
+| `search` | read | audience_scoped | public | visibility_gated | allowed | may call model | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/retrieval/episode-search.ts`<br>`src/faculties/memory/retrieval/episodic.ts` |
 | `get` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/retrieval/episode-drilldown.ts`<br>`src/faculties/memory/retrieval/episodic.ts` |
 | `timeline` | read | audience_scoped | public | visibility_gated | allowed | - | `src/faculties/memory/tools.ts`<br>`src/faculties/memory/retrieval/episodic.ts` |
 | `author_meaning` | write | companion_private | confidential | companion_authored, self_audience_only, append_only | denied | - | new: Donor had no model-facing meaning writer; meaning was authored only inside the dream pass. Related: `src/faculties/memory/episodic/dream-meaning-pass.ts`, `src/faculties/memory/episodic/store-port.ts` |
