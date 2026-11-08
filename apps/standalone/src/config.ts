@@ -50,7 +50,17 @@ export interface LiteConfig {
   };
   readonly storage: { readonly historyRoot: string; readonly workspaceRoot: string; readonly backupRoot: string | null };
   readonly postgres: { readonly urlEnv: string };
-  readonly model: { readonly provider: string; readonly modelId: string; readonly apiKeyEnv: string | null; readonly maxOutputTokens: number };
+  readonly model: {
+    readonly provider: string;
+    readonly modelId: string;
+    /**
+     * The variable holding the provider key. Null means no key is supplied and
+     * none is discovered (no provider variable, no credential file), so only a
+     * keyless provider works.
+     */
+    readonly apiKeyEnv: string | null;
+    readonly maxOutputTokens: number;
+  };
   readonly embedding: {
     readonly space: { readonly name: string; readonly dimensions: number };
     readonly provider:

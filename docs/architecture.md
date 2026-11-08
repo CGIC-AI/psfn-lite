@@ -695,7 +695,11 @@ does not use the `Agent` class, does not patch Pi internals and keeps no Pi
 session between turns. `src/pi.ts` is the only module that imports Pi, and
 `src/core.ts` is the only one that reaches core (through its public entry).
 The model, the provider key and the output ceiling are host-supplied as a
-`PiModelRuntime`.
+`PiModelRuntime`. A catalogue runtime uses an auth context that answers
+nothing, so pi-ai never discovers a credential on its own: no provider
+variable from the environment and no credential file. The explicit key is
+the only credential a request carries, and with none only a keyless provider
+can serve it.
 
 Every turn follows core's lifecycle:
 
@@ -704,10 +708,14 @@ Every turn follows core's lifecycle:
    turn's scope: enabled prompt layers, the conversation's orientation blocks
    (none for self turns), the labelled self-state context, and canonical
    history through `contextFromHistory`. Then `prepareTurn` opens the turn.
-   A stale revision retries once. A turn left open by another owner is
-   recovered through `recoverTurn` only after its lease, so the recovery is
-   attributed to the host. A replayed key returns the recorded settlement
-   without calling the model.
+   A stale revision is retried. An open turn of this harness that is not
+   running in this process is settled first: with the outcome the harness
+   holds for it, or else as interrupted by the host with delivery `unknown`.
+   A turn left open by another owner is recovered through `recoverTurn` only
+   after its lease, so the recovery is attributed to the host. A replayed key
+   returns the recorded settlement without calling the model. A repeated key
+   whose turn is still open never runs the turn again: it records the held
+   outcome or the abandoned one.
 2. **Execute.** The model loop sees one Pi tool per domain tool of
    `TOOL_INVENTORY`. Each takes `{action, args}` with the actions as an enum.
    Every call goes through core's dispatcher under the turn's scope. A
@@ -717,14 +725,21 @@ Every turn follows core's lifecycle:
    then committed with its delivery status. An aborted, failed or stopped
    loop is aborted with who interrupted (`participant`, `shutdown`, `host`)
    or the failure code. Any partial reply is kept, so the system note in
-   history says what happened.
+   history says what happened. A transient settlement failure is retried a
+   bounded number of times with the same outcome. An outcome that still
+   cannot be written is held in memory and recorded by a retry of the
+   request or by the session's next turn. A throwing delivery port is
+   recorded as delivery `unknown`.
 4. **Post-turn.** The settled turn is observed for emotion
    (`emotion.observeTurn`). In participant turns the conversation's requeued
    workers are resumed (`workers.resume`).
 
-Only companion speech is rendered in the assistant position. Participant
-speech, system notes, tool results and machine inference are rendered in the
-user position with their labels.
+Only companion speech is rendered in the assistant position. In the user
+position every block starts with a label line: `[participant speech]` for
+what a participant said, and core's label for system notes, tool results and
+machine inference. A line of text that starts with `[` is escaped as `\[`,
+so neither a participant nor labelled content can forge a label, and merged
+user messages keep every block boundary visible.
 
 Host ports implemented over Pi:
 
@@ -734,7 +749,10 @@ Host ports implemented over Pi:
 - `WorkerHostPort`: a worker runs inline with only its granted actions. Each
   model turn starts through `WorkerSession.beginTurn`, so core enforces the
   turn budget and delivers new guidance (injected as labelled steering).
-  Effects are keyed per attempt and tool call. Cancellation aborts the loop.
+  Effects are keyed per attempt and by a digest of the tool call id (provider
+  ids may hold characters core refuses in a key). Cancellation aborts the
+  loop. On shutdown the host refuses new attempts and aborts running ones,
+  each reported as `cancelled` with reason `host_shutdown`.
 - `ModelPort` and `AffectEstimatorPort`: machine tasks over the same model.
   A provider error or a non-JSON estimate is `unavailable`, never an empty
   success, and core re-validates every estimate.
@@ -756,8 +774,10 @@ is the composition entry, and it exposes the governed dispatcher and ingress
 for a later tool transport. The local host vouches for exactly two callers:
 the configured operator in their direct conversation and the companion's own
 internal turns. Its evidence is an opaque object minted in-process. `close`
-stops the scheduler, interrupts running turns as `shutdown`, waits for them to
-settle and then closes storage.
+first refuses new work and interrupts every turn as `shutdown`, including
+turns still preparing and the scheduler's own turns, and cancels running
+worker attempts. Then it stops the scheduler, waits for all of it to settle
+and closes storage.
 
 Known gaps:
 

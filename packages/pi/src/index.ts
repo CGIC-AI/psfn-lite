@@ -22,4 +22,4 @@ export { runModelLoop, type LoopOutcome, type LoopRequest, type LoopUsage, type 
 export { createCatalogModelRuntime, createPiModelRuntime, producerOf, type PiModelRuntime } from './model-runtime.ts';
 export { TurnInterruption, type InterruptedBy, type SettledStatus } from './settlement.ts';
 export { ToolRefusal, describeError, piTools, type ActionFilter, type ToolInvoker } from './tools.ts';
-export { createPiWorkerHost, type WorkerDiagnostic, type WorkerHostOptions } from './worker-host.ts';
+export { createPiWorkerHost, effectKey, type PiWorkerHost, type WorkerDiagnostic, type WorkerHostOptions } from './worker-host.ts';
