@@ -1,5 +1,6 @@
 import type {
   SessionArchivePort,
+  SessionCatalogPort,
   TurnLedgerPort,
   TurnOutcome,
   TurnOwner,
@@ -7,14 +8,15 @@ import type {
   TurnTrigger,
 } from '../sessions/index.ts';
 import {
+  conflict,
   denied,
   fail,
   invalid,
   isNonEmptyString,
   notFound,
   ok,
+  sameAudience,
   type Clock,
-  type ConflictReason,
   type IdSource,
   type IdempotencyKey,
   type InternalOrigin,
@@ -80,6 +82,8 @@ export interface TurnLifecycle {
 export interface TurnLifecycleDeps {
   readonly ledger: TurnLedgerPort;
   readonly archive: SessionArchivePort;
+  /** Sessions are bound to one audience; a turn from any other audience is refused. */
+  readonly sessions: SessionCatalogPort;
   readonly clock: Clock;
   readonly ids: IdSource;
   /** How long an open turn belongs exclusively to its owner before a successor may recover it. */
@@ -113,6 +117,11 @@ async function prepareTurn(
   const trigger = bindTrigger(scope, input.trigger);
   if (!trigger.ok) return trigger;
   const fingerprint = fingerprintRequest(input.sessionId, scope, trigger.value);
+  const session = await deps.sessions.get(input.sessionId);
+  if (!session.ok) return session;
+  if (!sameAudience(session.value.audience, scope.audience)) {
+    return denied('audience_not_admitted', 'the session belongs to another audience');
+  }
 
   const existing = await deps.ledger.findByIdempotencyKey(input.sessionId, input.idempotencyKey);
   if (!existing.ok) return existing;
@@ -164,6 +173,8 @@ async function prepareTurn(
     settlement: null,
   });
   if (!opened.ok) return opened;
+  const touched = await deps.sessions.touch(input.sessionId, opened.value.openedAt);
+  if (!touched.ok) return touched;
   // Archive the trigger at open so lived history is complete even if the turn never settles.
   const archived = await deps.archive.append([triggerEntry(opened.value)]);
   if (!archived.ok) return archived;
@@ -262,8 +273,4 @@ function bindTrigger(scope: TrustedTurnScope, input: TriggerInput): Result<TurnT
 
 function fingerprintRequest(sessionId: SessionId, scope: TrustedTurnScope, trigger: TurnTrigger): string {
   return digest({ sessionId, caller: scope.caller, audience: scope.audience, trigger });
-}
-
-function conflict(reason: ConflictReason, detail: string) {
-  return fail({ kind: 'conflict', reason, detail } as const);
 }

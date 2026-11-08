@@ -3,6 +3,7 @@
  * compare-and-set and idempotency contracts so behavior tests exercise real
  * failure paths. Nothing here is used by production code.
  */
+import { createHash } from 'node:crypto';
 import {
   BASELINE_DISCLOSURE_POLICY,
   createTrustedIngress,
@@ -13,6 +14,8 @@ import {
   type ActivityId,
   type ActivityLogPort,
   type ActivityRecord,
+  type ArchiveHead,
+  type ArchivedEntry,
   type CallerAuthenticatorPort,
   type ChannelIdentity,
   type Clock,
@@ -113,6 +116,7 @@ export class FakeTurnLedger implements TurnLedgerPort {
 
 export class FakeArchive implements SessionArchivePort {
   readonly entries: SessionEntry[] = [];
+  private readonly chains = new Map<SessionId, ArchivedEntry[]>();
   failNext = false;
 
   append(entries: readonly SessionEntry[]): Promise<Result<void>> {
@@ -122,19 +126,34 @@ export class FakeArchive implements SessionArchivePort {
     }
     const fresh: SessionEntry[] = [];
     for (const entry of entries) {
-      const existing = this.entries.find((e) => e.entryId === entry.entryId);
+      const existing = this.entries.find((e) => e.entryId === entry.entryId) ?? fresh.find((e) => e.entryId === entry.entryId);
       if (existing === undefined) {
         fresh.push(entry);
       } else if (JSON.stringify(existing) !== JSON.stringify(entry)) {
         return Promise.resolve(fail({ kind: 'conflict', reason: 'entry_mismatch', detail: `entry ${entry.entryId} differs` }));
       }
     }
-    this.entries.push(...fresh);
+    for (const entry of fresh) {
+      const chain = this.chains.get(entry.sessionId) ?? [];
+      const prev = chain.at(-1)?.hash ?? '';
+      chain.push({ seq: chain.length + 1, hash: createHash('sha256').update(prev + JSON.stringify(entry)).digest('hex'), entry });
+      this.chains.set(entry.sessionId, chain);
+      this.entries.push(entry);
+    }
     return Promise.resolve(ok(undefined));
   }
 
   readTail(sessionId: SessionId, limit: number): Promise<Result<readonly SessionEntry[]>> {
-    return Promise.resolve(ok(this.entries.filter((e) => e.sessionId === sessionId).slice(-limit)));
+    return Promise.resolve(ok((this.chains.get(sessionId) ?? []).slice(-limit).map((a) => a.entry)));
+  }
+
+  readRange(sessionId: SessionId, fromSeq: number, limit: number): Promise<Result<readonly ArchivedEntry[]>> {
+    return Promise.resolve(ok((this.chains.get(sessionId) ?? []).slice(fromSeq - 1, fromSeq - 1 + limit)));
+  }
+
+  head(sessionId: SessionId): Promise<Result<ArchiveHead>> {
+    const last = (this.chains.get(sessionId) ?? []).at(-1);
+    return Promise.resolve(ok({ sessionId, count: last?.seq ?? 0, hash: last?.hash ?? null }));
   }
 }
 
