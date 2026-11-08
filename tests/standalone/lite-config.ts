@@ -28,5 +28,7 @@ export function liteConfigDocument(roots: { readonly history: string; readonly w
     workers: { leaseMs: 60_000, maxAttempts: 2, resumeGraceMs: 15 * 60_000 },
     scheduler: { tickIntervalMs: 60_000, inFlightMs: 10 * 60_000, maintenanceEveryTicks: 10, maintenanceSessionLimit: 10, maintenanceMaxEntries: 500 },
     memory: { endedAfterMs: 30 * 60_000 },
+    mcp: null,
+    lifecycle: null,
   };
 }

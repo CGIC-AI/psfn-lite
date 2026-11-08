@@ -91,7 +91,7 @@ export async function piWorld(
     lifecycle: lifecycle.value,
     sessions: base.sessions,
     ledger: base.ledger,
-    context: { orientation: base.orientation, selfState: selfState.context, archive: base.archive },
+    context: { orientation: base.orientation, selfState: selfState.context, activity: stack.value.activity, archive: base.archive },
     dispatcher: stack.value.dispatcher,
     emotion: selfState.emotion,
     workers: stack.value.workers,
