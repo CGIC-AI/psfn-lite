@@ -59,6 +59,8 @@ import { recordReplyCanaryToken } from '../../cogsec/canary/reply-canary.js';
 import {
   DISCLOSURE_CLASSIFIER_VERSION,
   buildGenerationDisclosureLineage,
+} from '../../cogsec/disclosure/generation-lineage.js';
+import {
   turnEgressCustodyProof,
   type TurnEgressCustodyProof,
 } from '../../cogsec/disclosure/index.js';

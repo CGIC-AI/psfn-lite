@@ -38,7 +38,7 @@ const TOOL_CANCELLED_NOTICE =
 const NON_TEXT_TOOL_RESULT_WITHHELD_NOTICE =
   '[System notice] Non-text tool content was withheld because no intake screener admitted it.';
 import type { IntakeEnvelopeSnapshot } from '../../shared/contracts/intake-envelope.js';
-import type { IntakeMarkingPlan } from '../cogsec/intake/marking.js';
+import type { IntakeMarkingPlan } from '../../shared/contracts/intake-screening-port.js';
 import {
   attachToolResultInvocationAudit,
   type ToolResultInvocationAudit,

@@ -1,8 +1,10 @@
 import {
   deriveRoomDisclosureDestination,
+  type ChannelDisclosureResolver,
+} from '../cogsec/disclosure/egress-composition.js';
+import {
   egressContentSha256,
   evaluateEgressCustodyHold,
-  type ChannelDisclosureResolver,
   type EgressCustodyHoldReason,
   type EgressDeliveryRecorder,
   type TurnEgressCustodyProof,

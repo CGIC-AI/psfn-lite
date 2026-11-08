@@ -159,7 +159,7 @@ export interface SessionMessageRecordOptions {
     mode: 'shadow' | 'enforce';
     withheld: boolean;
     snapshot: IntakeEnvelopeSnapshot;
-    markingPlan?: import('../cogsec/intake/marking.js').IntakeMarkingPlan;
+    markingPlan?: import('../../shared/contracts/intake-screening-port.js').IntakeMarkingPlan;
   };
 }
 
