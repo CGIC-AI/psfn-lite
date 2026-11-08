@@ -1,8 +1,11 @@
 /**
  * The standalone composition root: open storage, build every core stack,
  * wire the Pi harness as the host of conversation turns, internal turns and
- * workers, and run the scheduler. `createLiteRuntime` is the one entry; a
- * tool transport can be mounted on the runtime's dispatcher and ingress.
+ * workers, and run the scheduler. `createLiteRuntime` is the one entry. When
+ * the config names them, it also mounts the governed MCP tool transport and
+ * the lifecycle bridge for an external companion host on the same
+ * dispatcher and ingress (see transports.ts); internal turns then run in the
+ * Pi harness or, delegated, in that host.
  */
 import {
   ok,
@@ -37,6 +40,7 @@ import { createLocalHost, type LocalHost, type OperatorChannel } from './local-h
 import { createTickLoop, type TickLoop } from './tick-loop.ts';
 import { buildStacks, refusingApprovals, type LiteStacks } from './stacks.ts';
 import { openLiteStorage, type LiteStorage } from './storage.ts';
+import { prepareTransports, type MountedTransports, type TransportReport } from './transports.ts';
 
 const OPERATOR_ACTOR = 'standalone:config';
 
@@ -58,7 +62,9 @@ export type LiteDiagnostic =
   | ({ readonly kind: 'worker_host' } & WorkerDiagnostic)
   | { readonly kind: 'tick'; readonly report: Result<LiteTickReport> }
   /** Turn outcomes known at close that storage still refused; each turn stays open until a successor recovers it as interrupted by the host. */
-  | { readonly kind: 'unsettled_turns'; readonly turnIds: readonly string[] };
+  | { readonly kind: 'unsettled_turns'; readonly turnIds: readonly string[] }
+  /** A transport failure the client was not shown in full: storage outages, exceptions, failed post-turn work, released internal turns. */
+  | { readonly kind: 'transport'; readonly report: TransportReport };
 
 export interface LiteTickReport {
   readonly scheduler: Result<SchedulerTickReport>;
@@ -76,6 +82,8 @@ export interface LiteRuntime {
   readonly dispatcher: ToolDispatcher;
   readonly ingress: TrustedIngress;
   readonly host: LocalHost;
+  /** Where the configured transports listen; null for one not configured. */
+  readonly transports: { readonly mcpUrl: string | null; readonly lifecycleUrl: string | null };
   /** Registers the configured operator once; an existing contact is left exactly as it is. */
   ensureOperator(): Promise<Result<{ readonly contactId: ContactId; readonly created: boolean }>>;
   /** One operator turn in their direct conversation. */
@@ -99,10 +107,20 @@ export async function createLiteRuntime(input: {
   readonly config: LiteConfig;
   readonly databaseUrl: string;
   readonly host: LiteHostCapabilities;
+  /** Where the transport credentials the MCP bindings name are read from. */
+  readonly env: Readonly<Record<string, string | undefined>>;
 }): Promise<Result<LiteRuntime>> {
   const { config, host } = input;
   const local = createLocalHost({ surface: config.surface, operator: config.operator, channel: host.channel });
   if (!local.ok) return local;
+  const transports = prepareTransports({
+    config,
+    env: input.env,
+    clock: host.clock,
+    local: local.value.authenticator,
+    onReport: (report) => host.onDiagnostic({ kind: 'transport', report }),
+  });
+  if (!transports.ok) return transports;
   const storage = await openLiteStorage({
     storage: config.storage,
     databaseUrl: input.databaseUrl,
@@ -119,7 +137,7 @@ export async function createLiteRuntime(input: {
   });
   // Core's free time and schedules ask for internal turns through this port; the harness exists once the dispatcher does.
   let harness: CompanionHarness | null = null;
-  const internalTurns: InternalTurnPort = {
+  const internalTurns: InternalTurnPort = transports.value.internalTurns ?? {
     run: (request) => (harness === null ? Promise.resolve(unavailable('internal_turns', 'the harness is not built yet')) : harness.internalTurns.run(request)),
   };
   const stacks = buildStacks({
@@ -127,7 +145,7 @@ export async function createLiteRuntime(input: {
     storage: storage.value,
     clock: host.clock,
     ids: host.ids,
-    authenticator: local.value.authenticator,
+    authenticator: transports.value.authenticator,
     approvals: refusingApprovals(),
     model,
     estimator: createPiAffectEstimator(host.model),
@@ -147,7 +165,7 @@ export async function createLiteRuntime(input: {
     lifecycle: stacks.value.lifecycle,
     sessions: stacks.value.sessions,
     ledger: storage.value.state.ledger,
-    context: { orientation: stacks.value.orientation, selfState: stacks.value.selfState, archive: storage.value.archive },
+    context: { orientation: stacks.value.orientation, selfState: stacks.value.selfState, activity: stacks.value.activity.activity, archive: storage.value.archive },
     dispatcher: stacks.value.activity.dispatcher,
     emotion: stacks.value.emotion,
     workers: stacks.value.activity.workers,
@@ -161,7 +179,12 @@ export async function createLiteRuntime(input: {
     return built;
   }
   harness = built.value;
-  return ok(assemble({ config, host, local: local.value, storage: storage.value, stacks: stacks.value, harness: built.value, workerHost, owner }));
+  const mounted = await transports.value.mount({ stacks: stacks.value, storage: storage.value });
+  if (!mounted.ok) {
+    await storage.value.close();
+    return mounted;
+  }
+  return ok(assemble({ config, host, local: local.value, storage: storage.value, stacks: stacks.value, harness: built.value, workerHost, owner, mounted: mounted.value }));
 }
 
 function assemble(parts: {
@@ -173,6 +196,7 @@ function assemble(parts: {
   readonly harness: CompanionHarness;
   readonly workerHost: PiWorkerHost;
   readonly owner: TurnOwner;
+  readonly mounted: MountedTransports;
 }): LiteRuntime {
   const { config, host, local, storage, stacks, harness, workerHost } = parts;
   const inFlight = new Set<Promise<unknown>>();
@@ -217,6 +241,7 @@ function assemble(parts: {
     dispatcher: stacks.activity.dispatcher,
     ingress: stacks.ingress,
     host: local,
+    transports: { mcpUrl: parts.mounted.mcpUrl, lifecycleUrl: parts.mounted.lifecycleUrl },
     ensureOperator: () =>
       track(async (): Promise<Result<{ readonly contactId: ContactId; readonly created: boolean }>> => {
         const identity = { channelKind: config.operator.channelKind, externalId: config.operator.externalId };
@@ -257,6 +282,8 @@ function assemble(parts: {
       if (closed) return;
       // Interrupt first: a tick in progress waits on its turn, which waits on the model.
       closed = true;
+      // No new transport request starts; a delegated internal turn still waiting fails visibly.
+      await parts.mounted.close();
       harness.shutdown();
       workerHost.shutdown();
       await loop?.stop();

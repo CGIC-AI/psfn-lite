@@ -83,10 +83,51 @@ const STANDALONE_RULES: OuterRules = {
     'packages/core/src/index.ts': 'apps/standalone/src/core.ts',
     'packages/adapters/src/index.ts': 'apps/standalone/src/adapters.ts',
     'packages/pi/src/index.ts': 'apps/standalone/src/harness.ts',
+    'packages/mcp/src/index.ts': 'apps/standalone/src/mcp.ts',
+    'packages/lifecycle/src/index.ts': 'apps/standalone/src/lifecycle.ts',
   },
   dependencies: Object.keys(STANDALONE_MANIFEST.dependencies ?? {}),
   dependencySite: null,
 };
+
+const LIFECYCLE_MANIFEST = manifest('packages/lifecycle');
+const LIFECYCLE_RULES: OuterRules = {
+  own: 'packages/lifecycle/src/',
+  entries: { 'packages/core/src/index.ts': 'packages/lifecycle/src/core.ts', 'packages/mcp/src/index.ts': 'packages/lifecycle/src/mcp.ts' },
+  dependencies: Object.keys(LIFECYCLE_MANIFEST.dependencies ?? {}),
+  dependencySite: null,
+};
+
+describe('lifecycle bridge import boundary', () => {
+  it('scans the real bridge package and finds no violations', () => {
+    const files = sources('packages/lifecycle/src');
+    expect(files.length).toBeGreaterThanOrEqual(5);
+    expect(checkOuterImports(files, LIFECYCLE_RULES)).toEqual([]);
+  });
+
+  it('gives the bridge no third-party dependency', () => {
+    expect(LIFECYCLE_MANIFEST).toMatchObject({ name: 'lite-lifecycle', private: true, type: 'module', exports: { '.': './src/index.ts' } });
+    expect(LIFECYCLE_MANIFEST.dependencies).toBeUndefined();
+  });
+
+  it.each([
+    ['a deep core import', "import { ok } from '../../core/src/shared/result.ts';", 'outer packages import only public entries'],
+    ['a deep MCP import', "import { bearerCredential } from '../../mcp/src/credentials.ts';", 'outer packages import only public entries'],
+    ['the MCP entry outside its shim', "import { publicError } from '../../mcp/src/index.ts';", 'must be reached through packages/lifecycle/src/mcp.ts'],
+    ['the Pi harness', "import '../../pi/src/index.ts';", 'outer packages import only public entries'],
+    ['an undeclared package', "import { createServer } from 'express';", 'not a declared dependency'],
+  ])('rejects %s in the bridge', (_label, text, expected) => {
+    const violations = checkOuterImports([{ path: 'packages/lifecycle/src/x.ts', text }], LIFECYCLE_RULES);
+    expect(violations.some((v) => v.includes(expected)), violations.join('\n')).toBe(true);
+  });
+
+  it('keeps core free of any reference to the bridge or the MCP transport', () => {
+    for (const file of sources('packages/core/src')) {
+      const { specifiers } = collectSpecifiers(file.path, file.text);
+      expect(specifiers.filter((s) => s.includes('/lifecycle/') || s.includes('/mcp/')), file.path).toEqual([]);
+    }
+  });
+});
 
 describe('Pi harness and standalone import boundaries', () => {
   it('scans the real Pi package and finds no violations', () => {
