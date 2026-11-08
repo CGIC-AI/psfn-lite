@@ -1,8 +1,35 @@
-export type {
-  ActiveConcern,
-  ConcernPort,
-  ConcernStatus,
-  ConcernTransitionTarget,
-  PendingFollowUp,
+export {
+  CONCERN_EVIDENCE_KINDS,
+  CONCERN_PRIORITIES,
+  CONCERN_STATUSES,
+  CONCERN_TRANSITION_TARGETS,
+  FOLLOW_UP_STATES,
+  type ActiveConcern,
+  type ConcernEvent,
+  type ConcernEvidenceKind,
+  type ConcernEvidenceRef,
+  type ConcernPort,
+  type ConcernPriority,
+  type ConcernResolution,
+  type ConcernStatus,
+  type ConcernTransitionTarget,
+  type FollowUpPort,
+  type FollowUpState,
+  type PendingFollowUp,
 } from './types.ts';
+export {
+  CONCERN_DUPLICATE_SIMILARITY,
+  MAX_CONCERN_OUTCOME_CHARS,
+  MAX_CONCERN_TEXT_CHARS,
+  canViewConcern,
+  concernTextSimilarity,
+  describeConcernArc,
+  isOpenConcernStatus,
+  isTerminalConcernStatus,
+  mergeEvidence,
+  parseEvidenceRefs,
+  reliefDelta,
+  validateConcernTransition,
+} from './concerns.ts';
+export { MAX_FOLLOW_UP_CHARS, followUpId, normalizeDueAt, normalizeFollowUpContent } from './follow-ups.ts';
 export { concernTool } from './tool.ts';
