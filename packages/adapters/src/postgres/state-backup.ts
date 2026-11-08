@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import type pg from 'pg';
 import { conflict, invalid, isRecord, ok, unavailable, type BackupComponentPort, type BackupFile, type Result } from '../core.ts';
 import { transaction, type Queryable } from './database.ts';
+import { MEMORY_BACKED_UP_TABLES } from './memory-tables.ts';
 import { requireCurrentSchema, type AppliedMigration } from './migrations.ts';
 
 interface TableSpec {
@@ -44,6 +45,7 @@ export const BACKED_UP_TABLES: readonly TableSpec[] = Object.freeze([
   { name: 'value_entries', orderBy: 'version' },
   { name: 'north_star_state', orderBy: 'singleton' },
   { name: 'north_star_item_versions', orderBy: 'item_id, version' },
+  ...MEMORY_BACKED_UP_TABLES,
 ]);
 
 const SCHEMA_FILE = 'schema.json';

@@ -363,3 +363,108 @@ reads, first-person authorship preservation, idempotent worker recovery, quiet
 rest across restart, and complete backup/restore. Measure dependency footprint,
 idle inference, model calls per workload, latency and memory use against a defined
 framework baseline; do not claim savings before measurement.
+
+## Memory, episodes and journals
+
+`createMemoryStack` (`packages/core/src/application/memory-composition.ts`)
+composes the `memory`, `episode` and `journal` tool handlers, the maintenance
+pass and the operator administration from explicit ports. Hosts merge its
+handlers with `createContinuityHandlers` before building the dispatcher. No
+port has an in-memory fallback, and nothing depends on a wiki.
+
+- **Access is data.** `sourceAccessFor` turns a viewer into a `SourceAccess`:
+  admitted sensitivities, readable source classes, own conversations, whether
+  self material is readable, and a subject binding. A participant reads only
+  memories about themselves or their room, and companion-internal memories
+  only from self turns (the donor's mandatory subject authorization). The
+  Postgres stores render the same predicate in SQL and apply it before
+  ranking, limits and counts, so withheld rows never shape results, census
+  totals or neighbour lists. A withheld id reads as `not_found` on every
+  read and write path. A test proves the predicate equals `canViewerRead`,
+  and an integration test proves the SQL equals the core predicates.
+- **Authorship.** Each memory records its author and attribution:
+  `companion_authored`, `participant_attributed` (bound to the speaking
+  contact), or `inferred` (with the producer). Workers and extraction write
+  only `inferred` or `participant_attributed`. A rewrite by the companion
+  becomes `companion_authored`, and the patch event keeps the previous text
+  and attribution.
+- **Writes and evolution.** One writer serves tool writes, imports and
+  extraction. Each write has an idempotency key; keys are namespaced by
+  conversation. A retry with the same content replays the receipt (same id,
+  same provenance), and a reused key with other content is an
+  `idempotency_mismatch`. A write is compared only with memories its own
+  conversation may read, by the donor's dedup thresholds and reconciliation.
+  A destructive supersede is allowed only when the incoming attribution has
+  at least the existing one's authority; otherwise it is recorded as a
+  conflict link. A near-identical write deduplicates only into a memory of
+  at least its own authority. A companion-authored or participant-attributed
+  write that matches an inference becomes a new record that supersedes it,
+  so the inference survives only as superseded history. Worker writes of boundary or relational kinds, or of
+  intimate or confidential material, are staged until an operator reviews
+  them. Deletion is a proposal through `ApprovalPort`; only operator
+  administration applies it, as a reversible soft delete.
+- **Extraction** runs only in a companion-internal maintenance turn, after a
+  per-session watermark. The model proposes; the runtime binds each subject
+  to the attributed speaker of the named turn and records nothing about a
+  contact without granted consent, nor anything drawn from such a contact's
+  own turn, whatever the subject (a group item about the room included).
+  Each write key covers every field of the writer's request digest, so a
+  rerun that relabels an item is a new write that deduplication resolves,
+  not a key mismatch that stalls the watermark. Malformed output fails the
+  session and keeps the watermark.
+- **Episodes** form only from ended conversations: no longer active, or idle
+  for `endedAfterMs`. A long pause splits a session. A short exchange becomes
+  a `brief` episode with deterministic signals and no model call. Ranges
+  without conversation are reported. Episode ids derive from the session and
+  archive position, so a rerun returns the same episodes. Meaning is written
+  only by the companion in a self turn, compare-and-set, and every version is
+  kept. Meaning is companion-private: only readers that may read self
+  material see it, everyone else gets the machine draft with no sign that
+  meaning exists, and it is neither indexed for search nor embedded.
+  Consolidation never merges, absorbs into or re-summarizes an episode that
+  has meaning. Writing meaning moves the episode revision, the store refuses
+  any machine change but promotion to an episode with meaning, and a merge is
+  one compare-and-set transaction over the survivor and every absorbed
+  episode, so neither a race with the companion nor a retry after a failure
+  merges anything twice or hides what the companion wrote. An arc is shown
+  only when every member is readable.
+- **Search** is hybrid. Lexical full-text and pgvector cosine results are
+  fused by reciprocal rank, and each response reports which modes worked. An
+  embedding that fails marks the write `pending`, and the maintenance
+  backfill embeds it later.
+- **Journals, reflections and letters.** Note provenance is stamped from the
+  writing scope: the source conversation, or `restricted` for self turns and
+  for notes merged across conversations. A restricted note is readable only
+  where confidential material is admitted. A reflection is either the
+  companion's own (only from its internal turn) or a process log. Letter
+  composition is idempotent by id, every transition is a recorded event, and
+  the Partner's drafts are never shown.
+- **Maintenance** (`createMemoryMaintenance`) runs extraction and episode
+  formation per recent session, then consolidation per conversation, arc
+  weaving and the embedding backfill. Each failure is reported with its
+  error, and its watermark stays put for the next run.
+
+Storage (`openPostgresMemoryState`, `postgresMemoryStores`) uses migration
+`0002_memory_state.sql`. Records are JSONB in core's shape. Columns hold keys,
+revisions and the access-filter fields. No column is generated, so a backup
+restores by plain insert. Embeddings are rows per named space with declared
+dimensions, checked per row. Opening the stores for a space creates its
+partial HNSW cosine index on each embedding table. Semantic queries order by
+the indexed expression and use pgvector's iterative scan, so a filtered search
+still fills its limit. A space reopened with different dimensions fails to
+open. The new tables are appended to the structured-state backup in
+foreign-key order. Embeddings are backed up as rows, and the indexes are
+rebuilt when the stores open.
+
+Known limits:
+
+- The soft delete and the proposal decision are separate port calls. If
+  saving the decision fails after the soft delete, the memory is soft-deleted
+  while its proposal stays pending. Repeating the decision then reports a
+  conflict, and `restore` still works. Likewise, `propose_delete` submits the
+  approval before it stores the proposal, so a retry after a failed store
+  submits a second approval.
+- A journal write to a path held by a note this conversation cannot read
+  returns `not_found`. That differs from a fresh create, so it reveals that
+  the path is taken.
+- Letter ids are one namespace shared by the companion and the Partner.
