@@ -1,6 +1,7 @@
 import {
   DEDUP_THRESHOLD,
   RELATED_OFFSET,
+  attributionRank,
   memoryReadable,
   chooseOutcome,
   classifyEvolution,
@@ -63,7 +64,11 @@ export interface MemoryWriter {
 /**
  * The single memory writer for tool writes, imports and extraction. It is
  * idempotent by key (`MemoryWriteReceipt`) and evolves memory against
- * current memories of the same subject and kind (`classifyEvolution`).
+ * current memories of the same subject and kind (`classifyEvolution`). A
+ * near-identical write deduplicates only into a memory of at least its own
+ * authority; when it outranks the existing one (a companion-authored or
+ * participant-attributed write over an inference) it becomes a new record
+ * that supersedes the lower-authority one, so authorship is never collapsed.
  */
 export function createMemoryWriter(deps: {
   readonly store: MemoryStorePort;
@@ -135,8 +140,11 @@ export function createMemoryWriter(deps: {
         .map((c) => ({ record: c.record, score: similarity({ content, vector }, { content: c.record.content, vector: c.vector }) }))
         .sort((a, b) => b.score - a.score);
       const threshold = DEDUP_THRESHOLD[request.kind];
-      const best = scored[0];
-      if (best !== undefined && best.score >= threshold) {
+      const incomingRank = attributionRank(request.provenance.attribution);
+      // Deduplicate only into a memory whose authorship carries at least the incoming authority, so a
+      // companion-authored or participant-attributed write is never absorbed into a machine inference.
+      const best = scored.find((c) => c.score >= threshold && attributionRank(c.record.provenance.attribution) >= incomingRank);
+      if (best !== undefined) {
         const reinforced = await deps.store.reinforce(
           receipt(best.record.id, 'deduplicated'),
           event(best.record.id, 'reinforced', author, at, { similarity: round(best.score), provenance: record.provenance }),
@@ -148,6 +156,11 @@ export function createMemoryWriter(deps: {
       const decisions: EvolutionDecision[] = [];
       for (const candidate of scored) {
         if (candidate.score < threshold - RELATED_OFFSET) break;
+        if (candidate.score >= threshold) {
+          // The same memory, held with less authority: the new record replaces it and the old one is kept as superseded.
+          decisions.push({ existing: candidate.record, similarity: candidate.score, relation: 'supersedes', destructive: true, reason: 'attribution_upgrade' });
+          continue;
+        }
         const decision = classifyEvolution({
           content,
           kind: request.kind,

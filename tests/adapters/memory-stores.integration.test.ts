@@ -278,6 +278,48 @@ describe.skipIf(dockerTestsOptedOut('postgres memory stores'))('postgres memory 
     expect(stale.ok || stale.error).toMatchObject({ kind: 'conflict', reason: 'stale_revision' });
   });
 
+  it('merges episodes all or nothing, and never merges, re-summarizes or indexes companion meaning', async () => {
+    const stores = await openMemory(await pgdb.database());
+    const dm: Audience = { kind: 'direct', channelId: id('dm-primary'), contactId: PRIMARY };
+    const [a, b, c] = [1, 2, 3].map((n) => ({ ...episodeRecord(n, dm, [PRIMARY]), lifecycle: 'candidate' as const }));
+    if (a === undefined || b === undefined || c === undefined) throw new Error('fixtures');
+    for (const episode of [a, b, c]) expect(kindOf(await stores.episodes.createIfAbsent(episode))).toBe('ok');
+    const meaning = { authoredBy: 'companion' as const, text: 'private resentment worry', source: 'companion_reflection' as const, revision: 1, authoredAt: AT };
+    const authored = await stores.episodes.setMeaning(c.id, meaning, 0);
+    expect(authored.ok && authored.value.revision).toBe(2);
+
+    // A merge planned against c's old revision fails whole: the survivor is left unchanged.
+    const survivor = { ...a, lifecycle: 'canonical' as const, segments: [...a.segments, ...b.segments, ...c.segments], revision: 2 };
+    const stale = await stores.episodes.merge(survivor, 1, [{ id: b.id, expectedRevision: 1 }, { id: c.id, expectedRevision: 1 }], AT);
+    expect(stale.ok || stale.error).toMatchObject({ kind: 'conflict', reason: 'stale_revision' });
+    const current = await stores.episodes.merge(survivor, 1, [{ id: b.id, expectedRevision: 1 }, { id: c.id, expectedRevision: 2 }], AT);
+    expect(current.ok || current.error).toMatchObject({ kind: 'conflict' });
+    const untouched = await stores.episodes.get(a.id);
+    expect(untouched.ok && [untouched.value.revision, untouched.value.segments.length]).toEqual([1, 1]);
+    const stillB = await stores.episodes.get(b.id);
+    expect(stillB.ok && stillB.value.lifecycle).toBe('candidate');
+
+    const merged = await stores.episodes.merge({ ...survivor, segments: [...a.segments, ...b.segments] }, 1, [{ id: b.id, expectedRevision: 1 }], AT);
+    expect(merged.ok && merged.value.segments.length).toBe(2);
+    const gone = await stores.episodes.get(b.id);
+    expect(gone.ok && [gone.value.lifecycle, gone.value.mergedInto, gone.value.revision]).toEqual(['merged', a.id, 2]);
+    expect(kindOf(await stores.episodes.merge({ ...survivor, revision: 3 }, 2, [{ id: b.id, expectedRevision: 2 }], AT))).toBe('conflict');
+
+    const withMeaning = await stores.episodes.get(c.id);
+    if (!withMeaning.ok) throw new Error('episode c');
+    expect(kindOf(await stores.episodes.saveMachine({ ...withMeaning.value, lifecycle: 'merged', mergedInto: a.id, revision: 3 }, 2))).toBe('conflict');
+    const resummarized = { ...withMeaning.value, machineSignals: { ...withMeaning.value.machineSignals, summary: 'other' }, revision: 3 };
+    expect(kindOf(await stores.episodes.saveMachine(resummarized, 2))).toBe('conflict');
+    const promoted = await stores.episodes.saveMachine({ ...withMeaning.value, lifecycle: 'canonical', revision: 3 }, 2);
+    expect(promoted.ok && [promoted.value.lifecycle, promoted.value.meaning?.text]).toEqual(['canonical', 'private resentment worry']);
+
+    const self = sourceAccessFor({ audience: { kind: 'self' }, admitted: [...SENSITIVITIES], worker: false }, null);
+    const byMeaning = await stores.episodes.searchLexical(self, 'resentment worry', 10);
+    expect(byMeaning.ok && byMeaning.value).toEqual([]);
+    const bySummary = await stores.episodes.searchLexical(self, 'lantern', 10);
+    expect(bySummary.ok && bySummary.value.map((h) => h.episode.id).sort()).toEqual([a.id, c.id]);
+  });
+
   it('backs up memory, episodes, journals and letters and restores them into a fresh database', async () => {
     const sourceUrl = await pgdb.database();
     const state = await pgdb.open(sourceUrl);

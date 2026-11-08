@@ -181,6 +181,48 @@ describe('memory writes are idempotent and evolve by authority', () => {
     expect(inferred?.provenance).toMatchObject({ author: { kind: 'machine', producer: 'memory_extraction' }, attribution: { kind: 'inferred' } });
   });
 
+  it('never absorbs the companion\'s write into a machine inference of the same text', async () => {
+    const world = await fakeMemoryWorld();
+    const robin = await world.admit('primary-dm');
+    const worker = deriveWorkerScope(robin, id('run-1'), { actions: [{ tool: 'memory', action: 'write' }], maxTurns: 3, maxSensitivity: 'personal' });
+    if (!worker.ok) throw new Error(JSON.stringify(worker.error));
+    const inferred = await mustWrite(world, worker.value, 'w1', 'Robin likes green tea');
+    expect(world.memories.records.get(inferred.memoryId)?.provenance.attribution).toEqual({ kind: 'inferred', producer: 'worker:run-1' });
+
+    const own = await mustWrite(world, robin, 'w2', 'Robin likes green tea');
+    expect(own.outcome).toBe('superseded');
+    expect(own.memoryId).not.toBe(inferred.memoryId);
+    expect(world.memories.records.get(own.memoryId)?.provenance).toMatchObject({ attribution: { kind: 'companion_authored' }, author: { kind: 'companion' } });
+    // The inference is kept, unchanged, as superseded history.
+    expect(world.memories.records.get(inferred.memoryId)).toMatchObject({
+      state: 'superseded',
+      supersededBy: own.memoryId,
+      provenance: { attribution: { kind: 'inferred', producer: 'worker:run-1' } },
+    });
+    const shown = await world.must<{ memories: View[] }>(robin, 'memory', 'search', { query: 'green tea' });
+    expect(shown.memories.map((m) => [m.id, m.attribution])).toEqual([[own.memoryId, { kind: 'companion_authored' }]]);
+
+    // A later extracted inference of the same text reinforces the companion's record; a changed one cannot replace it.
+    await world.converse(robin, 'Green tea again today', 'Of course', 'k1');
+    scriptExtraction(world, (turns) =>
+      ['Robin likes green tea', 'Robin now likes green tea'].map((content) => ({
+        turnId: turns[0]?.turnId,
+        kind: 'fact',
+        content,
+        sensitivity: 'personal',
+        about: 'speaker',
+        attribution: 'inferred',
+        confidence: 1,
+      })),
+    );
+    const report = await world.maintenance.run(await world.admit('maintenance'), MAINTAIN);
+    expect(report.ok && report.value.extraction[0]?.written.map((w) => [w.memoryId === own.memoryId, w.outcome])).toEqual([
+      [true, 'deduplicated'],
+      [false, 'conflict'],
+    ]);
+    expect(world.memories.records.get(own.memoryId)).toMatchObject({ state: 'current', provenance: { attribution: { kind: 'companion_authored' } } });
+  });
+
   it('never deduplicates into, supersedes or reveals a memory the writer cannot read', async () => {
     const world = await fakeMemoryWorld();
     const sam = await world.admit('friend-dm');
@@ -359,6 +401,30 @@ describe('memory extraction', () => {
     expect((await world.extractionCursors.get(sessionId)).ok).toBe(true);
   });
 
+  it('advances the watermark when a rerun relabels an item written by a failed run', async () => {
+    const world = await fakeMemoryWorld();
+    const sam = await world.admit('friend-dm');
+    const sessionId = await world.converse(sam, 'I moved to Lisbon', 'Noted', 'k1');
+    let sensitivity = 'personal';
+    scriptExtraction(world, (turns) => [
+      { turnId: turns[0]?.turnId, kind: 'fact', content: 'Sam moved to Lisbon', sensitivity, about: 'speaker', attribution: 'participant_attributed', confidence: 0.8 },
+    ]);
+    const maintenance = await world.admit('maintenance');
+    const advance = world.extractionCursors.advance.bind(world.extractionCursors);
+    world.extractionCursors.advance = () => Promise.resolve(unavailable('cursors', 'down'));
+    await world.maintenance.run(maintenance, MAINTAIN);
+    expect(world.memories.records.size).toBe(1);
+
+    world.extractionCursors.advance = advance;
+    sensitivity = 'intimate';
+    const retried = await world.maintenance.run(maintenance, MAINTAIN);
+    expect(retried.ok && retried.value.failures.filter((f) => f.step === 'extraction')).toEqual([]);
+    expect(retried.ok && retried.value.extraction[0]?.written.map((w) => w.outcome)).toEqual(['deduplicated']);
+    expect(world.memories.records.size).toBe(1);
+    const cursor = await world.extractionCursors.get(sessionId);
+    expect(cursor.ok && cursor.value.seq).toBeGreaterThan(0);
+  });
+
   it('fails closed on malformed output and keeps the watermark', async () => {
     const world = await fakeMemoryWorld();
     const sessionId = await world.converse(await world.admit('friend-dm'), 'I moved to Lisbon', 'Noted', 'k1');
@@ -381,6 +447,28 @@ describe('memory extraction', () => {
     ]);
     const report = await world.maintenance.run(await world.admit('maintenance'), MAINTAIN);
     expect(report.ok && report.value.extraction[0]?.withheld).toEqual([{ turnId: expect.any(String), reason: 'untracked_contact' }]);
+    expect(world.memories.records.size).toBe(0);
+  });
+
+  it('records nothing drawn from an untracked speaker\'s turn in a group, whatever the subject', async () => {
+    const world = await fakeMemoryWorld();
+    await world.converse(await world.admit('friend-group'), 'I moved to Lisbon and I am in recovery', 'Thanks for sharing', 'k1');
+    const sam = world.contactStore.records.get(world.people.friend);
+    if (sam === undefined) throw new Error('friend');
+    world.contactStore.records.set(world.people.friend, { ...sam, consent: 'revoked' });
+    scriptExtraction(world, (turns) =>
+      ['participant_attributed', 'inferred'].map((attribution) => ({
+        turnId: turns.find((t) => t.speaker !== null)?.turnId,
+        kind: 'fact',
+        content: `The room heard about Lisbon (${attribution})`,
+        sensitivity: 'personal',
+        about: 'room',
+        attribution,
+        confidence: 0.8,
+      })),
+    );
+    const report = await world.maintenance.run(await world.admit('maintenance'), MAINTAIN);
+    expect(report.ok && report.value.extraction[0]?.withheld.map((w) => w.reason)).toEqual(['untracked_contact', 'untracked_contact']);
     expect(world.memories.records.size).toBe(0);
   });
 

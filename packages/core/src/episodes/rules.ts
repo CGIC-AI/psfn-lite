@@ -157,15 +157,48 @@ export function planConsolidation(episodes: readonly Episode[], gapMs = CONSOLID
   return { merges, promote, frozen };
 }
 
-/** The survivor of a merge: union of coverage, joined runtime summaries, canonical. Meaning is untouched. */
-export function mergeEpisodes(survivor: Episode, absorbed: readonly Episode[], at: string): Episode {
+/**
+ * Why a machine save of `next` over `current` is refused, or null when it is
+ * allowed. An episode that carries the companion's meaning is frozen: the
+ * only machine change it accepts is promotion, so the coverage, signals and
+ * participants the companion wrote about stay exactly as they were.
+ */
+export function frozenEpisodeChange(current: Episode, next: Episode): string | null {
+  if (current.meaning === null) return null;
+  if (next.lifecycle === 'merged' || next.mergedInto !== null) return `episode ${current.id} carries companion meaning and cannot be merged`;
+  const same =
+    next.form === current.form &&
+    JSON.stringify(next.segments) === JSON.stringify(current.segments) &&
+    JSON.stringify(next.machineSignals) === JSON.stringify(current.machineSignals) &&
+    next.participantContactIds.join() === current.participantContactIds.join() &&
+    next.sourceTurnIds.join() === current.sourceTurnIds.join() &&
+    next.occurredFrom === current.occurredFrom &&
+    next.occurredTo === current.occurredTo;
+  return same ? null : `episode ${current.id} carries companion meaning and cannot be re-summarized`;
+}
+
+function segmentKey(segment: Episode['segments'][number]): string {
+  return `${segment.sessionId}|${segment.fromSeq}|${segment.toSeq}`;
+}
+
+/**
+ * The survivor of a merge: union of coverage, joined runtime summaries,
+ * canonical. Meaning is untouched. Idempotent: an absorbed episode whose
+ * segments the survivor already covers (a retry after a partial save) adds
+ * neither segments nor its summary again.
+ */
+export function mergeEpisodes(survivor: Episode, absorbedEpisodes: readonly Episode[], at: string): Episode {
+  const covered = new Set(survivor.segments.map(segmentKey));
+  const absorbed = absorbedEpisodes.filter((e) => !e.segments.every((s) => covered.has(segmentKey(s))));
   const all = [survivor, ...absorbed];
   const unique = <T>(items: readonly T[]): T[] => [...new Set(items)];
+  const segments = new Map<string, Episode['segments'][number]>();
+  for (const segment of all.flatMap((e) => e.segments)) if (!segments.has(segmentKey(segment))) segments.set(segmentKey(segment), segment);
   return {
     ...survivor,
     lifecycle: 'canonical',
     form: all.some((e) => e.form === 'conversation') ? 'conversation' : 'brief',
-    segments: all.flatMap((e) => e.segments),
+    segments: [...segments.values()],
     participantContactIds: unique(all.flatMap((e) => e.participantContactIds)).sort(),
     sourceTurnIds: unique(all.flatMap((e) => e.sourceTurnIds)),
     occurredFrom: all.map((e) => e.occurredFrom).sort()[0] ?? survivor.occurredFrom,

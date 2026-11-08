@@ -35,7 +35,7 @@ export function createEmbeddingBackfill(deps: {
       if (!pendingEpisodes.ok) return pendingEpisodes;
       const texts = [
         ...pendingMemories.value.map((m) => m.content),
-        ...pendingEpisodes.value.map((e) => episodeEmbeddingText(e.machineSignals.summary, e.meaning?.text ?? null)),
+        ...pendingEpisodes.value.map((e) => episodeEmbeddingText(e.machineSignals.summary)),
       ];
       if (texts.length === 0) return ok({ memories, episodes, failure: null, usage });
       const vectors = await embedTexts(deps.embeddings, texts, 'embedding_backfill');
@@ -57,9 +57,13 @@ export function createEmbeddingBackfill(deps: {
   };
 }
 
-/** What an episode's vector represents: its runtime summary and, when present, the companion's meaning. */
-export function episodeEmbeddingText(summary: string, meaning: string | null): string {
-  return meaning === null ? summary : `${summary}\n${meaning}`;
+/**
+ * What an episode's vector represents: its runtime summary only. The
+ * companion's meaning is companion-private, so it never shapes a vector that
+ * non-self readers' nearest-neighbour searches rank on.
+ */
+export function episodeEmbeddingText(summary: string): string {
+  return summary;
 }
 
 export type EmbeddingBackfill = ReturnType<typeof createEmbeddingBackfill>;

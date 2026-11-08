@@ -9,6 +9,7 @@ import {
   conflict,
   cosine,
   episodeReadable,
+  frozenEpisodeChange,
   journalReadable,
   lexicalTokens,
   memoryReadable,
@@ -20,6 +21,7 @@ import {
   type EmbeddingPort,
   type EmbeddingSpace,
   type Episode,
+  type EpisodeAbsorption,
   type EpisodeArc,
   type EpisodeHit,
   type EpisodeMeaning,
@@ -281,6 +283,8 @@ export class FakeEpisodes implements EpisodeStorePort {
     const current = this.episodes.get(episode.id);
     if (current === undefined) return Promise.resolve(notFound(`episode ${episode.id}`));
     if (current.revision !== expectedRevision) return Promise.resolve(conflict('stale_revision', 'episode moved'));
+    const frozen = frozenEpisodeChange(current, episode);
+    if (frozen !== null) return Promise.resolve(conflict('stale_revision', frozen));
     const saved = { ...episode, meaning: current.meaning };
     this.episodes.set(episode.id, saved);
     for (const key of [...this.vectors.keys()]) if (key.startsWith(`${episode.id}|`)) this.vectors.delete(key);
@@ -290,11 +294,34 @@ export class FakeEpisodes implements EpisodeStorePort {
     const current = this.episodes.get(episodeId);
     if (current === undefined) return Promise.resolve(notFound(`episode ${episodeId}`));
     if ((current.meaning?.revision ?? 0) !== expectedMeaningRevision) return Promise.resolve(conflict('stale_revision', 'meaning moved'));
-    const saved = { ...current, meaning };
+    const saved = { ...current, meaning, revision: current.revision + 1 };
     this.episodes.set(episodeId, saved);
     this.meanings.set(episodeId, [...(this.meanings.get(episodeId) ?? []), meaning]);
-    for (const key of [...this.vectors.keys()]) if (key.startsWith(`${episodeId}|`)) this.vectors.delete(key);
     return Promise.resolve(ok(saved));
+  }
+  /** Test hook: runs before each merge is checked, to inject a concurrent write or a failure. */
+  beforeMerge: (() => Promise<Result<void>>) | null = null;
+  async merge(survivor: Episode, expectedSurvivorRevision: number, absorbed: readonly EpisodeAbsorption[], at: string): Promise<Result<Episode>> {
+    if (this.beforeMerge !== null) {
+      const hook = await this.beforeMerge();
+      if (!hook.ok) return hook;
+    }
+    const expected: [string, number][] = [[survivor.id, expectedSurvivorRevision], ...absorbed.map((a): [string, number] => [a.id, a.expectedRevision])];
+    for (const [id, revision] of expected) {
+      const row = this.episodes.get(id);
+      if (row === undefined) return notFound(`episode ${id}`);
+      if (row.revision !== revision) return conflict('stale_revision', `episode ${id} moved`);
+      if (row.meaning !== null) return conflict('stale_revision', `episode ${id} carries companion meaning and cannot be merged`);
+      if (row.lifecycle === 'merged') return conflict('stale_revision', `episode ${id} was already merged`);
+    }
+    const saved = { ...survivor, meaning: null };
+    this.episodes.set(survivor.id, saved);
+    for (const { id } of absorbed) {
+      const row = this.episodes.get(id) as Episode;
+      this.episodes.set(id, { ...row, lifecycle: 'merged', mergedInto: survivor.id, revision: row.revision + 1, updatedAt: at });
+    }
+    for (const id of expected.map(([id]) => id)) for (const key of [...this.vectors.keys()]) if (key.startsWith(`${id}|`)) this.vectors.delete(key);
+    return ok(saved);
   }
   meaningHistory(episodeId: string): Promise<Result<readonly EpisodeMeaning[]>> {
     return Promise.resolve(ok(this.meanings.get(episodeId) ?? []));
@@ -304,7 +331,7 @@ export class FakeEpisodes implements EpisodeStorePort {
   }
   searchLexical(access: SourceAccess, query: string, limit: number): Promise<Result<readonly EpisodeHit[]>> {
     const hits = this.visible(access)
-      .map((episode) => ({ episode, score: lexicalScore(`${episode.machineSignals.summary} ${episode.meaning?.text ?? ''}`, query) }))
+      .map((episode) => ({ episode, score: lexicalScore(episode.machineSignals.summary, query) }))
       .filter((h) => h.score > 0)
       .sort((a, b) => b.score - a.score);
     return Promise.resolve(ok(hits.slice(0, limit)));

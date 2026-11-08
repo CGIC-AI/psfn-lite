@@ -6,6 +6,7 @@ import {
   type EpisodeMeaning,
   type EpisodeStorePort,
 } from '../episodes/index.ts';
+import type { SourceAccess } from '../memory/index.ts';
 import { conflict, denied, invalid, notFound, ok, type Clock, type ContactId, type Result, type TurnId } from '../shared/index.ts';
 import {
   accessOf,
@@ -74,13 +75,19 @@ export interface EpisodeService {
   ): Promise<Result<EpisodeView>>;
 }
 
-export function renderEpisode(episode: Episode): EpisodeView {
+/**
+ * The companion's meaning is companion-private: it is shown only to readers
+ * that may read companion-internal material (`selfSource`). Everyone else sees
+ * the machine draft, with no sign that meaning exists.
+ */
+export function renderEpisode(access: SourceAccess, episode: Episode): EpisodeView {
+  const meaning = access.selfSource ? episode.meaning : null;
   return {
     id: episode.id,
     lifecycle: episode.lifecycle,
     form: episode.form,
-    rendering: episode.meaning === null ? 'machine_draft' : 'companion_meaning',
-    meaning: episode.meaning,
+    rendering: meaning === null ? 'machine_draft' : 'companion_meaning',
+    meaning,
     machineSignals: { ...episode.machineSignals, origin: { kind: 'machine_inference', producer: episode.machineSignals.producer } },
     participantContactIds: episode.participantContactIds,
     occurredFrom: episode.occurredFrom,
@@ -131,7 +138,7 @@ export function createEpisodeService(deps: {
       const episodes = fuseRankings(lists, input.limit)
         .map((id) => byId.get(id))
         .filter((e): e is Episode => e !== undefined && episodeReadable(access, e))
-        .map(renderEpisode);
+        .map((e) => renderEpisode(access, e));
       return ok({ episodes, mode: { lexical: lexical.ok ? 'ok' : 'unavailable', semantic: semantic?.ok === true ? 'ok' : 'unavailable' }, usage });
     },
 
@@ -161,7 +168,7 @@ export function createEpisodeService(deps: {
           to: readable.map((m) => m.occurredTo).sort().at(-1) ?? episode.value.occurredTo,
         });
       }
-      return ok({ episode: renderEpisode(episode.value), sourceTurnIds: episode.value.sourceTurnIds, segments: episode.value.segments, arcs: shown });
+      return ok({ episode: renderEpisode(access, episode.value), sourceTurnIds: episode.value.sourceTurnIds, segments: episode.value.segments, arcs: shown });
     },
 
     async timeline(scope, input) {
@@ -171,7 +178,7 @@ export function createEpisodeService(deps: {
       if (Date.parse(input.to) - Date.parse(input.from) > TIMELINE_MAX_DAYS * 86_400_000) return invalid(`a timeline covers at most ${TIMELINE_MAX_DAYS} days`);
       const access = accessOf(scope);
       const found = await deps.store.timeline(access, input.from, input.to, input.limit);
-      return found.ok ? ok(found.value.filter((e) => episodeReadable(access, e)).map(renderEpisode)) : found;
+      return found.ok ? ok(found.value.filter((e) => episodeReadable(access, e)).map((e) => renderEpisode(access, e))) : found;
     },
 
     async authorMeaning(scope, input) {
@@ -193,7 +200,7 @@ export function createEpisodeService(deps: {
         { authoredBy: 'companion', text: text.value, source: input.source, revision: current + 1, authoredAt: deps.clock.now().toISOString() },
         current,
       );
-      return saved.ok ? ok(renderEpisode(saved.value)) : saved;
+      return saved.ok ? ok(renderEpisode(accessOf(scope), saved.value)) : saved;
     },
   };
 }

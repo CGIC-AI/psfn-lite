@@ -1,12 +1,15 @@
 /**
  * Postgres implementation of the core episode port: episodes, every version
  * of the companion's meaning, per-space embeddings and arcs. Filtered reads
- * apply `episodeReadable` in SQL. Machine saves never write meaning, and
- * meaning is written compare-and-set on its own revision.
+ * apply `episodeReadable` in SQL. Machine saves never write meaning or touch
+ * an episode that carries it beyond promotion, a merge is one transaction,
+ * and meaning is written compare-and-set on its own revision.
  */
 import type pg from 'pg';
 import {
   conflict,
+  frozenEpisodeChange,
+  invalid,
   notFound,
   ok,
   sourceKeys,
@@ -19,8 +22,12 @@ import {
 import { guarded, records, transaction, type Queryable, type Row } from './database.ts';
 import { SqlParams, anyTokenQuery, episodeAccessSql, iterativeScan, putVector, spaceSql, vectorLiteral } from './memory-sql.ts';
 
-/** Must match the `episodes_search` index expression exactly. */
-const SEARCH_TEXT = `coalesce(e.record -> 'machineSignals' ->> 'summary', '') || ' ' || coalesce(e.record -> 'meaning' ->> 'text', '')`;
+/**
+ * Must match the `episodes_search` index expression exactly. The companion's
+ * meaning is companion-private and deliberately not indexed, so it can never
+ * decide whether or how high a shared search ranks an episode.
+ */
+const SEARCH_TEXT = `coalesce(e.record -> 'machineSignals' ->> 'summary', '')`;
 
 function episodeColumns(episode: Episode): unknown[] {
   const { conversation, sourceClass } = sourceKeys(episode.source);
@@ -91,10 +98,38 @@ export function createPostgresEpisodeStore(pool: pg.Pool): EpisodeStorePort {
         if (current.revision !== expectedRevision) {
           return conflict('stale_revision', `episode ${episode.id} moved`, { expectedRevision, actualRevision: current.revision });
         }
+        const frozen = frozenEpisodeChange(current, episode);
+        if (frozen !== null) return conflict('stale_revision', frozen);
         // Machine passes never write meaning: whatever the companion wrote is carried over unchanged.
         const saved: Episode = { ...episode, meaning: current.meaning };
         await replaceEpisode(client, saved);
         await client.query('DELETE FROM episode_embeddings WHERE episode_id = $1', [episode.id]);
+        return ok(saved);
+      }),
+
+    merge: (survivor, expectedSurvivorRevision, absorbed, at) =>
+      transaction(pool, async (client) => {
+        const ids = [survivor.id, ...absorbed.map((a) => a.id)];
+        if (new Set(ids).size !== ids.length) return invalid('a merge names each episode once');
+        // Lock every row in a stable order, then check all of them before writing any.
+        const found = await client.query('SELECT record FROM episodes WHERE episode_id = ANY($1::text[]) ORDER BY episode_id FOR UPDATE', [ids]);
+        const current = new Map(records<Episode>(found.rows).map((e) => [e.id, e]));
+        const expected = new Map<string, number>([[survivor.id, expectedSurvivorRevision], ...absorbed.map((a) => [a.id, a.expectedRevision] as const)]);
+        for (const [id, revision] of expected) {
+          const row = current.get(id);
+          if (row === undefined) return notFound(`episode ${id}`);
+          if (row.revision !== revision) return conflict('stale_revision', `episode ${id} moved`, { expectedRevision: revision, actualRevision: row.revision });
+          if (row.meaning !== null) return conflict('stale_revision', `episode ${id} carries companion meaning and cannot be merged`);
+          if (row.lifecycle === 'merged') return conflict('stale_revision', `episode ${id} was already merged`);
+        }
+        const saved: Episode = { ...survivor, meaning: null };
+        await replaceEpisode(client, saved);
+        await client.query('DELETE FROM episode_embeddings WHERE episode_id = $1', [survivor.id]);
+        for (const { id } of absorbed) {
+          const row = current.get(id) as Episode;
+          await replaceEpisode(client, { ...row, lifecycle: 'merged', mergedInto: survivor.id, revision: row.revision + 1, updatedAt: at });
+          await client.query('DELETE FROM episode_embeddings WHERE episode_id = $1', [id]);
+        }
         return ok(saved);
       }),
 
@@ -106,10 +141,10 @@ export function createPostgresEpisodeStore(pool: pg.Pool): EpisodeStorePort {
         if (actual !== expectedMeaningRevision) {
           return conflict('stale_revision', `meaning of episode ${episodeId} moved`, { expectedRevision: expectedMeaningRevision, actualRevision: actual });
         }
-        const saved: Episode = { ...current, meaning };
+        // The episode revision moves too, so a machine change planned against the old record fails its compare-and-set.
+        const saved: Episode = { ...current, meaning, revision: current.revision + 1 };
         await replaceEpisode(client, saved);
         await client.query('INSERT INTO episode_meanings (episode_id, revision, record) VALUES ($1, $2, $3)', [episodeId, meaning.revision, meaning]);
-        await client.query('DELETE FROM episode_embeddings WHERE episode_id = $1', [episodeId]);
         return ok(saved);
       }),
 

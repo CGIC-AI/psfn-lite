@@ -1,5 +1,6 @@
 export type {
   Episode,
+  EpisodeAbsorption,
   EpisodeArc,
   EpisodeForm,
   EpisodeHit,
@@ -19,6 +20,7 @@ export {
   arcReadable,
   briefSignals,
   episodeReadable,
+  frozenEpisodeChange,
   isConversational,
   mergeEpisodes,
   participantsOf,

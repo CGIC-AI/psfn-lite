@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { unavailable, type Audience, type ContactId, type Episode, type SessionId } from '../../packages/core/src/index.ts';
+import { accessOf, deriveWorkerScope, mergeEpisodes, ok, unavailable, type Audience, type ContactId, type Episode, type SessionId } from '../../packages/core/src/index.ts';
 import { id } from './fakes.ts';
 import { ENDED_AFTER_MS, fakeMemoryWorld, kindOf } from './memory-world.ts';
 
@@ -172,6 +172,157 @@ describe('episode meaning is the companion\'s and survives consolidation', () =>
     expect(world.episodes.episodes.get('ep-a')?.meaning?.text).toBe('first');
   });
 });
+
+describe('consolidation races and retries', () => {
+  async function sitting(world: World) {
+    await world.converse(await world.admit('primary-dm'), 'hi!', 'hello Robin', 'k1');
+    const source: Audience = { kind: 'direct', channelId: id('dm-primary'), contactId: world.people.primary };
+    const people = [world.people.primary];
+    await store(
+      world,
+      fixture('ep-b', source, people, '2029-12-31T10:15:00.000Z', 5, 'fence planning talk'),
+      fixture('ep-c', source, people, '2029-12-31T10:30:00.000Z', 5, 'spring planting talk'),
+    );
+  }
+
+  it('never absorbs an episode whose meaning the companion wrote after the merge was planned', async () => {
+    const world = await fakeMemoryWorld();
+    await sitting(world);
+    const self = await world.admit('reflection');
+    let raced = false;
+    world.episodes.beforeMerge = async () => {
+      if (raced) return ok(undefined);
+      raced = true;
+      await world.must(self, 'episode', 'author_meaning', { episodeId: 'ep-c', text: 'The day Robin planned spring with me.', expectedRevision: 0 });
+      return ok(undefined);
+    };
+
+    const first = await formation(world);
+    // Extraction is unscripted here and fails on its own; only consolidation matters.
+    expect(first.failures.filter((f) => f.step === 'consolidation').map((f) => f.error.kind)).toEqual(['conflict']);
+    expect(world.episodes.episodes.get('ep-c')).toMatchObject({ lifecycle: 'candidate', mergedInto: null });
+    expect(world.episodes.episodes.get('ep-b')?.segments).toHaveLength(1);
+
+    const second = await formation(world);
+    expect(second.consolidation.find((c) => c.conversation === 'channel:dm-primary')).toMatchObject({ merged: [], frozen: ['ep-c'] });
+    const shown = await world.must<{ episode: EpisodeView }>(self, 'episode', 'get', { episodeId: 'ep-c' });
+    expect(shown.episode).toMatchObject({ lifecycle: 'canonical', rendering: 'companion_meaning', meaning: { text: 'The day Robin planned spring with me.' } });
+    expect(world.episodes.episodes.get('ep-b')?.machineSignals.summary).toBe('fence planning talk');
+  });
+
+  it('refuses any machine change but promotion to an episode that carries meaning', async () => {
+    const world = await fakeMemoryWorld();
+    await sitting(world);
+    await world.must(await world.admit('reflection'), 'episode', 'author_meaning', { episodeId: 'ep-c', text: 'mine', expectedRevision: 0 });
+    const current = world.episodes.episodes.get('ep-c') as Episode;
+    expect(current.revision).toBe(2);
+    const absorb = await world.episodes.saveMachine({ ...current, lifecycle: 'merged', mergedInto: 'ep-b', revision: 3 }, 2);
+    expect(absorb.ok || absorb.error).toMatchObject({ kind: 'conflict' });
+    const resummarize = await world.episodes.saveMachine({ ...current, machineSignals: { ...current.machineSignals, summary: 'other' }, revision: 3 }, 2);
+    expect(resummarize.ok || resummarize.error).toMatchObject({ kind: 'conflict' });
+    const merged = await world.episodes.merge(world.episodes.episodes.get('ep-b') as Episode, 1, [{ id: 'ep-c', expectedRevision: 2 }], current.updatedAt);
+    expect(merged.ok || merged.error).toMatchObject({ kind: 'conflict' });
+    const promoted = await world.episodes.saveMachine({ ...current, lifecycle: 'canonical', revision: 3 }, 2);
+    expect(promoted.ok && promoted.value.meaning?.text).toBe('mine');
+  });
+
+  it('merges once when a run is retried after the merge failed', async () => {
+    const world = await fakeMemoryWorld();
+    await sitting(world);
+    let failures = 1;
+    world.episodes.beforeMerge = () => Promise.resolve(failures-- > 0 ? unavailable('episodes', 'down') : ok(undefined));
+    const failed = await formation(world);
+    expect(failed.failures.filter((f) => f.step === 'consolidation').map((f) => f.error.kind)).toEqual(['unavailable']);
+    expect(world.episodes.episodes.get('ep-b')?.segments).toHaveLength(1);
+    expect(world.episodes.episodes.get('ep-c')?.lifecycle).toBe('candidate');
+
+    await formation(world);
+    await formation(world);
+    const survivor = world.episodes.episodes.get('ep-b');
+    expect(survivor?.segments.map((s) => s.sessionId)).toEqual(['session-ep-b', 'session-ep-c']);
+    expect(survivor?.machineSignals.summary).toBe('fence planning talk Then: spring planting talk');
+    expect(world.episodes.episodes.get('ep-c')).toMatchObject({ lifecycle: 'merged', mergedInto: 'ep-b' });
+  });
+
+  it('adds nothing twice when merging an episode the survivor already covers', async () => {
+    const world = await fakeMemoryWorld();
+    const source: Audience = { kind: 'direct', channelId: id('dm-primary'), contactId: world.people.primary };
+    const b = fixture('ep-b', source, [world.people.primary], '2029-12-31T10:15:00.000Z', 5, 'fence planning talk');
+    const c = fixture('ep-c', source, [world.people.primary], '2029-12-31T10:30:00.000Z', 5, 'spring planting talk');
+    const once = mergeEpisodes(b, [c], c.updatedAt);
+    const twice = mergeEpisodes(once, [c], c.updatedAt);
+    expect(twice.segments).toEqual(once.segments);
+    expect(twice.machineSignals.summary).toBe(once.machineSignals.summary);
+  });
+});
+
+describe('episode meaning is companion-private', () => {
+  it('shows meaning only to self readers and never lets it decide search results', async () => {
+    const world = await fakeMemoryWorld();
+    const room: Audience = { kind: 'group', channelId: id('room-a'), room: 'small_group' };
+    await store(world, fixture('ep-g', room, [world.people.friend], '2029-12-27T10:00:00.000Z', 30, 'garden talk', 'canonical'));
+    const self = await world.admit('reflection');
+    await world.must(self, 'episode', 'author_meaning', { episodeId: 'ep-g', text: 'private worry about resentment', expectedRevision: 0 });
+    await formation(world);
+    const embedded = world.embeddings.calls.flatMap((c) => c.texts);
+    expect(embedded).toContain('garden talk');
+    expect(embedded.join('\n')).not.toContain('resentment');
+
+    const samGroup = await world.admit('friend-group');
+    const readers = {
+      lee: await world.admit('acq-group'),
+      samDm: await world.admit('friend-dm'),
+      samGroup,
+      groupWorker: must(
+        deriveWorkerScope(samGroup, id('run-1'), {
+          actions: [{ tool: 'episode', action: 'get' }, { tool: 'episode', action: 'search' }, { tool: 'episode', action: 'timeline' }],
+          maxTurns: 2,
+          maxSensitivity: 'personal',
+        }),
+      ),
+      selfWorker: must(
+        deriveWorkerScope(self, id('run-2'), {
+          actions: [{ tool: 'episode', action: 'get' }, { tool: 'episode', action: 'search' }, { tool: 'episode', action: 'timeline' }],
+          maxTurns: 2,
+          maxSensitivity: 'personal',
+        }),
+      ),
+    };
+    const draft = { rendering: 'machine_draft', meaning: null };
+    const read: string[] = [];
+    for (const [name, scope] of Object.entries(readers)) {
+      const got = await world.call(scope, 'episode', 'get', { episodeId: 'ep-g' });
+      if (!got.ok) {
+        expect(got.error.kind, name).toBe('not_found');
+        continue;
+      }
+      read.push(name);
+      expect((got.value.content as { episode: EpisodeView }).episode, name).toMatchObject(draft);
+      const found = await world.must<{ episodes: EpisodeView[] }>(scope, 'episode', 'search', { query: 'garden' });
+      for (const episode of found.episodes) expect(episode, name).toMatchObject(draft);
+      const day = await world.must<EpisodeView[]>(scope, 'episode', 'timeline', { date: '2029-12-27' });
+      for (const episode of day) expect(episode, name).toMatchObject(draft);
+    }
+    expect(read).toEqual(['lee', 'samDm', 'samGroup', 'groupWorker', 'selfWorker']);
+    const background = await world.call(readers.samGroup, 'memory', 'shared_background', { contactId: world.people.friend });
+    for (const episode of background.ok ? (background.value.content as { episodes: EpisodeView[] }).episodes : []) expect(episode).toMatchObject(draft);
+    expect(background.ok && (background.value.content as { episodes: EpisodeView[] }).episodes.map((e) => e.id)).toEqual(['ep-g']);
+
+    // Meaning is not indexed: even an unrestricted lexical search cannot match or rank on it.
+    const byMeaning = await world.episodes.searchLexical(accessOf(self), 'resentment worry', 10);
+    expect(byMeaning.ok && byMeaning.value).toEqual([]);
+
+    const own = await world.must<{ episode: EpisodeView }>(self, 'episode', 'get', { episodeId: 'ep-g' });
+    expect(own.episode).toMatchObject({ rendering: 'companion_meaning', meaning: { text: 'private worry about resentment' } });
+    const ownBackground = await world.must<{ episodes: EpisodeView[] }>(self, 'memory', 'shared_background', { contactId: world.people.friend });
+    expect(ownBackground.episodes[0]?.meaning?.text).toBe('private worry about resentment');
+  });
+});
+
+function must<T>(result: { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown }): T {
+  if (!result.ok) throw new Error(JSON.stringify(result.error));
+  return result.value;
+}
 
 describe('episode privacy', () => {
   it('withholds an arc whole when any member is unreadable, and filters search and timeline', async () => {
