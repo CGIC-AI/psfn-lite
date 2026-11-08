@@ -25,6 +25,7 @@ import {
   type SelfModelSnapshot,
   type SelfReportPort,
   type Vad,
+  parseAffectObservation,
 } from '../emotion/index.ts';
 import { canViewConcern, isOpenConcernStatus, type ConcernPort } from '../intention/index.ts';
 import type { SessionArchivePort, TurnLedgerPort, TurnRecord } from '../sessions/index.ts';
@@ -33,6 +34,7 @@ import {
   denied,
   fail,
   invalid,
+  unavailable,
   notFound,
   ok,
   sameAudience,
@@ -249,8 +251,11 @@ export function createEmotionService(deps: EmotionServiceDeps): EmotionService {
       if (messages.length === 0) return invalid('the turn has no text to observe');
       const reading = await deps.estimator.estimate({ purpose: 'emotion.observe', turnId: record.turnId, messages });
       if (!reading.ok) return reading;
-      const observation = reading.value;
-      const trusted = Number.isFinite(observation.confidence) && observation.confidence >= policy.trustedConfidence;
+      // A malformed reading changes nothing and is reported; observing the turn again re-asks the estimator.
+      const parsed = parseAffectObservation(reading.value as unknown);
+      if (!parsed.ok) return unavailable('affect_estimator', `estimator returned a malformed reading: ${parsed.error.kind === 'invalid' ? parsed.error.issues.join('; ') : parsed.error.kind}`);
+      const observation = parsed.value;
+      const trusted = observation.confidence >= policy.trustedConfidence;
       const concernTexts = await openConcernTexts(scope);
       if (!concernTexts.ok) return concernTexts;
 
@@ -290,7 +295,7 @@ export function createEmotionService(deps: EmotionServiceDeps): EmotionService {
             kind: 'turn',
             trusted,
             impulse: trusted ? observation.vad : null,
-            confidence: Number.isFinite(observation.confidence) ? observation.confidence : null,
+            confidence: observation.confidence,
             producer: observation.producer,
             gate: gate.outcome,
             at,

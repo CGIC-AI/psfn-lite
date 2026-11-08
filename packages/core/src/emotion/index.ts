@@ -21,7 +21,8 @@ export type {
   SelfReportPort,
   Vad,
 } from './types.ts';
-export { BASELINE_EMOTION_POLICY, parseEmotionPolicy, type EmotionPolicy } from './policy.ts';
+export { BASELINE_EMOTION_POLICY, EMOTION_LABEL_PATTERN, parseEmotionPolicy, type EmotionPolicy } from './policy.ts';
+export { parseAffectObservation } from './observation.ts';
 export {
   NEUTRAL_AFFECT,
   NEUTRAL_VAD,
