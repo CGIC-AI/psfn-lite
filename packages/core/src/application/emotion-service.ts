@@ -316,6 +316,7 @@ export function createEmotionService(deps: EmotionServiceDeps): EmotionService {
 
     async read(scope) {
       if (!isTrustedTurnScope(scope)) return untrusted();
+      if (scope.caller.kind === 'worker') return denied('worker_not_permitted', 'workers may not read emotion state');
       const scopeKey = emotionScopeOf(scope.audience);
       const key = emotionScopeKey(scopeKey);
       const state = await deps.states.get(key);
@@ -344,6 +345,7 @@ export function createEmotionService(deps: EmotionServiceDeps): EmotionService {
 
     async appraisals(scope, input) {
       if (!isTrustedTurnScope(scope)) return untrusted();
+      if (scope.caller.kind === 'worker') return denied('worker_not_permitted', 'workers may not read appraisals');
       const recent = await deps.appraisals.recent(RECENT_SCAN);
       if (!recent.ok) return recent;
       const viewer = viewerOf(scope);

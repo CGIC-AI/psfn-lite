@@ -1,5 +1,6 @@
 import { describeVad, type AuthoredReflectionPort } from '../emotion/index.ts';
 import { canViewerRead, denied, ok, type Author, type InternalOrigin, type Result } from '../shared/index.ts';
+import { permitsAction } from './action-permission.ts';
 import type { ConcernService } from './concern-service.ts';
 import { internalContext, type ContextEntry } from './context.ts';
 import type { EmotionService } from './emotion-service.ts';
@@ -13,8 +14,9 @@ export interface SelfStateContext {
    * The companion's orientation beyond retrieved facts, as labelled internal
    * context for this turn: machine estimates and appraisals, companion
    * self-reports, authored values and reflections, open concerns and due
-   * follow-ups. Each item passes the same admission and audience rules as the
-   * tool that would show it, and none can render as participant speech.
+   * follow-ups. Each item passes the same declared restrictions (admission,
+   * worker denial and the worker's grant) and audience rules as the tool that
+   * would show it, and none can render as participant speech.
    */
   build(scope: TrustedTurnScope, input: { readonly limit: number }): Promise<Result<readonly ContextEntry[]>>;
 }
@@ -35,24 +37,26 @@ export function createSelfStateContext(deps: {
       };
       const admits = (tool: string, action: string) => {
         const resolved = resolveAction(TOOL_INVENTORY, tool, action);
-        return resolved.ok && scope.admitted.includes(resolved.value.action.admission);
+        return resolved.ok && permitsAction(scope, tool, action, resolved.value.action).ok;
       };
 
-      const reading = await deps.emotion.read(scope);
-      if (!reading.ok && reading.error.kind !== 'not_found') return reading;
-      if (reading.ok) {
-        const { estimate, selfModel, latestSelfReport } = reading.value;
-        push(
-          { kind: 'machine_inference', producer: estimate.producer },
-          `Affect estimate for this conversation (confidence ${estimate.confidence.toFixed(2)}): ${estimate.description}.`,
-        );
-        if (selfModel !== null) {
+      if (admits('emotion', 'read')) {
+        const reading = await deps.emotion.read(scope);
+        if (!reading.ok && reading.error.kind !== 'not_found') return reading;
+        if (reading.ok) {
+          const { estimate, selfModel, latestSelfReport } = reading.value;
           push(
-            { kind: 'machine_inference', producer: 'self_model' },
-            `Self-model signals: certainty ${selfModel.certainty}, engagement ${selfModel.engagement}, processing ${selfModel.processing}, conversation ${selfModel.trajectory}.`,
+            { kind: 'machine_inference', producer: estimate.producer },
+            `Affect estimate for this conversation (confidence ${estimate.confidence.toFixed(2)}): ${estimate.description}.`,
           );
+          if (selfModel !== null) {
+            push(
+              { kind: 'machine_inference', producer: 'self_model' },
+              `Self-model signals: certainty ${selfModel.certainty}, engagement ${selfModel.engagement}, processing ${selfModel.processing}, conversation ${selfModel.trajectory}.`,
+            );
+          }
+          if (latestSelfReport !== null) push({ kind: 'authored_reflection' }, `What I last said about my own state here: ${latestSelfReport.text}`);
         }
-        if (latestSelfReport !== null) push({ kind: 'authored_reflection' }, `What I last said about my own state here: ${latestSelfReport.text}`);
       }
 
       if (admits('emotion', 'appraisals')) {
