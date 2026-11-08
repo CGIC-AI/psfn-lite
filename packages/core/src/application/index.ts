@@ -96,6 +96,7 @@ export {
 } from './hosted-turns.ts';
 export {
   createTurnContextAssembler,
+  type HistoryContextEntry,
   type TurnContextAssembler,
   type TurnContextDeps,
   type TurnContextLimits,
