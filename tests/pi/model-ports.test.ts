@@ -104,6 +104,7 @@ describe('catalog model credentials', () => {
     // A request without a key fails closed instead of authenticating with the ambient one.
     const reply = await runtime.models.completeSimple(runtime.model, { messages: [{ role: 'user', content: 'hi', timestamp: 0 }] }, { maxTokens: 16 });
     expect(reply.stopReason).toBe('error');
+    expect(reply.errorMessage).toContain('Provider is not configured: anthropic');
     expect(JSON.stringify(reply)).not.toContain('ambient');
   });
 

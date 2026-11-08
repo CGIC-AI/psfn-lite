@@ -32,10 +32,12 @@ export interface TurnSettler {
   settleAbandoned(turn: PreparedTurn): Promise<Result<SettledTurn>>;
   /** Turn ids whose outcome is known here but not yet recorded. */
   held(): readonly TurnId[];
+  /** Tries once more to record every held outcome; returns the turn ids still held. */
+  flush(): Promise<readonly TurnId[]>;
 }
 
 export function createTurnSettler(deps: { readonly lifecycle: Pick<TurnLifecycle, 'commitTurn' | 'abortTurn'>; readonly owner: TurnOwner }): TurnSettler {
-  const held = new Map<TurnId, { readonly outcome: TurnOutcome; readonly toolCalls: number }>();
+  const held = new Map<TurnId, { readonly turn: PreparedTurn; readonly outcome: TurnOutcome; readonly toolCalls: number }>();
 
   const write = async (turn: PreparedTurn, outcome: TurnOutcome): Promise<Result<TurnRecord>> => {
     try {
@@ -59,7 +61,7 @@ export function createTurnSettler(deps: { readonly lifecycle: Pick<TurnLifecycle
       return { ok: true, value: { record: result.value, toolCalls } };
     }
     // A definite refusal will not change on retry; only a transient failure keeps the outcome for later.
-    if (transient(result.error)) held.set(turnId, { outcome, toolCalls });
+    if (transient(result.error)) held.set(turnId, { turn, outcome, toolCalls });
     else held.delete(turnId);
     return result;
   };
@@ -71,6 +73,10 @@ export function createTurnSettler(deps: { readonly lifecycle: Pick<TurnLifecycle
       return known === undefined ? settle(turn, ABANDONED_OUTCOME, 0) : settle(turn, known.outcome, known.toolCalls);
     },
     held: () => [...held.keys()],
+    async flush() {
+      for (const { turn, outcome, toolCalls } of [...held.values()]) await settle(turn, outcome, toolCalls);
+      return [...held.keys()];
+    },
   };
 }
 

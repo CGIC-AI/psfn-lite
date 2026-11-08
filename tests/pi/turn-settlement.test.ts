@@ -73,6 +73,22 @@ describe('recording a turn when storage fails', () => {
     expect(replayed.ok && replayed.value.status).toBe('replayed');
   });
 
+  it('records held outcomes when the host asks before closing, and reports the ones storage still refuses', async () => {
+    const w = await piWorld(withDefaults(() => say('reply')));
+    let broken = true;
+    breakSettlement(w, () => broken);
+    expect((await w.harness.converse({ evidence: 'primary-dm', text: 'one', idempotencyKey: 'k-1' })).ok).toBe(false);
+    const stillHeld = await w.harness.settleHeld();
+    expect(stillHeld).toHaveLength(1);
+
+    broken = false;
+    expect(await w.harness.settleHeld()).toEqual([]);
+    const scope = await w.admit('primary-dm');
+    const session = await w.sessions.current(scope);
+    if (!session.ok) throw new Error('session');
+    expect((await history(w, session.value.sessionId as SessionId)).map((e) => e.text)).toEqual(['one', 'reply']);
+  });
+
   it('records a held outcome before the next turn of the session, so one failure does not end the conversation', async () => {
     const w = await piWorld(withDefaults((call) => say(call.lastUser.endsWith('two') ? 'second' : 'first')));
     let broken = true;
