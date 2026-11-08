@@ -50,7 +50,11 @@ delegated work that needs Lite belongs in Lite's own workers (automata).
 Context blocks use the same labels as Lite's native Pi harness:
 `[participant speech]`, `[your own earlier reply]`, `[system note: ...]` and
 `[internal signal: ...]`. Any line of content that starts with `[` is escaped
-as `\[`. Self-state and recent activity are never rendered as speech. History
+as `\[`. Hermes appends the context to the participant's message, which it
+sends unlabelled and as written, so the first block states that the text before
+it is the participant's own message, label-like lines included (not on
+companion-internal turns, whose message is Lite's own trigger). Self-state and
+recent activity are never rendered as speech. History
 entries of turns the Hermes session already holds are left out. When the
 context exceeds `max_context_chars`, the oldest history is dropped and the
 block says so.
