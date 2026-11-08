@@ -13,14 +13,18 @@ import { currentChannelClassificationEpoch } from '../../../system/trust/runtime
 import {
   composeEgressDisclosureDecision,
   deriveDisclosureDestination,
+  isDisclosureSocialEgressInvocation,
+} from '../../cogsec/disclosure/egress-composition.js';
+import type {
+  DisclosureDestination,
+  DisclosureLineage,
+} from '../../cogsec/disclosure/contracts.js';
+import {
   destinationRequiresCustodyProof,
   egressContentSha256,
   evaluateEgressCustodyHold,
   isCustodyDurabilityHoldReason,
-  isDisclosureSocialEgressInvocation,
   turnEgressCustodyProof,
-  type DisclosureDestination,
-  type DisclosureLineage,
   type EgressCustodyHoldReason,
   type EgressDeliveryRecorder,
   type TurnEgressCustodyProof,
@@ -28,7 +32,7 @@ import {
 import {
   isEgressCapabilityToken,
   type IntakeSinkGate,
-} from '../../cogsec/intake/sink-gates.js';
+} from '../../../shared/contracts/intake-sink-gate-port.js';
 import { INTAKE_FIREWALL_NOTICE_TEMPLATES } from '../../cogsec/intake-firewall-notice-templates.js';
 import type { IntakeEnvelopeSnapshot } from '../../../shared/contracts/intake-envelope.js';
 import { canonicalJsonString } from '../../../shared/utils/json-serialization.js';

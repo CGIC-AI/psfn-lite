@@ -120,8 +120,8 @@ import {
 import { buildSessionMetadataWithMessageAddressing } from './message-addressing.js';
 import type { IntakeEnvelopeSnapshot } from '../../shared/contracts/intake-envelope.js';
 // Type-only structural port: the session layer never imports cogsec runtime code.
-import type { IntakeScreeningService } from '../cogsec/intake/screening.js';
-import type { IntakeSinkGate } from '../cogsec/intake/sink-gates.js';
+import type { IntakeScreeningService } from '../../shared/contracts/intake-screening-port.js';
+import type { IntakeSinkGate } from '../../shared/contracts/intake-sink-gate-port.js';
 import {
   applyPromptAssemblySinkGate,
   type PromptAssemblyGateSummary,

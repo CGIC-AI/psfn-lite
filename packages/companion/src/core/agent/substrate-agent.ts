@@ -46,8 +46,8 @@ import {
 } from '../../system/trust/policy.js';
 import {
   type CapsuleCustodyService,
-  type DisclosureLineage,
 } from '../cogsec/disclosure/index.js';
+import type { DisclosureLineage } from '../cogsec/disclosure/contracts.js';
 import type { CustodySnapshotStorePort } from '../cogsec/disclosure/custody-snapshot.js';
 import {
   EgressDeliveryRecorder,
@@ -97,7 +97,7 @@ import { isCanonicalFirstPartyToolName } from './tool-surface/registry.js';
 import type { ToolUsageRanking } from './tool-surface/usage-ranking.js';
 import {
   type IntakeSinkGate,
-} from '../cogsec/intake/sink-gates.js';
+} from '../../shared/contracts/intake-sink-gate-port.js';
 import { classifyToolResultCogSecProvenance } from '../cogsec/intake/tool-result-provenance.js';
 import type { IntakeEnvelopeSnapshot } from '../../shared/contracts/intake-envelope.js';
 import { CapabilityRuntime } from '../../system/capabilities/runtime.js';

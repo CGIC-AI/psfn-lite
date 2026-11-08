@@ -23,7 +23,7 @@ import {
 import {
   isIntakeMarkingIntensity,
   type IntakeMarkingPlan,
-} from '../cogsec/intake/marking.js';
+} from '../../shared/contracts/intake-screening-port.js';
 
 export const INTAKE_SCREENING_METADATA_KEY = 'intakeScreening';
 const INTAKE_SCREENING_METADATA_SCHEMA_VERSION = 1;
