@@ -81,3 +81,4 @@ export {
 export { syncTranscriptProjection } from './transcript-projection.ts';
 export { createValuesService, type ValuesService } from './values-service.ts';
 export * from './self-state.ts';
+export * from './memory-index.ts';
