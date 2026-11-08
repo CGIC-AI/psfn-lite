@@ -57,7 +57,7 @@ import { FREE_TIME_CHANNEL_PREFIX } from '../session/session-id.js';
 import type { SessionEntry } from '../session/types.js';
 import type { Scheduler } from './scheduler.js';
 import type { FleetSlotStagger, ScheduledTaskRun } from './types.js';
-import { staggerFleetOrdinalWithinWindow } from './fleet-maintenance-coordinator.js';
+import { staggerFleetOrdinalWithinWindow } from './fleet-stagger.js';
 import type { FreeTimeChooserOutcome, FreeTimeRestReason } from './free-time-chooser.js';
 import type { FreeTimeLane } from './free-time-lane.js';
 import type { RestWindowPolicyPort } from './rest-window-policy.js';

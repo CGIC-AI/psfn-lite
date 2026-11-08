@@ -14,7 +14,7 @@ import type {
   TaskState,
   WeeklyRecurringCadence,
 } from './types.js';
-import { staggerFleetOrdinalWithinWindow } from './fleet-maintenance-coordinator.js';
+import { staggerFleetOrdinalWithinWindow } from './fleet-stagger.js';
 import {
   emitHealthEvent,
   hashHealthEventSubject,
