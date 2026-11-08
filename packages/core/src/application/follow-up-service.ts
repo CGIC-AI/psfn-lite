@@ -15,13 +15,12 @@ import {
   denied,
   invalid,
   notFound,
-  ok,
   sameConversation,
-  type Audience,
   type ChannelId,
   type Clock,
   type Result,
 } from '../shared/index.ts';
+import { conversationTarget } from './conversation-target.ts';
 import { collectPaged } from './paging.ts';
 import { authorOf, isTrustedTurnScope, viewerOf, type TrustedTurnScope } from './trusted-scope.ts';
 
@@ -62,17 +61,7 @@ export function createFollowUpService(deps: {
     });
   };
 
-  const targetFor = async (scope: TrustedTurnScope, channelId: ChannelId | null): Promise<Result<Audience>> => {
-    if (channelId === null) {
-      return scope.audience.kind === 'self' ? invalid('a follow-up from a companion-internal turn must name channelId') : ok(scope.audience);
-    }
-    const head = await deps.catalog.active(`channel:${channelId}`);
-    if (!head.ok) return head;
-    if (head.value === null) return notFound(`channel ${channelId}`);
-    const session = await deps.catalog.get(head.value.sessionId);
-    if (!session.ok) return session;
-    return canViewerRead(viewerOf(scope), session.value.audience) ? ok(session.value.audience) : notFound(`channel ${channelId}`);
-  };
+  const targetFor = conversationTarget(deps.catalog, 'a follow-up');
 
   return {
     async list(scope, input) {

@@ -8,7 +8,8 @@ import type {
   TurnId,
 } from '../shared/index.ts';
 import type { ChannelIdentity } from '../contacts/index.ts';
-import type { InternalPurpose } from './trusted-scope.ts';
+import type { CareReminder } from '../intention/index.ts';
+import type { InternalPurpose, TrustedTurnScope } from './trusted-scope.ts';
 
 /**
  * Capabilities the host supplies to core. Core owns these interfaces;
@@ -67,4 +68,38 @@ export interface ApprovalPort {
     readonly payload: Readonly<Record<string, unknown>>;
     readonly requestedBy: Author;
   }): Promise<Result<{ readonly proposalId: string }>>;
+}
+
+/**
+ * Channel delivery of a due care reminder, owned by the host. Return ok only
+ * once delivered and an error only when it was not; core marks the reminder
+ * before asking, so a crash in between is never delivered twice.
+ */
+export interface ReminderDeliveryPort {
+  deliver(reminder: CareReminder): Promise<Result<void>>;
+}
+
+/** Why core asks the host for a companion-internal turn, and what it refers to. */
+export interface InternalTurnRequest {
+  /** A companion-internal scope admitted by ingress for a self audience; the turn's tool calls use it. */
+  readonly scope: TrustedTurnScope;
+  readonly purpose: InternalPurpose;
+  /** The internal trigger shown to the companion, labelled as a system note, never as participant speech. */
+  readonly prompt: string;
+  readonly reference: { readonly kind: 'free_time_block' | 'scheduled_prompt'; readonly id: string };
+}
+
+export interface InternalTurnResult {
+  readonly status: 'completed' | 'interrupted' | 'failed';
+  /** The companion's own reply in that turn, if any. */
+  readonly reply: string | null;
+}
+
+/**
+ * Runs one companion turn in a self audience through the active harness: the
+ * host prepares and settles the turn and runs the model loop with the
+ * companion's identity and permitted tools. Every call is model inference.
+ */
+export interface InternalTurnPort {
+  run(request: InternalTurnRequest): Promise<Result<InternalTurnResult>>;
 }
