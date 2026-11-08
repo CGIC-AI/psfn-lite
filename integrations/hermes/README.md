@@ -24,7 +24,7 @@ other revision.
 | `on_session_end` | Settles the turn with what actually happened: `completed` with the reply; `interrupted`; `failed` with Hermes's exit reason; or `failed` / `hermes_no_reply` when Hermes completed without a reply. Open turns are keyed by Hermes's turn id, so a compression that rotates the session id mid-turn does not lose the turn. |
 | `on_session_finalize` | Settles, as failed (`hermes_turn_unfinished`), any turn still open in the session Hermes closed (exit, `/new`, expiry). |
 | `subagent_start` | Marks the child session. Subagent turns and the background review fork never become Lite turns, in a delegated internal-turn process too. |
-| memory provider `on_session_switch` | Links a compression's new session id to the one it continues, so the conversation's open turns and checkpoint list follow it. |
+| memory provider `on_session_switch` | Links a compression's new session id to the one it continues, so the conversation's open turns and checkpoint list follow it. Only `reason: compression` is linked: `/new` starts another conversation, and `/branch` forks one that may stay live beside the original. A hook that arrives for an open turn under a different session id is linked the same way. |
 | memory provider `on_pre_compress` | Asks Lite to prove every Lite turn of the session is in canonical history. It raises otherwise, so Hermes keeps the uncompressed transcript. |
 
 `on_session_end` is not sent on every exit at the tested revision. Hermes

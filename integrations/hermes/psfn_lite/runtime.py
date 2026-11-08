@@ -9,6 +9,7 @@ are active, so no turn is ever prepared twice.
 
 import logging
 import os
+import sqlite3
 import threading
 
 from .bridge import BridgeClient
@@ -104,8 +105,8 @@ def _hook(name: str):
             issues = profile_issues()
             if issues:
                 raise ConfigError("psfn_lite refuses to drive Lite turns: " + "; ".join(issues))
-            active = driver()
-        except (ConfigError, ValueError, OSError) as error:
+            return getattr(driver(), name)(**kwargs)
+        except (ConfigError, ValueError, OSError, sqlite3.Error) as error:
             logger.error("psfn_lite is not usable: %s", error)
             notify(f"PSFN Lite is not usable in this profile: {error}")
             if name == "pre_llm_call":
@@ -113,7 +114,6 @@ def _hook(name: str):
 
                 return {"context": block("system note: psfn_lite", f"Your PSFN Lite continuity is not reachable from this Hermes profile ({error}); this turn is not recorded there.")}
             return None
-        return getattr(active, name)(**kwargs)
 
     call.__name__ = f"psfn_lite_{name}"
     return call
