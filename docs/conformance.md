@@ -74,9 +74,11 @@ tests plus the parity test.
 | `pytest tests/test_conformance.py` (real plugin, Hermes `f0187332`) | 17 passed (16 scenario runs + inventory parity), 1 skipped (06, see below), about 33 s |
 | `tests/conformance/absence.test.ts` | 7 passed |
 
-The checks were tested by mutation. Extra `sees`, `speech`, result and
-history-count expectations added to scenarios 01 and 07 each failed in both
-runners, and were then removed.
+The checks were tested by mutation in both runners. Expectations that must
+fail were added to scenarios 01 and 07: an unseen text, internal context
+claimed as speech, a missing result substring, a wrong history count, and
+participant text required to be hidden. Every one was reported, in both
+orders where it applied, and the mutations were then removed.
 
 ## Absence of excluded subsystems
 
