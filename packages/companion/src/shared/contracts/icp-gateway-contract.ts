@@ -13,8 +13,16 @@
 // (app/agent/core-runtime.ts:426-432 composes the agent-facing runtime only
 // when `config.multiCompanion === true`; app/agent/icp-initiation-source-wiring.ts
 // composes the source runtime and its adapters only when ICP autonomy is
-// enabled). Peer-target routing then reports unavailable or not authorized,
-// and human-target outreach is unchanged.
+// enabled). Each consumer then takes its donor no-ICP path: self_status's
+// availability actions answer that the ICP availability runtime is not wired
+// (core/tools/self-status.ts:636-638), the companion handoff is reachable only
+// from the notify tool (core/tools/ntfy.ts), which is outside the core, the
+// contact tools' peer availability is optional and absent, social desire's
+// human policy refuses a companion target
+// (core/intention/social-desire-human-policy.ts, social_desire_human_target_is_companion),
+// and weighted thoughts skip the ICP branch and take the human lane
+// (core/intention/weighted-thought-outreach.ts). Human-target outreach is
+// unchanged.
 //
 // Declarations copied verbatim from the donor's
 // src/boundary/gateway/icp-autonomy-contract.ts at e6a9546 (lines 29-88,

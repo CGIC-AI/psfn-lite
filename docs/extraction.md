@@ -22,7 +22,9 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding; typechecks with the donor compiler options; the extracted tests reproduce the baseline in a clean full run (Equivalence, below). |
 | B1 seam cuts (3.7, 3.8, 3.13, 3.14, 3.16, 3.18) | Done (Seam cuts, below). |
 | B2 seam cuts (3.4, 3.5, 3.6) | Done (Seam cuts, below). |
-| B3-B7 | Not started. |
+| B3 seam cuts (3.2, 3.3, 3.12, 3.15) | Done (Seam cuts, below). |
+| B4 seam cut (3.9) | Done (Seam cuts, below). |
+| B5-B7 | Not started. |
 
 ## Closure (Step A0)
 
@@ -218,15 +220,27 @@ and `persistence/sessions/store.ts`, and deleted
 `persistence/sessions/store/{cogsec-operations,cogsec-journal-helpers}.ts`.
 Two vendored scaffolding files were adjusted only so they still typecheck
 (`app/startup/composition/composition.ts`,
-`operator/garden/services/types/sessions.ts`); both leave in B7. The Step A0
+`operator/garden/services/types/sessions.ts`); both leave in B7. B3 edited
+`core/agent/satellite-adapter-port.ts`, `core/agent/substrate-agent.ts`,
+`substrate-agent/{channel-routing-runtime,prompt-context-builder,runtime-context,turn-execution-adapter}.ts`,
+`substrate-agent/runtime-context-sections/reaction-surface.ts`,
+`substrate-agent/turn-execution/{contracts,post-turn-scheduling}.ts`,
+`core/artifacts/sensitivity-egress.ts`,
+`core/icp/{agent-facing-autonomy,initiation-source-support,runtime-availability,speaking-precedence-resolver}.ts`,
+`core/session/manager.ts`, `shared/event-bus.ts` and
+`system/capabilities/gate.ts`. B4 edited
+`core/scheduler/{free-time,quiet-hours-release-stagger,reflection-runtime-contracts,scheduler}.ts`
+and `core/scheduler/post-turn-runtime/scheduler-lanes.ts`. Neither batch
+touched a vendored file. The Step A0
 closure lists (`closure-files.txt`, `closure-levels.tsv`, `closure-seams.tsv`,
 `tests.tsv`) are the Step A record and are not pruned when a cut deletes a
 file.
 
 Donor test files are modified by deleting `it()` blocks (and a `describe()`
-the deletions left empty, which vitest rejects), and in two cases by removing
-a cut-path assertion from a test whose subject is kept (Deleted and modified
-tests, below).
+the deletions left empty, which vitest rejects), in two cases by removing
+a cut-path assertion from a test whose subject is kept, and in one case
+(B4) by removing fixture plumbing that only deleted tests used (Deleted and
+modified tests, below).
 
 ### Test configuration differences (Lite vs donor)
 
@@ -276,6 +290,25 @@ the baseline's 9,485 tests minus 68 deleted (7 card importer, 3 in B1, 58 in
 B2); the 2 edited tests are among the 9,417 matched. No `lite-companion-*`
 containers and no `/tmp/lc-*` directories were left.
 
+Step B3 seam-group run (`--project companion`, after 3.2/3.3/3.12/3.15,
+2026-11-08 23:14Z): exit 0, 733 files / 9,417 tests passed; comparison
+`deleted: 2 files, 68 tests; matched: 9417`, equivalent. B3 deleted and
+edited no test.
+
+Step B4 seam-group run (`--project companion`, after 3.9, 23:19Z): exit 0,
+733 files / 9,415 tests passed; `deleted: 2 files, 70 tests; matched: 9415`,
+equivalent.
+
+Step B3+B4 result (the plain validation command with a JSON reporter,
+2026-11-08 23:23Z): exit 0, **785 files and 9,852 tests, all passed**
+(`lite` 52 files / 437 tests, `companion` 733 files / 9,415 tests).
+Comparison: `deleted: 2 files, 70 tests; matched: 9415`, `equivalent: every
+remaining baseline test has its baseline status`. That is the baseline's
+9,485 tests minus 70 deleted (7 card importer, 3 in B1, 58 in B2, 2 in B4).
+The 2 edited B2 tests are among the 9,415 matched, and the B4 fixture edit
+touches no test case. No `lite-companion-*` containers and no `/tmp/lc-*`
+directories were left.
+
 ## Deleted and modified tests
 
 Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
@@ -299,6 +332,7 @@ relaxed.
 | `src/persistence/sessions/store.test.ts` (6) and `store/cogsec-operations.test.ts` (whole file, 2) | The CogSec tombstone, compaction-invalidation and regeneration writes are cut. | 3.6 session ops |
 | `src/faculties/memory/writer.test.ts` (4), `core-memory/tools.test.ts` (1), `memory/extraction/orchestrator.test.ts` (1), `memory/sleeptime-agent.test.ts` (1) | Each asserts a rejection by a cut candidacy pattern class. The sleeptime test's "keeping safe memory writes" half is the control for that skip, so the test is deleted, not edited. | 3.5 split |
 | `src/persistence/sessions/store-turn-record-session-refs.test.ts` (6; the emptied `sm9l` describe removed), `src/core/session/manager.test.ts` "withholds tombstoned origin content before live cross-channel context assembly", `src/persistence/sessions/store.session-tail.test.ts` "the second fence still lands when a step AFTER the journal rewrite throws" | **Not clean scaffolding deletions.** They assert kept read-side behaviour (tombstone gating in session reads, turn records, wire bodies and the Loom; the session-tail post-rewrite fence) but build their scenario through `applyCogSecTombstones`, which is cut. Lite has no path that writes a CogSec tombstone, so that read guard is unreachable in Lite. The session-tail fence's exception safety on a failing post-rewrite step had no other test; `redactTurn` tests cover the fence bumps only. Recorded as an open question. | 3.6 session ops |
+| `src/core/scheduler/post-turn-lanes.test.ts` "runs the companion sleeptime action under the fleet baton" and "runs episode synthesis under the fleet baton and checkpoints only after private progress" (2) | They assert the cross-companion maintenance lease protocol around the lane (`announceDemand`, `tryAcquire`, `commitCheckpoint`, `release`, the baton yield); the fleet coordinator, its runner and the `fleetMaintenance` runtime option are cut. The other two tests in the file (cadence never infers sleeptime; the task list, including the forwarded fleet stagger) still pass. | 3.9 fleet baton |
 
 Edited (`modified-tests.tsv`): `turn-execution-runtime.test.ts` "moves system
 context into the prompt system lane instead of assistant history in
@@ -308,6 +342,13 @@ expected system prompt; only that element (and, in the first, the canary
 `toMatch` line) is removed. The donor always armed a canary, so the expected
 prompt now equals the donor's `assembleTurnPrompt` output with `canaryToken`
 undefined (`prompt-assembly.ts:537`), not any donor runtime configuration.
+
+Fixture edit (B4, `modified-tests.tsv`): in `post-turn-lanes.test.ts` the
+`wireLanes` helper lost its `options` parameter (`{ fleetMaintenance? }`) and
+the spread that passed it into the runtime options. Only the two deleted
+baton tests passed it, and the runtime option no longer exists. The two
+remaining tests call `wireLanes()` with no argument, as before; no assertion
+changed.
 
 ## Seam cuts
 
@@ -378,6 +419,104 @@ itself is kept unchanged for that host and for the MCP disclosure floor.
 Tests that construct the vendored sink gate or screening service (for example
 `createIntakeSinkGate` in `context-builder.channel-bond.test.ts`) still pass
 against the vendored implementation and leave, or move to the port, in B7.
+
+### B3 (3.2, 3.3, 3.12, 3.15)
+
+Remaining seam statements: 65 before, 46 after 3.2/3.3/3.12, 34 after 3.15.
+No remaining seam targets `boundary/gateway`, `channels` or
+`core/agent/arbiter`.
+
+Every new file is a verbatim copy (cut type **move verbatim** or **type
+copy**), checked block by block against the donor git objects; its header
+names the donor file and lines. Nothing is promoted: plan Step B7 requires
+0 imports into the plan's scaffolding set, which includes
+`src/boundary/gateway/**` and `src/channels/**`, so no file stays at a
+gateway or channel path. The vendored originals stay (the vendored notify
+tool, channel plugins and adapters still import them) and leave in B7.
+
+| Seam | Cut | Behaviour change |
+|---|---|---|
+| 3.2 notifications | Move verbatim into `shared/contracts/notification-port.ts`: `boundary/gateway/notification-sender.ts` (whole file), `NotifyNtfyParams` and `NotifyNtfyResult` (`protocol.ts:703-711,1109-1113`), `NotificationPort`. 4 core sites redirected. | none. `artifactApprovalNotifier` is optional and defaults to null, the donor's no-notifier path; a host wires delivery. Unchanged from the donor: sharing a sensitive artifact with a non-self audience throws without an approval queue and a notifier (`sensitivity-egress.ts:167-169`). |
+| 3.3 pre-tool hook | `boundary/gateway/pre-tool-hook.ts` moved whole to `system/capabilities/pre-tool-hook.ts` (only its config import path changes). | none, and no allow-all stub is needed: `gate.ts:336` (`getPreToolHookGate?.() ?? null`) and the agent's `preToolHookGate = null` (donor `substrate-agent.ts:387`) are the donor's no-hook path. A host with decision hooks passes a gate built with `createPreToolHookGate`. |
+| 3.12 channels | Type copies: `shared/contracts/channel-prompt-port.ts` (`MessageHandlerOptions`, `ChannelChatType`, `ChannelCapabilities`, `ChannelPromptAdapter`, `ChannelPromptDock`, `ChannelPromptRegistryPort`) and `shared/contracts/api-health.ts` (`channels/api/types.ts:161-199`). Move verbatim: `channels/shared/reaction-surface.ts` to `shared/contracts/reaction-surface.ts`. Inline constant: `TESTING_HARNESS_API_PRINCIPAL_ID = 'testing-harness'` in `core/session/manager.ts` (donor `channels/backplane/http/auth.ts:8`). Delete call path: the companion-relay artifact announcement in `post-turn-scheduling.ts`. Delete unused declarations: `SatelliteChannelAdapterPort` and the `SatelliteAdapterPort.channel` facet. | none. The agent's channel registry defaults to an empty `Map` (donor `substrate-agent.ts:367`), so every turn takes the dock-less path and the reaction-surface block renders nothing. The announcement branch ran only for a non-empty attachment list, and since the 3.13 stub that list is always empty. Nothing in the donor tree references the removed satellite declarations. `handleMessage` keeps its `MessageHandlerOptions` parameter unchanged for the host adapters (Step C). |
+| 3.15 ICP | Type copies: `shared/contracts/icp-gateway-contract.ts` (the ICP broker result shapes, `icp-autonomy-contract.ts:29-88,113-138,154-163`, including the three type-position `import()` sites) and `shared/contracts/speaking-arbiter-types.ts` (the arbiter's string unions and the `IcpSocialPrecedenceResolver` port, `core/agent/arbiter/{reservation-phase,egress-lease-phase,speaking-arbiter-store-port}.ts`), used by `core/icp/speaking-precedence-resolver.ts` and by the event-bus event types. `createAgentFacingIcpAutonomyRuntime` takes `gateway: IcpAgentGatewayPort`; the `GatewayClient` arm of the union is dropped (the vendored composition root still passes its `GatewayClient`, which satisfies the port structurally; the package typecheck passes). | none. See "Peer-target routing is unsupported" below. The speaking arbiter is not composed in Lite, so its events are never emitted; the event contract is unchanged. |
+
+**Peer-target routing is unsupported (operator ruling), through the donor's
+own no-broker mode.** The ICP broker (permits, dyads, peer availability) is
+the donor gateway. The donor composes the agent-facing ICP runtime only when
+`config.multiCompanion === true` (`app/agent/core-runtime.ts:426-432`), and
+the source runtime with its weighted-thought and intention adapters only when
+ICP autonomy is enabled (`app/agent/icp-initiation-source-wiring.ts:76-110`).
+In that mode, read from the code:
+
+- `self_status` availability actions answer `unavailable: ICP availability
+  runtime is not wired` (`core/tools/self-status.ts:636-638`);
+- the contact tools' peer availability is optional and skipped
+  (`core/contacts/tools.ts:587`);
+- social desire's human delivery policy refuses a companion target
+  (`core/intention/social-desire-human-policy.ts:34-35`,
+  `social_desire_human_target_is_companion`);
+- weighted thoughts skip the ICP branch (`weighted-thought-outreach.ts:288`,
+  guarded by `deps.icpCandidateAdapter`) and take the human lane, as in the
+  donor's single-companion mode;
+- the companion handoff is reached only from the notify tool
+  (`core/tools/ntfy.ts`), which is outside the closure;
+- the donor installs a fail-closed felt-impulse consumer that records
+  `not_authorized` (`icp-initiation-source-wiring.ts`, disabled branch).
+
+B3 therefore cuts types only. **For B6:** compose exactly that mode. Do not
+compose the agent-facing runtime, the source runtime or their adapters, and
+do not write a placeholder broker. Wire the disabled felt-impulse consumer
+the way the donor does. `self-availability.ts:69` and
+`notify-companion-handoff.ts:340,492,600` take the runtime as a required
+argument, so nothing may call them without one.
+
+**Notify and clarify tools.** `core/tools/ntfy.ts` (the HTTP ntfy notifier,
+`notify` and `clarify` tools, the gateway notification port) is vendored
+scaffolding outside the Step A0 closure, so the extracted core has no
+notify tool. Whether a host adapter supplies one is a B6/Step C decision.
+
+**For B7:** the B2 `promoted` files at `core/cogsec/*` sit inside the plan's
+scaffolding set (`src/core/cogsec/**`). They are exempt only by the
+operator's KEEP of `assessDisclosure`, the SOFT contact block list and the
+memory-candidacy fallback exclusion. `remaining-seams.mjs` trusts the
+`promoted` kind, so B7 has to state that exemption explicitly when it checks
+"0 imports into the scaffolding set".
+
+### B4 (3.9)
+
+Remaining seam statements: 34 before, 28 after. No remaining seam targets
+`core/scheduler/fleet-maintenance-*`.
+
+| Seam | Cut | Behaviour change |
+|---|---|---|
+| 3.9 fleet stagger | Move verbatim: `staggerFleetOrdinalWithinWindow` and its local `requireTimestamp` (`fleet-maintenance-coordinator.ts:20-25,342-363`) into `core/scheduler/fleet-stagger.ts`. 3 sites redirected (`scheduler.ts`, `free-time.ts`, `quiet-hours-release-stagger.ts`). | none. |
+| 3.9 fleet baton | Delete call path: the `ReflectionRuntimeOptions.fleetMaintenance` option (coordinator, lease and retry durations) and both `runWithFleetMaintenanceBaton` branches in `scheduler-lanes.ts` (sleeptime, episode synthesis). | none for a host without a fleet coordinator: this is the donor's path when the option is absent (the plan's "immediate baton"). Sleeptime runs at once, and a sleeptime yield reschedules after the rest-window inactivity threshold. An episode-synthesis yield throws the donor's `Episode synthesis cannot yield without fleet maintenance authority`. A host can no longer serialize heavy maintenance across companions. 2 tests deleted, 1 fixture helper edited. |
+
+**Why the stagger is moved, not stubbed to zero.** The plan said "stub to a
+zero stagger". The arithmetic is the scheduler's own wall-clock stagger.
+`FleetSlotStagger` is a closure type (`core/scheduler/types.ts`), set from
+scheduler.json `fleetStagger`. Baseline tests assert the stagger with
+`fleetSize > 1`: `scheduler.test.ts:244-309`, `free-time.test.ts:418-431`,
+`temporal-wakeup.test.ts:487` and `post-turn-lanes.test.ts:155,230-254` (donor line numbers). They
+test the scheduler, not the fleet lease, so a zero stub would break them and
+could not delete them under the equivalence rule. Only the pure function
+moves. The lease coordinator, the runner and the Postgres lease store stay
+vendored and leave in B7.
+
+**Plan 7.7, "stagger(ordinal 0 of 1) = 0", is now verified from the code.**
+The function returns
+`windowStartMs + floor((windowEndMs - windowStartMs) * manifestOrdinal / fleetSize)`,
+which is `windowStartMs` for ordinal 0 of 1. Every caller also skips it when
+no stagger is passed (`scheduler.ts:173,209`, `free-time.ts:992`,
+`quiet-hours-release-stagger.ts:50`).
+
+**For B6:** donor migration 18 (`fleet-maintenance-process-fencing`) creates
+the lease tables. `migrations.test.ts:416` and two Postgres integration tests
+(`companion-presence`, `schema-tenancy`) assert it in the chain, so it was not
+touched here. It belongs to the migration-chain cut (3.11). The vendored
+composition root (`app/agent/scheduler-runtime.ts`, a source-text fixture)
+still passes `fleetMaintenance`. It is not compiled and leaves in B6/B7.
 
 ## Package changes
 
