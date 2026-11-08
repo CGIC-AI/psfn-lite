@@ -22,7 +22,7 @@ const contentOf = <T>(result: { ok: boolean; value?: { content: unknown } }): T 
   return result.value.content as T;
 };
 
-function workerOf(scope: TrustedTurnScope, actions: { tool: string; action: string }[], maxSensitivity: 'public' | 'personal' = 'personal') {
+function workerOf(scope: TrustedTurnScope, actions: { tool: string; action: string }[], maxSensitivity: 'public' | 'personal' | 'confidential' = 'personal') {
   const derived = deriveWorkerScope(scope, 'run-1' as WorkerRunId, { actions, maxTurns: 1, maxSensitivity });
   if (!derived.ok) throw new Error(JSON.stringify(derived.error));
   return derived.value;
@@ -370,6 +370,41 @@ describe('self-state context', () => {
     expect(samText).toContain('honesty with care');
     const inRoom = await w.context.build(await w.admit('primary-room'), { limit: 10 });
     expect(inRoom.ok && inRoom.value.map((e) => e.text).join('\n')).not.toMatch(/job|delighted|first day/);
+  });
+  it("gives a worker only what its grant would let it read through dispatch", async () => {
+    const w = await selfStateWorld();
+    const robin = await w.admit('primary-dm');
+    const freeTime = await w.admit('free-time');
+    await w.talk(robin, 'hello', 'hi', 'k1', steady());
+    await w.talk(robin, 'I got the job!', 'that is wonderful', 'k2', reading(0.9, 0.5, 0.3));
+    await w.selfReport(robin, 'I am delighted for Robin');
+    await w.call(robin, 'values', 'add_value', { value: 'honesty with care' });
+    await w.call(robin, 'concern', 'create', { text: 'bring the spare umbrella back', sensitivity: 'public' });
+    w.ports.reflections.reflections.push({
+      id: 'r-1',
+      text: 'I want to be steadier when news is big.',
+      author: { kind: 'companion' },
+      source: { kind: 'self' },
+      createdAt: '2030-01-01T00:00:00.000Z',
+    });
+
+    const narrow = workerOf(robin, [{ tool: 'memory', action: 'search' }], 'public');
+    expect(errorOf(await w.call(narrow, 'emotion', 'read'))).toMatchObject({ reason: 'worker_not_permitted' });
+    expect(errorOf(await w.emotion.read(narrow))).toMatchObject({ reason: 'worker_not_permitted' });
+    expect(errorOf(await w.emotion.appraisals(narrow, { limit: 5 }))).toMatchObject({ reason: 'worker_not_permitted' });
+    expect(await w.context.build(narrow, { limit: 10 })).toEqual({ ok: true, value: [] });
+
+    // A grant for concern.list shows the concerns it could list, and still no affect, self-report or value.
+    // A direct conversation discloses at confidential, so the worker needs that ceiling to see its concerns at all.
+    const concernWorker = workerOf(robin, [{ tool: 'concern', action: 'list' }], 'confidential');
+    expect(contentOf<ActiveConcern[]>(await w.call(concernWorker, 'concern', 'list')).map((c) => c.text)).toEqual(['bring the spare umbrella back']);
+    const forWorker = await w.context.build(concernWorker, { limit: 10 });
+    expect(forWorker.ok && forWorker.value.map((e) => e.text)).toEqual(['Open concerns:\n- bring the spare umbrella back (medium, active)']);
+
+    // journal.reflections_list is closed to workers even under a confidential ceiling in a companion-internal turn.
+    const internalWorker = workerOf(freeTime, [{ tool: 'memory', action: 'search' }], 'confidential');
+    const internal = await w.context.build(internalWorker, { limit: 10 });
+    expect(internal.ok && internal.value.map((e) => e.text).join('\n')).not.toMatch(/steadier|delighted|Affect estimate/);
   });
 });
 
