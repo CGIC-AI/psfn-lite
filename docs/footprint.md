@@ -24,7 +24,7 @@ npx tsx scripts/bench/latency.ts
 
 ## Dependency and install footprint
 
-`scripts/bench/footprint.ts`, on a fresh `npm ci` of each project. It reads
+`scripts/bench/footprint.ts`, on each project's install of its own lockfile: the donor clone's fresh `npm ci`, and the Lite worktree's existing install. It reads
 package.json, package-lock.json and the installed node_modules (no symlinks
 followed). It counts a package wherever a package.json sits directly under a
 node_modules entry, nested ones included.
@@ -42,7 +42,9 @@ node_modules entry, nested ones included.
 | own non-test TypeScript lines | 24,364 | 725,449 |
 
 Cross-checks: `du -sh --apparent-size` gives 195M and 772M, and
-`npm ls --all --omit=dev --parseable` lists 115 and 282 lines.
+`npm ls --all --omit=dev --parseable` lists 115 and 282 lines. `npm ls`
+lists what is installed, while the lockfile's production count also holds
+platform-optional entries that a Linux x64 install skips.
 
 Lite's four runtime dependencies are `@earendil-works/pi-agent-core`,
 `@earendil-works/pi-ai`, `@modelcontextprotocol/server` and `pg`. The donor's
@@ -66,8 +68,8 @@ Notes:
   `*.spec.ts`, `test`, `tests` and `test-support` directories) are excluded.
   The donor keeps its 1,776 test files (631,534 lines) beside its source.
   Lite keeps its tests under `tests/`, outside these roots.
-- Both `npm ci` runs were served from a warm npm cache, so install time is
-  not reported.
+- Install time is not reported. The donor's `npm ci` came from a warm npm
+  cache in about 4 s, and Lite's install was already there.
 
 ## Idle inference
 
