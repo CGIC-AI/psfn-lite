@@ -7,6 +7,8 @@ import {
   computeSelfModel,
   decayAffect,
   evaluateAppraisalGate,
+  maxAxisDelta,
+  parseAffectObservation,
   parseEmotionPolicy,
   settleAppraisal,
   type EmotionPolicy,
@@ -63,6 +65,46 @@ describe('affect dynamics (ported from the donor EmotionState tests)', () => {
     expect(later.mood).toEqual(next.mood);
     expect(later.vad.valence).toBeCloseTo(next.vad.valence / 2, 6);
     expect(() => advanceAffect(next, null, -1, BASELINE_EMOTION_POLICY)).toThrow(RangeError);
+  });
+
+  it('throws on a non-finite number instead of clamping or zeroing it', () => {
+    const fromJson = { ...NEUTRAL_AFFECT, vad: { valence: null, arousal: 0, dominance: 0 } } as never;
+    expect(() => advanceAffect(fromJson, null, 10, BASELINE_EMOTION_POLICY)).toThrow(/snapshot\.vad\.valence/);
+    const nanImpulse = { vad: { valence: Number.NaN, arousal: 0, dominance: 0 }, discrete: {}, confidence: 0.9 };
+    expect(() => advanceAffect(NEUTRAL_AFFECT, nanImpulse, 0, BASELINE_EMOTION_POLICY)).toThrow(RangeError);
+    expect(() => advanceAffect(NEUTRAL_AFFECT, { ...nanImpulse, vad: NEUTRAL_AFFECT.vad, discrete: { joy: Number.NaN } }, 0, BASELINE_EMOTION_POLICY)).toThrow(RangeError);
+    expect(() => maxAxisDelta({ valence: Number.NaN, arousal: 0, dominance: 0 }, NEUTRAL_AFFECT.vad)).toThrow(RangeError);
+  });
+});
+
+describe('estimator reading parser', () => {
+  const good = { vad: { valence: -1, arousal: 0.5, dominance: 1 }, discrete: { joy: 0, sadness: 1 }, confidence: 0.6, producer: 'classifier-a' };
+
+  it('accepts a well-formed reading unchanged', () => {
+    expect(parseAffectObservation(good)).toEqual({ ok: true, value: good });
+  });
+
+  it('refuses every malformed shape whole, naming what is wrong', () => {
+    const cases: [unknown, RegExp][] = [
+      [null, /must be an object/],
+      [{ ...good, vad: { valence: Number.NaN, arousal: 0, dominance: 0 } }, /vad\.valence/],
+      [{ ...good, vad: { valence: 0.1 } }, /exactly valence, arousal and dominance/],
+      [{ ...good, vad: { ...good.vad, extra: 0 } }, /exactly valence/],
+      [{ ...good, vad: { ...good.vad, arousal: 1.01 } }, /vad\.arousal/],
+      [{ ...good, discrete: { joy: Number.NaN } }, /discrete\.joy/],
+      [{ ...good, discrete: { joy: -0.1 } }, /discrete\.joy/],
+      [{ ...good, discrete: { 'Big Joy': 0.5 } }, /lowercase word/],
+      [{ ...good, discrete: [] }, /discrete/],
+      [{ ...good, confidence: Number.NaN }, /confidence/],
+      [{ ...good, confidence: 1.5 }, /confidence/],
+      [{ ...good, producer: '  ' }, /producer/],
+      [{ ...good, note: 'x' }, /exactly confidence, discrete, producer, vad/],
+    ];
+    for (const [raw, issue] of cases) {
+      const parsed = parseAffectObservation(raw);
+      expect(parsed.ok, JSON.stringify(raw)).toBe(false);
+      expect(parsed.ok ? '' : JSON.stringify(parsed.error)).toMatch(issue);
+    }
   });
 });
 

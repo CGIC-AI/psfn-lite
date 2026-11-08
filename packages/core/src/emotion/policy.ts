@@ -42,7 +42,8 @@ export const BASELINE_EMOTION_POLICY: EmotionPolicy = deepFreeze({
 });
 
 const KEYS = Object.keys(BASELINE_EMOTION_POLICY) as readonly (keyof EmotionPolicy)[];
-const LABEL_PATTERN = /^[a-z][a-z_]{0,39}$/;
+/** Discrete emotion labels: lowercase words, as the policy and every reading name them. */
+export const EMOTION_LABEL_PATTERN = /^[a-z][a-z_]{0,39}$/;
 
 export function parseEmotionPolicy(raw: unknown): Result<EmotionPolicy> {
   if (!isRecord(raw)) return invalid('emotion policy must be an object');
@@ -70,7 +71,7 @@ export function parseEmotionPolicy(raw: unknown): Result<EmotionPolicy> {
   const discreteHalfLifeSeconds: Record<string, number> = {};
   if (isRecord(discrete)) {
     for (const [label, value] of Object.entries(discrete)) {
-      if (!LABEL_PATTERN.test(label) || !isPositive(value)) issues.push(`discreteHalfLifeSeconds.${label} must be a positive half-life for a lowercase label`);
+      if (!EMOTION_LABEL_PATTERN.test(label) || !isPositive(value)) issues.push(`discreteHalfLifeSeconds.${label} must be a positive half-life for a lowercase label`);
       else discreteHalfLifeSeconds[label] = value;
     }
   } else {

@@ -15,12 +15,36 @@ const AXES = ['valence', 'arousal', 'dominance'] as const;
 export const NEUTRAL_VAD: Vad = Object.freeze({ valence: 0, arousal: 0, dominance: 0 });
 export const NEUTRAL_AFFECT: AffectSnapshot = Object.freeze({ vad: NEUTRAL_VAD, mood: NEUTRAL_VAD, discrete: Object.freeze({}), confidence: 0 });
 
+/** Throws unless `value` is a finite number: NaN and null must never be clamped into a plausible reading. */
+function requireFinite(value: unknown, what: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) throw new RangeError(`${what} must be a finite number, got ${String(value)}`);
+  return value;
+}
+
 export function clampSigned(value: number): number {
-  return Math.max(-1, Math.min(1, value));
+  return Math.max(-1, Math.min(1, requireFinite(value, 'affect value')));
 }
 
 export function clampUnit(value: number): number {
-  return Math.max(0, Math.min(1, value));
+  return Math.max(0, Math.min(1, requireFinite(value, 'affect value')));
+}
+
+/**
+ * Rejects a snapshot or impulse carrying a non-number anywhere. Records come
+ * back from storage as JSON, where NaN becomes null and `null * factor` is a
+ * silent 0, so the check runs before any arithmetic.
+ */
+function requireFiniteAffect(snapshot: AffectSnapshot, observation: Pick<AffectObservation, 'vad' | 'discrete' | 'confidence'> | null): void {
+  for (const axis of AXES) {
+    requireFinite(snapshot.vad[axis], `snapshot.vad.${axis}`);
+    requireFinite(snapshot.mood[axis], `snapshot.mood.${axis}`);
+  }
+  for (const [label, score] of Object.entries(snapshot.discrete)) requireFinite(score, `snapshot.discrete.${label}`);
+  requireFinite(snapshot.confidence, 'snapshot.confidence');
+  if (observation === null) return;
+  for (const axis of AXES) requireFinite(observation.vad[axis], `observation.vad.${axis}`);
+  for (const [label, score] of Object.entries(observation.discrete)) requireFinite(score, `observation.discrete.${label}`);
+  requireFinite(observation.confidence, 'observation.confidence');
 }
 
 function decayFactor(halfLifeSeconds: number, elapsedSeconds: number): number {
@@ -29,7 +53,8 @@ function decayFactor(halfLifeSeconds: number, elapsedSeconds: number): number {
 
 /**
  * Decays for `elapsedSeconds`, applies the observation (if any), then moves
- * mood toward VAD. `elapsedSeconds` must be finite and non-negative.
+ * mood toward VAD. `elapsedSeconds` must be finite and non-negative, and
+ * every number in the snapshot and observation finite; anything else throws.
  */
 export function advanceAffect(
   snapshot: AffectSnapshot,
@@ -38,6 +63,7 @@ export function advanceAffect(
   policy: EmotionPolicy,
 ): AffectSnapshot {
   if (!Number.isFinite(elapsedSeconds) || elapsedSeconds < 0) throw new RangeError(`elapsedSeconds must be finite and >= 0, got ${String(elapsedSeconds)}`);
+  requireFiniteAffect(snapshot, observation);
   const vad = { ...snapshot.vad };
   const discrete = new Map(Object.entries(snapshot.discrete));
   let confidence = snapshot.confidence;
@@ -88,6 +114,10 @@ export function decayAffect(snapshot: AffectSnapshot, elapsedSeconds: number, po
 
 /** Largest per-axis movement between two VAD readings (donor `maxAbsoluteNarrativeVadDelta`). */
 export function maxAxisDelta(a: Vad, b: Vad): number {
+  for (const axis of AXES) {
+    requireFinite(a[axis], `vad.${axis}`);
+    requireFinite(b[axis], `vad.${axis}`);
+  }
   return Math.max(Math.abs(a.valence - b.valence), Math.abs(a.arousal - b.arousal), Math.abs(a.dominance - b.dominance));
 }
 

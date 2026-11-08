@@ -54,6 +54,41 @@ describe('emotion state and the meaningful-change gate', () => {
     expect(w.ports.appraiser.calls).toHaveLength(1);
   });
 
+  it('refuses a malformed estimator reading without touching state or the gate', async () => {
+    const w = await selfStateWorld();
+    const robin = await w.admit('primary-dm');
+    await w.talk(robin, 'hello', 'hi there', 'k1', steady());
+    const key = `direct:${w.people.primary}`;
+    const before = w.ports.emotionStates.states.get(key);
+    const malformed: unknown[] = [
+      { ...steady(), vad: { valence: Number.NaN, arousal: 0, dominance: 0 }, discrete: { joy: Number.NaN } },
+      { ...steady(), vad: { valence: 0.1 } },
+      { ...steady(), discrete: { joy: Number.NaN } },
+      { ...steady(), discrete: { Joy: 0.5 } },
+      { ...steady(), vad: { valence: 3, arousal: 0, dominance: 0 } },
+      { ...steady(), confidence: Number.POSITIVE_INFINITY },
+      { ...steady(), producer: '' },
+      { ...steady(), extra: true },
+    ];
+    for (const [index, bad] of malformed.entries()) {
+      w.ports.estimator.reading = bad as never;
+      const sessionId = await w.converse(robin, `turn ${String(index)}`, 'ok', `bad-${String(index)}`);
+      const settled = await w.ledger.lastSettled(sessionId);
+      if (!settled.ok || settled.value === null) throw new Error('no settled turn');
+      const observed = await w.emotion.observeTurn(robin, { turnId: settled.value.turnId, toolCallCount: 0 });
+      expect(errorOf(observed), JSON.stringify(bad)).toMatchObject({ kind: 'unavailable', capability: 'affect_estimator' });
+      expect(w.ports.emotionStates.observations.has(`turn:${settled.value.turnId}`)).toBe(false);
+    }
+    expect(w.ports.emotionStates.states.get(key)).toEqual(before);
+
+    // The baseline is still a real reading, so stable turns afterwards stay free of appraisal.
+    for (const turnKey of ['k2', 'k3', 'k4']) {
+      const stable = await w.talk(robin, 'still here', 'me too', turnKey, steady());
+      expect(stable.observed).toMatchObject({ gate: 'no_movement', inference: { estimator: 1, model: 0 } });
+    }
+    expect(w.ports.appraiser.calls).toHaveLength(0);
+  });
+
   it('replays an observed turn without inference and keeps the gate across a restart', async () => {
     const w = await selfStateWorld();
     const robin = await w.admit('primary-dm');
