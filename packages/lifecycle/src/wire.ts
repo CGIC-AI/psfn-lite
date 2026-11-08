@@ -210,7 +210,7 @@ export function renderContext(parts: TurnContextParts): Readonly<Record<string, 
     orientation: parts.orientation.map((b) => ({ name: b.name, text: b.text })),
     internal: parts.internal.map(entry),
     activity: parts.activity.map(entry),
-    history: parts.history.map(entry),
+    history: parts.history.map((e) => ({ ...entry(e), turnId: e.turnId })),
   };
 }
 

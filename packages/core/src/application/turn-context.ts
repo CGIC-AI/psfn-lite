@@ -31,7 +31,12 @@ export interface TurnContextParts {
   readonly orientation: readonly CoreBlock[];
   readonly internal: readonly ContextEntry[];
   readonly activity: readonly ContextEntry[];
-  readonly history: readonly ContextEntry[];
+  /** Each entry keeps the turn it belongs to, so a host can tell the turns it already holds. */
+  readonly history: readonly HistoryContextEntry[];
+}
+
+export interface HistoryContextEntry extends ContextEntry {
+  readonly turnId: TurnId;
 }
 
 export interface TurnContextAssembler {
@@ -77,7 +82,7 @@ export function createTurnContextAssembler(deps: TurnContextDeps): TurnContextAs
         orientation: blocks.value.filter((block) => block.text.trim().length > 0),
         internal: internal.value,
         activity: activity.value,
-        history: history.map(contextFromHistory),
+        history: history.map((entry) => ({ ...contextFromHistory(entry), turnId: entry.turnId })),
       });
     },
   };
