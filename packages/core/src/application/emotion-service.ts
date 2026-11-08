@@ -27,7 +27,7 @@ import {
   type Vad,
   parseAffectObservation,
 } from '../emotion/index.ts';
-import { canViewConcern, isOpenConcernStatus, type ConcernPort } from '../intention/index.ts';
+import { canViewConcern, isOpenConcernStatus, type ActiveConcern, type ConcernPort } from '../intention/index.ts';
 import type { SessionArchivePort, TurnLedgerPort, TurnRecord } from '../sessions/index.ts';
 import {
   canViewerRead,
@@ -46,10 +46,10 @@ import {
 } from '../shared/index.ts';
 import { contextFromHistory } from './context.ts';
 import type { ModelMessage, ModelPort } from './host-ports.ts';
+import { collectPaged } from './paging.ts';
 import { authorOf, isTrustedTurnScope, viewerOf, type TrustedTurnScope } from './trusted-scope.ts';
 
 const SELF_REPORT_MAX_CHARS = 1_000;
-const RECENT_SCAN = 500;
 const COMMIT_ATTEMPTS = 3;
 const APPRAISAL_PRODUCER = 'emotion.appraisal';
 const APPRAISAL_MAX_OUTPUT_TOKENS = 300;
@@ -162,11 +162,16 @@ export function createEmotionService(deps: EmotionServiceDeps): EmotionService {
     }
   };
 
+  /** Every open concern this scope may see; the self-model counts them all. */
   const openConcernTexts = async (scope: TrustedTurnScope): Promise<Result<readonly string[]>> => {
-    const listed = await deps.concerns.list(RECENT_SCAN);
-    if (!listed.ok) return listed;
     const viewer = viewerOf(scope);
-    return ok(listed.value.filter((c) => isOpenConcernStatus(c.status) && canViewConcern(viewer, c)).map((c) => c.text));
+    const open = await collectPaged({
+      fetch: (after, pageSize) => deps.concerns.list({ openOnly: true, limit: pageSize, after }),
+      cursorOf: (c: ActiveConcern) => ({ updatedAt: c.updatedAt, id: c.id }),
+      keep: (c) => isOpenConcernStatus(c.status) && canViewConcern(viewer, c),
+      limit: Number.POSITIVE_INFINITY,
+    });
+    return open.ok ? ok(open.value.map((c) => c.text)) : open;
   };
 
   const appraise = async (record: TurnRecord, key: string, decision: AppraisalDecision): Promise<{ outcome: AppraisalOutcome; calls: number }> => {
@@ -346,10 +351,13 @@ export function createEmotionService(deps: EmotionServiceDeps): EmotionService {
     async appraisals(scope, input) {
       if (!isTrustedTurnScope(scope)) return untrusted();
       if (scope.caller.kind === 'worker') return denied('worker_not_permitted', 'workers may not read appraisals');
-      const recent = await deps.appraisals.recent(RECENT_SCAN);
-      if (!recent.ok) return recent;
       const viewer = viewerOf(scope);
-      return ok(recent.value.filter((entry) => canViewerRead(viewer, entry.source)).slice(0, input.limit));
+      return collectPaged({
+        fetch: (before, pageSize) => deps.appraisals.recent({ limit: pageSize, before }),
+        cursorOf: (entry: AppraisalEntry) => entry.id,
+        keep: (entry) => canViewerRead(viewer, entry.source),
+        limit: input.limit,
+      });
     },
 
     async selfReport(scope, input) {

@@ -28,7 +28,9 @@ const MAX_EVIDENCE_REFS = 32;
 export const CONCERN_DUPLICATE_SIMILARITY = 0.72;
 
 const TERMINAL: readonly ConcernStatus[] = ['resolved', 'dismissed', 'suppressed'];
-const OPEN: readonly ConcernStatus[] = ['active', 'watching', 'deferred', 'blocked'];
+/** Statuses that still ask for the companion's attention; stores filter on them. */
+export const OPEN_CONCERN_STATUSES: readonly ConcernStatus[] = Object.freeze(['active', 'watching', 'deferred', 'blocked']);
+const OPEN = OPEN_CONCERN_STATUSES;
 
 const ALLOWED: Readonly<Record<ConcernStatus, readonly ConcernStatus[]>> = {
   candidate: ['active', 'watching', 'deferred', 'blocked', 'resolved', 'dismissed', 'suppressed'],

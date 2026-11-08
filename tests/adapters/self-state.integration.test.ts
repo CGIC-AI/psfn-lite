@@ -102,16 +102,16 @@ function continuityBackup(archive: FileSessionArchive, state: PostgresState) {
 
 /** Everything the self-state stores hold that a companion can reach, for before/after comparison. */
 async function snapshotOf(stores: SelfStateStores, keys: readonly string[], observationIds: readonly string[]) {
-  const concerns = await stores.concerns.list(50);
+  const concerns = await stores.concerns.list({ openOnly: false, limit: 50, after: null });
   const ids = concerns.ok ? concerns.value.map((c) => c.id) : [];
   return {
     states: await Promise.all(keys.map((k) => stores.emotionStates.get(k))),
     observations: await Promise.all(observationIds.map((id) => stores.emotionStates.observation(id))),
-    appraisals: await stores.appraisals.recent(50),
+    appraisals: await stores.appraisals.recent({ limit: 50, before: null }),
     reports: await Promise.all(keys.map((k) => stores.selfReports.recent(k, 50))),
     concerns,
     events: await Promise.all(ids.map((id) => stores.concerns.events(id, 50))),
-    followUps: await stores.followUps.list(50),
+    followUps: await stores.followUps.list({ state: null, dueAtOrBefore: null, limit: 50, after: null }),
   };
 }
 
@@ -241,6 +241,110 @@ describe.skipIf(dockerTestsOptedOut('self-state'))('self-state over the real ada
     expect(errorOf(await stores.followUps.update({ ...followUp, revision: 3 }, 2))).toMatchObject({ reason: 'stale_revision' });
     expect(errorOf(await stores.followUps.update({ ...followUp, revision: 2 }, 1))).toBe('ok');
     expect(errorOf(await stores.followUps.update({ ...followUp, revision: 2 }, 1))).toMatchObject({ reason: 'stale_revision' });
+  });
+
+  it('filters and pages lists in the database by state, due time, status and cursor', async () => {
+    const url = await pgdb.database();
+    await pgdb.open(url);
+    const { pool, stores } = storesFor(url);
+    const base = Date.parse('2030-01-01T00:00:00.000Z');
+    const at = (seconds: number) => new Date(base + seconds * 1000).toISOString();
+
+    const followUp = (i: number): PendingFollowUp => ({
+      id: `follow_up:${String(i).padStart(3, '0')}`,
+      target: { kind: 'self' },
+      content: `f${String(i)}`,
+      // Pairs share a due time, so the id breaks ties in the cursor.
+      dueAt: at(Math.floor(i / 2)),
+      state: 'pending',
+      concernId: null,
+      author: { kind: 'companion' },
+      createdAt: at(0),
+      activatedAt: null,
+      revision: 1,
+    });
+    for (let i = 0; i < 120; i += 1) {
+      const made = followUp(i);
+      expect(errorOf(await stores.followUps.create(made))).toBe('ok');
+      if (i % 3 === 0) expect(errorOf(await stores.followUps.update({ ...made, state: 'activated', activatedAt: at(1), revision: 2 }, 1))).toBe('ok');
+    }
+    const pageAll = async (query: { state: 'pending' | null; dueAtOrBefore: string | null }) => {
+      const seen: PendingFollowUp[] = [];
+      for (;;) {
+        const last = seen.at(-1);
+        const page = await stores.followUps.list({ ...query, limit: 7, after: last === undefined ? null : { dueAt: last.dueAt, id: last.id } });
+        if (!page.ok) throw new Error(JSON.stringify(page.error));
+        seen.push(...page.value);
+        if (page.value.length < 7) return seen;
+      }
+    };
+    const pending = await pageAll({ state: 'pending', dueAtOrBefore: null });
+    expect(pending.map((f) => f.id)).toEqual(Array.from({ length: 120 }, (_, i) => i).filter((i) => i % 3 !== 0).map((i) => followUp(i).id));
+    expect(pending.every((f) => f.state === 'pending')).toBe(true);
+    const duePending = await pageAll({ state: 'pending', dueAtOrBefore: at(10) });
+    expect(duePending.map((f) => f.content)).toEqual(['f1', 'f2', 'f4', 'f5', 'f7', 'f8', 'f10', 'f11', 'f13', 'f14', 'f16', 'f17', 'f19', 'f20']);
+    expect(await pageAll({ state: null, dueAtOrBefore: null })).toHaveLength(120);
+
+    const concern = (i: number, status: ActiveConcern['status']): ActiveConcern => ({
+      id: `concern-${String(i).padStart(3, '0')}`,
+      text: `c${String(i)}`,
+      status,
+      priority: 'medium',
+      sensitivity: 'public',
+      owner: 'companion',
+      author: { kind: 'companion' },
+      formedIn: { kind: 'self' },
+      contactId: null,
+      evidenceRefs: [],
+      formationVad: null,
+      resolution: null,
+      nextReviewAt: null,
+      createdAt: at(0),
+      updatedAt: at(Math.floor(i / 2)),
+      revision: 1,
+    });
+    for (let i = 0; i < 60; i += 1) {
+      const made = concern(i, 'active');
+      const event = { concernId: made.id, revision: 1, kind: 'created' as const, from: null, to: 'active' as const, evidenceRefs: [], outcome: null, resolution: null, author: made.author, at: made.updatedAt };
+      expect(errorOf(await stores.concerns.create(made, event))).toBe('ok');
+      if (i % 4 === 0) {
+        const closed = { ...made, status: 'dismissed' as const, revision: 2 };
+        expect(errorOf(await stores.concerns.update(closed, 1, { ...event, revision: 2, kind: 'transitioned', from: 'active', to: 'dismissed' }))).toBe('ok');
+      }
+    }
+    const openConcerns: ActiveConcern[] = [];
+    for (;;) {
+      const last = openConcerns.at(-1);
+      const page = await stores.concerns.list({ openOnly: true, limit: 9, after: last === undefined ? null : { updatedAt: last.updatedAt, id: last.id } });
+      if (!page.ok) throw new Error(JSON.stringify(page.error));
+      openConcerns.push(...page.value);
+      if (page.value.length < 9) break;
+    }
+    const expectedOpen = Array.from({ length: 60 }, (_, i) => 59 - i).filter((i) => i % 4 !== 0).map((i) => concern(i, 'active').id);
+    expect(openConcerns.map((c) => c.id)).toEqual(expectedOpen);
+    const everyConcern = await stores.concerns.list({ openOnly: false, limit: 100, after: null });
+    expect(everyConcern.ok && everyConcern.value).toHaveLength(60);
+    // The status column is checked against the record, so a filter can never disagree with it.
+    await expect(pool.query("UPDATE concerns SET status = 'active' WHERE concern_id = 'concern-000'")).rejects.toThrow(/check constraint/);
+
+    const entry = (i: number): AppraisalEntry => ({
+      id: `appraisal:t-${String(i)}`,
+      scopeKey: 'self',
+      source: { kind: 'self' },
+      sessionId: 's-1' as never,
+      turnId: `t-${String(i)}` as TurnId,
+      summary: `a${String(i)}`,
+      vad: { valence: 0, arousal: 0, dominance: 0 },
+      delta: 0.5,
+      author: { kind: 'machine', producer: 'emotion.appraisal' },
+      at: at(i),
+    });
+    for (let i = 0; i < 12; i += 1) expect(errorOf(await stores.appraisals.append(entry(i)))).toBe('ok');
+    const first = await stores.appraisals.recent({ limit: 5, before: null });
+    expect(first.ok && first.value.map((e) => e.summary)).toEqual(['a11', 'a10', 'a9', 'a8', 'a7']);
+    const next = await stores.appraisals.recent({ limit: 5, before: 'appraisal:t-7' });
+    expect(next.ok && next.value.map((e) => e.summary)).toEqual(['a6', 'a5', 'a4', 'a3', 'a2']);
+    expect(errorOf(await stores.appraisals.recent({ limit: 5, before: 'appraisal:missing' }))).toMatchObject({ kind: 'not_found' });
   });
 
   it('restores self-state from a full backup into a fresh database and carries on from it', async () => {

@@ -6,7 +6,6 @@ import {
   canViewConcern,
   concernTextSimilarity,
   describeConcernArc,
-  isOpenConcernStatus,
   isTerminalConcernStatus,
   mergeEvidence,
   normalizeDueAt,
@@ -35,9 +34,9 @@ import {
   type Result,
   type Sensitivity,
 } from '../shared/index.ts';
+import { collectPaged } from './paging.ts';
 import { authorOf, isTrustedTurnScope, viewerOf, type TrustedTurnScope } from './trusted-scope.ts';
 
-const RECENT_SCAN = 500;
 const ARC_PRODUCER = 'intention.concern_arc';
 
 export type ReliefOutcome =
@@ -94,11 +93,15 @@ export function createConcernService(deps: {
   readonly clock: Clock;
   readonly ids: IdSource;
 }): ConcernService {
-  const visible = async (scope: TrustedTurnScope): Promise<Result<readonly ActiveConcern[]>> => {
-    const listed = await deps.concerns.list(RECENT_SCAN);
-    if (!listed.ok) return listed;
+  /** Up to `limit` concerns this scope may see, most recently updated first. */
+  const visible = (scope: TrustedTurnScope, input: { readonly openOnly: boolean; readonly limit: number; readonly match?: (c: ActiveConcern) => boolean }) => {
     const viewer = viewerOf(scope);
-    return ok(listed.value.filter((c) => canViewConcern(viewer, c)));
+    return collectPaged({
+      fetch: (after, pageSize) => deps.concerns.list({ openOnly: input.openOnly, limit: pageSize, after }),
+      cursorOf: (c: ActiveConcern) => ({ updatedAt: c.updatedAt, id: c.id }),
+      keep: (c) => canViewConcern(viewer, c) && (input.match?.(c) ?? true),
+      limit: input.limit,
+    });
   };
 
   /**
@@ -121,9 +124,7 @@ export function createConcernService(deps: {
   return {
     async list(scope, input) {
       if (!isTrustedTurnScope(scope)) return untrusted();
-      const concerns = await visible(scope);
-      if (!concerns.ok) return concerns;
-      return ok(concerns.value.filter((c) => input.includeClosed || isOpenConcernStatus(c.status)).slice(0, input.limit));
+      return visible(scope, { openOnly: !input.includeClosed, limit: input.limit });
     },
 
     async create(scope, input) {
@@ -138,9 +139,9 @@ export function createConcernService(deps: {
       if (!evidence.ok) return evidence;
       const nextReviewAt = input.nextReviewAt === null ? ok(null) : normalizeDueAt(input.nextReviewAt);
       if (!nextReviewAt.ok) return invalid('nextReviewAt must be an ISO 8601 timestamp');
-      const existing = await visible(scope);
-      if (!existing.ok) return existing;
-      const duplicate = existing.value.find((c) => isOpenConcernStatus(c.status) && concernTextSimilarity(c.text, text) >= CONCERN_DUPLICATE_SIMILARITY);
+      const duplicates = await visible(scope, { openOnly: true, limit: 1, match: (c) => concernTextSimilarity(c.text, text) >= CONCERN_DUPLICATE_SIMILARITY });
+      if (!duplicates.ok) return duplicates;
+      const duplicate = duplicates.value[0];
       if (duplicate !== undefined) return conflict('already_exists', `an open concern already says this: ${duplicate.id}`);
       // A concern is formed in the scope's own conversation, so this is that conversation's estimate.
       const formationVad = await affectIn(scope, scope.audience);

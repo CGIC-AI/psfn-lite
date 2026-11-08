@@ -11,6 +11,7 @@ import {
   invalid,
   notFound,
   ok,
+  OPEN_CONCERN_STATUSES,
   type ActiveConcern,
   type AppraisalEntry,
   type AppraisalLogPort,
@@ -113,9 +114,16 @@ function appraisals(pool: pg.Pool): AppraisalLogPort {
         return ok(records<AppraisalEntry>(found.rows)[0] ?? null);
       }),
 
-    recent: (limit) =>
+    recent: ({ limit, before }) =>
       guarded(async () => {
-        const found = await pool.query('SELECT record FROM emotion_appraisals ORDER BY seq DESC LIMIT $1', [limit]);
+        if (before === null) {
+          const found = await pool.query('SELECT record FROM emotion_appraisals ORDER BY seq DESC LIMIT $1', [limit]);
+          return ok(records<AppraisalEntry>(found.rows));
+        }
+        const cursor = await pool.query<{ seq: string }>('SELECT seq FROM emotion_appraisals WHERE appraisal_id = $1', [before]);
+        const seq = cursor.rows[0]?.seq;
+        if (seq === undefined) return notFound(`appraisal ${before}`);
+        const found = await pool.query('SELECT record FROM emotion_appraisals WHERE seq < $1 ORDER BY seq DESC LIMIT $2', [seq, limit]);
         return ok(records<AppraisalEntry>(found.rows));
       }),
   };
@@ -156,16 +164,28 @@ function concerns(pool: pg.Pool): ConcernPort {
         return record === undefined ? notFound(`concern ${id}`) : ok(record);
       }),
 
-    list: (limit) =>
+    list: ({ openOnly, limit, after }) =>
       guarded(async () => {
-        const found = await pool.query('SELECT record FROM concerns ORDER BY updated_at DESC, concern_id DESC LIMIT $1', [limit]);
+        const found = await pool.query(
+          `SELECT record FROM concerns
+            WHERE ($1::text[] IS NULL OR status = ANY($1))
+              AND ($2::timestamptz IS NULL OR (updated_at, concern_id) < ($2::timestamptz, $3::text))
+            ORDER BY updated_at DESC, concern_id DESC
+            LIMIT $4`,
+          [openOnly ? [...OPEN_CONCERN_STATUSES] : null, after?.updatedAt ?? null, after?.id ?? null, limit],
+        );
         return ok(records<ActiveConcern>(found.rows));
       }),
 
     create: (concern, event) =>
       transaction(pool, async (client) => {
         if (concern.revision !== 1 || event.revision !== 1 || event.concernId !== concern.id) return invalid('a new concern starts at revision 1 with its event');
-        await client.query('INSERT INTO concerns (concern_id, revision, updated_at, record) VALUES ($1, 1, $2, $3)', [concern.id, concern.updatedAt, concern]);
+        await client.query('INSERT INTO concerns (concern_id, revision, status, updated_at, record) VALUES ($1, 1, $2, $3, $4)', [
+          concern.id,
+          concern.status,
+          concern.updatedAt,
+          concern,
+        ]);
         await insertEvent(client, event);
         return ok(concern);
       }),
@@ -179,7 +199,13 @@ function concerns(pool: pg.Pool): ConcernPort {
         const actual = current.rows[0]?.revision;
         if (actual === undefined) return notFound(`concern ${next.id}`);
         if (actual !== expectedRevision) return conflict('stale_revision', `concern ${next.id} moved`, { expectedRevision, actualRevision: actual });
-        await client.query('UPDATE concerns SET revision = $2, updated_at = $3, record = $4 WHERE concern_id = $1', [next.id, next.revision, next.updatedAt, next]);
+        await client.query('UPDATE concerns SET revision = $2, status = $3, updated_at = $4, record = $5 WHERE concern_id = $1', [
+          next.id,
+          next.revision,
+          next.status,
+          next.updatedAt,
+          next,
+        ]);
         await insertEvent(client, event);
         return ok(next);
       }),
@@ -198,8 +224,8 @@ function followUps(pool: pg.Pool): FollowUpPort {
       guarded<{ readonly followUp: PendingFollowUp; readonly created: boolean }>(async () => {
         if (followUp.revision !== 1) return invalid('a new follow-up starts at revision 1');
         const inserted = await pool.query(
-          'INSERT INTO follow_ups (follow_up_id, revision, due_at, record) VALUES ($1, 1, $2, $3) ON CONFLICT (follow_up_id) DO NOTHING',
-          [followUp.id, followUp.dueAt, followUp],
+          'INSERT INTO follow_ups (follow_up_id, revision, state, due_at, record) VALUES ($1, 1, $2, $3, $4) ON CONFLICT (follow_up_id) DO NOTHING',
+          [followUp.id, followUp.state, followUp.dueAt, followUp],
         );
         if ((inserted.rowCount ?? 0) > 0) return ok({ followUp, created: true });
         const found = await pool.query('SELECT record FROM follow_ups WHERE follow_up_id = $1', [followUp.id]);
@@ -214,9 +240,17 @@ function followUps(pool: pg.Pool): FollowUpPort {
         return record === undefined ? notFound(`follow-up ${id}`) : ok(record);
       }),
 
-    list: (limit) =>
+    list: ({ state, dueAtOrBefore, limit, after }) =>
       guarded(async () => {
-        const found = await pool.query('SELECT record FROM follow_ups ORDER BY due_at, follow_up_id LIMIT $1', [limit]);
+        const found = await pool.query(
+          `SELECT record FROM follow_ups
+            WHERE ($1::text IS NULL OR state = $1)
+              AND ($2::timestamptz IS NULL OR due_at <= $2)
+              AND ($3::timestamptz IS NULL OR (due_at, follow_up_id) > ($3::timestamptz, $4::text))
+            ORDER BY due_at, follow_up_id
+            LIMIT $5`,
+          [state, dueAtOrBefore, after?.dueAt ?? null, after?.id ?? null, limit],
+        );
         return ok(records<PendingFollowUp>(found.rows));
       }),
 
@@ -227,7 +261,7 @@ function followUps(pool: pg.Pool): FollowUpPort {
         const actual = current.rows[0]?.revision;
         if (actual === undefined) return notFound(`follow-up ${next.id}`);
         if (actual !== expectedRevision) return conflict('stale_revision', `follow-up ${next.id} moved`, { expectedRevision, actualRevision: actual });
-        await client.query('UPDATE follow_ups SET revision = $2, record = $3 WHERE follow_up_id = $1', [next.id, next.revision, next]);
+        await client.query('UPDATE follow_ups SET revision = $2, state = $3, record = $4 WHERE follow_up_id = $1', [next.id, next.revision, next.state, next]);
         return ok(next);
       }),
   };
