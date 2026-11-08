@@ -2,7 +2,9 @@
 
 A modular persistent companion core, derived from [PSFN Framework](https://github.com/CGIC-AI/psfn-framework), with a native Pi harness and a planned Hermes integration.
 
-Status: repository and planning bootstrap. No companion runtime is implemented yet.
+Status: bootstrap. `packages/core` defines the domain interfaces, tool inventory and
+application boundary (ingress, turn lifecycle, dispatch); no storage, harness or
+companion runtime is implemented yet. See [the tool inventory](docs/tool-inventory.md).
 
 The core owns one companion's identity and continuity: constitution, persona,
 values, North Star, sessions, contacts, privacy, core and long-term memory,
