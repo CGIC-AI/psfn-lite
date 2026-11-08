@@ -36,7 +36,7 @@ describe('activity records', () => {
     const parent = await admit('primary-dm');
     const started = await service.start(parent, { purpose: 'research', sessionId: null, turnId: null });
     if (!started.ok) throw new Error('start');
-    const worker = deriveWorkerScope(parent, id('run-7'), { actions: [], maxTurns: 2 });
+    const worker = deriveWorkerScope(parent, id('run-7'), { actions: [], maxTurns: 2, maxSensitivity: 'personal' });
     if (!worker.ok) throw new Error('worker');
 
     const machine = await service.update(worker.value, { id: started.value.id, expectedRevision: 1, note: 'found 3 sources' });

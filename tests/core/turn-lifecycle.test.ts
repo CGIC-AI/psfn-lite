@@ -198,7 +198,7 @@ describe('turn lifecycle', () => {
     const forged = await lifecycle.prepareTurn({ ...scope }, input());
     expect(forged.ok || forged.error).toMatchObject({ kind: 'denied', reason: 'unknown_authority' });
 
-    const worker = deriveWorkerScope(scope, id('run-1'), { actions: [], maxTurns: 1 });
+    const worker = deriveWorkerScope(scope, id('run-1'), { actions: [], maxTurns: 1, maxSensitivity: 'public' });
     expect(worker.ok).toBe(true);
     if (!worker.ok) return;
     const workerTurn = await lifecycle.prepareTurn(worker.value, input());

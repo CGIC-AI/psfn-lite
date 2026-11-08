@@ -101,26 +101,69 @@ describe('domain action dispatch', () => {
   it('limits workers to their grant and to actions open to workers', async () => {
     const seen: TrustedTurnScope[] = [];
     const handler = recordingHandler(seen);
-    const dispatcher = dispatcherWith({ memory: { search: handler, get: handler }, contact: { lookup: handler } });
+    const dispatcher = dispatcherWith({ memory: { search: handler, get: handler } });
     const parent = await standardWorld().admit('primary-dm');
     const worker = deriveWorkerScope(parent, id('run-1'), {
-      actions: [
-        { tool: 'memory', action: 'search' },
-        { tool: 'contact', action: 'lookup' },
-      ],
+      actions: [{ tool: 'memory', action: 'search' }],
       maxTurns: 4,
+      maxSensitivity: 'personal',
     });
     if (!worker.ok) throw new Error('worker scope');
 
     expect((await dispatcher.dispatch(worker.value, { tool: 'memory', action: 'search', args: {} })).ok).toBe(true);
     const ungranted = await dispatcher.dispatch(worker.value, { tool: 'memory', action: 'get', args: {} });
     expect(ungranted.ok || ungranted.error).toMatchObject({ kind: 'denied', reason: 'worker_not_permitted' });
-    const closed = await dispatcher.dispatch(worker.value, { tool: 'contact', action: 'lookup', args: {} });
-    expect(closed.ok || closed.error).toMatchObject({ kind: 'denied', reason: 'worker_not_permitted' });
     expect(seen.map((s) => s.caller.kind)).toEqual(['worker']);
 
-    const nested = deriveWorkerScope(worker.value, id('run-2'), { actions: [], maxTurns: 1 });
+    const nested = deriveWorkerScope(worker.value, id('run-2'), { actions: [], maxTurns: 1, maxSensitivity: 'public' });
     expect(nested.ok || nested.error).toMatchObject({ kind: 'denied', reason: 'worker_not_permitted' });
+  });
+
+  it('caps worker admission at the grant ceiling instead of inheriting the parent ceiling', async () => {
+    const seen: TrustedTurnScope[] = [];
+    const dispatcher = dispatcherWith({ free_time: { status: recordingHandler(seen) } });
+    const parent = await standardWorld().admit('primary-dm');
+    expect(parent.admitted).toContain('confidential');
+
+    const personal = deriveWorkerScope(parent, id('run-1'), { actions: [], maxTurns: 2, maxSensitivity: 'personal' });
+    if (!personal.ok) throw new Error('worker scope');
+    expect(personal.value.admitted).toEqual(['public', 'personal']);
+    const refused = await dispatcher.dispatch(personal.value, { tool: 'free_time', action: 'status', args: {} });
+    expect(refused.ok || refused.error).toMatchObject({ kind: 'denied', reason: 'audience_not_admitted' });
+
+    const confidential = deriveWorkerScope(parent, id('run-2'), {
+      actions: [{ tool: 'free_time', action: 'status' }],
+      maxTurns: 2,
+      maxSensitivity: 'confidential',
+    });
+    if (!confidential.ok) throw new Error('worker scope');
+    expect((await dispatcher.dispatch(confidential.value, { tool: 'free_time', action: 'status', args: {} })).ok).toBe(true);
+    expect(seen).toHaveLength(1);
+  });
+
+  it('refuses worker grants that are malformed, closed to workers or wider than the parent', async () => {
+    const world = standardWorld();
+    const primary = await world.admit('primary-dm');
+    const friend = await world.admit('friend-dm');
+    const grant = { actions: [], maxTurns: 1, maxSensitivity: 'public' } as const;
+    const cases = [
+      deriveWorkerScope(primary, id('r'), { ...grant, maxTurns: 0 }),
+      deriveWorkerScope(primary, id('r'), { ...grant, maxTurns: 1.5 }),
+      deriveWorkerScope(primary, id('r'), { ...grant, maxSensitivity: 'secret' as never }),
+      deriveWorkerScope(primary, id('r'), { ...grant, actions: [{ tool: 'memory', action: 'redact' }] }),
+      deriveWorkerScope(primary, id('r'), { ...grant, actions: [{ tool: 'contact', action: 'lookup' }] }),
+      deriveWorkerScope(primary, id('r'), { ...grant, actions: [{ tool: 'free_time', action: 'status' }] }),
+      deriveWorkerScope(friend, id('r'), { ...grant, maxSensitivity: 'intimate' }),
+    ];
+    expect(cases.map((r) => (r.ok ? 'ok' : `${r.error.kind}`))).toEqual([
+      'invalid',
+      'invalid',
+      'invalid',
+      'denied',
+      'denied',
+      'denied',
+      'denied',
+    ]);
   });
 
   it('returns domain failures unchanged and attributes results as tool output, never speech', async () => {

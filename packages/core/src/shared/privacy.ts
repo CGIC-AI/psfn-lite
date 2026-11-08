@@ -111,6 +111,8 @@ function wideningIssues(trust: TrustLevel, byRoom: Partial<Record<RoomKind, read
   return issues;
 }
 
-export function admitsSensitivity(admitted: readonly Sensitivity[], sensitivity: Sensitivity): boolean {
-  return admitted.includes(sensitivity);
+/** The sensitivities in `admitted` that are no more sensitive than `ceiling`. */
+export function capSensitivities(admitted: readonly Sensitivity[], ceiling: Sensitivity): readonly Sensitivity[] {
+  const limit = SENSITIVITIES.indexOf(ceiling);
+  return admitted.filter((s) => SENSITIVITIES.indexOf(s) <= limit);
 }

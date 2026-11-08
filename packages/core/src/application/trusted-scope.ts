@@ -1,5 +1,9 @@
 import {
+  SENSITIVITIES,
+  capSensitivities,
   denied,
+  invalid,
+  isOneOf,
   ok,
   type Audience,
   type CompanionId,
@@ -11,6 +15,7 @@ import {
   type WorkerRunId,
 } from '../shared/index.ts';
 import type { WorkerGrant } from '../automata/index.ts';
+import { resolveAction, TOOL_INVENTORY } from './tool-inventory.ts';
 
 export type InternalPurpose = 'reflection' | 'free_time' | 'maintenance' | 'scheduled_prompt';
 
@@ -56,8 +61,11 @@ export function isTrustedTurnScope(value: unknown): value is TrustedTurnScope {
 }
 
 /**
- * Narrows a turn scope for a bounded worker: same audience and ceiling, a
- * background turn, and only the granted actions. Workers cannot spawn workers.
+ * Narrows a turn scope for a bounded worker: same audience, a background turn,
+ * only the granted actions, and admission capped at the grant's
+ * `maxSensitivity`. A grant that names an unknown or worker-closed action, an
+ * action above its own ceiling, or a ceiling the parent was not admitted to is
+ * refused rather than trimmed. Workers cannot spawn workers.
  */
 export function deriveWorkerScope(
   parent: TrustedTurnScope,
@@ -66,10 +74,34 @@ export function deriveWorkerScope(
 ): Result<TrustedTurnScope> {
   if (!isTrustedTurnScope(parent)) return denied('unknown_authority', 'parent scope was not admitted by ingress');
   if (parent.caller.kind === 'worker') return denied('worker_not_permitted', 'workers cannot spawn workers');
+  if (!Number.isInteger(grant.maxTurns) || grant.maxTurns < 1) return invalid('worker maxTurns must be a positive integer');
+  if (!isOneOf(SENSITIVITIES, grant.maxSensitivity)) return invalid('worker maxSensitivity must be a known sensitivity');
+  if (!parent.admitted.includes(grant.maxSensitivity)) {
+    return denied('worker_not_permitted', `worker ceiling ${grant.maxSensitivity} exceeds the parent's admission`);
+  }
+  const admitted = capSensitivities(parent.admitted, grant.maxSensitivity);
+  const issues: string[] = [];
+  for (const { tool, action } of grant.actions) {
+    const resolved = resolveAction(TOOL_INVENTORY, tool, action);
+    if (!resolved.ok) {
+      issues.push(`unknown action ${tool}.${action}`);
+    } else if (resolved.value.action.workers === 'denied') {
+      issues.push(`${tool}.${action} is not open to workers`);
+    } else if (!admitted.includes(resolved.value.action.admission)) {
+      issues.push(`${tool}.${action} requires ${resolved.value.action.admission} admission, above the worker ceiling`);
+    }
+  }
+  if (issues.length > 0) return denied('worker_not_permitted', issues.join('; '));
+  const frozenGrant: WorkerGrant = Object.freeze({
+    actions: Object.freeze(grant.actions.map((a) => Object.freeze({ tool: a.tool, action: a.action }))),
+    maxTurns: grant.maxTurns,
+    maxSensitivity: grant.maxSensitivity,
+  });
   return ok(
     mintTrustedScope({
       ...parent,
-      caller: { kind: 'worker', runId, grant, parent: parent.caller },
+      caller: { kind: 'worker', runId, grant: frozenGrant, parent: parent.caller },
+      admitted,
       turnKind: 'background',
     }),
   );
