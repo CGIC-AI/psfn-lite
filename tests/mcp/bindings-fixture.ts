@@ -28,9 +28,11 @@ export const BINDINGS = {
     room: { kind: 'group', channelId: 'room-a', room: 'small_group' },
     turnKind: 'foreground',
   },
-  self: { surface: SURFACE, principal: { kind: 'companion_internal', purpose: 'free_time' }, room: { kind: 'self' }, turnKind: 'background' },
   // Bound, but to nobody core knows.
   nobody: direct('nobody-handle', 'dm-nobody'),
   // A participant claiming the companion's own room.
   'self-claim': { surface: SURFACE, principal: { kind: 'channel_account', identity: { channelKind: 'chat', externalId: 'primary-handle' } }, room: { kind: 'self' }, turnKind: 'foreground' },
 } as const;
+
+/** A standing companion-internal binding, which the loader must refuse: self scopes come only from turn credentials. */
+export const STANDING_INTERNAL = { surface: SURFACE, principal: { kind: 'companion_internal', purpose: 'free_time' }, room: { kind: 'self' }, turnKind: 'background' } as const;

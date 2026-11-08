@@ -116,8 +116,11 @@ revision above. No donor code was copied.
 | `packages/mcp/src/bindings.ts`, `credentials.ts` | `src/channels/api/server/external-memory-mcp.ts` (binding uniqueness), `src/channels/backplane/http/auth.ts` (`isExpectedApiToken`) | Unique, non-empty credentials per binding; constant-time comparison | Credentials only from environment variables or owner-only files, never configuration; digests of equal length compared against every binding without early exit (the donor's length check returned early); bindings attest surface, principal, room and turn kind for core ingress instead of naming a contact directly |
 | `packages/mcp/src/catalog.ts`, `arguments/*.ts` | `src/core/agent/tool-surface/registry.ts` | One semantic tool per domain | Tool names, actions and restrictions from `TOOL_INVENTORY`; argument descriptions checked against core's handler key lists; the transport never validates or filters arguments |
 | `packages/mcp/src/stdio.ts` | none (the donor served MCP only over HTTP) | | One bound credential per process, every call still admitted |
+| `packages/mcp/src/internal-turns.ts`, `callers.ts` | `src/boundary/gateway/mcp/invocation-authority.ts` | Opaque random authority minted by the host for one use, with a TTL and a bound on how many are outstanding | One credential per companion-internal turn instead of per model-emitted call, revoked when the turn settles; its attestation comes from core's `InternalTurnRequest`; at the bound a new turn is refused (`unavailable`) instead of evicting the oldest permit; matched by digest in constant time |
 
-`src/boundary/gateway/mcp/authentication.ts` and `invocation-authority.ts` were
-assessed and not ported: they authenticate the donor as a client of outbound MCP
-servers and mint single-use permits for model-emitted calls to them, which has
-no counterpart in a server that binds its caller from the transport credential.
+`src/boundary/gateway/mcp/authentication.ts` was assessed and not ported: it
+authenticates the donor as a client of outbound MCP servers, which has no
+counterpart in a server that binds its caller from the transport credential.
+`invocation-authority.ts` contributed only its permit pattern, above; its
+argument normalization and outbound-sensitivity binding belong to outbound
+calls.

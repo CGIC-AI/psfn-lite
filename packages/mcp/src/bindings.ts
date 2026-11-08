@@ -1,7 +1,9 @@
 /**
  * Operator-configured principal bindings: each transport credential is
  * bound to exactly one host attestation (surface, principal, room and turn
- * kind). The binding configuration names where each credential lives and
+ * kind) for a channel account. A standing credential never binds a
+ * companion-internal principal; a self-audience scope is reached only with
+ * the per-turn credentials in internal-turns.ts. The binding configuration names where each credential lives and
  * never holds a credential itself. Core's trusted ingress then resolves the
  * attested principal through its contact authority, so the transport never
  * decides caller, contact, trust or audience on its own, and tool arguments
@@ -18,6 +20,7 @@ import {
   type HostAttestation,
   type Result,
 } from './core.ts';
+import type { McpCallers } from './callers.ts';
 import {
   createCredentialIndex,
   credentialDigest,
@@ -33,7 +36,7 @@ export interface McpCredentialEvidence {
   readonly credential: string;
 }
 
-export interface McpPrincipalBindings {
+export interface McpPrincipalBindings extends McpCallers {
   /** Bound principal names, in configuration order. */
   readonly principals: readonly string[];
   /** The principal a presented credential is bound to, or null. */
@@ -132,15 +135,17 @@ function parseAttestation(raw: unknown): Result<HostAttestation> {
   if (!isNonEmptyString(raw['surface'])) issues.push('surface must be a non-empty string');
   if (raw['turnKind'] !== 'foreground' && raw['turnKind'] !== 'background') issues.push('turnKind must be foreground or background');
   const principal = raw['principal'];
-  if (!isRecord(principal) || (principal['kind'] !== 'channel_account' && principal['kind'] !== 'companion_internal')) {
-    issues.push('principal.kind must be channel_account or companion_internal');
-  } else if (principal['kind'] === 'channel_account') {
+  if (isRecord(principal) && principal['kind'] === 'companion_internal') {
+    issues.push(
+      'principal.kind companion_internal cannot be bound to a standing credential: it admits all companion-private state, so it is reached only with the credential the host mints for one internal turn',
+    );
+  } else if (!isRecord(principal) || principal['kind'] !== 'channel_account') {
+    issues.push('principal.kind must be channel_account');
+  } else {
     const identity = principal['identity'];
     if (!isRecord(identity) || !isNonEmptyString(identity['channelKind']) || !isNonEmptyString(identity['externalId'])) {
       issues.push('principal.identity must name channelKind and externalId');
     }
-  } else if (!isNonEmptyString(principal['purpose'])) {
-    issues.push('principal.purpose must be named');
   }
   const room = raw['room'];
   if (!isRecord(room) || !['self', 'direct', 'group'].includes(String(room['kind']))) issues.push('room.kind must be self, direct or group');

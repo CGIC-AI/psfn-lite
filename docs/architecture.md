@@ -713,17 +713,40 @@ adapters reference it.
   must be a regular file readable only by its owner. A credential must be
   32-4096 printable characters and is kept only as a SHA-256 digest; startup
   fails on a weak, missing or reused credential or a principal bound twice.
-  The attestation fixes surface, principal (a channel identity, or
-  `companion_internal` with a purpose for a harness that runs the companion's
-  own turns), room and turn kind. The returned `authenticator` is the
-  `CallerAuthenticatorPort` the host builds MCP's `createTrustedIngress` with;
-  it accepts only `{ kind: 'mcp_credential', credential }` and answers with the
-  bound attestation. Every tool call is admitted again (`ingress.admit`), so a
+  The attestation fixes surface, principal (a channel identity), room and
+  turn kind. A `companion_internal` principal is refused at startup: a
+  self-audience scope admits every sensitivity and every conversation's
+  sources, so no standing credential may reach it (see internal turns below).
+  The returned `authenticator` is the `CallerAuthenticatorPort` the host
+  builds MCP's `createTrustedIngress` with; it accepts only
+  `{ kind: 'mcp_credential', credential }` and answers with the bound
+  attestation. Every tool call is admitted again (`ingress.admit`), so a
   contact that is blocked, unblocked or loses consent changes what its next
   call may do on the same connection. A binding to an identity core does not
   know is unknown authority, and a channel account bound to a self room is
   refused by ingress. Credentials are matched by hashing the candidate and
   comparing it with every digest in constant time, without early exit.
+- **Internal turns** (`createMcpInternalTurns`, `combineCallers`). The
+  companion's own tools (reflections, letters, episode meaning, free time) are
+  reached only inside a companion-internal turn core asked for. The host
+  implements core's `InternalTurnPort` with `createTurnPort(launch)`: each
+  `run(request)` mints a random credential, calls `launch(request,
+  credential)` so the host's harness connects its MCP client with it (as its
+  bearer, never in the prompt or arguments), and revokes it when the run
+  settles, whether it completed, failed or threw. The credential's
+  attestation is derived from the request (its purpose and the surface of the
+  scope core admitted, self room, background), and a request whose scope is
+  not an ingress-admitted companion-internal self scope of the same purpose
+  mints nothing. A credential also expires after `ttlMs` while its turn is
+  still running, and at most `maxOpen` turns hold one; another turn is then
+  refused as `unavailable` rather than evicting a live one. The host builds
+  ingress and the HTTP transport with `combineCallers(bindings,
+  internalTurns)`, so both the pre-body 401 check and ingress recognize a
+  live turn credential. The credential is bound to the turn by lifetime:
+  ingress admits each call and mints a fresh scope from the attestation,
+  not the scope object in the request. stdio carries participants only,
+  since the harness launches the stdio server process and no host there
+  mints turn credentials.
 - **Results.** A success returns `{ origin: tool_result, content }` as
   structured content and JSON text, so a harness labels it tool output. A
   failure returns `isError` with core's error: `denied` (reason and detail),
@@ -749,8 +772,12 @@ adapters reference it.
   connection are still admitted one by one.
 
 Tests: `tests/mcp/inventory-parity.test.ts` lists the tools through the SDK
-client and calls every inventory action over a real HTTP connection (free-time
-choice from inside the scheduler's internal turn, answering over MCP);
+client and calls every inventory action over a real HTTP connection (every
+companion-only action from inside an internal turn under its minted
+credential, free-time choice from the scheduler's own turn);
+`internal-turns.test.ts` covers standing credentials reaching no private
+state, revocation on settle, TTL expiry, the open-turn bound and refusal to
+mint for any other scope;
 `authority.test.ts` and `leakage.test.ts` cover unknown, untracked, blocked and
 background authority, identity in arguments, cross-audience reads and counts,
 companion-private state, credential non-disclosure and error redaction;

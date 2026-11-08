@@ -78,9 +78,10 @@ describe.skipIf(dockerTestsOptedOut('mcp-postgres'))('MCP over the real adapters
     expect(await mustInvoke(primary, 'automata', { action: 'inspect', runId: spawned.run.id })).toMatchObject({ run: { id: spawned.run.id } });
     expect((await invoke(friend, 'automata', { action: 'inspect', runId: spawned.run.id })).payload).toMatchObject({ error: { kind: 'not_found' } });
 
-    const self = await w.as('self');
-    expect(await mustInvoke<unknown[]>(self, 'free_time', { action: 'status' })).not.toHaveLength(0);
-    await mustInvoke(self, 'free_time', { action: 'rest', minutes: 30 });
+    await w.inSelfTurn(async (self) => {
+      expect(await mustInvoke<unknown[]>(self, 'free_time', { action: 'status' })).not.toHaveLength(0);
+      await mustInvoke(self, 'free_time', { action: 'rest', minutes: 30 });
+    });
     expect((await invoke(friend, 'free_time', { action: 'status' })).payload).toMatchObject({ error: { kind: 'denied', reason: 'audience_not_admitted' } });
     expect(w.errors).toEqual([]);
   });

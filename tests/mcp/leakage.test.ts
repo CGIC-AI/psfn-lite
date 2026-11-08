@@ -4,6 +4,7 @@
  * content or counts, no companion-private state for participants, and no
  * storage detail in an unavailable error.
  */
+import type { Client } from '@modelcontextprotocol/client';
 import { describe, expect, it } from 'vitest';
 import {
   BASELINE_DISCLOSURE_POLICY,
@@ -59,8 +60,7 @@ describe('cross-audience disclosure over MCP', () => {
     const privateText = 'a private reflection about the move';
     expect((await w.journal.recordReflection(await w.admit('reflection'), { reflectionId: 'r-1', templateId: 't', kind: 'companion_reflection', text: privateText })).ok).toBe(true);
     await w.talk(await w.admit('primary-dm'), 'we are moving', 'that is a big change', 'p-1');
-    const self = await w.as('self');
-    expect((await invoke(self, 'journal', { action: 'reflections_read', reflectionId: 'r-1' })).text).toContain(privateText);
+    expect(await w.inSelfTurn(async (self) => (await invoke(self, 'journal', { action: 'reflections_read', reflectionId: 'r-1' })).text)).toContain(privateText);
 
     const friend = await w.as('friend');
     for (const [tool, action] of [
@@ -87,19 +87,23 @@ describe('cross-audience disclosure over MCP', () => {
     const w = await fakeMcpWorld();
     const seen: string[] = [];
     const record = (outcome: ToolOutcome) => seen.push(outcome.text, JSON.stringify(outcome.payload));
-    for (const principal of ['primary', 'friend', 'nobody', 'self-claim', 'self'] as const) {
-      const client = await w.as(principal);
+    const probe = async (client: Client, smuggled: string) => {
       seen.push(JSON.stringify(await client.listTools()));
       record(await invoke(client, 'memory', { action: 'census' }));
       record(await invoke(client, 'memory', { action: 'census', caller: w.credentials.primary }));
       // Core echoes a caller's own argument (a missing subject); a credential smuggled as an authority key is refused without echo.
-      record(await invoke(client, 'journal', { action: 'reflections_list', viewer: w.credentials.self }));
-    }
+      record(await invoke(client, 'journal', { action: 'reflections_list', viewer: smuggled }));
+    };
+    const turnCredential = await w.inSelfTurn(async (self, credential) => {
+      await probe(self, w.credentials.friend);
+      return credential;
+    });
+    for (const principal of ['primary', 'friend', 'nobody', 'self-claim'] as const) await probe(await w.as(principal), turnCredential);
     const refused = await fetch(w.url, { method: 'POST', headers: { Authorization: `Bearer ${w.credentials.primary}x` } });
     seen.push(await refused.text(), JSON.stringify([...refused.headers]));
     seen.push(JSON.stringify(w.errors), JSON.stringify(w.surface.tools));
     const all = seen.join('\n');
-    for (const credential of Object.values(w.credentials)) {
+    for (const credential of [...Object.values(w.credentials), turnCredential]) {
       expect(all).not.toContain(credential);
       expect(all).not.toContain(credential.slice(0, 16));
     }
