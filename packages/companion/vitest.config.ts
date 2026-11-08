@@ -11,7 +11,9 @@ import { defineConfig } from 'vitest/config';
  * - vitest.setup.ts makes this package the working directory, because donor
  *   tests resolve config/ seeds and README.md from process.cwd();
  * - hookTimeout is raised to Lite's harness start budget (120 s), because each
- *   run starts fresh containers instead of reusing warm ones.
+ *   run starts fresh containers instead of reusing warm ones;
+ * - maxWorkers is 16, the same cap as the root config (the two projects share
+ *   one pool, so the values must match), also for runs of this config alone.
  */
 export default defineConfig({
   test: {
@@ -24,5 +26,6 @@ export default defineConfig({
     setupFiles: ['./vitest.setup.ts'],
     testTimeout: 10_000,
     hookTimeout: 120_000,
+    maxWorkers: 16,
   },
 });

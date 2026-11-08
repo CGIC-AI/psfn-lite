@@ -75,7 +75,10 @@ mise exec node@24.22.1 -- node packages/companion/extraction/compare-baseline.mj
 ```
 
 The donor Postgres-harness tests need Docker. Each run gets its own harness
-profile and temp directory, and removes exactly its own containers.
+profile and temp directory, and removes exactly its own containers. Both vitest
+configs cap the run at 16 forks (`maxWorkers`), the shared-workstation budget. Do
+not raise it with `--maxWorkers`: uncapped runs lost forks there (see
+[extraction](extraction.md)).
 
 Adapter integration tests (`*.integration.test.ts`) run inside `npx vitest run`
 against a throwaway pinned pgvector container, so Docker is required. Without it

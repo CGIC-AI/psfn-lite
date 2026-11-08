@@ -2,6 +2,10 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
+    // Shared-workstation budget: at most 16 test forks. Vitest's default for
+    // `run` is one fork per available CPU minus one (31 on the 32-core
+    // workstation), and uncapped runs there lost forks (docs/extraction.md).
+    maxWorkers: 16,
     projects: [
       {
         test: {
