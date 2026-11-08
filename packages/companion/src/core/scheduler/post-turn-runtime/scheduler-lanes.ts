@@ -32,8 +32,6 @@ import type {
 } from '../reflection-runtime-contracts.js';
 import type { Scheduler } from '../scheduler.js';
 import type { DailyRecurringCadence, RecurringCadenceTimezone } from '../types.js';
-import { FleetMaintenanceFenceLostError } from '../fleet-maintenance-coordinator.js';
-import { runWithFleetMaintenanceBaton } from '../fleet-maintenance-runner.js';
 import {
   runGovernedAutomataClass,
   type AutomataClassWorkResult,
@@ -373,36 +371,12 @@ export function registerSchedulerOwnedPostTurnLanes(
     async function runSleeptimeAttempt(
       action: PostTurnActionHandlerAction,
     ): Promise<AutomataClassWorkResult<PostTurnActionHandlerResult | undefined>> {
-        const fleetMaintenance = runtimeOptions.fleetMaintenance;
-        const batonRun = fleetMaintenance
-          ? await runWithFleetMaintenanceBaton({
-              coordinator: fleetMaintenance.coordinator,
-              leaseDurationMs: fleetMaintenance.leaseDurationMs,
-              retryDelayMs: fleetMaintenance.retryDelayMs,
-              phase: 'sleeptime',
-              run: control => sleeptimeAgent.execute(action, {
-                onSafeBoundary: input => control.checkpoint({
-                  phase: `sleeptime:${input.stage}`,
-                  checkpointRef: null,
-                }),
-                isYieldError: error => error instanceof FleetMaintenanceFenceLostError,
-              }),
-            })
-          : null;
-        if (batonRun?.outcome === 'waiting') {
-          return {
-            value: {
-              rescheduleAt: batonRun.retryAtMs,
-              detail: 'Sleeptime is waiting for the fleet maintenance baton',
-            },
-            // No summary: an attempt that never won the baton did no work, so
-            // it settles as a typed no-finding rather than a useful handoff.
-            lifecycleState: 'cancelled',
-            outcome: 'cancelled',
-            resultKind: 'none',
-          };
-        }
-        const outcome = batonRun?.result ?? await sleeptimeAgent.execute(action);
+        // Lite extraction (seam 3.9, fleet cut): the donor ran this attempt
+        // under the cross-companion fleet maintenance baton when a host passed
+        // `fleetMaintenance` (lease, checkpoints at safe boundaries, a
+        // `waiting` reschedule). The fleet coordinator is not core; this is the
+        // donor's path without it: the attempt runs at once.
+        const outcome = await sleeptimeAgent.execute(action);
         if (outcome.outcome === 'retry') {
           throw new AggregateError(
             outcome.failures.map(failure => new Error(
@@ -412,9 +386,7 @@ export function registerSchedulerOwnedPostTurnLanes(
           );
         }
         if (outcome.outcome === 'yield') {
-          const delayMs = fleetMaintenance
-            ? fleetMaintenance.retryDelayMs
-            : runtimeOptions.episodicProcessingRestWindow!.inactivityThresholdMinutes * 60_000;
+          const delayMs = runtimeOptions.episodicProcessingRestWindow!.inactivityThresholdMinutes * 60_000;
           return {
             value: {
               rescheduleAt: Date.now() + delayMs,
@@ -532,36 +504,13 @@ export function registerSchedulerOwnedPostTurnLanes(
     postTurnActions.registerHandler(
       EPISODE_SYNTHESIS_ACTION_KIND,
       async (action) => {
-        const fleetMaintenance = runtimeOptions.fleetMaintenance;
-        const batonRun = fleetMaintenance
-          ? await runWithFleetMaintenanceBaton({
-              coordinator: fleetMaintenance.coordinator,
-              leaseDurationMs: fleetMaintenance.leaseDurationMs,
-              retryDelayMs: fleetMaintenance.retryDelayMs,
-              phase: 'episode_synthesis',
-              run: control => episodeSynthesisLane.execute(action, {
-                onSafeBoundary: () => control.checkpoint({
-                  phase: 'episode_synthesis',
-                  checkpointRef: null,
-                }),
-              }),
-            })
-          : null;
-        if (batonRun?.outcome === 'waiting') {
-          return {
-            rescheduleAt: batonRun.retryAtMs,
-            detail: 'Episode synthesis is waiting for the fleet maintenance baton',
-          };
-        }
-        const outcome = batonRun?.result ?? await episodeSynthesisLane.execute(action);
+        // Lite extraction (seam 3.9, fleet cut): the donor ran the drain under
+        // the fleet maintenance baton when a host passed `fleetMaintenance`,
+        // and only that baton could make it yield. The fleet coordinator is not
+        // core; this is the donor's path without it.
+        const outcome = await episodeSynthesisLane.execute(action);
         if (outcome.outcome === 'yield') {
-          if (!fleetMaintenance) {
-            throw new Error('Episode synthesis cannot yield without fleet maintenance authority');
-          }
-          return {
-            rescheduleAt: Date.now() + fleetMaintenance.retryDelayMs,
-            detail: 'Episode synthesis yielded for fleet preemption',
-          };
+          throw new Error('Episode synthesis cannot yield without fleet maintenance authority');
         }
         return { detail: 'Episode synthesis drain completed' };
       },

@@ -27,7 +27,6 @@ import type { SleeptimeWikiPass } from '../../faculties/wiki/sleeptime-wiki-pass
 import type { AutomataClassLifecycleRuntime } from '../../faculties/automata/bus/class-lifecycle.js';
 import type { NearTurnMemoryScopeClassifierPort } from '../../faculties/memory/near-turn-memory-lane.js';
 import type { ConversationalActivityWorksetPort } from '../session/conversational-activity-workset.js';
-import type { FleetMaintenanceCoordinator } from './fleet-maintenance-coordinator.js';
 import type { FleetSlotStagger } from './types.js';
 import type { ProactiveOutboundDispatcher } from '../intention/proactive-outbound.js';
 import type { OutreachOutboxStore } from '../intention/outreach-outbox.js';
@@ -246,12 +245,10 @@ export interface ReflectionRuntimeOptions {
     | 'getEpisodesByIds'
     | 'listEpisodeArcsForEpisodes'
   > | null;
-  /** System-scoped scheduling authority for private heavy maintenance drains. */
-  fleetMaintenance?: {
-    coordinator: FleetMaintenanceCoordinator;
-    leaseDurationMs: number;
-    retryDelayMs: number;
-  };
+  // Lite extraction (seam 3.9, fleet cut): the donor's optional
+  // `fleetMaintenance` authority (a cross-companion maintenance lease
+  // coordinator plus its lease and retry durations) is removed with the fleet
+  // coordinator; sleeptime and episode synthesis take the donor's path without it.
   /** Stable fleet position for lightweight wall-clock task spreading. */
   fleetScheduleStagger?: FleetSlotStagger;
   /** Companion aliases for deterministic relevance classification. */

@@ -16,7 +16,7 @@
 
 import { parseLocalMinute } from '../../shared/time/daily-window.js';
 import type { ProactiveQuietHoursConfig } from '../intention/proactive-time-gate.js';
-import { staggerFleetOrdinalWithinWindow } from './fleet-maintenance-coordinator.js';
+import { staggerFleetOrdinalWithinWindow } from './fleet-stagger.js';
 import type { FleetSlotStagger } from './types.js';
 
 const MINUTE_MS = 60_000;
