@@ -116,3 +116,71 @@ export function capSensitivities(admitted: readonly Sensitivity[], ceiling: Sens
   const limit = SENSITIVITIES.indexOf(ceiling);
   return admitted.filter((s) => SENSITIVITIES.indexOf(s) <= limit);
 }
+
+/** Rank of a sensitivity, lowest first. */
+export function sensitivityRank(sensitivity: Sensitivity): number {
+  return SENSITIVITIES.indexOf(sensitivity);
+}
+
+/**
+ * The sensitivity class of material produced in an audience, derived from the
+ * donor's channel classification (`src/core/session/search-runtime.ts`): a
+ * private (direct) room is confidential, an invite-only small group personal,
+ * and large groups and broadcasts public. Companion-internal material is
+ * confidential. Another audience may read such material only when its own
+ * admission includes this class.
+ */
+export function audienceDisclosureClass(audience: Audience): Sensitivity {
+  switch (audience.kind) {
+    case 'self':
+    case 'direct':
+      return 'confidential';
+    case 'group':
+      return audience.room === 'small_group' ? 'personal' : 'public';
+  }
+}
+
+/** Stable key of the conversation an audience belongs to. */
+export function conversationKey(audience: Audience): string {
+  return audience.kind === 'self' ? 'self' : `channel:${audience.channelId}`;
+}
+
+/** Whether two audiences are the same conversation (same room). */
+export function sameConversation(a: Audience, b: Audience): boolean {
+  return conversationKey(a) === conversationKey(b);
+}
+
+/** Structural equality of audiences, including the direct contact. */
+export function sameAudience(a: Audience, b: Audience): boolean {
+  if (a.kind === 'self' || b.kind === 'self') return a.kind === b.kind;
+  if (a.kind === 'direct' && b.kind === 'direct') return a.channelId === b.channelId && a.contactId === b.contactId;
+  if (a.kind === 'group' && b.kind === 'group') return a.channelId === b.channelId && a.room === b.room;
+  return false;
+}
+
+/** Channel privacy labels a host may record as evidence; they never gate disclosure. */
+export const CHANNEL_PRIVACY_LEVELS = ['private', 'invite_only', 'public'] as const;
+export type ChannelPrivacy = (typeof CHANNEL_PRIVACY_LEVELS)[number];
+
+/** Who is reading: the turn's audience and admission, and whether a bounded worker reads for it. */
+export interface Viewer {
+  readonly audience: Audience;
+  readonly admitted: readonly Sensitivity[];
+  readonly worker: boolean;
+}
+
+/**
+ * Whether a viewer may read material produced in `source`. Companion-internal
+ * material stays with self turns. A principal always reads its own
+ * conversation, and companion turns read every participant conversation;
+ * otherwise, and always for workers, the viewer's admission must include the
+ * source's disclosure class.
+ */
+export function canViewerRead(viewer: Viewer, source: Audience): boolean {
+  const sourceClass = audienceDisclosureClass(source);
+  if (source.kind === 'self') {
+    return viewer.audience.kind === 'self' && (!viewer.worker || viewer.admitted.includes(sourceClass));
+  }
+  if (!viewer.worker && (viewer.audience.kind === 'self' || sameConversation(viewer.audience, source))) return true;
+  return viewer.admitted.includes(sourceClass);
+}
