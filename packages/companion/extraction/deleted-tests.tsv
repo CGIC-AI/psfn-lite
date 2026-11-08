@@ -1,0 +1,2 @@
+# donor test file	test full name (* = whole file)	reason	seam
+src/core/identity/importer.test.ts	*	Character card importer is cut (operator ruling) and @character-foundry is not an allowed package; core/identity/importer.ts is imported only by operator/garden and app/maintenance, so it was not extracted	card importer (core/identity/importer.ts:12)
