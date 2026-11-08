@@ -169,7 +169,8 @@ export async function openFileSessionArchive(layout: StorageLayout): Promise<Res
     try {
       const handle = await open(path, 'a', 0o600);
       try {
-        await handle.write(text);
+        // writeFile loops until every byte is written (a bare write may be short); 'a' appends.
+        await handle.writeFile(text);
         await handle.sync();
       } finally {
         await handle.close();
