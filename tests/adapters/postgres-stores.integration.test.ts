@@ -72,7 +72,7 @@ describe.skipIf(dockerTestsOptedOut('postgres stores'))('postgres stores', () =>
   it('migrates idempotently with pgvector and refuses drifted or unknown migrations', async () => {
     const url = await pgdb.database();
     const state = await pgdb.open(url);
-    expect(state.schemaVersion).toBe(loadMigrations().length);
+    expect(state.schemaVersion).toBe(loadMigrations().at(-1)?.version);
     const pool = new pg.Pool({ connectionString: url });
     try {
       const again = await migrate(pool);

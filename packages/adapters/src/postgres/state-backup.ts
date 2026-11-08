@@ -45,6 +45,13 @@ export const BACKED_UP_TABLES: readonly TableSpec[] = Object.freeze([
   { name: 'value_entries', orderBy: 'version' },
   { name: 'north_star_state', orderBy: 'singleton' },
   { name: 'north_star_item_versions', orderBy: 'item_id, version' },
+  { name: 'emotion_states', orderBy: 'scope_key' },
+  { name: 'emotion_observations', orderBy: 'observation_id' },
+  { name: 'emotion_appraisals', orderBy: 'seq', identity: 'seq' },
+  { name: 'emotion_self_reports', orderBy: 'seq', identity: 'seq' },
+  { name: 'concerns', orderBy: 'concern_id' },
+  { name: 'concern_events', orderBy: 'concern_id, revision' },
+  { name: 'follow_ups', orderBy: 'follow_up_id' },
   ...MEMORY_BACKED_UP_TABLES,
 ]);
 

@@ -5,10 +5,10 @@ import {
   isRecord,
   ok,
   unavailable,
-  type ActionDescriptor,
   type Result,
   type ToolDescriptor,
 } from '../shared/index.ts';
+import { permitsAction } from './action-permission.ts';
 import { resolveAction } from './tool-inventory.ts';
 import { isTrustedTurnScope, type TrustedTurnScope } from './trusted-scope.ts';
 
@@ -68,7 +68,7 @@ async function dispatch(
   const reserved = RESERVED_AUTHORITY_KEYS.filter((key) => Object.hasOwn(call.args as object, key));
   if (reserved.length > 0) return invalid(`authority cannot be passed as arguments: ${reserved.join(', ')}`);
 
-  const gate = enforceDeclaredRestrictions(scope, call, action);
+  const gate = permitsAction(scope, call.tool, call.action, action);
   if (!gate.ok) return gate;
 
   const handler = deps.handlers[call.tool]?.[call.action];
@@ -76,22 +76,4 @@ async function dispatch(
   const result = await handler(scope, call.args);
   if (!result.ok) return fail(result.error);
   return ok({ origin: { kind: 'tool_result', tool: call.tool, action: call.action }, content: result.value });
-}
-
-function enforceDeclaredRestrictions(scope: TrustedTurnScope, call: ToolCall, action: ActionDescriptor): Result<void> {
-  if (!scope.admitted.includes(action.admission)) {
-    return denied('audience_not_admitted', `${call.tool}.${call.action} requires ${action.admission} admission`);
-  }
-  if (action.restrictions.includes('foreground_only') && scope.turnKind !== 'foreground') {
-    return denied('background_turn', `${call.tool}.${call.action} is refused in background turns`);
-  }
-  if (action.restrictions.includes('self_audience_only') && scope.audience.kind !== 'self') {
-    return denied('requires_self_audience', `${call.tool}.${call.action} runs only in companion-internal turns`);
-  }
-  if (scope.caller.kind === 'worker') {
-    if (action.workers === 'denied') return denied('worker_not_permitted', `workers may not call ${call.tool}.${call.action}`);
-    const granted = scope.caller.grant.actions.some((g) => g.tool === call.tool && g.action === call.action);
-    if (!granted) return denied('worker_not_permitted', `${call.tool}.${call.action} is outside this worker's grant`);
-  }
-  return ok(undefined);
 }
