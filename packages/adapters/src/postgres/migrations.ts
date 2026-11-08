@@ -45,8 +45,13 @@ export function loadMigrations(dir: URL = MIGRATIONS_DIR): Migration[] {
       };
     })
     .sort((a, b) => a.version - b.version);
+  // Versions are unique and increasing from 0001. Parallel lanes reserve numbers, so a gap
+  // can exist until the earlier lane lands; applied-migration checks still match by order.
   migrations.forEach((migration, index) => {
-    if (migration.version !== index + 1) throw new Error(`migrations must be numbered contiguously from 0001; found ${String(migration.version)}`);
+    const previous = index === 0 ? 0 : (migrations[index - 1]?.version ?? 0);
+    if (migration.version <= previous || (index === 0 && migration.version !== 1)) {
+      throw new Error(`migrations must start at 0001 with unique increasing numbers; found ${String(migration.version)}`);
+    }
   });
   return migrations;
 }
