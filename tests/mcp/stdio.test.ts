@@ -12,6 +12,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { afterEach, describe, expect, it } from 'vitest';
 import { TOOL_INVENTORY } from '../../packages/core/src/index.ts';
 
+const ROOT = join(import.meta.dirname, '..', '..');
 const FIXTURE = join(import.meta.dirname, 'fixtures', 'stdio-server.ts');
 const ARGS = ['--import', 'tsx', FIXTURE];
 const clients: Client[] = [];
@@ -33,7 +34,7 @@ describe('stdio transport', () => {
     const creds = credentials();
     const client = new Client({ name: 'stdio-test', version: '0.0.0' });
     clients.push(client);
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: ARGS, env: environment(creds, creds.friend), stderr: 'pipe' }));
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: ARGS, cwd: ROOT, env: environment(creds, creds.friend), stderr: 'pipe' }));
     const listed = await client.listTools();
     expect(listed.tools.map((t) => t.name)).toEqual(TOOL_INVENTORY.map((t) => t.name));
 
@@ -50,7 +51,7 @@ describe('stdio transport', () => {
   it('refuses to start with an unbound credential and does not echo it', () => {
     const creds = credentials();
     const presented = randomBytes(32).toString('base64url');
-    const run = spawnSync(process.execPath, ARGS, { env: environment(creds, presented), input: '', encoding: 'utf8', timeout: 20_000 });
+    const run = spawnSync(process.execPath, ARGS, { cwd: ROOT, env: environment(creds, presented), input: '', encoding: 'utf8', timeout: 20_000 });
     expect(run.status).toBe(2);
     expect(run.stdout).toBe('');
     expect(run.stderr).toContain('unknown_authority');
