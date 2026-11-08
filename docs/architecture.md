@@ -238,8 +238,9 @@ never references the adapters.
     content becomes durable. The state component recomputes it inside the
     import transaction and rolls back on a mismatch. The history component
     verifies every backed-up chain and the fingerprint before it installs the
-    first session. A failed import leaves that target empty and the restore
-    retryable. Core then recomputes each fingerprint once more. The two
+    first session. A fingerprint mismatch in either component leaves that
+    target empty and the restore retryable. An I/O failure partway through
+    installing history sessions does not. Core then recomputes each fingerprint once more. The two
     components are still separate stores, so an I/O failure in the second
     after the first committed leaves the first restored.
   - A component that changes during the backup fails it, and the writers must
