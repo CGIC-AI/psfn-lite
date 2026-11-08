@@ -40,12 +40,12 @@
  * way: they throw rather than admit.
  */
 
-import type { IcpOwnAvailabilityResult } from '../../boundary/gateway/icp-autonomy-contract.js';
+import type { IcpOwnAvailabilityResult } from '../../shared/contracts/icp-gateway-contract.js';
 import type { IcpAvailabilityState } from '../../shared/contracts/icp-autonomy.js';
 import type {
   IcpSocialPrecedenceResolver,
   ReservationSignalContext,
-} from '../agent/arbiter/reservation-phase.js';
+} from '../../shared/contracts/speaking-arbiter-types.js';
 import type { IcpSocialPrecedenceInput } from './social-precedence.js';
 
 /** Reads the local companion's own current ICP availability lease/state. */

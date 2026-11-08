@@ -22,7 +22,7 @@ import type { InternalStateContinuityGap } from '../../self-model/internal-state
 import type { ActiveConcernContextProvider } from '../../intention/concern-store-port.js';
 import type { ActiveConcernRuntimeData } from '../../intention/concerns.js';
 import type { BehavioralPatternContextProvider } from '../../intention/patterns.js';
-import type { ChannelPromptRegistryPort } from '../../../channels/backplane/registry-port.js';
+import type { ChannelPromptRegistryPort } from '../../../shared/contracts/channel-prompt-port.js';
 import type { CapturedSessionReads } from '../../session/manager/captured-session-owner.js';
 import { resolveCompanionIdFromConfig } from '../../identity/companion-runtime.js';
 import { resolveRuntimePromptGuidanceVariables } from './prompt-runtime-helpers.js';

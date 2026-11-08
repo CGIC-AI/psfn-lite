@@ -1,4 +1,3 @@
-import type { GatewayClient } from '../../boundary/gateway/client.js';
 import type {
   IcpInitiationHandoffPrepareResult,
   IcpDyadLifecycleProjection,
@@ -6,7 +5,7 @@ import type {
   IcpOpenDyadProjection,
   IcpOwnAvailabilityResult,
   IcpPeerAvailabilityResult,
-} from '../../boundary/gateway/icp-autonomy-contract.js';
+} from '../../shared/contracts/icp-gateway-contract.js';
 import type { ContactStorePort } from '../contacts/contact-store-port.js';
 import type { Contact } from '../contacts/types.js';
 import type {
@@ -103,7 +102,7 @@ export interface IcpAgentGatewayPort {
     peerContactId: string;
     initiationSource: IcpInitiationSource;
     sourceDyadId?: string;
-  }): Promise<import('../../boundary/gateway/icp-autonomy-contract.js').IcpDyadContinuationPrepareResult>;
+  }): Promise<import('../../shared/contracts/icp-gateway-contract.js').IcpDyadContinuationPrepareResult>;
 }
 
 export interface IcpTargetChannelCommandPort {
@@ -114,13 +113,13 @@ export interface IcpTargetChannelCommandPort {
     continuationTaskKind?: IcpContinuationTaskKind;
   }): Promise<IcpCompanionOutreachExecutionResult>;
   executeContinuation?(input: {
-    authorization: import('../../boundary/gateway/icp-autonomy-contract.js').IcpDyadContinuationAuthorization;
+    authorization: import('../../shared/contracts/icp-gateway-contract.js').IcpDyadContinuationAuthorization;
     peerContactId: string;
     privateIntent: string;
     continuationTaskKind?: IcpContinuationTaskKind;
   }): Promise<IcpCompanionOutreachExecutionResult>;
   executeHumanRelay?(input: {
-    authorization: import('../../boundary/gateway/icp-autonomy-contract.js').IcpDyadContinuationAuthorization;
+    authorization: import('../../shared/contracts/icp-gateway-contract.js').IcpDyadContinuationAuthorization;
     peerContactId: string;
     capsule: import('./human-relay-capsule.js').HumanRelayIntentCapsule;
   }): Promise<IcpCompanionOutreachExecutionResult>;
@@ -237,7 +236,7 @@ function requirePermitId(value: string): string {
 
 export function createAgentFacingIcpAutonomyRuntime(input: {
   contactStore: ContactStorePort;
-  gateway: IcpAgentGatewayPort | GatewayClient;
+  gateway: IcpAgentGatewayPort;
   command: IcpTargetChannelCommandPort;
 }): AgentFacingIcpAutonomyRuntime {
   const resolveKnownPeer = async (contactId: string): Promise<KnownCompanionPeer> => {

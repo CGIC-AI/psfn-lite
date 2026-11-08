@@ -11,7 +11,7 @@ import type {
   SubstrateMessage,
   ResponseStyle,
 } from '../../../shared/contracts/runtime.js';
-import type { ApiHealthResponse } from '../../../channels/api/types.js';
+import type { ApiHealthResponse } from '../../../shared/contracts/api-health.js';
 import type { CapabilityTier } from '../../../system/config/runtime-config-contracts.js';
 import type { CapabilityToken } from '../../../system/capabilities/tokens.js';
 import type { TrustLevel } from '../../../system/trust/types.js';
@@ -101,7 +101,7 @@ import {
 import { buildSelfPresentationPromptVariables } from './runtime-context-sections/self-presentation.js';
 import { buildSatelliteEndpointContextBlock } from './runtime-context-sections/satellite.js';
 import { buildReactionSurfaceContextBlock } from './runtime-context-sections/reaction-surface.js';
-import type { ResolvedReactionSurface } from '../../../channels/shared/reaction-surface.js';
+import type { ResolvedReactionSurface } from '../../../shared/contracts/reaction-surface.js';
 import {
   buildSituatedPresenceContextBlock,
   type CoPresentCompanion,

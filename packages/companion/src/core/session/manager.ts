@@ -72,7 +72,6 @@ import {
   type ImportedHistoryBootstrapChunk,
   type ImportedHistoryBootstrapResult,
 } from './manager/import-bootstrap.js';
-import { TESTING_HARNESS_API_PRINCIPAL_ID } from '../../channels/backplane/http/auth.js';
 import {
   mirrorMessageToActiveSessions,
 } from './manager/mirroring.js';
@@ -199,6 +198,11 @@ export type {
 };
 
 const log = createComponentLogger('SessionManager');
+
+// Lite extraction (seam 3.12, channels cut): the donor imports this principal
+// id from src/channels/backplane/http/auth.ts:8 (TESTING_HARNESS_API_PRINCIPAL_ID),
+// which is not core. Inlined with the donor's value.
+const TESTING_HARNESS_API_PRINCIPAL_ID = 'testing-harness';
 
 /**
  * Initial per-channel scan depth used by listRecentlyActiveChannels to confirm

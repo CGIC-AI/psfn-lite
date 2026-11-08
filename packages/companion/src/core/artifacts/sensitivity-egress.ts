@@ -1,5 +1,7 @@
-import type { NotificationPort } from '../../boundary/gateway/notification-port.js';
-import type { NotificationSenderMetadata } from '../../boundary/gateway/notification-sender.js';
+import type {
+  NotificationPort,
+  NotificationSenderMetadata,
+} from '../../shared/contracts/notification-port.js';
 import type { Attachment } from '../../shared/contracts/runtime.js';
 import {
   artifactSensitivityRequiresApproval,
