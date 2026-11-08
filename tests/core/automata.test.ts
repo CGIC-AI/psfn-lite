@@ -249,6 +249,46 @@ describe('bounded workers', () => {
     expect(w.workerHost.sessions).toHaveLength(3);
   });
 
+  it('settles the activity even when a note lands between reading and writing it', async () => {
+    const w = await fakeActivityWorld();
+    const { scope, run, session } = await spawn(w);
+    await session.beginTurn();
+    const update = w.activities.update.bind(w.activities);
+    let raced = false;
+    w.activities.update = async (record, expectedRevision) => {
+      if (!raced && record.id === run.activityId && record.status !== 'in_progress') {
+        raced = true;
+        // The parent's note commits first, so the runner's write is stale.
+        const noted = await w.call(scope, 'activity', 'update', { activityId: run.activityId, expectedRevision, note: 'thanks' });
+        if (!noted.ok) throw new Error(JSON.stringify(noted.error));
+      }
+      return update(record, expectedRevision);
+    };
+    await finish(session, 'blocked');
+    expect(raced).toBe(true);
+    expect(w.activities.records.get(run.activityId)).toMatchObject({ status: 'failed', notes: [{ text: 'thanks' }] });
+  });
+
+  it('gives a scheduled run queued through an outage its resume before the grace window settles it', async () => {
+    const w = await fakeActivityWorld();
+    const self = await w.admit('free-time');
+    w.workerHost.refuse = true;
+    const spawned = await w.workers.spawn(self, {
+      key: 'nightly',
+      label: 'index',
+      task: 'Index the week',
+      grant: { actions: [], maxTurns: 1, maxSensitivity: 'public' },
+      trigger: 'schedule',
+    });
+    if (!spawned.ok) throw new Error(JSON.stringify(spawned.error));
+    w.workerHost.refuse = false;
+    w.clock.advance(WORKER_RESUME_GRACE_MS * 2);
+    const ticked = await w.scheduler.tick(self);
+    if (!ticked.ok) throw new Error(JSON.stringify(ticked.error));
+    expect(ticked.value.unresumedWorkers).toEqual({ ok: true, value: [] });
+    expect(w.workerRuns.runs.get(spawned.value.run.id)?.status).toBe('running');
+  });
+
   it('enforces the turn budget and honours cancellation', async () => {
     const w = await fakeActivityWorld();
     const { session, run, scope } = await spawn(w, 'primary-dm', { ...RESEARCH, maxTurns: 1 });

@@ -362,6 +362,8 @@ export function createFreeTimeService(deps: FreeTimeDeps): FreeTimeService {
       const before = await recentAcrossLanes();
       if (!before.ok) return before;
       const closed = await closeStale(before.value[0]);
+      // Another pass is closing the same stale block: leave it to that pass.
+      if (!closed.ok && closed.error.kind === 'conflict' && closed.error.reason === 'stale_revision') return ok({ lane, kind: 'skipped', reason: 'invitation_open' });
       if (!closed.ok) return closed;
       const recent = await recentAcrossLanes();
       if (!recent.ok) return recent;

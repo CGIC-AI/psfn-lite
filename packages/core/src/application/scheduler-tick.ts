@@ -1,5 +1,5 @@
 import { FREE_TIME_LANES } from '../scheduler/index.ts';
-import { denied, ok, type Result } from '../shared/index.ts';
+import { denied, ok, type Result, type WorkerRunId } from '../shared/index.ts';
 import type { CareReminderService, ReminderDeliveryReport } from './care-reminder-service.ts';
 import type { FreeTimeRunReport, FreeTimeService } from './free-time-service.ts';
 import type { ScheduleRunReport, ScheduleService } from './schedule-service.ts';
@@ -10,6 +10,8 @@ import type { SweepReport, WorkerRunner } from './worker-runner.ts';
 export interface SchedulerTickReport {
   readonly workers: Result<SweepReport>;
   readonly resumedWorkers: Result<number>;
+  /** Queued runs nothing drove within the grace window, settled as `not_resumed` after this tick's resume. */
+  readonly unresumedWorkers: Result<readonly WorkerRunId[]>;
   readonly reminders: Result<ReminderDeliveryReport>;
   readonly schedule: Result<ScheduleRunReport>;
   readonly freeTime: readonly Result<FreeTimeRunReport>[];
@@ -23,7 +25,7 @@ export interface SchedulerTick {
 /**
  * The scheduler pass the host runs on a timer: recover expired worker
  * attempts and resume queued scheduled workers through the shared runner,
- * deliver due care reminders, run due self-prompts and reflection templates,
+ * settle queued runs nothing drove within the grace window, deliver due care reminders, run due self-prompts and reflection templates,
  * then offer free time on each lane through its deterministic gate.
  */
 export function createSchedulerTick(deps: {
@@ -39,11 +41,12 @@ export function createSchedulerTick(deps: {
       }
       const workers = await deps.workers.sweep();
       const resumed = await deps.workers.resume(scope);
+      const unresumedWorkers = await deps.workers.settleUnresumed();
       const reminders = await deps.reminders.deliverDue(scope);
       const schedule = await deps.schedule.runDue(scope);
       const freeTime: Result<FreeTimeRunReport>[] = [];
       for (const lane of FREE_TIME_LANES) freeTime.push(await deps.freeTime.runLane(scope, lane));
-      return ok({ workers, resumedWorkers: resumed.ok ? ok(resumed.value.length) : resumed, reminders, schedule, freeTime });
+      return ok({ workers, resumedWorkers: resumed.ok ? ok(resumed.value.length) : resumed, unresumedWorkers, reminders, schedule, freeTime });
     },
   };
 }
