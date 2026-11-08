@@ -64,7 +64,6 @@ import {
 } from '../../fatigue/human-attention-pressure.js';
 import type { ResolvedAuthorContext, UserRuntimeProfile } from '../runtime-context.js';
 import { renderBackgroundCompletionsBlock } from '../../completion-notices.js';
-import { renderCanaryPromptMarker } from '../../../cogsec/canary/canary-token.js';
 import type { TurnExecutionObservability } from './observability.js';
 import type { TurnExecutionRuntime, TurnSessionIdentity } from './contracts.js';
 import type { CapturedSessionReads } from '../../../session/manager/captured-session-owner.js';
@@ -253,13 +252,6 @@ export async function assembleTurnPrompt(input: {
   turnCorrelationBase: CorrelationMetadata;
   turnCallType: ObservabilityCallType;
   turnSnapshot: TurnSnapshot;
-  /**
-   * htm9.18 per-session canary token. Planted as an inert session-stable block
-   * in privileged prompt material; if it later surfaces at the gateway egress
-   * boundary the outbound action is held (prompt-leak tripwire). Absent ⇒ no
-   * canary is planted this turn (e.g. custom-prompt override paths).
-   */
-  canaryToken?: string;
   currentSessionEntryId: number | null;
   memoryManifestSeed: ContextManifestMemorySeed | undefined;
   fatigue?: FatigueEnforcementMetadata;
@@ -299,7 +291,6 @@ export async function assembleTurnPrompt(input: {
     memoryManifestSeed,
     fatigue,
     humanAttentionPressure,
-    canaryToken,
     getRetrievalProvenanceRefs,
     getObservedTurnRetrievals,
     observability,
@@ -527,21 +518,6 @@ export async function assembleTurnPrompt(input: {
         ? { scopeKey: prefixScope.scopeKey }
         : {}),
       renderedText: promptPrefix,
-    }));
-  }
-  // htm9.18 canary: an inert, per-session marker planted in privileged prompt
-  // material. It is 'session_stable' (stable across a session's turns, rotates
-  // per session) and sits AFTER the frozen static prefix so it never churns the
-  // cross-session static-prefix render/provider cache — the per-session
-  // session-stable region is already session-bound.
-  if (canaryToken) {
-    planBlocks.push(createPromptPlanBlock({
-      id: 'cogsec.canary',
-      layer: 'prompt_stack',
-      volatility: 'session_stable',
-      producer: 'cogsec.canary',
-      scopeKey: 'global',
-      renderedText: renderCanaryPromptMarker(canaryToken),
     }));
   }
   if (renderedDynamicSuffix.trim().length > 0) {

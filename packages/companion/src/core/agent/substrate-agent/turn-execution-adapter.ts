@@ -44,10 +44,6 @@ import type { NotificationPort } from '../../../boundary/gateway/notification-po
 import type { Attachment } from '../../../shared/contracts/runtime.js';
 import type { ArtifactEgressDestination } from '../../artifacts/sensitivity-egress.js';
 import type { DisclosureLineage } from '../../cogsec/disclosure/contracts.js';
-import type {
-  ActiveTurnEgressCustody,
-  EgressDeliveryRecorder,
-} from '../../cogsec/disclosure/index.js';
 import type { ProviderRuntime } from '../../../primitives/llm/provider-runtime.js';
 
 import type { ViewerCeiling } from '../../session/viewer-ceiling.js';
@@ -115,8 +111,6 @@ interface TurnExecutionAdapterCallbacks {
   ) => Promise<void>;
   setCurrentTurnDisclosureLineage: (lineage: DisclosureLineage) => void;
   getCurrentTurnDisclosureLineage: () => DisclosureLineage | undefined;
-  setCurrentTurnEgressCustody: (custody: ActiveTurnEgressCustody | null) => void;
-  getEgressDeliveryRecorder: () => EgressDeliveryRecorder | null;
   buildRuntimeContext: (
     message: SubstrateMessage,
     resolvedUserName: string,
@@ -413,13 +407,6 @@ export function createTurnExecutionRuntimeAdapter(
       options.callbacks.setCurrentTurnDisclosureLineage(lineage),
     getCurrentTurnDisclosureLineage: () =>
       options.callbacks.getCurrentTurnDisclosureLineage(),
-    setCurrentTurnEgressCustody: (custody) =>
-      options.callbacks.setCurrentTurnEgressCustody(custody),
-    getEgressDeliveryRecorder: () => options.callbacks.getEgressDeliveryRecorder(),
-    recordTurnCustodySnapshot: (input) =>
-      options.turnSupportRuntime.recordTurnCustodySnapshot(input),
-    recordTurnContextManifest: (input) =>
-      options.turnSupportRuntime.recordTurnContextManifest(input),
     buildRuntimeContext: (
       message,
       resolvedUserName,

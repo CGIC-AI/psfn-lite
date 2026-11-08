@@ -17,7 +17,7 @@ import {
   type InternalState,
 } from '../../self-model/state.js';
 import { extractRelayAcacAxisScores } from '../../emotion/relay-emotion-snapshot.js';
-import { classifyChannelDisclosure, type ChannelMeta } from '../../../system/trust/policy.js';
+import type { ChannelMeta } from '../../../system/trust/policy.js';
 import { currentChannelClassificationEpoch } from '../../../system/trust/runtime-classification-epochs.js';
 import type {
   AgentResponse,
@@ -52,18 +52,9 @@ import {
   type PendingPaidDeliverable,
 } from '../../../shared/paid-deliverable-tracking.js';
 import {
-  SessionCanaryRegistry,
-  runWithCanaryContext,
-} from '../../cogsec/canary/canary-token.js';
-import { recordReplyCanaryToken } from '../../cogsec/canary/reply-canary.js';
-import {
   DISCLOSURE_CLASSIFIER_VERSION,
   buildGenerationDisclosureLineage,
 } from '../../cogsec/disclosure/generation-lineage.js';
-import {
-  turnEgressCustodyProof,
-  type TurnEgressCustodyProof,
-} from '../../cogsec/disclosure/index.js';
 import { runWithMcpTurnDisclosureContext } from '../../cogsec/disclosure/mcp-turn-context.js';
 import {
   mergeChargedImageDeliverableSummaries,
@@ -157,11 +148,6 @@ export type {
 } from './turn-execution/contracts.js';
 
 const log = createComponentLogger('SubstrateAgent');
-
-// htm9.18: process-scoped per-session canary registry. Keyed by the session
-// channel id so the same token is planted on every turn of a session and
-// rotates when a new session begins.
-const sessionCanaryRegistry = new SessionCanaryRegistry();
 
 function assertForegroundWorkOwned(lease: ForegroundWorkLease | null): void {
   if (!lease?.signal.aborted) return;
@@ -725,16 +711,12 @@ export async function handleMessageForTurn(
   let userSessionEntryId = preparedUserSessionEntryId;
   let assistantSessionEntryId: number | null = null;
   let internalStateSnapshotRef: string | undefined;
-  // Resolvable reference to this turn's durable custody snapshot
-  // (psfn-framework-ccgdz.1). Absent until the generation context is folded and
-  // recorded; absent thereafter only when the write failed visibly.
-  let custodySnapshotRef: string | undefined;
+  // Lite extraction (seam 3.6): the durable custody snapshot and context
+  // manifest are cut. These keep the donor's no-custody-store result
+  // (TurnSupportRuntime.recordTurnCustodySnapshot without a store): no
+  // snapshot ref and no context manifest ref, as a donor deployment with no
+  // custody store records them.
   let custodySnapshotAbsence: TurnCustodySnapshotAbsenceReason | undefined;
-  let contextManifestRef: string | undefined;
-  // ccgdz.6: the content-free custody proof handed to whatever delivers this
-  // turn's output — the autonomous reply sender, artifact egress, the tool
-  // guard. Undefined until the lineage is folded and the snapshot write settles.
-  let turnEgressCustody: TurnEgressCustodyProof | undefined;
   // ccgdz.5: the observed tool results' custody edges, keyed by the lineage ref
   // they fold into. Empty until tool observations are recorded.
   let toolResultCustody: ReadonlyMap<string, TurnToolResultCustodyRecord> = new Map();
@@ -1070,17 +1052,6 @@ export async function handleMessageForTurn(
       toolTurnOutcome,
     );
     const responseStyle = runtime.resolveResponseStyle(message, channelType, channelMeta);
-    // htm9.18: the canonical CogSec mode is always armed (shadow/boundary/
-    // strict), so a turn-scoped canary carrier is always registered; shadow
-    // observes, boundary/strict may hold at the egress sink.
-    const canaryToken = sessionCanaryRegistry.ensure(emotionSessionId);
-    // d269: when this turn was initiated by a reply-bearing reverse-RPC call
-    // (voice.handleMessage / voice.transcript.end / api.chat.completion), record
-    // the token into the ambient reply capture so the reply result carries the
-    // carrier back to the gateway reply guard. No-op outside such a capture.
-    if (canaryToken) {
-      recordReplyCanaryToken(canaryToken);
-    }
     const promptAssemblyStartedAt = performance.now();
     const promptAssembly = await assembleTurnPrompt({
       runtime,
@@ -1114,7 +1085,6 @@ export async function handleMessageForTurn(
       memoryManifestSeed: preTurnState.memoryManifestSeed ?? observability.getMemoryManifestSeed(),
       ...(fatigueDecision ? { fatigue: fatigueDecision.metadata } : {}),
       ...(humanAttentionPressure ? { humanAttentionPressure } : {}),
-      ...(canaryToken ? { canaryToken } : {}),
       getRetrievalProvenanceRefs: observability.getRetrievalProvenanceRefs,
       getObservedTurnRetrievals: observability.getObservedTurnRetrievals,
       observability,
@@ -1143,14 +1113,6 @@ export async function handleMessageForTurn(
         wikiSources: preTurnState.disclosureWikiSources,
         toolResultSources: [],
       }));
-      // ccgdz.6: publish the turn CORRELATION beside that lineage, before the
-      // model can call an egress tool. The custody snapshot itself is folded
-      // after the tool loop returns, so a mid-turn send cannot cite a ref — but
-      // it must still bind its delivery record to the turn whose lineage
-      // authorized it. Without this, every in-turn tool egress reached its
-      // record-first commit with no correlation key at all and a
-      // proof-requiring destination was refused as a custody-store outage.
-      runtime.setCurrentTurnEgressCustody({ turnId });
     }
 
     const promptStageStart = Date.now();
@@ -1191,8 +1153,6 @@ export async function handleMessageForTurn(
         pendingPaidDeliverables = scopedPendingPaidDeliverables;
       }
     });
-    // Shadow/enforce carry the marker for observation. Off bypasses the async
-    // canary context entirely so gateway client calls remain byte-identical.
     const recoveredInvocationResult: AgentInvocationResult | null = recoveredResponse
       ? {
           firstTokenAt: null,
@@ -1214,12 +1174,9 @@ export async function handleMessageForTurn(
           turnIntent: null,
         }
       : null;
-    const invokeWithCanary = () => canaryToken
-      ? runWithCanaryContext(canaryToken, invokeWithPaidDeliverableTracking)
-      : invokeWithPaidDeliverableTracking();
     const invokeWithMcpDisclosure = () => runWithMcpTurnDisclosureContext({
       getLineage: runtime.getCurrentTurnDisclosureLineage,
-    }, invokeWithCanary);
+    }, invokeWithPaidDeliverableTracking);
     assertForegroundWorkOwned(foregroundLease);
     const invocationResult = recoveredInvocationResult ?? await invokeWithCompanionSocialCharge({
       chargePolicy: runtime.config.chargePolicy,
@@ -1461,51 +1418,11 @@ export async function handleMessageForTurn(
     // destination check over it for outbound social sends this turn. Until this
     // point the guard sees no lineage and fails closed for outward destinations.
     runtime.setCurrentTurnDisclosureLineage(generationDisclosureLineage);
-    // ccgdz.1: record-first. The custody snapshot is written HERE — after the
-    // fold and before the reply is composed — so the durable proof of which
-    // sources were admitted into this generation exists before anything can be
-    // delivered on the strength of it. The write is content-free and never
-    // throws; a failure leaves the ref absent so a missing chain reads as
-    // missing rather than as proof.
-    const custodyOutcome = await runtime.recordTurnCustodySnapshot({
-      lineage: generationDisclosureLineage,
-      turnId,
-      requestId,
-      toolResultEdges: new Map(
-        [...toolResultCustody].map(([ref, record]) => [ref, record.custody]),
-      ),
-    });
-    if ('ref' in custodyOutcome) {
-      custodySnapshotRef = custodyOutcome.ref;
-    } else {
-      custodySnapshotAbsence = custodyOutcome.absenceReason;
-    }
-    // ccgdz.4: the per-block source manifest is written beside the snapshot,
-    // under the same `turn:<turnId>` key. It is what makes
-    // `TurnRecord.contextManifestRef` a reference that resolves instead of the
-    // synthesized display string it replaced.
-    contextManifestRef = await runtime.recordTurnContextManifest({
-      turnId,
-      requestId,
-      blocks: promptAssembly.plan.blocks.map(block => ({
-        id: block.id,
-        layer: block.layer,
-        volatility: block.volatility,
-        producer: block.producer,
-        ...(block.scopeKey ? { scopeKey: block.scopeKey } : {}),
-        tokensEst: block.tokensEst,
-        renderedText: block.renderedText,
-        ...(block.sources ? { sources: block.sources } : {}),
-      })),
-    });
-    // ccgdz.6: publish the durable proof (ref + the lineage facts the hold
-    // rules read) so an outward egress later in this turn can be held when the
-    // chain is incomplete, and so its delivery record is keyed to this turn.
-    turnEgressCustody = turnEgressCustodyProof(generationDisclosureLineage, custodySnapshotRef);
-    // Upgrades the correlation published before generation into the folded
-    // proof: from here on an egress cites the durable snapshot, not a pending
-    // one, and a post-fold deliverer reads this exact state.
-    runtime.setCurrentTurnEgressCustody({ turnId, proof: turnEgressCustody });
+    // Lite extraction (seam 3.6): no custody store is wired, so the turn
+    // records the donor's no-store absence (TurnSupportRuntime
+    // .recordTurnCustodySnapshot: `if (!store) return { absenceReason:
+    // 'no_custody_store' }`) and no context manifest ref.
+    custodySnapshotAbsence = 'no_custody_store';
     let responseAttachments = honorNoReply
       ? []
       : recoveredResponse?.attachments
@@ -1542,24 +1459,10 @@ export async function handleMessageForTurn(
                 ? 'conversation'
                 : 'external',
       };
-      const artifactEgressRecorder = runtime.getEgressDeliveryRecorder();
       const egressDeps = {
         approvalQueue: runtime.artifactApprovalQueue,
         notifier: runtime.artifactApprovalNotifier,
         readCurrentClassifications: readGeneratedImageSensitivityClassifications,
-        // ccgdz.6: outward file/image egress carries the same chain-of-custody
-        // requirement as text. The proof is this run's, so a recovered turn is
-        // re-checked rather than inheriting the interrupted run's release.
-        ...(artifactEgressRecorder
-          ? {
-            custody: {
-              recorder: artifactEgressRecorder,
-              turnId,
-              proof: turnEgressCustody,
-              resolveChannel: (channelId: string) => classifyChannelDisclosure(channelId),
-            },
-          }
-          : {}),
         executeApprovedShare: async (
           approvedAttachments: readonly Attachment[],
           approvedDestination: ArtifactEgressDestination,
@@ -1594,22 +1497,6 @@ export async function handleMessageForTurn(
           'artifact_egress_approval',
           turnSessionIdentity.sourceChannelId,
         );
-      }
-      if (egress.disposition === 'held') {
-        // Not an approval decision: the chain of custody for this share is
-        // incomplete, so there is nothing an operator could approve yet.
-        runtime.sessionManager.appendSystemNote(
-          turnSessionIdentity.logicalSessionId,
-          'Artifact share held because its chain of custody is incomplete '
-            + `(${egress.holdReason}); the artifact remains in the personal gallery.`,
-          'artifact_egress_custody_hold',
-          turnSessionIdentity.sourceChannelId,
-        );
-        log.warn('Artifact egress held by the fail-closed provenance rule', {
-          turnId,
-          requestId,
-          holdReason: egress.holdReason,
-        });
       }
     }
 
@@ -1992,9 +1879,7 @@ export async function handleMessageForTurn(
       turnBudgetCharacteristics,
       observability,
       persistedUserMessageContent,
-      ...(custodySnapshotRef ? { custodySnapshotRef } : {}),
       ...(custodySnapshotAbsence ? { custodySnapshotAbsence } : {}),
-      ...(contextManifestRef ? { contextManifestRef } : {}),
       toolResultCustody,
       onTurnRecordPersisted: () => {
         completedTurnRecordState.persisted = true;
@@ -2127,9 +2012,7 @@ export async function handleMessageForTurn(
           ...(observability.getObservedTurnSnapshot() ? { snapshot: observability.getObservedTurnSnapshot() } : {}),
         },
         ...(internalStateSnapshotRef ? { internalStateSnapshotRef } : {}),
-        ...(custodySnapshotRef ? { custodySnapshotRef } : {}),
         ...(custodySnapshotAbsence ? { custodySnapshotAbsence } : {}),
-        ...(contextManifestRef ? { contextManifestRef } : {}),
         toolResultCustody,
       }, sessionReads));
     }

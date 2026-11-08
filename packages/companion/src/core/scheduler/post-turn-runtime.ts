@@ -70,7 +70,6 @@ function outwardQuietHours(
 
 export {
   CONTACT_TRUST_DRIFT_REVIEW_OPERATION_ID,
-  DRIFT_VELOCITY_REVIEW_OPERATION_ID,
   SLEEPTIME_REST_WINDOW_OPERATION_ID,
 } from './post-turn-runtime/scheduler-lanes.js';
 import { staggerQuietHoursRelease } from './quiet-hours-release-stagger.js';

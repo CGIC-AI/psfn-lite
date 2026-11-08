@@ -13,7 +13,18 @@ import type {
   CogSecAgentVisibleEvent,
   CogSecOperatorVisibleEvent,
 } from '../../../../core/cogsec/safe-log.js';
-import type { CogSecL0TombstoneResult } from '../../../../persistence/sessions/store.js';
+// Lite extraction (seam 3.6): the session store's CogSec tombstone write path
+// is cut; this vendored Garden type keeps the donor's result shape
+// (persistence/sessions/store/cogsec-operations.ts) until Garden leaves (B7).
+interface CogSecL0TombstoneResult {
+  caseId: string;
+  sourceChannelId: string;
+  logicalSessionId: string;
+  tombstonedL0RowCount: number;
+  tombstonedMessageIds: number[];
+  sealedForensicPayloadRef?: string;
+  sealedForensicPayloadHash?: string;
+}
 import type { CogSecRevocationResult } from '../../../../core/cogsec/revocation.js';
 import type { CogSecRegenerationResult } from '../../../../core/cogsec/regeneration.js';
 import type { TurnRecord } from '../../../../shared/contracts/runtime.js';

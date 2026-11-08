@@ -100,17 +100,6 @@ import {
   type StartupTombstoneAuthorityPrimeReport,
 } from './store/startup-tombstone-authority.js';
 import { SessionTailOperations } from './store/tail-operations.js';
-import {
-  buildCogSecTombstoneDiagnostics,
-  SessionCogSecOperations,
-  type CogSecCompactionInvalidationOptions,
-  type CogSecCompactionInvalidationResult,
-  type CogSecCompactionRegenerationOptions,
-  type CogSecCompactionRegenerationResult,
-  type CogSecL0TombstoneOptions,
-  type CogSecL0TombstoneResult,
-  type CogSecTombstoneDiagnostic,
-} from './store/cogsec-operations.js';
 import { SessionCursorOperations } from './store/cursor-operations.js';
 import type { LatestSessionSummary, SessionActivitySummary } from './store/cursor-operations.js';
 import type {
@@ -136,15 +125,6 @@ export type {
   SessionIntegrityProvider,
   SessionStoreOptions,
 } from './store-primitives.js';
-export type {
-  CogSecCompactionInvalidationOptions,
-  CogSecCompactionInvalidationResult,
-  CogSecCompactionRegenerationOptions,
-  CogSecCompactionRegenerationResult,
-  CogSecL0TombstoneOptions,
-  CogSecL0TombstoneResult,
-  CogSecTombstoneDiagnostic,
-} from './store/cogsec-operations.js';
 
 
 
@@ -199,7 +179,6 @@ export class SessionStore implements TranscriptSearchPort {
   private journalRuntime: SessionJournalRuntime;
   private channelIndexFailureLogged = false;
   private readonly tailOperations: SessionTailOperations;
-  private readonly cogSecOperations: SessionCogSecOperations;
   private readonly cursorOperations: SessionCursorOperations;
   private readonly automataRetentionWriteBarrier:
     NonNullable<SessionStoreOptions['automataRetentionWriteBarrier']> | null;
@@ -285,18 +264,6 @@ export class SessionStore implements TranscriptSearchPort {
     this.captureStartupTurnTombstoneBaseline();
     this.backfillTranscriptProjectionFromDisk();
     this.channelIndexFingerprint = this.fingerprintChannelIndex();
-    this.cogSecOperations = new SessionCogSecOperations({
-      journalRuntime: this.journalRuntime,
-      bumpSessionTailEpoch: this.tailOperations.bumpSessionTailEpoch.bind(this.tailOperations),
-      withPostRewriteTailFence: this.tailOperations.withPostRewriteTailFence.bind(this.tailOperations),
-      withLockedExistingChannelWrite: this.withLockedExistingChannelWrite.bind(this),
-      readJournalChain: this.readJournalChain.bind(this),
-      loadJournalChain: this.loadJournalChain.bind(this),
-      syncTranscriptProjectionForChannel: this.syncTranscriptProjectionForChannel.bind(this),
-      resolveCacheSessionKey: this.resolveCacheSessionKey.bind(this),
-      setChannelCache: this.setChannelCache.bind(this),
-      upsertChannelIndex: this.upsertChannelIndex.bind(this),
-    });
     this.turnRecordOperations = new SessionTurnRecordOperations({
       sessionsDir: this.sessionsDir,
       journalRuntime: this.journalRuntime,
@@ -1241,31 +1208,6 @@ export class SessionStore implements TranscriptSearchPort {
     };
   }
 
-  async applyCogSecTombstones(options: CogSecL0TombstoneOptions): Promise<CogSecL0TombstoneResult> {
-    return this.cogSecOperations.applyCogSecTombstones(options);
-  }
-  listCogSecTombstoneDiagnostics(options: { channelId?: string } = {}): CogSecTombstoneDiagnostic[] {
-    const targets = options.channelId
-      ? [options.channelId]
-      : this.listChannels().map(channel => channel.sessionId);
-    const inputs = [];
-    for (const target of targets) {
-      const cache = this.ensureChannelFullyLoaded(target);
-      if (!cache) continue;
-      inputs.push({ channelId: cache.channelId, entries: cache.entries });
-    }
-    return buildCogSecTombstoneDiagnostics(inputs);
-  }
-  async applyCogSecCompactionInvalidations(
-    options: CogSecCompactionInvalidationOptions,
-  ): Promise<CogSecCompactionInvalidationResult> {
-    return this.cogSecOperations.applyCogSecCompactionInvalidations(options);
-  }
-  async applyCogSecCompactionRegenerations(
-    options: CogSecCompactionRegenerationOptions,
-  ): Promise<CogSecCompactionRegenerationResult> {
-    return this.cogSecOperations.applyCogSecCompactionRegenerations(options);
-  }
   /**
    * Longest prefix that a scalar compaction boundary may safely cover.
    * Read projections override this when they can temporarily hide a row that
@@ -1362,7 +1304,7 @@ export class SessionStore implements TranscriptSearchPort {
     // Second fence AFTER the tombstone landed, exception-safe: closes the
     // race where another process repopulated the post-bump epoch from a
     // pre-tombstone journal read, even when a post-journal step (cache
-    // rebuild, index/projection sync) throws (see applyCogSecTombstones).
+    // rebuild, index/projection sync) throws.
     await this.tailOperations.withPostRewriteTailFence(channelId, `turn_tombstone_${action}`, (markRewritten) => this.withLockedChannelWrite(
       channelId,
       {
