@@ -1,6 +1,6 @@
-import type { ChannelPromptRegistryPort } from '../../../channels/backplane/registry-port.js';
-import type { ChannelPromptDock } from '../../../channels/backplane/types.js';
-import type { ResolvedReactionSurface } from '../../../channels/shared/reaction-surface.js';
+import type { ChannelPromptRegistryPort } from '../../../shared/contracts/channel-prompt-port.js';
+import type { ChannelPromptDock } from '../../../shared/contracts/channel-prompt-port.js';
+import type { ResolvedReactionSurface } from '../../../shared/contracts/reaction-surface.js';
 import {
   isIcpContinuationTaskKind,
   type SubstrateMessage,

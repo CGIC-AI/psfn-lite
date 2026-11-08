@@ -40,7 +40,7 @@ import type { HumanAttentionPressurePort } from '../fatigue/human-attention-pres
 import type { IcpFatigueRegulationReservationPort } from '../fatigue/regulation-reservation.js';
 import type { IntakeFirewallMode } from '../../../system/config/intake-policy-config.js';
 import type { ApprovalQueuePort } from '../../../system/capabilities/approval-queue-port.js';
-import type { NotificationPort } from '../../../boundary/gateway/notification-port.js';
+import type { NotificationPort } from '../../../shared/contracts/notification-port.js';
 import type { Attachment } from '../../../shared/contracts/runtime.js';
 import type { ArtifactEgressDestination } from '../../artifacts/sensitivity-egress.js';
 import type { DisclosureLineage } from '../../cogsec/disclosure/contracts.js';

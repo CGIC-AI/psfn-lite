@@ -1,7 +1,3 @@
-import type {
-  ChannelAdapterManifestEntry,
-  ChannelAdapterPort,
-} from '../../channels/backplane/types.js';
 import type { SubstrateMessage } from '../../shared/contracts/runtime.js';
 import type { SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
 import type {
@@ -50,16 +46,16 @@ export interface SatellitePresencePort {
   resolveCanonicalSatellite(value: unknown): SatellitePresenceMetadata | undefined;
 }
 
-export interface SatelliteChannelAdapterPort {
-  manifest: ChannelAdapterManifestEntry;
-  create(): Promise<ChannelAdapterPort> | ChannelAdapterPort;
-}
-
+// Lite extraction (seam 3.12, channels cut): the donor's
+// SatelliteChannelAdapterPort (a satellite's channel adapter factory,
+// `{ manifest: ChannelAdapterManifestEntry; create(): ChannelAdapterPort }`)
+// and the `channel?` facet below are removed. Both are typed by the channel
+// backplane, which is not core, and nothing in the donor tree at e6a9546
+// references either declaration.
 export interface SatelliteAdapterPort {
   id: string;
   routing?: SatelliteRoutingPort;
   presence?: SatellitePresencePort;
-  channel?: SatelliteChannelAdapterPort;
 }
 
 export function createNoopSatelliteRoutingPort(): SatelliteRoutingPort {

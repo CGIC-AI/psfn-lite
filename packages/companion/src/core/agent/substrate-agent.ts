@@ -46,8 +46,8 @@ import {
 } from '../../system/trust/policy.js';
 import type { DisclosureLineage } from '../cogsec/disclosure/contracts.js';
 import { applyAdmittedToolResultDisclosureFloor } from '../cogsec/disclosure/mcp-turn-context.js';
-import type { ChannelPromptRegistryPort } from '../../channels/backplane/registry-port.js';
-import type { MessageHandlerOptions } from '../../channels/backplane/types.js';
+import type { ChannelPromptRegistryPort } from '../../shared/contracts/channel-prompt-port.js';
+import type { MessageHandlerOptions } from '../../shared/contracts/channel-prompt-port.js';
 import type { PromptComposer } from '../identity/prompt-composer.js';
 import {
   createSubstrateStreamFn,
@@ -80,7 +80,7 @@ import {
   type CapabilityAccess,
   type EgressToolGuard,
 } from '../../system/capabilities/gate.js';
-import type { PreToolHookGate } from '../../boundary/gateway/pre-tool-hook.js';
+import type { PreToolHookGate } from '../../system/capabilities/pre-tool-hook.js';
 import { assertToolCapabilityRequirementDeclared } from '../../system/capabilities/requirements.js';
 import { isCanonicalFirstPartyToolName } from './tool-surface/registry.js';
 import type { ToolUsageRanking } from './tool-surface/usage-ranking.js';
@@ -196,7 +196,7 @@ import {
 } from './substrate-agent/tool-runtime-facade.js';
 import { createResponseControlTool } from './no-reply-tool.js';
 import type { ApprovalQueuePort } from '../../system/capabilities/approval-queue-port.js';
-import type { NotificationPort } from '../../boundary/gateway/notification-port.js';
+import type { NotificationPort } from '../../shared/contracts/notification-port.js';
 import type { ArtifactEgressDestination } from '../artifacts/sensitivity-egress.js';
 import { TurnSupportRuntime } from './substrate-agent/turn-support-runtime.js';
 import {

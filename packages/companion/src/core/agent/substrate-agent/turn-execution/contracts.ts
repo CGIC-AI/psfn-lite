@@ -63,7 +63,7 @@ import type {
 } from '../runtime-context.js';
 import type { ToolTurnOutcome } from '../tool-runtime-contracts.js';
 import type { ApprovalQueuePort } from '../../../../system/capabilities/approval-queue-port.js';
-import type { NotificationPort } from '../../../../boundary/gateway/notification-port.js';
+import type { NotificationPort } from '../../../../shared/contracts/notification-port.js';
 import type { ArtifactEgressDestination } from '../../../artifacts/sensitivity-egress.js';
 import type { PromptCacheTurnRuntime } from './prompt-cache-runtime.js';
 import type { CompletionNoticeBuffer } from '../../completion-notices.js';

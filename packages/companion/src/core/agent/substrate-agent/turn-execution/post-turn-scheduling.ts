@@ -3,7 +3,6 @@ import {
   collectGeneratedImageAttachments,
   type GeneratedImageGalleryContext,
 } from '../generated-media-stub.js';
-import { emitCompanionArtifactCreatedEvents } from '../../../../channels/backplane/companion-relay/artifact-emission.js';
 import type {
   AgentResponse,
   CorrelationMetadata,
@@ -20,8 +19,6 @@ import {
   type ContextBudgetTurnCharacteristics,
 } from '../../../../shared/context-budget.js';
 import { countTokens } from '../../../../primitives/llm/tokens.js';
-import { createComponentLogger } from '../../../../shared/logger.js';
-import { toErrorMessage } from '../../../../shared/utils/errors.js';
 import { buildTurnSubsystemProjectionRef } from '../../../../shared/contracts/subsystem-output-refs.js';
 import type { ChannelMeta } from '../../../../system/trust/policy.js';
 import type { TrustLevel } from '../../../../system/trust/types.js';
@@ -46,8 +43,6 @@ import type { TurnExecutionRuntime, TurnSessionIdentity } from './contracts.js';
 import type { TurnToolResultCustodyRecord } from '../turn-tool-result-custody.js';
 import type { CapturedSessionReads } from '../../../session/manager/captured-session-owner.js';
 
-const log = createComponentLogger('SubstrateAgent');
-
 export async function collectTurnResponseAttachments(input: {
   runtime: TurnExecutionRuntime;
   turnMessages: AgentMessage[];
@@ -60,22 +55,12 @@ export async function collectTurnResponseAttachments(input: {
     paidDeliverables: input.paidDeliverables,
     galleryContext: input.galleryContext,
   });
-  if (attachments.length > 0) {
-    // Companion relay artifact announcement choke point (w9hj.1): redacted at
-    // emission; never blocks the outbound reply.
-    try {
-      await emitCompanionArtifactCreatedEvents({
-        eventBus: input.runtime.eventBus,
-        attachments,
-        ...(input.galleryContext?.channelId ? { channelId: input.galleryContext.channelId } : {}),
-      });
-    } catch (error) {
-      log.error('Failed to emit companion artifact events', {
-        channelId: input.galleryContext?.channelId,
-        error: toErrorMessage(error),
-      });
-    }
-  }
+  // Lite extraction (seam 3.12, channels cut): the donor announced collected
+  // attachments here as `companion.artifact.created` events for the companion
+  // relay (channels/backplane/companion-relay/artifact-emission.ts). The relay
+  // is not core, and since the images cut (seam 3.13) the collector above
+  // always returns [], so the donor's `attachments.length > 0` branch could
+  // not run; it is removed.
   return attachments;
 }
 
