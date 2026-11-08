@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { CoreBlock, NorthStarItem, ValueEntry } from '../../packages/core/src/index.ts';
+import { deriveWorkerScope, type CoreBlock, type NorthStarItem, type ValueEntry } from '../../packages/core/src/index.ts';
 import { continuityWorld, OPERATOR } from './continuity-world.ts';
+import { id } from './fakes.ts';
 
 const errorOf = (result: { ok: boolean; error?: unknown }) => (result.ok ? 'ok' : result.error);
 const blockText = (content: unknown, name: string) => (content as CoreBlock[]).find((b) => b.name === name)?.text;
@@ -33,6 +34,21 @@ describe('orientation blocks', () => {
     const reoriented = await world.call(primary, 'orient', 'reorient', { persona: 'steady', human: 'Robin', goals: 'help with the move' });
     expect(reoriented.ok && (reoriented.value.content as CoreBlock[]).map((b) => b.text)).toEqual(['steady', 'Robin', 'help with the move']);
     expect(errorOf(await world.call(await world.admit('free-time'), 'orient', 'view'))).toMatchObject({ kind: 'invalid' });
+  });
+
+  it('shows a worker a conversation\'s blocks only where its grant admits that conversation', async () => {
+    const world = await continuityWorld();
+    const primary = await world.admit('primary-dm');
+    await world.call(primary, 'orient', 'append', { block: 'human', text: 'Robin is recovering from surgery' });
+    const grant = (maxSensitivity: 'public' | 'confidential') =>
+      deriveWorkerScope(primary, id(`run-${maxSensitivity}`), { actions: [{ tool: 'orient', action: 'view' }], maxTurns: 1, maxSensitivity });
+    const narrow = grant('public');
+    if (!narrow.ok) throw new Error('worker');
+    expect(errorOf(await world.call(narrow.value, 'orient', 'view'))).toMatchObject({ kind: 'denied', reason: 'audience_not_admitted' });
+    const wide = grant('confidential');
+    if (!wide.ok) throw new Error('worker');
+    const view = await world.call(wide.value, 'orient', 'view');
+    expect(view.ok && blockText(view.value.content, 'human')).toBe('Robin is recovering from surgery');
   });
 });
 

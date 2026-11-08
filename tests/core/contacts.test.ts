@@ -133,6 +133,34 @@ describe('contact tool', () => {
     expect(fromFriend.ok && fromFriend.value.notes).toEqual([]);
   });
 
+  it('records nothing about a contact whose tracking consent is withdrawn, but still lets them be blocked', async () => {
+    const world = await continuityWorld();
+    const scope = await world.admit('primary-dm');
+    const { acquaintance } = world.people;
+    expect((await world.call(scope, 'contact', 'note', { contactId: acquaintance, text: 'likes chess' })).ok).toBe(true);
+    for (const consent of ['revoked', 'denied', 'pending'] as const) {
+      await world.admin.setConsent(OPERATOR, acquaintance, consent);
+      const attempts = [
+        world.call(scope, 'contact', 'note', { contactId: acquaintance, text: 'mentioned a new job' }),
+        world.call(scope, 'contact', 'link_identity', { contactId: acquaintance, channelKind: 'mail', externalId: 'lee@example.org' }),
+        world.call(scope, 'contact', 'set_trust', { contactId: acquaintance, trust: 'public' }),
+        world.call(scope, 'contact', 'propose_trust', { contactId: acquaintance, rationale: 'known for years' }),
+        world.call(scope, 'contact', 'set_relationship', { contactId: acquaintance, relationship: 'friend' }),
+        world.call(scope, 'contact', 'set_machine_intelligence', { contactId: acquaintance, isMachineIntelligence: true }),
+      ];
+      for (const attempt of await Promise.all(attempts)) expect(errorOf(attempt)).toMatchObject({ kind: 'denied', reason: 'untracked_contact' });
+      const lookup = await world.contacts.lookup(scope, { contactId: acquaintance });
+      expect(lookup.ok && [lookup.value.contact.consent, lookup.value.notes]).toEqual([consent, []]);
+    }
+    const stored = await world.contactStore.notes(acquaintance, 10);
+    expect(stored.ok && stored.value.map((n) => n.text)).toEqual(['likes chess']);
+    const record = world.contactStore.records.get(acquaintance);
+    expect(record?.identities.map((i) => i.externalId)).not.toContain('lee@example.org');
+
+    const blocked = await world.call(scope, 'contact', 'block', { contactId: acquaintance, reason: 'unwanted contact' });
+    expect(blocked.ok && blocked.value.content).toMatchObject({ status: 'applied', contact: { status: 'blocked' } });
+  });
+
   it('blocks and unblocks through status, protects the primary, and lets operator classification win', async () => {
     const world = await continuityWorld();
     const scope = await world.admit('primary-dm');

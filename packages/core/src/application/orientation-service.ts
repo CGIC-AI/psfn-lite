@@ -22,6 +22,7 @@ import {
   type PromptLayerVersion,
 } from '../identity/index.ts';
 import {
+  canViewerRead,
   denied,
   fail,
   invalid,
@@ -33,7 +34,7 @@ import {
   type Result,
 } from '../shared/index.ts';
 import type { ApprovalPort } from './host-ports.ts';
-import { authorOf, isTrustedTurnScope, type TrustedTurnScope } from './trusted-scope.ts';
+import { authorOf, isTrustedTurnScope, viewerOf, type TrustedTurnScope } from './trusted-scope.ts';
 
 export type IdentityWriteOutcome<T> =
   | { readonly status: 'applied'; readonly value: T }
@@ -137,6 +138,11 @@ export function createOrientationService(deps: OrientationDeps): OrientationServ
     async view(scope) {
       const blockScope = conversationScope(scope);
       if (!blockScope.ok) return blockScope;
+      // Blocks describe the conversation they belong to, so a worker reads them only where its
+      // grant admits that conversation's material, exactly as for its history.
+      if (scope.caller.kind === 'worker' && !canViewerRead(viewerOf(scope), scope.audience)) {
+        return denied('audience_not_admitted', "this worker's grant does not admit this conversation's orientation");
+      }
       return deps.blocks.read(blockScope.value);
     },
 
