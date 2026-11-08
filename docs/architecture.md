@@ -1022,9 +1022,11 @@ no recall:
    With `compression.checkpoint_required`, Hermes then keeps the
    uncompressed transcript.
 
-The provider refuses to start unless Hermes's own memory stores are off and
-compaction is fail-closed, so the profile has one authoritative memory.
-Subagent sessions and the background review fork never become Lite turns.
+Unless Hermes's own memory stores are off and compaction is fail-closed, the
+provider refuses to start, and the hooks refuse to drive any Lite turn and say
+so. Hermes only logs a provider that fails to start, so the hooks enforce
+this themselves. This keeps one authoritative memory per profile.
+Subagent sessions (seen through `subagent_start` or their `subagent` platform), the background review fork, and cron or flush agents never become Lite turns.
 
 Every event Lite did not accept is logged, kept in an owner-only SQLite
 ledger in the profile, reported through the warning callback, and named in

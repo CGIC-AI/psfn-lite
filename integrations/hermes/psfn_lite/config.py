@@ -20,7 +20,7 @@ HERMES_REVISION = "f0187332d13679e2ace74d1f0eb399eb91a90571"
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _SERVER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 #: Hermes surfaces that are never a participant's conversation.
-_NON_INTERACTIVE = {"subagent", "cron", "tool", "flush"}
+NON_INTERACTIVE_PLATFORMS = frozenset({"subagent", "cron", "tool", "flush"})
 _MIN_CREDENTIAL = 32
 
 
@@ -86,7 +86,7 @@ class Config:
         for index, raw in enumerate(senders):
             _exact(raw, ("platform", "sender_id"), f"senders[{index}]")
             platform, sender = raw["platform"], raw["sender_id"]
-            if not isinstance(platform, str) or not platform.strip() or platform in _NON_INTERACTIVE:
+            if not isinstance(platform, str) or not platform.strip() or platform in NON_INTERACTIVE_PLATFORMS:
                 raise ConfigError(f"senders[{index}].platform must name an interactive Hermes platform")
             if not isinstance(sender, str):
                 raise ConfigError(f"senders[{index}].sender_id must be a string (\"\" for the local CLI)")
@@ -109,6 +109,22 @@ class Config:
         except (OSError, ValueError):
             raise ConfigError(f"{CONFIG_FILE} is not readable JSON") from None
         return cls.parse(raw)
+
+
+def ownership_issues(hermes_config: dict) -> list:
+    """Hermes settings that would give the profile a second memory or a lossy compaction."""
+    memory = hermes_config.get("memory") if isinstance(hermes_config.get("memory"), dict) else {}
+    compression = hermes_config.get("compression") if isinstance(hermes_config.get("compression"), dict) else {}
+    issues = []
+    if memory.get("provider") != "psfn_lite":
+        issues.append("memory.provider must be psfn_lite")
+    if memory.get("memory_enabled", True) is not False:
+        issues.append("memory.memory_enabled must be false (Lite is the only memory)")
+    if memory.get("user_profile_enabled", True) is not False:
+        issues.append("memory.user_profile_enabled must be false (Lite is the only memory)")
+    if compression.get("checkpoint_required") is not True:
+        issues.append("compression.checkpoint_required must be true (compaction must not drop unproven turns)")
+    return issues
 
 
 def _internal(raw) -> Optional[InternalTurns]:

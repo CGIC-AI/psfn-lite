@@ -22,7 +22,7 @@ import secrets
 import threading
 
 from .bridge import BridgeClient, BridgeError
-from .config import Config
+from .config import NON_INTERACTIVE_PLATFORMS, Config
 from .ledger import Ledger
 from .render import block, render_context
 
@@ -68,7 +68,7 @@ class Driver:
                 self._subagents.add(child_session_id)
 
     def pre_llm_call(self, session_id="", turn_id="", user_message="", parent_session_id="", platform="", sender_id="", **_):
-        if not self._root(session_id, parent_session_id):
+        if not self.internal_job and not self._root(session_id, parent_session_id, platform):
             return None
         with self._lock:
             if parent_session_id and parent_session_id in self._turns and session_id not in self._turns:
@@ -184,9 +184,11 @@ class Driver:
             if isinstance(value, dict) and value.get("ok") is False:
                 self._fail(f"post_turn_{part}", session_id, payload["turnId"], f"Lite's post-turn {part} work failed", record=True)
 
-    def _root(self, session_id, parent_session_id) -> bool:
+    def _root(self, session_id, parent_session_id, platform="") -> bool:
         if parent_session_id and parent_session_id == session_id:
             return False  # the background review fork shares its parent's session
+        if platform in NON_INTERACTIVE_PLATFORMS:
+            return False  # delegate children run as platform "subagent"; cron and flush agents speak for no participant
         with self._lock:
             return session_id not in self._subagents
 

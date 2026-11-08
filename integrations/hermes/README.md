@@ -86,9 +86,11 @@ Delete rows once you have dealt with them.
        timeout: 30
    ```
 
-   The provider refuses to start unless `memory.provider`,
-   `memory.memory_enabled`, `memory.user_profile_enabled` and
-   `compression.checkpoint_required` are set as shown.
+   Unless `memory.provider`, `memory.memory_enabled`,
+   `memory.user_profile_enabled` and `compression.checkpoint_required` are set
+   as shown, the provider refuses to start. The lifecycle hooks also refuse to
+   drive any Lite turn, and they say so in the turn's context. Hermes only
+   logs a provider that fails to start, so the hooks enforce this themselves.
 5. Write `$HERMES_HOME/psfn-lite.json`. Every field is required and unknown
    fields are refused:
 
