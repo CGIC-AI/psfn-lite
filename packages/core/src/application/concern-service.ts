@@ -1,4 +1,4 @@
-import type { Vad } from '../emotion/index.ts';
+import { emotionScopeKey, emotionScopeOf, type Vad } from '../emotion/index.ts';
 import {
   CONCERN_DUPLICATE_SIMILARITY,
   MAX_CONCERN_OUTCOME_CHARS,
@@ -27,6 +27,8 @@ import {
   invalid,
   notFound,
   ok,
+  sameConversation,
+  type Audience,
   type Clock,
   type CoreError,
   type IdSource,
@@ -80,7 +82,8 @@ export interface ConcernService {
  * `canViewConcern`, so a concern the audience may not see reads as missing and
  * is never counted. Writes are compare-and-set and append an event, so
  * evidence and earlier resolutions survive reopening. Formation and resolution
- * affect come only from the scope's trusted, fresh estimate.
+ * affect come only from the trusted, fresh estimate of the concern's own
+ * conversation, read from inside it; relief is applied there and nowhere else.
  */
 export function createConcernService(deps: {
   readonly concerns: ConcernPort;
@@ -96,6 +99,17 @@ export function createConcernService(deps: {
     if (!listed.ok) return listed;
     const viewer = viewerOf(scope);
     return ok(listed.value.filter((c) => canViewConcern(viewer, c)));
+  };
+
+  /**
+   * The affect estimate of the conversation a concern belongs to, read only
+   * from inside that conversation. Resolving from elsewhere captures nothing:
+   * another scope's estimate would leak into the concern's audience, and a
+   * relief computed across two scopes means nothing.
+   */
+  const affectIn = async (scope: TrustedTurnScope, formedIn: Audience): Promise<Result<Vad | null>> => {
+    const sameScope = sameConversation(scope.audience, formedIn) && emotionScopeKey(emotionScopeOf(scope.audience)) === emotionScopeKey(emotionScopeOf(formedIn));
+    return sameScope ? deps.emotion.currentVad(scope) : ok(null);
   };
 
   const visibleOne = async (scope: TrustedTurnScope, id: string): Promise<Result<ActiveConcern>> => {
@@ -128,7 +142,8 @@ export function createConcernService(deps: {
       if (!existing.ok) return existing;
       const duplicate = existing.value.find((c) => isOpenConcernStatus(c.status) && concernTextSimilarity(c.text, text) >= CONCERN_DUPLICATE_SIMILARITY);
       if (duplicate !== undefined) return conflict('already_exists', `an open concern already says this: ${duplicate.id}`);
-      const formationVad = await deps.emotion.currentVad(scope);
+      // A concern is formed in the scope's own conversation, so this is that conversation's estimate.
+      const formationVad = await affectIn(scope, scope.audience);
       if (!formationVad.ok) return formationVad;
       const at = deps.clock.now().toISOString();
       const author = authorOf(scope);
@@ -186,7 +201,7 @@ export function createConcernService(deps: {
       const at = deps.clock.now().toISOString();
       let resolution: ConcernResolution | null = isTerminalConcernStatus(concern.status) ? concern.resolution : null;
       if (isTerminalConcernStatus(input.to)) {
-        const resolutionVad = await deps.emotion.currentVad(scope);
+        const resolutionVad = await affectIn(scope, concern.formedIn);
         if (!resolutionVad.ok) return resolutionVad;
         const relief = input.to === 'resolved' && concern.formationVad !== null && resolutionVad.value !== null ? reliefDelta(concern.formationVad, resolutionVad.value) : null;
         const arc = describeConcernArc(concern.formationVad, resolutionVad.value);

@@ -198,6 +198,29 @@ describe('concerns', () => {
     expect(resolved.concern.resolution).toMatchObject({ resolutionVad: null, reliefDelta: null, arc: null });
   });
 
+  it("captures and relieves affect only inside the concern's own conversation", async () => {
+    const w = await selfStateWorld();
+    const robin = await w.admit('primary-dm');
+    const sam = await w.admit('friend-dm');
+    await w.talk(sam, 'the exam is tomorrow', 'you prepared well', 'k1', steady());
+    const samsConcern = contentOf<ActiveConcern>(await w.call(sam, 'concern', 'create', { text: 'Sam worries about the exam' }));
+    expect(samsConcern.formationVad).toEqual({ valence: 0, arousal: 0, dominance: 0 });
+    await w.talk(robin, 'awful day', 'I am here', 'k2', reading(-0.9, 0.8, -0.7));
+    const robinBefore = await w.emotion.currentVad(robin);
+
+    // Robin's primary DM may see and resolve Sam's concern, but must not stamp its own estimate onto it.
+    const resolved = contentOf<ConcernTransitionOutcome>(await w.call(robin, 'concern', 'resolve', { concernId: samsConcern.id, expectedRevision: 1 }));
+    expect(resolved.relief).toEqual({ status: 'not_captured' });
+    expect(resolved.concern.resolution).toMatchObject({ resolutionVad: null, reliefDelta: null });
+    expect(resolved.concern.resolution?.arc?.text ?? '').not.toMatch(/heavy|settled to/);
+    expect(await w.emotion.currentVad(robin)).toEqual(robinBefore);
+    expect([...w.ports.emotionStates.observations.keys()].filter((id) => id.startsWith('relief:'))).toEqual([]);
+
+    const seenBySam = contentOf<ActiveConcern[]>(await w.call(sam, 'concern', 'list', { includeClosed: true }));
+    expect(seenBySam.map((c) => c.resolution?.resolutionVad ?? null)).toEqual([null]);
+    expect(JSON.stringify(seenBySam)).not.toMatch(/-0\.8|-0\.7|-0\.6/);
+  });
+
   it('hides concerns an audience cannot read, without counting them', async () => {
     const w = await selfStateWorld();
     const robin = await w.admit('primary-dm');
