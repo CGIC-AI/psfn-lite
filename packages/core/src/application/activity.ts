@@ -7,14 +7,13 @@ import {
   notFound,
   type ActivityId,
   type Audience,
-  type Author,
   type Clock,
   type IdSource,
   type Result,
   type SessionId,
   type TurnId,
 } from '../shared/index.ts';
-import { isTrustedTurnScope, type TrustedTurnScope } from './trusted-scope.ts';
+import { authorOf, isTrustedTurnScope, type TrustedTurnScope } from './trusted-scope.ts';
 
 export interface ActivityService {
   start(
@@ -100,7 +99,7 @@ export function createActivityService(deps: {
           status: input.status ?? record.status,
           outcome: input.outcome ?? record.outcome,
           artifacts: [...record.artifacts, ...(input.artifacts ?? [])],
-          notes: input.note === undefined ? record.notes : [...record.notes, { author: noteAuthor(scope), text: input.note }],
+          notes: input.note === undefined ? record.notes : [...record.notes, { author: authorOf(scope), text: input.note }],
           updatedAt: deps.clock.now().toISOString(),
           revision: record.revision + 1,
         },
@@ -112,9 +111,6 @@ export function createActivityService(deps: {
   };
 }
 
-function noteAuthor(scope: TrustedTurnScope): Author {
-  return scope.caller.kind === 'worker' ? { kind: 'machine', producer: `worker:${scope.caller.runId}` } : { kind: 'companion' };
-}
 
 /** Self turns see everything; otherwise only activity from the same channel is visible. */
 function isVisibleTo(viewer: Audience, visibility: Audience): boolean {

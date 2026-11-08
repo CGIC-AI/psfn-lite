@@ -8,11 +8,21 @@ import {
   type TurnLifecycle,
   type TurnOwner,
 } from '../../packages/core/src/index.ts';
+import { FakeSessionCatalog } from './continuity-fakes.ts';
 import { FakeArchive, FakeTurnLedger, FixedClock, PI, PRIMARY, SequentialIds, TOOL_TRANSPORT, id, standardWorld } from './fakes.ts';
 
 const PI_OWNER: TurnOwner = { surface: PI, instance: 'pi-1' };
 const OTHER_OWNER: TurnOwner = { surface: TOOL_TRANSPORT, instance: 'hermes-1' };
 const SESSION = id<'session'>('session-1');
+const SELF_SESSION = id<'session'>('session-self');
+
+function catalogWithSessions(): FakeSessionCatalog {
+  const sessions = new FakeSessionCatalog();
+  const base = { createdAt: '2030-01-01T00:00:00.000Z', lastActivityAt: '2030-01-01T00:00:00.000Z', previousSessionId: null, continuesFrom: null };
+  sessions.sessions.set(SESSION, { ...base, sessionId: SESSION, audience: { kind: 'direct', channelId: id('dm-primary'), contactId: PRIMARY } });
+  sessions.sessions.set(SELF_SESSION, { ...base, sessionId: SELF_SESSION, audience: { kind: 'self' } });
+  return sessions;
+}
 
 const LEASE_MS = 60_000;
 
@@ -20,9 +30,10 @@ function setup() {
   const ledger = new FakeTurnLedger();
   const archive = new FakeArchive();
   const clock = new FixedClock();
-  const created = createTurnLifecycle({ ledger, archive, clock, ids: new SequentialIds(), turnLeaseMs: LEASE_MS });
+  const sessions = catalogWithSessions();
+  const created = createTurnLifecycle({ ledger, archive, sessions, clock, ids: new SequentialIds(), turnLeaseMs: LEASE_MS });
   if (!created.ok) throw new Error(JSON.stringify(created.error));
-  return { ledger, archive, clock, lifecycle: created.value, ...standardWorld() };
+  return { ledger, archive, sessions, clock, lifecycle: created.value, ...standardWorld() };
 }
 
 function input(overrides: Partial<PrepareTurnInput> = {}): PrepareTurnInput {
@@ -189,6 +200,35 @@ describe('turn lifecycle', () => {
     expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'hi']);
   });
 
+  it('lets a successor that does not own a settled turn still repair its missing history', async () => {
+    const { lifecycle, archive, admit } = setup();
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    archive.failNext = true;
+    await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'morning!', delivery: 'delivered' });
+    // The owner crashes here: the ledger holds the reply, history does not.
+    const replay = await lifecycle.prepareTurn(await admit('primary-dm-mcp'), input({ owner: OTHER_OWNER }));
+    expect(replay.ok || replay.error).toMatchObject({ kind: 'conflict', reason: 'turn_ownership' });
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'morning!']);
+  });
+
+  it('archives the last settled turn before opening the next one, and opens nothing if that fails', async () => {
+    const { lifecycle, archive, ledger, admit } = setup();
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    archive.failNext = true;
+    await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'morning!', delivery: 'delivered' });
+    const successor = await admit('primary-dm-mcp');
+    const next = input({ owner: OTHER_OWNER, idempotencyKey: id('key-2'), expectedRevision: 1, trigger: { kind: 'participant_message', text: 'still there?' } });
+
+    archive.failNext = true;
+    const refused = await lifecycle.prepareTurn(successor, next);
+    expect(refused.ok || refused.error).toMatchObject({ kind: 'unavailable', capability: 'session_archive' });
+    expect((await ledger.head(SESSION)).ok && ledger.turns.size).toBe(1);
+
+    const opened = await lifecycle.prepareTurn(successor, next);
+    expect(opened.ok && opened.value.kind).toBe('prepared');
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'morning!', 'still there?']);
+  });
+
   it('never archives a reply the ledger did not record when the ledger write fails', async () => {
     const { lifecycle, archive, ledger, admit } = setup();
     const turn = await prepared(lifecycle, await admit('primary-dm'));
@@ -259,14 +299,20 @@ describe('turn lifecycle', () => {
   });
 
   it('requires an explicit positive turn lease', () => {
-    const deps = { ledger: new FakeTurnLedger(), archive: new FakeArchive(), clock: new FixedClock(), ids: new SequentialIds() };
+    const deps = {
+      ledger: new FakeTurnLedger(),
+      archive: new FakeArchive(),
+      sessions: new FakeSessionCatalog(),
+      clock: new FixedClock(),
+      ids: new SequentialIds(),
+    };
     expect(createTurnLifecycle({ ...deps, turnLeaseMs: 0 }).ok).toBe(false);
     expect(createTurnLifecycle({ ...deps, turnLeaseMs: 1.5 }).ok).toBe(false);
   });
 
   it('binds speech attribution to the scope: no participant speech from internal turns, and vice versa', async () => {
     const { lifecycle, admit } = setup();
-    const internal = await lifecycle.prepareTurn(await admit('free-time'), input());
+    const internal = await lifecycle.prepareTurn(await admit('free-time'), input({ sessionId: SELF_SESSION }));
     expect(internal.ok || internal.error).toMatchObject({ kind: 'denied', reason: 'unknown_authority' });
 
     const disguised = await lifecycle.prepareTurn(
@@ -277,13 +323,19 @@ describe('turn lifecycle', () => {
 
     const smuggled = await lifecycle.prepareTurn(
       await admit('free-time'),
-      input({ trigger: { kind: 'internal', origin: { kind: 'participant_speech', speaker: PRIMARY } as never, purpose: 'p', text: 'hi' } }),
+      input({
+        sessionId: SELF_SESSION,
+        trigger: { kind: 'internal', origin: { kind: 'participant_speech', speaker: PRIMARY } as never, purpose: 'p', text: 'hi' },
+      }),
     );
     expect(smuggled.ok || smuggled.error.kind).toBe('invalid');
 
     const freeTime = await lifecycle.prepareTurn(
       await admit('free-time'),
-      input({ trigger: { kind: 'internal', origin: { kind: 'internal_signal', source: 'free_time_gate' }, purpose: 'free_time', text: 'invite' } }),
+      input({
+        sessionId: SELF_SESSION,
+        trigger: { kind: 'internal', origin: { kind: 'internal_signal', source: 'free_time_gate' }, purpose: 'free_time', text: 'invite' },
+      }),
     );
     expect(freeTime.ok && freeTime.value.kind === 'prepared' && freeTime.value.turn.record.trigger.kind).toBe('internal');
   });
@@ -303,5 +355,17 @@ describe('turn lifecycle', () => {
     const turn = await prepared(lifecycle, scope);
     const wrongWay = await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'interrupted', by: 'host', partialReply: null, delivery: 'unknown' } as never);
     expect(wrongWay.ok || wrongWay.error.kind).toBe('invalid');
+  });
+
+  it('binds a session to its audience: another audience cannot open turns in it, and unknown sessions are missing', async () => {
+    const { lifecycle, sessions, clock, admit } = setup();
+    clock.advance(5_000);
+    const fromFriend = await lifecycle.prepareTurn(await admit('friend-dm'), input());
+    expect(fromFriend.ok || fromFriend.error).toMatchObject({ kind: 'denied', reason: 'audience_not_admitted' });
+    const unknown = await lifecycle.prepareTurn(await admit('primary-dm'), input({ sessionId: id('session-unknown') }));
+    expect(unknown.ok || unknown.error.kind).toBe('not_found');
+
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    expect(sessions.sessions.get(SESSION)?.lastActivityAt).toBe(turn.record.openedAt);
   });
 });
