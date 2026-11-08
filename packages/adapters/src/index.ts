@@ -12,3 +12,4 @@ export { createPostgresPool } from './postgres/database.ts';
 export { loadMigrations, migrate, type AppliedMigration, type Migration } from './postgres/migrations.ts';
 export { BACKED_UP_TABLES } from './postgres/state-backup.ts';
 export { openPostgresState, postgresStores, type PostgresState } from './postgres/state.ts';
+export { openPostgresMemoryState, postgresMemoryStores, type PostgresMemoryState, type PostgresMemoryStores } from './postgres/memory-state.ts';
