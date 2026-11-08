@@ -1,0 +1,126 @@
+// ── Structured provenance reference with admission identity (ccgdz.3) ──
+//
+// `CogSecStructuredProvenanceRef` is the ref shape the custody design names as
+// its second primitive (design §2): a `{kind, refId}` pointer that may ALSO
+// carry the admission identity of the bytes it points at — the ingress receipt
+// (`receiptId`, psfn-framework-ccgdz.2), the intake envelope that admitted them
+// (`envelopeId`), and/or the sha256 of the admitted bytes (`contentSha256`).
+//
+// Why it lives in `shared/contracts` rather than beside `core/cogsec/lineage`:
+// the producers are faculties (memory provenance, episode synthesis, prompt
+// blocks) and the consumer is core CogSec lineage, which already imports the
+// memory contracts. Defining it here is what keeps that a tree instead of an
+// import cycle (`npm run verify:dependency-cycles`).
+//
+// CONTENT-FREE BY CONSTRUCTION. Every field is an id or a hash under a bounded
+// pattern; no field can carry prose, a path, or a message body.
+//
+// NORMALIZATION DIRECTION IS DELIBERATE. A malformed identity field is dropped
+// while the ref itself survives, and a malformed ref is dropped entirely. Both
+// directions LOSE verification, so a corrupted row degrades a descendant to
+// `uncertain` — it can never manufacture a `tainted`-clearing verified match.
+
+import { isRecord } from '../utils/types.js';
+
+/** Bounded ref kind: a compile-time vocabulary word, never runtime prose. */
+const PROVENANCE_REF_KIND_PATTERN = /^[A-Za-z][A-Za-z0-9_]{0,63}$/u;
+
+/** Bounded runtime identifier: no whitespace, slash, quote, or newline. */
+const PROVENANCE_REF_ID_PATTERN = /^[A-Za-z0-9_:.@+-]{1,256}$/u;
+
+/** Admission ids (receipt, envelope) share the custody identifier bound. */
+const ADMISSION_ID_PATTERN = /^[A-Za-z0-9_:.@+-]{1,128}$/u;
+
+const SHA256_HEX_PATTERN = /^[a-f0-9]{64}$/u;
+
+/**
+ * One structured provenance pointer, optionally carrying the admission proof
+ * for the exact bytes it identifies.
+ *
+ * The three identity fields are independent evidence, not a required triple: a
+ * source admitted before receipts were issued on its path carries an
+ * `envelopeId` and no `receiptId`, and a source whose bytes were never hashed
+ * carries neither. Absence is never a claim about the content — it means the
+ * chain is unproven here, which classifies as `uncertain`, never as clean.
+ */
+export interface CogSecStructuredProvenanceRef {
+  kind: string;
+  refId: string;
+  /** Content-addressed ingress admission receipt for these exact bytes. */
+  receiptId?: string;
+  /** sha256 of the admitted bytes this ref identifies. */
+  contentSha256?: string;
+  /** Intake envelope that admitted the bytes (taint-chain anchor). */
+  envelopeId?: string;
+}
+
+/** True when the ref carries at least one verifiable admission identity. */
+export function hasVerifiedAdmissionIdentity(
+  ref: CogSecStructuredProvenanceRef,
+): boolean {
+  return ref.receiptId !== undefined
+    || ref.contentSha256 !== undefined
+    || ref.envelopeId !== undefined;
+}
+
+function boundedField(value: unknown, pattern: RegExp): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return pattern.test(trimmed) ? trimmed : undefined;
+}
+
+/**
+ * Re-derive one structured ref from unknown (stored or transported) data.
+ * Returns `null` when the ref has no usable `kind`/`refId`; identity fields
+ * that fail their pattern are dropped individually.
+ */
+export function normalizeCogSecStructuredProvenanceRef(
+  value: unknown,
+): CogSecStructuredProvenanceRef | null {
+  if (!isRecord(value)) return null;
+  const kind = boundedField(value.kind, PROVENANCE_REF_KIND_PATTERN);
+  const refId = boundedField(value.refId, PROVENANCE_REF_ID_PATTERN);
+  if (!kind || !refId) return null;
+  const receiptId = boundedField(value.receiptId, ADMISSION_ID_PATTERN);
+  const contentSha256 = boundedField(value.contentSha256, SHA256_HEX_PATTERN);
+  const envelopeId = boundedField(value.envelopeId, ADMISSION_ID_PATTERN);
+  return {
+    kind,
+    refId,
+    ...(receiptId ? { receiptId } : {}),
+    ...(contentSha256 ? { contentSha256 } : {}),
+    ...(envelopeId ? { envelopeId } : {}),
+  };
+}
+
+function structuredRefIdentityKey(ref: CogSecStructuredProvenanceRef): string {
+  return [
+    ref.kind,
+    ref.refId,
+    ref.receiptId ?? '',
+    ref.contentSha256 ?? '',
+    ref.envelopeId ?? '',
+  ].join('\0');
+}
+
+/**
+ * Normalize a list of structured refs, dropping unusable entries and exact
+ * duplicates while preserving first-seen order (so a persisted row round-trips
+ * to itself instead of reshuffling).
+ */
+export function normalizeCogSecStructuredProvenanceRefs(
+  value: unknown,
+): CogSecStructuredProvenanceRef[] {
+  if (!Array.isArray(value)) return [];
+  const seen = new Set<string>();
+  const refs: CogSecStructuredProvenanceRef[] = [];
+  for (const entry of value) {
+    const ref = normalizeCogSecStructuredProvenanceRef(entry);
+    if (!ref) continue;
+    const key = structuredRefIdentityKey(ref);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    refs.push(ref);
+  }
+  return refs;
+}

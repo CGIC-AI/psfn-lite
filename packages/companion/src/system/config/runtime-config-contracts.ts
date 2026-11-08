@@ -1,0 +1,687 @@
+import type {
+  FalCreateModel,
+  FalEditModel,
+  ImageProvider,
+  ImageWorkflowSettings,
+} from '../../primitives/images/types.js';
+import type { CredentialReference, CredentialVaultPort } from '../../boundary/custody/credential-vault.js';
+import type { StreamingSttProvider } from '../../primitives/voice/connectors/stt/index.js';
+import type { StreamingTtsProvider } from '../../primitives/voice/connectors/tts/index.js';
+import type { CapabilityTier } from '../capabilities/tier-types.js';
+import type { ChargePolicyConfig } from './charge-policy-config.js';
+import type { SubagentRoleRegistryConfig } from '../../faculties/subagents/role-registry.js';
+import type { AutomataOwnerPolicy } from '../../faculties/automata/registry-contract.js';
+import type {
+  CompanionRuntimeIdentity,
+  ResolvedCompanionsFleetConfig,
+} from './companions-config.js';
+import type { SatelliteRegistryConfig } from '../../shared/contracts/satellite-registry.js';
+import type { GroupMemorySettings } from './group-memory-config.js';
+import type { EmotionScopingSettings } from './emotion-scoping-config.js';
+import type { NarrativeEmotionAppraisalSettings } from './narrative-emotion-appraisal-config.js';
+import type { MemoryRetrievalPolicy } from './memory-retrieval-policy.js';
+import type { MemoryPresentationProfile } from './memory-presentation-profile.js';
+import type { MemoryDeletionPolicy } from './memory-deletion-policy.js';
+import type { BiographicalDepthPolicy } from './biographical-depth-policy.js';
+import type { BiographicalCandidatePolicy } from './biographical-candidate-policy.js';
+import type { ShellExecSettings } from './shell-exec-config.js';
+import type { DecisionBackendSettings } from './decision-backend-config.js';
+import type { RuntimeCompanionId } from '../../shared/routing/companion-id.js';
+import type {
+  FleetAuthConfig,
+  FleetAuthVerifierConfig,
+} from './fleet-auth-config.js';
+import type {
+  CanonicalModelRegistry,
+  CanonicalProviderRegistry,
+  ChannelType,
+  CompositionalPurpose,
+  ImportProcessingRouteMode,
+  ModelCatalogEntry,
+  ModelPurpose,
+  ModelPurposeSelection,
+  ModelRoleAssignments,
+  ModelSlot,
+  ObserverEvalSidecarSettings,
+  EmoSimProactivitySettings,
+  ResponseStyleOverrides,
+  RuntimeConfigHooks,
+  TextEmotionDType,
+} from '../../shared/contracts/runtime.js';
+import {
+  EMOSIM_PROACTIVITY_SOURCE_MODEL,
+  EMOSIM_PROACTIVITY_SOURCE_VERSION,
+  EMOSIM_WOULD_MESSAGE_V1,
+} from '../../shared/contracts/runtime.js';
+import type { CogSecPersonaConformanceSettings } from '../../shared/contracts/cogsec-persona-conformance.js';
+
+export type { CapabilityTier } from '../capabilities/tier-types.js';
+export type ShardToolsetConfig = Partial<Record<CapabilityTier, string[]>>;
+export type SessionRestartBehavior = 'reuse_latest_session' | 'new_session';
+export type ActiveMemoryRetrievalMode = 'background' | 'inline';
+export type PersistenceBackend = 'postgres';
+export const PROMOTED_EXTENDED_TOOL_SLOTS_MAX = 4;
+
+export interface CompositionalPolicyConfig {
+  enabled: boolean;
+  allowedTiers: CapabilityTier[];
+  allowedChannelTypes: ChannelType[];
+  allowedPurposes: CompositionalPurpose[];
+}
+
+export function createDefaultCompositionalPolicyConfig(): CompositionalPolicyConfig {
+  return {
+    enabled: false,
+    allowedTiers: [],
+    allowedChannelTypes: [],
+    allowedPurposes: [],
+  };
+}
+
+export function createDefaultObserverEvalSidecarLeverSettings(): NonNullable<ObserverEvalSidecarSettings['levers']> {
+  return {
+    enabled: false,
+    cooldownMs: 21_600_000,
+    wouldMessage: {
+      enabled: true,
+      socialNeedThreshold: 0.7,
+      attachmentIntensityThreshold: 0.5,
+      sustainMs: 1_800_000,
+    },
+    wouldCheckIn: {
+      enabled: true,
+      valenceThreshold: -0.3,
+      sustainMs: 1_200_000,
+    },
+    wouldRest: {
+      enabled: true,
+      arousalThreshold: 0.8,
+      sustainMs: 1_800_000,
+    },
+    ruminationWatch: {
+      enabled: true,
+      intensityThreshold: 0.4,
+      sustainMs: 2_700_000,
+    },
+  };
+}
+
+export function createDefaultObserverEvalSidecarSettings(): ObserverEvalSidecarSettings {
+  return {
+    enabled: false,
+    sidecarId: 'observer-eval-sidecar',
+    deploymentTarget: 'test_persona',
+    mode: 'observe_only',
+    queue: {
+      maxQueuedTurns: 32,
+      overflowPolicy: 'drop_newest',
+      observerTimeoutMs: 5_000,
+      maxRetries: 0,
+      retryDelayMs: 0,
+      shutdownDrainTimeoutMs: 5_000,
+    },
+    adapter: {
+      kind: 'disabled',
+      sessionLabel: 'psfn-observer-eval',
+      agentName: 'psfn-companion',
+      includeWorldState: false,
+    },
+    persistence: {
+      enabled: false,
+      retentionDays: 14,
+      maxStoredObservations: 10_000,
+    },
+    garden: {
+      exposeHealth: true,
+      exposeTelemetry: true,
+    },
+    levers: createDefaultObserverEvalSidecarLeverSettings(),
+  };
+}
+
+/**
+ * Public bootstrap proactivity profile (revision v2). Tuned for companion
+ * sessions whose social need is regulated by real inbound contact (emo_sim
+ * `external_actor`): with contact the drive falls, and with none it rises from
+ * zero to one over roughly half a day of wall time. A 0.8 threshold therefore
+ * reflects most of a day without warm contact rather than the unregulated
+ * pegged drive that used to cross on every cooldown expiry, and the jittered
+ * cooldown keeps a fleet from re-arming in lockstep. Each companion owns its
+ * copy through its settings.overlay.json; this default stays unmeasured.
+ */
+export function createDefaultEmoSimProactivitySettings(): EmoSimProactivitySettings {
+  return {
+    mode: 'off',
+    thresholdProfile: {
+      schemaVersion: 1,
+      profileId: EMOSIM_WOULD_MESSAGE_V1,
+      revision: 'public-bootstrap.v2',
+      applicableSource: {
+        model: EMOSIM_PROACTIVITY_SOURCE_MODEL,
+        version: EMOSIM_PROACTIVITY_SOURCE_VERSION,
+      },
+      reviewNote: 'Conservative public bootstrap for contact-regulated social need; '
+        + 'production remains off until each companion promotes its own profile.',
+      calibration: {
+        corpusVersion: 'public-bootstrap-sanitized.v1',
+        metricsVersion: 'emosim-proactivity.metrics.v1',
+        status: 'bootstrap_unmeasured',
+        fireRate: null,
+        falsePositiveRate: null,
+        fatigueRate: null,
+      },
+      promotionCriteria: {
+        criteriaVersion: 'emosim-proactivity-promotion.v1',
+        maximumFalsePositiveRate: 0.1,
+        maximumFatigueRate: 0.25,
+      },
+      rollbackProfileId: null,
+      socialNeedThreshold: 0.8,
+      attachmentIntensityThreshold: 0.65,
+      samplingIntervalMs: 60_000,
+      minimumConfidence: 0.6,
+      abstainBelowMinimumConfidence: true,
+      sustainMs: 2_700_000,
+      dedupeWindowMs: 300_000,
+      cooldownMs: 28_800_000,
+      cooldownJitterMs: 14_400_000,
+    },
+  };
+}
+
+export interface WyomingShardRoutingConfig {
+  enabled: boolean;
+  siteAllowlist?: string[];
+  satelliteAllowlist?: string[];
+}
+
+/**
+ * Optional Redis-backed hot session tail (psfn-framework-hgw3.5). Owned by
+ * settings.json. Enablement and the per-channel bound live here; the Redis
+ * connection itself (URL, credentials, TLS) stays in `.env` (PSFN_REDIS_URL
+ * and friends — see src/shared/cache/redis-cache.ts). Disabled by default:
+ * deployments without Redis keep byte-identical file-only session reads.
+ */
+export interface SessionTailCacheSettings {
+  enabled: boolean;
+  maxEntriesPerChannel: number;
+}
+
+export const SESSION_TAIL_CACHE_MAX_ENTRIES_RANGE = {
+  min: 16,
+  max: 8_192,
+} as const;
+
+export function createDefaultSessionTailCacheSettings(): SessionTailCacheSettings {
+  return {
+    enabled: false,
+    maxEntriesPerChannel: 512,
+  };
+}
+
+export interface SubstrateConfig {
+  [key: string]: unknown;
+  primaryModel: string;
+  primaryProvider: string;
+  extractionModel: string;
+  extractionProvider: string;
+  primaryMaxTokens: number;
+  extractionMaxTokens: number;
+  discordToken?: string;
+  discordBotId?: string;
+  characterCardPath: string;
+  companionId?: RuntimeCompanionId;
+  /**
+   * True when the mandatory companions.json manifest enumerates more than one
+   * companion (multi-companion tenancy). A one-entry manifest is the canonical
+   * single-companion deployment and leaves this false.
+   */
+  multiCompanion?: boolean;
+  /**
+   * Resolved fleet manifest. Always present in the operator process and in
+   * Fleet Auth/multi-companion gateway and agent processes.
+   */
+  companionFleet?: ResolvedCompanionsFleetConfig;
+  /** Fleet-bound process identity for an agent/gateway using fleet routing. */
+  companionRuntimeIdentity?: CompanionRuntimeIdentity;
+  /** Per-companion proof used only during gateway connection authentication. */
+  gatewayCompanionAuthToken?: string;
+  /** Role-bound proof delegated only to the session-integrity worker. */
+  gatewaySessionIntegrityAuthToken?: string;
+  systemDataDir?: string;
+  companionDataDir?: string;
+  workspacePath?: string;
+  /** Governed fleet-shared workspace. Never inherited from environment. */
+  sharedWorkspacePath?: string;
+  dataDir: string;
+  databasePath: string;
+  persistenceBackend?: PersistenceBackend;
+  postgresDatabaseUrl?: string;
+  /** Gateway-only full owner-file projection; never present in agent/operator config. */
+  fleetAuth?: FleetAuthConfig;
+  /** Public-key-only projection supplied to operator/agent verifier processes. */
+  fleetAuthVerifier?: FleetAuthVerifierConfig;
+  /**
+   * Optional per-companion Postgres schema (sprint 10, W2 multi-companion
+   * tenancy). When set, the agent's runtime persistence pools pin their
+   * search_path to this schema so all queries run inside it unchanged; the
+   * schema is created on startup if missing. When unset, runtime persistence
+   * uses the default (`public`) schema — byte-identical to single-companion
+   * behavior. Sourced from the `COMPANION_PG_SCHEMA` env var (see load-config).
+   */
+  postgresSchema?: string;
+  /**
+   * Topology-owned PostgreSQL role paired with `postgresSchema`. In a
+   * multi-companion agent this is resolved from the matching companions.json
+   * entry and must match the delivered database credential.
+   */
+  postgresRole?: string;
+  sessionMessageLimit?: number;
+  sessionRestartBehavior?: SessionRestartBehavior;
+  continuityMessageLimit?: number;
+  memoryRetrievalLimit?: number;
+  sessionHistoryBudgetPct?: number;
+  memoryRetrievalBudgetPct?: number;
+  moodCongruenceWeight?: number;
+  adaptiveContextBudgetsEnabled?: boolean;
+  wikiRetrievalEnabled?: boolean;
+  wikiRetrievalChatTokenCap?: number;
+  wikiRetrievalGroupTokenCap?: number;
+  wikiRetrievalFocusTokenCap?: number;
+  wikiRetrievalSimilarityThreshold?: number;
+  wikiRetrievalGroupSimilarityThreshold?: number;
+  /** settings.json-owned startup wiki cache hydration volume. */
+  wikiStartupHydration?: WikiStartupHydrationSettings;
+  /** settings.json-owned lifecycle and Kubernetes operational policy. */
+  lifecycleKubernetes?: LifecycleKubernetesSettings;
+  /** Per-companion JSON-owned baseline for CogSec persona drift detection. */
+  cogSecPersonaConformance?: CogSecPersonaConformanceSettings;
+  extractionInterval: number;
+  maintenanceIntervalMs: number;
+  defaultContextWindow: number;
+  extractionThresholdPct: number;
+  compactionThresholdPct: number;
+  observationMaskingWindow?: number;
+  compactionEmotionalSalienceThresholdPct?: number;
+  /**
+   * Consecutive unhandled rejections from one origin before runtime
+   * diagnostics records an operator-visible escalation. Owned by settings.json.
+   */
+  backgroundFailureEscalationThreshold?: number;
+  /**
+   * Retained health-event row target, owned by settings.json and required at
+   * boot. The stream may exceed this target within the operational retention
+   * horizon; only expired overflow is pruned.
+   */
+  healthEventStreamMaxRows?: number;
+  /** Minimum retained operational history, in days; never below thirty. */
+  operationalMetadataRetentionDays?: number;
+  /**
+   * Bounded retry budget for a diagnostic PostgreSQL store's startup readiness
+   * task (psfn-framework-6c6cq). Owned by settings.json. A first-boot
+   * credential race used to burn the single attempt, log one ERROR, and leave
+   * the process advertising Ready with that store silently broken; the budget
+   * is spent before Ready, so it delays the Ready boundary by at most
+   * (attempts - 1) x backoff. Attempts include the first, so 1 is "no retry".
+   */
+  postgresStoreReadinessRetryAttempts?: number;
+  /** Fixed delay between readiness attempts. Owned by settings.json. */
+  postgresStoreReadinessRetryBackoffMs?: number;
+  /**
+   * Days a per-turn CogSec custody snapshot is retained
+   * (psfn-framework-ccgdz.1). Owned by settings.json; the store fails closed at
+   * boot when it is absent, so the durable custody trail can never grow without
+   * an operator-declared retention bound.
+   */
+  custodySnapshotRetentionDays?: number;
+  /**
+   * Artifacts served by one governed Shared Workspace list page. Owned by
+   * settings.json; the gateway and Garden refuse to expose a shared workspace
+   * without it, so a reviewed corpus can never be listed unbounded
+   * (psfn-framework-9jld5).
+   */
+  sharedWorkspaceListPageSize?: number;
+  /**
+   * Artifact bytes read and hashed for one governed Shared Workspace list page.
+   * Owned by settings.json alongside `sharedWorkspaceListPageSize`; both are
+   * required before a shared workspace is exposed.
+   */
+  sharedWorkspaceListPageBytes?: number;
+  sessionMirrorEnabled?: boolean;
+  sessionMirrorMaxChars?: number;
+  sessionMirrorActiveWindowMs?: number;
+  sessionMirrorChannelOverrides?: Record<string, boolean>;
+  memoryExtractionMinImportance?: number;
+  memoryExtractionMinConfidence?: number;
+  memoryExtractionMinNovelty?: number;
+  memoryExtractionEmotionalIntensityWeight?: number;
+  memoryExtractionMaxWrites?: number;
+  memoryExtractionTelemetryEnabled?: boolean;
+  memoryRetrievalTelemetryEnabled?: boolean;
+  /** settings.json-owned categories and eligibility for companion-raised deletion proposals. */
+  memoryDeletionPolicy?: MemoryDeletionPolicy;
+  memoryRetrievalPolicy?: MemoryRetrievalPolicy;
+  /** Owner-configured adaptive biographical collection economics. */
+  biographicalDepthPolicy?: BiographicalDepthPolicy;
+  /** Owner-controlled admission and review policy for durable biography candidates. */
+  biographicalCandidatePolicy?: BiographicalCandidatePolicy;
+  /**
+   * Versioned, schema-validated presentation profile for the retrieval
+   * formatting layer (ordering, headings, valence markers, recency labels,
+   * episode cap, display caps, withheld wording). Governs presentation only,
+   * never selection. Owned by settings.json.
+   */
+  memoryPresentationProfile?: MemoryPresentationProfile;
+  /**
+   * Consecutive failed active-memory context refreshes (per context key)
+   * before an operator alert is raised via the system-derived notification
+   * path (E5.5). Owned by settings.json.
+   */
+  memoryRefreshFailureAlertThreshold?: number;
+  /**
+   * When a foreground turn gets its active memory context. `background` serves
+   * the last-good context and refreshes it for the next turn. `inline` awaits
+   * the refresh for the current message (same sticky merge) for at most
+   * `activeMemoryInlineBudgetMs`, then falls back to the last-good context.
+   * Owned by settings.json.
+   */
+  activeMemoryRetrievalMode?: ActiveMemoryRetrievalMode;
+  /**
+   * Inline active-memory wait budget in milliseconds. Must exceed the sum of
+   * the enabled memory decision-site latency budgets or inline turns will
+   * regularly fall back to the last-good context. Owned by settings.json.
+   */
+  activeMemoryInlineBudgetMs?: number;
+  /**
+   * Fail-closed intake screening events per stage/source class before one
+   * deduplicated operator alert is raised. Owned by settings.json.
+   */
+  intakeScreeningFailureAlertThreshold?: number;
+  groupMemory?: GroupMemorySettings;
+  emotionScoping?: EmotionScopingSettings;
+  /** settings.json-owned gate for expensive narrative emotion appraisal. */
+  narrativeEmotionAppraisal?: NarrativeEmotionAppraisalSettings;
+  profileSynthesisEnabled?: boolean;
+  profileSynthesisRefreshIntervalMs?: number;
+  profileSynthesisCooldownMs?: number;
+  profileSynthesisMinWrites?: number;
+  profileSynthesisMinImportance?: number;
+  profileSynthesisMinConfidence?: number;
+  profileSynthesisMinNovelty?: number;
+  profileSynthesisSourceMemoryLimit?: number;
+  profileSynthesisMinSourceMemories?: number;
+  modelRoster: Partial<Record<ModelPurpose, ModelSlot>>;
+  modelCatalog?: Record<string, ModelCatalogEntry>;
+  modelRoleAssignments?: ModelRoleAssignments;
+  modelRegistry?: CanonicalModelRegistry;
+  /**
+   * Per-companion model selection (23pp): canonical purpose → models.json slot
+   * key from the companion's effective runtime settings. Validated fail-closed
+   * against the registry after models hydration; leads the lane's routing chain.
+   */
+  modelPurposeSelection?: ModelPurposeSelection;
+  providerRegistry?: CanonicalProviderRegistry;
+  credentialVault?: CredentialVaultPort;
+  openRouterApiBaseUrl?: string;
+  openRouterApiKeyRef?: CredentialReference;
+  /**
+   * OpenRouter server-tools web backend selection (bead htm9.10),
+   * projected from providers.json `openrouter.metadata.webTools`. When enabled,
+   * the gateway routes web search/fetch through OpenRouter's built-in server
+   * tools instead of the self-hosted crawler lane.
+   */
+  openRouterWebTools?: { enabled: boolean; model: string };
+  responseStyleOverrides?: ResponseStyleOverrides;
+  runtimeHooks?: RuntimeConfigHooks;
+  promotedExtendedTools?: string[];
+  /** settings.json-owned gateway shell execution policy and hard limits. */
+  shellExec?: ShellExecSettings;
+  /** settings.json-owned typed-decision backend selection (epic 4lf3r); absent = local. */
+  decisionBackend?: DecisionBackendSettings;
+  capabilityTier?: CapabilityTier;
+  compositionalPolicy?: CompositionalPolicyConfig;
+  observerEvalSidecar?: ObserverEvalSidecarSettings;
+  emosimProactivity?: EmoSimProactivitySettings;
+  sessionTailCache?: SessionTailCacheSettings;
+  shardToolsets?: ShardToolsetConfig;
+  /**
+   * bead 7ym.2.1 — schema-owned subagent role registry (subagent-roles.json).
+   * Named role profiles layered over inherited companion identity; each role may
+   * only narrow the tools/limits the parent tier grants. Absent/empty ⇒ no roles
+   * configured (unknown-role spawns fail closed).
+   */
+  subagentRoles?: SubagentRoleRegistryConfig;
+  /** System-owned automata class eligibility and retention policy. */
+  automataPolicy?: AutomataOwnerPolicy;
+  /** Concurrency cap on simultaneously active subagent tasks (zet.7). */
+  subagentMaxConcurrent?: number;
+  /** Concurrency cap on simultaneously active shards (zet.7). */
+  shardMaxConcurrent?: number;
+  /** Shard heartbeat silence (ms) before a shard is marked degraded/stale (zet.7). */
+  shardHeartbeatStaleAfterMs?: number;
+  /** Shard heartbeat silence (ms) before a shard is marked offline (zet.7). */
+  shardHeartbeatDisconnectAfterMs?: number;
+  /** Satellite heartbeat silence (ms) before a hub device reads degraded (s7wq3). */
+  satelliteHeartbeatStaleAfterMs?: number;
+  /** Max document attachment size accepted by file ingest (bytes, zet.7). */
+  documentIngestMaxBytes?: number;
+  /** Max plain-text attachment size accepted by file ingest (bytes, zet.7). */
+  documentIngestTextMaxBytes?: number;
+  /** Char cap on parsed attachment text injected into the prompt (zet.7). */
+  documentIngestPromptChars?: number;
+  /** Char cap on parsed attachment text written to the sidecar file (zet.7). */
+  documentIngestSidecarChars?: number;
+  ledgerReadChunkBytes?: number;
+  ledgerReadMaxRowBytes?: number;
+  ledgerReadYieldRows?: number;
+  sessionTombstoneAuthorityOwners?: number;
+  /** Overall wait cap (ms) for FAL image queue results (zet.7). */
+  imageFalTimeoutMs?: number;
+  /** Poll cadence (ms) for FAL image queue status (zet.7). */
+  imageFalPollIntervalMs?: number;
+  /** Overall wait cap (ms) for ComfyUI workflow completion (zet.7). */
+  imageComfyTimeoutMs?: number;
+  /** Poll cadence (ms) for ComfyUI workflow history (zet.7). */
+  imageComfyPollIntervalMs?: number;
+  voiceEnabled?: boolean;
+  discordBackfillOnStartup?: boolean;
+  discordTriggerWords?: string[];
+  discordTriggerReactions?: string[];
+  discordTriggerListenWindowMs?: number;
+  characterName?: string;
+  /**
+   * Companion's active IANA timezone (settings.json-owned). Precedence, fail-closed:
+   * settings.json activeTimezone (validated IANA) > env TZ (bootstrap only, validated)
+   * > 'America/New_York' default. Installed into the shared active-timezone module at
+   * settings load; consumed live by every formatter, the scheduler, and rest windows.
+   */
+  activeTimezone?: string;
+  uiThemeId?: string;
+  voiceTargetGuildId?: string;
+  voiceTargetUserId?: string;
+  voiceReadyCueText?: string;
+  voiceDaveEncryption?: boolean;
+  voiceDecryptionFailureTolerance?: number;
+  /** Idle-connection timeout for the voice websocket session before force-close. */
+  voiceSessionTimeoutMs?: number;
+  /** Maximum inbound voice websocket frame size (bytes) before rejection. */
+  voiceMaxFrameBytes?: number;
+  /** Backpressure cap on queued inbound voice frames before overflow close. */
+  voiceMaxPendingFrames?: number;
+  /** settings.json-owned committed voice reply segmentation thresholds. */
+  voiceReplySegmenter?: VoiceReplySegmenterSettings;
+  sttProvider?: StreamingSttProvider | 'disabled';
+  ttsProvider?: StreamingTtsProvider | 'disabled';
+  deepgramApiKey?: string;
+  deepgramModel?: string;
+  deepgramSttEndpoint?: string;
+  deepgramListenEndpoint?: string;
+  elevenLabsApiKey?: string;
+  elevenLabsVoiceId?: string;
+  elevenLabsModelId?: string;
+  elevenLabsEndpointBase?: string;
+  falApiKey?: string;
+  comfyUiBaseUrl?: string;
+  imageProvider?: ImageProvider;
+  imageFalCreateModel?: FalCreateModel;
+  imageFalEditModel?: FalEditModel;
+  imageSelfieEditModel?: FalEditModel;
+  imageWorkflows?: ImageWorkflowSettings;
+  echoTtsUrl?: string;
+  echoTtsVoice?: string;
+  echoTtsPreset?: string;
+  echoTtsModel?: string;
+  analysisWorkbenchMaxTokens?: number;
+  analysisWorkbenchMaxWallTimeMs?: number;
+  /** Shared response-wait window for direct-parent Workbench execution. */
+  analysisWorkbenchDirectResponseTimeoutMs?: number;
+  analysisWorkbenchMaxSubQueries?: number;
+  /** Operator override for the analysis workbench iteration cap (turns). */
+  analysisWorkbenchMaxIterations?: number;
+  /** Per-code-block sandbox execution timeout (ms) for the analysis workbench. */
+  analysisWorkbenchExecutionTimeoutMs?: number;
+  /** Character cap on a single analysis-workbench code execution's output. */
+  analysisWorkbenchOutputTruncation?: number;
+  /** Default byte page size for the unified filesystem read tool. */
+  fsReadMaxBytes?: number;
+  retryMaxAttempts?: number;
+  retryBaseDelayMs?: number;
+  openRouterProviderOrder?: string[];
+  openRouterModelsApiUrl?: string;
+  importProcessingRouteMode?: ImportProcessingRouteMode;
+  importProcessingStrictPolicy?: boolean;
+  importProcessingLocalEndpointUrl?: string;
+  importProcessingLocalModel?: string;
+  embeddingProvider?: 'ollama' | 'transformers' | 'api';
+  embeddingModel?: string;
+  embeddingDims?: number;
+  embeddingOllamaUrl?: string;
+  transformersModel?: string;
+  transformersCacheDir?: string;
+  textEmotionModel?: string;
+  textEmotionCacheDir?: string;
+  textEmotionDtype?: TextEmotionDType;
+  embeddingApiUrl?: string;
+  embeddingApiModel?: string;
+  embeddingApiDims?: number;
+  webFetchAllowHttp?: boolean;
+  webFetchDomainAllowlist?: string[];
+  webFetchAllowInternalNetwork?: boolean;
+  homeAssistantEnabled?: boolean;
+  webFetchTlsCaCertPaths?: string[];
+  /** Path to a CA certificate file (PEM) to trust for all outbound TLS connections (LLM, embeddings, etc.). Sets NODE_EXTRA_CA_CERTS at startup. */
+  gatewayTlsCaPath?: string;
+  /** Dev/test-only request for endpoint-scoped TLS verification exceptions. Rejected in production; never maps to NODE_TLS_REJECT_UNAUTHORIZED. */
+  gatewayTlsRejectUnauthorized?: boolean;
+  wyomingShardRouting?: WyomingShardRoutingConfig;
+  wyomingEnabled?: boolean;
+  wyomingHost?: string;
+  wyomingPort?: number;
+
+  // ── Telegram ──
+  telegramEnabled?: boolean;
+  telegramAuthorizedUsers?: string[];
+
+  // ── Obsidian vault ──
+  obsidianVaultName?: string;
+  obsidianCliPath?: string;
+  obsidianAutoPublish?: boolean;
+  obsidianTimeoutMs?: number;
+
+  // ── Charge policy ──
+  chargePolicy?: ChargePolicyConfig;
+
+  // ── Satellite claim registry ──
+  satelliteRegistry?: SatelliteRegistryConfig;
+
+  // ── MoA (Mixture of Agents) ──
+  moaEnabled?: boolean;
+  moaReferenceModels?: string[];
+  moaAggregatorModel?: string;
+  moaMaxRounds?: number;
+  moaMaxTokensPerRound?: number;
+  moaTimeoutMs?: number;
+}
+
+export interface WikiStartupHydrationSettings {
+  recentSessionLimit: number;
+  recentMessageLimit: number;
+  maxContextChars: number;
+}
+
+export interface VoiceReplySegmenterSettings {
+  minSegmentLength: number;
+  maxBufferLength: number;
+}
+
+/**
+ * Mutable operational limits for lifecycle commands and the Kubernetes
+ * self-management surfaces. Network coordinates and credentials remain
+ * environment-owned; immutable protocol and response-size guards remain code-owned.
+ */
+export interface LifecycleKubernetesSettings {
+  lifecycleCommandTimeoutMs: number;
+  operatorCommandTimeoutMs: number;
+  operatorHttpTimeoutMs: number;
+  operatorConfirmationRequestTimeoutMs: number;
+  kubernetesReadRequestTimeoutMs: number;
+  kubernetesRolloutRequestTimeoutMs: number;
+  rolloutWaitTimeoutMs: number;
+  rolloutPollIntervalMs: number;
+  rollbackWaitTimeoutMs: number;
+  rollbackPollIntervalMs: number;
+  postRolloutMaxLogRecords: number;
+  postRolloutValidationHistoryLimit: number;
+  rollbackHistoryLimit: number;
+}
+export const DEFAULT_MOOD_CONGRUENCE_WEIGHT = 0.15;
+export const DEFAULT_UI_THEME_ID = 'garden';
+
+export const CORE_SECRET_BEARING_CONFIG_KEYS = [
+  'credentialVault',
+  'discordToken',
+  'discordBotId',
+  'gatewayCompanionAuthToken',
+  'gatewaySessionIntegrityAuthToken',
+  'postgresDatabaseUrl',
+  'fleetAuth',
+  'openRouterApiKeyRef',
+  'deepgramApiKey',
+  'elevenLabsApiKey',
+  'falApiKey',
+] as const;
+
+export type CoreSecretBearingConfigKey = (typeof CORE_SECRET_BEARING_CONFIG_KEYS)[number];
+
+export interface CoreSubstrateConfig extends SubstrateConfig {
+  credentialVault?: never;
+  discordToken?: never;
+  discordBotId?: never;
+  gatewayCompanionAuthToken?: never;
+  gatewaySessionIntegrityAuthToken?: never;
+  postgresDatabaseUrl?: never;
+  fleetAuth?: never;
+  openRouterApiKeyRef?: never;
+  deepgramApiKey?: never;
+  elevenLabsApiKey?: never;
+  falApiKey?: never;
+}
+
+export function sanitizeCoreSubstrateConfig(config: SubstrateConfig): CoreSubstrateConfig {
+  const {
+    credentialVault: _credentialVault,
+    discordToken: _discordToken,
+    discordBotId: _discordBotId,
+    gatewayCompanionAuthToken: _gatewayCompanionAuthToken,
+    gatewaySessionIntegrityAuthToken: _gatewaySessionIntegrityAuthToken,
+    postgresDatabaseUrl: _postgresDatabaseUrl,
+    fleetAuth: _fleetAuth,
+    openRouterApiKeyRef: _openRouterApiKeyRef,
+    deepgramApiKey: _deepgramApiKey,
+    elevenLabsApiKey: _elevenLabsApiKey,
+    falApiKey: _falApiKey,
+    ...coreConfig
+  } = config;
+
+  return coreConfig as CoreSubstrateConfig;
+}

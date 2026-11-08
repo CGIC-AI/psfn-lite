@@ -1,0 +1,506 @@
+import type { RetrievalVADInput } from '../../../core/agent/contracts.js';
+import { DEFAULT_MOOD_CONGRUENCE_WEIGHT } from '../../../system/config/runtime-config-contracts.js';
+import {
+  computeBoundarySimilarityBoost,
+  isBoundaryMemory,
+} from '../boundary-log.js';
+import {
+  MEMORY_CONFIG,
+  computeMemoryScopeMatchStrength,
+  evaluateMemoryPrivacyRisk,
+  isDurablePreferenceMemory,
+  type MemoryPrivacyRiskBreakdown,
+  type MemoryScopeQuery,
+  type PurrMemory,
+  type RetrievalCallerContext,
+  type RetrievalModeInput,
+} from '../types.js';
+import { normalizeRetrievalModes } from './modes.js';
+import type { ScoredMemory } from './types.js';
+import { calculateEffectiveMemorySalience } from '../decay.js';
+import {
+  createDefaultMemoryRetrievalPolicy,
+  resolveMemoryRetrievalPolicy,
+  resolveMemoryRetrievalPrior,
+  type MemoryRetrievalPolicy,
+} from '../../../system/config/memory-retrieval-policy.js';
+
+const DEFAULT_MEMORY_RETRIEVAL_POLICY = createDefaultMemoryRetrievalPolicy();
+/** Default score-guarantee floor (owner file: memoryRetrievalPolicy.scoreGuaranteeMinK). */
+export const SCORE_GUARANTEE_MIN_K = DEFAULT_MEMORY_RETRIEVAL_POLICY.scoreGuaranteeMinK;
+/** Default score-guarantee similarity multiplier (memoryRetrievalPolicy.scoreGuaranteeFloor). */
+export const SCORE_GUARANTEE_FLOOR = DEFAULT_MEMORY_RETRIEVAL_POLICY.scoreGuaranteeFloor;
+
+const DEFAULT_RECENCY_DECAY_DAYS = 30;
+const TEMPORAL_RECENCY_DECAY_DAYS = 7;
+const TEMPORAL_SAME_DAY_EVIDENCE_BOOST = 1.2;
+const REFLECTION_PROVENANCE_PREFIXES = [
+  'reflection_journal:',
+  'reflection_daily:',
+  'reflection_process:',
+] as const;
+const PREFERENCE_CONTEXT_HINT =
+  /\b(favou?rite|prefer|preference|likes?|loves?|enjoys?|dislikes?|hates?|taste|colou?r|outfit|wear|clothes?|moment|memory|recommend|choose|which)\b/i;
+const BROAD_PROFILE_CONTEXT_HINT =
+  /\b(what do you remember|what do we remember|tell me about|what do you know about|profile|preferences?)\b/i;
+const PREFERENCE_CATEGORY_CONTEXT_HINTS: ReadonlyArray<readonly [string, RegExp]> = [
+  ['preference:color', /\b(?:colou?r|palette|shade|hue)\b/i],
+  ['preference:outfit', /\b(?:outfit|wear|clothes?|clothing|dress|shirt|jacket)\b/i],
+  ['preference:moment', /\b(?:moment|memory|occasion|tradition|ritual)\b/i],
+  ['preference:food', /\b(?:food|meal|coffee|tea|drink|dessert|snack|restaurant|cuisine)\b/i],
+  ['preference:media', /\b(?:music|song|movie|film|book|game|show|artist|album)\b/i],
+  ['preference:place', /\b(?:place|city|room|park|beach|mountain|home|venue)\b/i],
+  ['preference:style', /\b(?:style|aesthetic|vibe|tone|format|communication)\b/i],
+];
+
+interface RetrievalScoreComponents {
+  score: number;
+  baseScore: number;
+  effectiveSalience: number;
+  evidenceSupport: number;
+  contradictionPenaltyMultiplier: number;
+  explicitlyQueried: boolean;
+  lowConfidenceSingleSourceSuppressed: boolean;
+  quietPreferenceSuppressed: boolean;
+  preferenceContextBoost: number;
+  evidenceSourceCount: number;
+  privacyRisk: number;
+  privacyPenalty: number;
+  privacyBreakdown: MemoryPrivacyRiskBreakdown;
+  retrievalModeExcluded: boolean;
+}
+
+export interface ScoreGuaranteeResult {
+  scored: ScoredMemory[];
+  rejectedByScore: number;
+  scoreGuaranteedCount: number;
+}
+
+export function countSelectedMemoryTypes(scored: ScoredMemory[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const item of scored) {
+    counts[item.memory.type] = (counts[item.memory.type] ?? 0) + 1;
+  }
+  return counts;
+}
+
+export function collectSelectedProvenanceRefs(
+  scored: ScoredMemory[],
+  retrievalSource: 'embedding' | 'lexical_fallback' = 'embedding',
+): string[] {
+  const refs = new Set<string>();
+  if (retrievalSource === 'lexical_fallback') {
+    refs.add('retrieval:lexical_fallback');
+  }
+  for (const item of scored) {
+    // The metacognition monitor counts memory-backed evidence by the
+    // `memory:` prefix; without these entries supporting_memories is
+    // structurally zero and confabulation_risk pins at max confidence.
+    if (item.memory.id.trim()) {
+      refs.add(`memory:${item.memory.id.trim()}`);
+    }
+    for (const link of item.evolutionChain ?? []) {
+      if (link.relation === 'conflicts_with' || link.relation === 'negates') {
+        refs.add(`memory:${link.memory.id}|conflict:${link.relation}`);
+      }
+    }
+    if (item.memory.sourceRef.trim()) {
+      refs.add(item.memory.sourceRef.trim());
+    }
+    for (const provenanceRef of item.memory.provenanceRefs ?? []) {
+      const normalized = provenanceRef.trim();
+      if (normalized) refs.add(normalized);
+    }
+  }
+  return [...refs];
+}
+
+export function applyScoreGuarantee(
+  scoredCandidates: ScoredMemory[],
+  policyInput?: MemoryRetrievalPolicy,
+): ScoreGuaranteeResult {
+  const policy = resolveMemoryRetrievalPolicy(policyInput);
+  const positiveScored = scoredCandidates.filter(candidate => candidate.score > 0);
+  const zeroScored = scoredCandidates.filter(candidate => candidate.score <= 0);
+  const guaranteeEligibleZeroScored = zeroScored.filter(candidate => !candidate.quietPreferenceSuppressed);
+  const rejectedByScore = zeroScored.length;
+
+  let scoreGuaranteedCount = 0;
+  if (positiveScored.length < policy.scoreGuaranteeMinK && guaranteeEligibleZeroScored.length > 0) {
+    const needed = policy.scoreGuaranteeMinK - positiveScored.length;
+    const rescued = guaranteeEligibleZeroScored
+      .sort((a, b) => b.memory.similarity - a.memory.similarity)
+      .slice(0, needed)
+      .map(item => ({
+        ...item,
+        score: item.memory.similarity * policy.scoreGuaranteeFloor,
+      }));
+    positiveScored.push(...rescued);
+    positiveScored.sort((a, b) => b.score - a.score);
+    scoreGuaranteedCount = rescued.length;
+  }
+
+  return {
+    scored: positiveScored,
+    rejectedByScore,
+    scoreGuaranteedCount,
+  };
+}
+
+export function computeRetrievalScore(
+  memory: PurrMemory & { similarity: number },
+  contextText: string,
+  options?: {
+    currentVAD?: RetrievalVADInput;
+    moodCongruenceWeight: number;
+    scopeQuery?: MemoryScopeQuery;
+    callerContext?: RetrievalCallerContext;
+    retrievalMode?: RetrievalModeInput;
+    memoryRetrievalPolicy?: MemoryRetrievalPolicy;
+    taskKind?: string;
+  },
+): RetrievalScoreComponents {
+  const now = Date.now();
+  const policy = resolveMemoryRetrievalPolicy(options?.memoryRetrievalPolicy);
+  const retrievalModes = normalizeRetrievalModes(options?.callerContext, options?.retrievalMode);
+  const temporalMode = retrievalModes.has('temporal');
+  const reflectionMode = retrievalModes.has('reflection');
+  const recencyBoost = computeRetrievalRecencyBoost(
+    memory.extractedAt,
+    now,
+    temporalMode,
+    policy,
+  );
+  const sameDayEvidenceBoost = temporalMode && hasSameDayTemporalEvidence(memory, now)
+    ? TEMPORAL_SAME_DAY_EVIDENCE_BOOST
+    : 1;
+  const emotionalWeight = 1 + Math.abs(memory.emotionalValence) * 0.5;
+  const moodCongruenceFactor = computeMoodCongruenceFactor(
+    memory.formationVAD,
+    options?.currentVAD,
+    options?.moodCongruenceWeight ?? DEFAULT_MOOD_CONGRUENCE_WEIGHT,
+  );
+  const typePriorityBoost = resolveMemoryRetrievalPrior(
+    policy,
+    memory.type,
+    options?.taskKind,
+  );
+  const boundarySimilarityBoost = isBoundaryMemory(memory)
+    ? computeBoundarySimilarityBoost(contextText, memory)
+    : 1;
+  const explicitlyQueried = hasExplicitMemoryMention(contextText, memory.text);
+  const preferenceContext = computePreferenceContextRelevance(memory, contextText, explicitlyQueried);
+  const preferenceContextBoost = preferenceContext.relevant ? preferenceContext.boost : 1;
+  const scopeMatchStrength = computeMemoryScopeMatchStrength(memory, options?.scopeQuery);
+  const scopeBoost = 1 + (scopeMatchStrength * 0.35);
+  const accessReinforcementBoost = deriveAccessReinforcement(memory);
+  const effectiveSalience = calculateEffectiveMemorySalience(memory, now, policy);
+  const rawBaseScore = (
+    memory.similarity *
+    recencyBoost *
+    sameDayEvidenceBoost *
+    emotionalWeight *
+    memory.importance *
+    effectiveSalience *
+    moodCongruenceFactor *
+    typePriorityBoost *
+    boundarySimilarityBoost *
+    preferenceContextBoost *
+    scopeBoost *
+    accessReinforcementBoost
+  );
+  const evidence = deriveEvidenceSupport(memory);
+  const contradictionPenaltyMultiplier = deriveContradictionPenalty(memory);
+  const retrievalModeExcluded = reflectionMode && isReflectionRetrievalCandidate(memory);
+  const lowConfidenceSingleSourceSuppressed = (
+    evidence.sourceCount <= 1
+    && memory.confidence < 0.45
+    && !explicitlyQueried
+  );
+  const quietPreferenceSuppressed = (
+    isDurablePreferenceMemory(memory)
+    && !preferenceContext.relevant
+    && !explicitlyQueried
+  );
+  const evidenceBoost = 0.45 + (evidence.support * 0.55);
+  const baseScore = rawBaseScore * evidenceBoost * contradictionPenaltyMultiplier;
+  const privacyEvaluation = evaluateMemoryPrivacyRisk(memory);
+  const privacyPenalty = baseScore * privacyEvaluation.risk * MEMORY_CONFIG.privacyRiskPenaltyWeight;
+  let score = retrievalModeExcluded ? 0 : Math.max(0, baseScore - privacyPenalty);
+  if (!retrievalModeExcluded && lowConfidenceSingleSourceSuppressed) {
+    const dominanceCap = memory.similarity * 0.02;
+    score = Math.min(score, dominanceCap);
+  }
+  if (!retrievalModeExcluded && quietPreferenceSuppressed) {
+    score = 0;
+  }
+  return {
+    score,
+    baseScore,
+    effectiveSalience,
+    evidenceSupport: evidence.support,
+    contradictionPenaltyMultiplier,
+    explicitlyQueried,
+    lowConfidenceSingleSourceSuppressed,
+    quietPreferenceSuppressed,
+    preferenceContextBoost,
+    evidenceSourceCount: evidence.sourceCount,
+    privacyRisk: privacyEvaluation.risk,
+    privacyPenalty,
+    privacyBreakdown: privacyEvaluation.breakdown,
+    retrievalModeExcluded,
+  };
+}
+
+export function computeRetrievalRecencyBoost(
+  extractedAt: number,
+  now: number,
+  temporalMode: boolean,
+  policyInput?: MemoryRetrievalPolicy,
+): number {
+  if (!Number.isFinite(extractedAt)) return 1;
+  const ageDays = Math.max(0, (now - extractedAt) / (1000 * 60 * 60 * 24));
+  const decayDays = temporalMode ? TEMPORAL_RECENCY_DECAY_DAYS : DEFAULT_RECENCY_DECAY_DAYS;
+  const recency = 1 / (1 + ageDays / decayDays);
+  return temporalMode
+    ? recency
+    : Math.max(resolveMemoryRetrievalPolicy(policyInput).nonTemporalRecencyFloor, recency);
+}
+
+function hasSameDayTemporalEvidence(
+  memory: Pick<PurrMemory, 'extractedAt' | 'sourceRef' | 'provenanceRefs'>,
+  now: number,
+): boolean {
+  if (isSameUtcDay(memory.extractedAt, now)) return true;
+  const currentDate = formatUtcDate(now);
+  if (memory.sourceRef.includes(`date:${currentDate}`) || memory.sourceRef.includes(`createdAt:${currentDate}`)) {
+    return true;
+  }
+  for (const ref of memory.provenanceRefs ?? []) {
+    if (ref.includes(`date:${currentDate}`) || ref.includes(`createdAt:${currentDate}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isReflectionRetrievalCandidate(
+  memory: Pick<PurrMemory, 'type' | 'sourceRef' | 'provenanceRefs'>,
+): boolean {
+  if (memory.type === 'reflection') return true;
+  if (REFLECTION_PROVENANCE_PREFIXES.some(prefix => memory.sourceRef.startsWith(prefix))) {
+    return true;
+  }
+  return (memory.provenanceRefs ?? []).some(ref => (
+    REFLECTION_PROVENANCE_PREFIXES.some(prefix => ref.startsWith(prefix))
+  ));
+}
+
+function isSameUtcDay(left: number, right: number): boolean {
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  return formatUtcDate(left) === formatUtcDate(right);
+}
+
+function formatUtcDate(epochMs: number): string {
+  if (!Number.isFinite(epochMs)) return '';
+  return new Date(epochMs).toISOString().slice(0, 10);
+}
+
+function computeMoodCongruenceFactor(
+  formationVAD: RetrievalVADInput | undefined,
+  currentVAD: RetrievalVADInput | undefined,
+  moodCongruenceWeight: number,
+): number {
+  if (moodCongruenceWeight <= 0) return 1;
+  if (!isFiniteRetrievalVAD(formationVAD) || !isFiniteRetrievalVAD(currentVAD)) return 1;
+  const similarity = computeVADSimilarity(formationVAD, currentVAD);
+  return 1 + (moodCongruenceWeight * similarity);
+}
+
+function computeVADSimilarity(
+  left: RetrievalVADInput,
+  right: RetrievalVADInput,
+): number {
+  const deltaValence = clamp(left.valence, -1, 1) - clamp(right.valence, -1, 1);
+  const deltaArousal = clamp(left.arousal, -1, 1) - clamp(right.arousal, -1, 1);
+  const deltaDominance = clamp(left.dominance, -1, 1) - clamp(right.dominance, -1, 1);
+  const distance = Math.sqrt(
+    (deltaValence ** 2)
+    + (deltaArousal ** 2)
+    + (deltaDominance ** 2),
+  );
+  const maxDistance = 2 * Math.sqrt(3);
+  return clamp(1 - (distance / maxDistance), 0, 1);
+}
+
+function isFiniteRetrievalVAD(vad: RetrievalVADInput | undefined): vad is RetrievalVADInput {
+  if (!vad) return false;
+  return Number.isFinite(vad.valence)
+    && Number.isFinite(vad.arousal)
+    && Number.isFinite(vad.dominance);
+}
+
+function deriveEvidenceSupport(
+  memory: Pick<PurrMemory, 'confidence' | 'sourceRef' | 'provenanceRefs' | 'accessCount'>,
+): { support: number; sourceCount: number } {
+  const confidence = clamp(memory.confidence, 0, 1);
+  const sourceCount = countDistinctEvidenceSources(memory);
+  const sourceSupport = clamp(0.25 + (Math.min(4, sourceCount) / 4) * 0.75, 0, 1);
+  const reinforcement = clamp(memory.accessCount / 8, 0, 1);
+  const support = clamp(
+    (confidence * 0.6)
+    + (sourceSupport * 0.3)
+    + (reinforcement * 0.1),
+    0.05,
+    1,
+  );
+  return { support, sourceCount };
+}
+
+function deriveAccessReinforcement(
+  memory: Pick<PurrMemory, 'lastAccessed' | 'extractedAt' | 'accessCount'>,
+): number {
+  const effectiveLastAccessed = Number.isFinite(memory.lastAccessed)
+    ? memory.lastAccessed
+    : Number.isFinite(memory.extractedAt)
+      ? memory.extractedAt
+      : Date.now();
+  const ageMs = Math.max(0, Date.now() - effectiveLastAccessed);
+  const ageDays = ageMs / (1000 * 60 * 60 * 24);
+  const freshnessDays = Math.max(1, MEMORY_CONFIG.retrievalAccessFreshnessDays);
+  const countCap = Math.max(1, MEMORY_CONFIG.retrievalAccessCountCap);
+  const freshness = clamp(1 / (1 + ageDays / freshnessDays), 0, 1);
+  const reinforcement = clamp(memory.accessCount / countCap, 0, 1);
+  const combinedSignal = clamp(
+    (freshness * MEMORY_CONFIG.retrievalAccessFreshnessWeight)
+    + (reinforcement * (1 - MEMORY_CONFIG.retrievalAccessFreshnessWeight)),
+    0,
+    1,
+  );
+  return 1 + (combinedSignal * MEMORY_CONFIG.retrievalAccessReinforcementMaxBoost);
+}
+
+function deriveContradictionPenalty(
+  memory: Pick<PurrMemory, 'supersededBy' | 'tags'>,
+): number {
+  const normalizedTags = new Set(memory.tags.map(tag => tag.trim().toLowerCase()).filter(Boolean));
+  const hasContradictionHint = [...normalizedTags].some(tag => (
+    tag === 'contradicted'
+    || tag === 'contradiction'
+    || tag === 'disputed'
+    || tag === 'retracted'
+    || tag === 'hallucinated'
+    || tag.includes('contradict')
+    || tag.includes('disput')
+  ));
+  if (memory.supersededBy) return 0.25;
+  if (hasContradictionHint) return 0.55;
+  return 1;
+}
+
+function computePreferenceContextRelevance(
+  memory: Pick<PurrMemory, 'text' | 'type' | 'tags' | 'retentionClass'>,
+  contextText: string,
+  explicitlyQueried: boolean,
+): { relevant: boolean; boost: number } {
+  if (!isDurablePreferenceMemory(memory)) {
+    return { relevant: false, boost: 1 };
+  }
+  const context = contextText.trim();
+  if (!context) return { relevant: false, boost: 1 };
+  if (explicitlyQueried) return { relevant: true, boost: 1.4 };
+  if (BROAD_PROFILE_CONTEXT_HINT.test(context)) return { relevant: true, boost: 1.15 };
+
+  const tags = new Set(memory.tags.map(tag => tag.trim().toLowerCase()).filter(Boolean));
+  for (const [tag, pattern] of PREFERENCE_CATEGORY_CONTEXT_HINTS) {
+    if (tags.has(tag) && pattern.test(context)) {
+      return { relevant: true, boost: 1.45 };
+    }
+  }
+
+  if (!PREFERENCE_CONTEXT_HINT.test(context)) return { relevant: false, boost: 1 };
+
+  const contextTokens = new Set(tokenizeForExplicitMatch(context));
+  if (contextTokens.size === 0) return { relevant: false, boost: 1 };
+  const memoryTokens = new Set([
+    ...tokenizeForExplicitMatch(memory.text),
+    ...memory.tags.flatMap(tag => tokenizeForExplicitMatch(tag)),
+  ]);
+  let overlap = 0;
+  for (const token of contextTokens) {
+    if (memoryTokens.has(token)) overlap++;
+  }
+  return overlap > 0
+    ? { relevant: true, boost: Math.min(1.5, 1.2 + overlap * 0.08) }
+    : { relevant: false, boost: 1 };
+}
+
+function countDistinctEvidenceSources(
+  memory: Pick<PurrMemory, 'sourceRef' | 'provenanceRefs'>,
+): number {
+  const sourceSet = new Set<string>();
+  const normalizedSourceRef = normalizeEvidenceSource(memory.sourceRef);
+  if (normalizedSourceRef) sourceSet.add(normalizedSourceRef);
+  for (const ref of memory.provenanceRefs ?? []) {
+    const normalized = normalizeEvidenceSource(ref);
+    if (normalized) sourceSet.add(normalized);
+  }
+  return sourceSet.size;
+}
+
+function normalizeEvidenceSource(value: string): string {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed) return '';
+  const firstSeparator = trimmed.indexOf(':');
+  if (firstSeparator <= 0) return trimmed;
+  return trimmed.slice(0, firstSeparator + 1);
+}
+
+function hasExplicitMemoryMention(contextText: string, memoryText: string): boolean {
+  const contextTokens = tokenizeForExplicitMatch(contextText);
+  if (contextTokens.length === 0) return false;
+
+  const memoryTokenSet = new Set(tokenizeForExplicitMatch(memoryText));
+  if (memoryTokenSet.size === 0) return false;
+
+  let overlap = 0;
+  let hasLongOverlap = false;
+  for (const token of contextTokens) {
+    if (!memoryTokenSet.has(token)) continue;
+    overlap++;
+    if (token.length >= 6) {
+      hasLongOverlap = true;
+    }
+  }
+
+  if (overlap >= 2 && hasLongOverlap) return true;
+  return overlap >= 3;
+}
+
+export function tokenizeForExplicitMatch(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .map(token => token.trim())
+    .filter(token => token.length >= 4);
+}
+
+/**
+ * Local clamp retained intentionally: it maps both `NaN` and non-finite values
+ * (e.g. `Infinity`) to the midpoint. The shared `clampWithMidpointNaN` only maps
+ * `NaN`, so adopting it here would change behavior for infinite inputs and is not
+ * part of this slice.
+ */
+export function clamp(val: number, min: number, max: number): number {
+  if (!Number.isFinite(val)) return (min + max) / 2;
+  return Math.max(min, Math.min(max, val));
+}
+
+export function resolveMoodCongruenceWeight(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MOOD_CONGRUENCE_WEIGHT;
+  if (!Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`moodCongruenceWeight must be a finite number between 0 and 1; received ${String(value)}`);
+  }
+  return value;
+}

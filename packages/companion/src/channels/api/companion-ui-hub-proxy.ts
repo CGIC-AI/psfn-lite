@@ -1,0 +1,110 @@
+import { request as httpRequest, type IncomingMessage } from 'node:http';
+import { request as httpsRequest } from 'node:https';
+import type { Duplex } from 'node:stream';
+
+const SESSION_COOKIE_NAME = '__Host-psfn_session';
+const SESSION_COOKIE_VALUE = /^[A-Za-z0-9_-]{43}$/u;
+
+export type CompanionUiSessionCookie =
+  | { state: 'absent' }
+  | { state: 'valid'; cookie: string }
+  | { state: 'invalid' };
+
+/**
+ * Browsers send every cookie for the host in one Cookie header, so the session
+ * cookie is found by pair, not by matching the whole header. Unrelated cookies
+ * are ignored and never forwarded; a duplicated or malformed session cookie,
+ * or more than one Cookie header, fails closed.
+ */
+export function resolveCompanionUiSessionCookie(
+  cookieHeaderCount: number,
+  header: string | undefined,
+): CompanionUiSessionCookie {
+  if (cookieHeaderCount > 1) return { state: 'invalid' };
+  if (cookieHeaderCount === 0 || header === undefined) return { state: 'absent' };
+  const values = header.split(';')
+    .map(pair => pair.trim())
+    .filter(pair => pair.length > 0)
+    .flatMap((pair) => {
+      const separator = pair.indexOf('=');
+      return separator > 0 && pair.slice(0, separator).trim() === SESSION_COOKIE_NAME
+        ? [pair.slice(separator + 1).trim()]
+        : [];
+    });
+  if (values.length === 0) return { state: 'absent' };
+  const [value] = values;
+  if (values.length !== 1 || value === undefined || !SESSION_COOKIE_VALUE.test(value)) {
+    return { state: 'invalid' };
+  }
+  return { state: 'valid', cookie: `${SESSION_COOKIE_NAME}=${value}` };
+}
+
+/** The public leg contains only browser metadata; Hub adds its own authority. */
+export function proxyCompanionUiBrowserUpgrade(input: {
+  request: IncomingMessage;
+  socket: Duplex;
+  head: Buffer;
+  hubOrigin: string;
+  canonicalOrigin: string;
+  timeoutMs: number;
+  allowGuest: boolean;
+}): void {
+  const { request, socket, head } = input;
+  const origin = new URL(input.hubOrigin);
+  const canonical = new URL(input.canonicalOrigin);
+  const names = request.rawHeaders.filter((_, index) => index % 2 === 0).map(name => name.toLowerCase());
+  const session = resolveCompanionUiSessionCookie(
+    names.filter(name => name === 'cookie').length,
+    request.headers.cookie,
+  );
+  if (request.headers.host !== canonical.host || request.headers.origin !== canonical.origin
+    || !['host', 'origin'].every(name => names.filter(entry => entry === name).length === 1)
+    || names.some(name => name === 'authorization' || name === 'sec-websocket-protocol'
+      || name.startsWith('x-psfn-') || name.startsWith('x-identity-claim-'))
+    || session.state === 'invalid'
+    || (session.state === 'absent' && !input.allowGuest)) {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+    return;
+  }
+  const outgoing = (origin.protocol === 'https:' ? httpsRequest : httpRequest)(
+    new URL(request.url!, origin), {
+      method: 'GET',
+      headers: {
+        Host: canonical.host,
+        Origin: canonical.origin,
+        ...(session.state === 'valid' ? { Cookie: session.cookie } : {}),
+        Connection: 'Upgrade',
+        Upgrade: 'websocket',
+        'Sec-WebSocket-Key': String(request.headers['sec-websocket-key'] ?? ''),
+        'Sec-WebSocket-Version': String(request.headers['sec-websocket-version'] ?? ''),
+      },
+    },
+  );
+  outgoing.once('upgrade', (response, upstream, upstreamHead) => {
+    outgoing.setTimeout(0);
+    upstream.setTimeout(0);
+    const accept = response.headers['sec-websocket-accept'];
+    if (typeof accept !== 'string' || response.headers['sec-websocket-protocol'] !== undefined) {
+      upstream.destroy();
+      socket.destroy();
+      return;
+    }
+    socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+    if (head.length > 0) upstream.write(head);
+    if (upstreamHead.length > 0) socket.write(upstreamHead);
+    upstream.on('error', () => socket.destroy());
+    socket.on('error', () => upstream.destroy());
+    socket.once('close', () => upstream.destroy());
+    upstream.once('close', () => socket.destroy());
+    upstream.pipe(socket);
+    socket.pipe(upstream);
+  });
+  outgoing.once('response', response => {
+    response.resume();
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+  });
+  outgoing.once('error', () => socket.destroy());
+  outgoing.setTimeout(input.timeoutMs, () => { outgoing.destroy(); socket.destroy(); });
+  socket.once('close', () => outgoing.destroy());
+  outgoing.end();
+}

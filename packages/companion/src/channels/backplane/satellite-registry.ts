@@ -1,0 +1,1564 @@
+import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import type { IncomingHttpHeaders } from 'node:http';
+import type {
+  SatelliteCapability,
+  SatelliteClientCertIdentity,
+  SatelliteConfigPullResponse,
+  SatelliteConfig,
+  SatelliteConfigRestartPolicy,
+  SatelliteEndpointAuthConfig,
+  SatelliteEndpointAudioRuntimeConfig,
+  SatelliteEndpointConfig,
+  SatelliteHubDeviceEnrollmentConfig,
+  SatelliteEndpointRefreshConfig,
+  SatelliteEndpointRuntimeConfig,
+  SatelliteEndpointTransportConfig,
+  SatelliteMobility,
+  SatelliteRegistryConfig,
+  SatelliteRoutingMetadata,
+  SatelliteTestingHarnessProvenance,
+  RetiredSatelliteConfig,
+  SatelliteTelemetryScope,
+  SatelliteTransportMode,
+  SatelliteSpeakerIdentity,
+} from '../../shared/contracts/satellite-registry.js';
+import {
+  SATELLITE_CAPABILITIES,
+  SATELLITE_CONFIG_RESTART_POLICIES,
+  SATELLITE_REGISTRY_FILE_NAME,
+  SATELLITE_RUNTIME_ENABLED_CAPABILITIES,
+  SATELLITE_TELEMETRY_SCOPES,
+  SATELLITE_TRANSPORT_MODES,
+  satelliteClientCertMatchesBinding,
+  satelliteEndpointAdmitsApiKeyPrincipal,
+} from '../../shared/contracts/satellite-registry.js';
+import type { ApiAuthPrincipal } from './http/auth.js';
+import { CHANNEL_PRIVACY_VALUES, normalizeChannelPrivacy, type ChannelPrivacy } from '../../system/trust/context-envelope.js';
+import { toErrorMessage } from '../../shared/utils/errors.js';
+import { isRecord } from '../../shared/utils/types.js';
+import { createCompanionId } from '../../shared/routing/companion-id.js';
+import { assertNoUnknownKeys } from './config-validation.js';
+import { parseHubDeviceAssertionVerifierConfig } from '../../boundary/fleet-auth/hub-device-assertion-config.js';
+import { withSessionJournalWriteLock } from '../../persistence/sessions/store/session-journal-write-lock.js';
+
+const ID_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const CLAIM_TYPE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
+const SESSION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const HEX_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+
+const SATELLITE_CAPABILITY_SET = new Set<string>(SATELLITE_CAPABILITIES);
+const SATELLITE_RUNTIME_ENABLED_CAPABILITY_SET = new Set<string>(SATELLITE_RUNTIME_ENABLED_CAPABILITIES);
+const SATELLITE_TELEMETRY_SCOPE_SET = new Set<string>(SATELLITE_TELEMETRY_SCOPES);
+const SATELLITE_TRANSPORT_MODE_SET = new Set<string>(SATELLITE_TRANSPORT_MODES);
+const SATELLITE_CONFIG_RESTART_POLICY_SET = new Set<string>(SATELLITE_CONFIG_RESTART_POLICIES);
+
+export const EMPTY_SATELLITE_REGISTRY_CONFIG: SatelliteRegistryConfig = Object.freeze({
+  schemaVersion: 1,
+  enabled: false,
+  satellites: [],
+  retiredSatellites: [],
+});
+
+// NOTE (Sprint-10 C1): `X-PSFN-Client-Cert-*` headers are intentionally NOT
+// claim headers. Client-certificate identity is derived exclusively via
+// `deriveClientCertIdentity` (real TLS peer cert or token-authenticated
+// trusted proxy) and passed to the resolvers as `clientCert`; raw request
+// headers are never consulted for certificate matching.
+export const SATELLITE_CLAIM_HEADERS = {
+  claimType: 'x-psfn-satellite-claim-type',
+  satelliteId: 'x-psfn-satellite-id',
+  endpointId: 'x-psfn-satellite-endpoint-id',
+  sessionId: 'x-psfn-satellite-session-id',
+  threadId: 'x-psfn-satellite-thread-id',
+  capabilities: 'x-psfn-satellite-capabilities',
+  telemetryScopes: 'x-psfn-satellite-telemetry-scopes',
+  addressedCompanionId: 'x-psfn-satellite-addressed-companion-id',
+  /** Per-turn in-world speaker (S13 MOVE); see `SatelliteSpeakerIdentity`. */
+  speakerId: 'x-psfn-satellite-speaker-id',
+  speakerName: 'x-psfn-satellite-speaker-name',
+  speakerKind: 'x-psfn-satellite-speaker-kind',
+} as const;
+
+type HeaderMap = IncomingHttpHeaders | Record<string, string | string[] | undefined>;
+
+export interface ResolvedSatelliteClaim {
+  channelId: string;
+  authorId: string;
+  authorName: string;
+  channelPrivacy: ChannelPrivacy;
+  canonicalContactId: string;
+  satellite: SatelliteRoutingMetadata;
+}
+
+export type SatelliteClaimResolution = { ok: true; value: ResolvedSatelliteClaim } | {
+  ok: false;
+  status: number;
+  type: string;
+  message: string;
+};
+type SatelliteClaimErrorResolution = Extract<SatelliteClaimResolution, { ok: false }>;
+
+export type SatelliteConfigPullResolution = { ok: true; value: SatelliteConfigPullResponse } | {
+  ok: false;
+  status: number;
+  type: string;
+  message: string;
+};
+
+function parseConfiguredString(value: unknown, fieldName: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`${fieldName} must be a string`);
+  }
+  const parsed = value.trim();
+  if (!parsed) {
+    throw new Error(`${fieldName} must not be empty`);
+  }
+  return parsed;
+}
+
+function parseOptionalConfiguredString(value: unknown, fieldName: string): string | undefined {
+  if (value === undefined) return undefined;
+  return parseConfiguredString(value, fieldName);
+}
+
+function parseOptionalConfiguredBoolean(value: unknown, fieldName: string): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new Error(`${fieldName} must be a boolean`);
+  }
+  return value;
+}
+
+function parsePositiveInteger(value: unknown, fieldName: string): number {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${fieldName} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseOptionalPositiveInteger(value: unknown, fieldName: string): number | undefined {
+  if (value === undefined) return undefined;
+  return parsePositiveInteger(value, fieldName);
+}
+
+function parseStringArray(value: unknown, fieldName: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an array of strings`);
+  }
+  const unique = new Set<string>();
+  for (const entry of value) {
+    if (typeof entry !== 'string') {
+      throw new Error(`${fieldName} must contain only strings`);
+    }
+    const trimmed = entry.trim();
+    if (!trimmed) {
+      throw new Error(`${fieldName} must not contain empty strings`);
+    }
+    unique.add(trimmed);
+  }
+  if (unique.size === 0) {
+    throw new Error(`${fieldName} must contain at least one value`);
+  }
+  return [...unique];
+}
+
+function assertIdToken(value: string, fieldName: string): string {
+  if (!ID_TOKEN_PATTERN.test(value)) {
+    throw new Error(`${fieldName} must use only letters, numbers, dot, underscore, dash, or colon`);
+  }
+  return value;
+}
+
+function assertClaimType(value: string, fieldName: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (!CLAIM_TYPE_PATTERN.test(normalized)) {
+    throw new Error(`${fieldName} must be lowercase letters, numbers, dot, underscore, or dash`);
+  }
+  return normalized;
+}
+
+function parseMobility(value: unknown, fieldName: string): SatelliteMobility {
+  const parsed = parseConfiguredString(value, fieldName);
+  if (parsed !== 'static' && parsed !== 'portable' && parsed !== 'mobile' && parsed !== 'unknown') {
+    throw new Error(`${fieldName} must be one of: static, portable, mobile, unknown`);
+  }
+  return parsed;
+}
+
+function parseChannelPrivacy(value: unknown, fieldName: string): ChannelPrivacy {
+  const raw = parseConfiguredString(value, fieldName);
+  const parsed = normalizeChannelPrivacy(raw);
+  if (!parsed) {
+    throw new Error(`${fieldName} must be one of: ${CHANNEL_PRIVACY_VALUES.join(', ')}`);
+  }
+  return parsed;
+}
+
+function parseEndpointPath(value: unknown, fieldName: string): string | undefined {
+  const parsed = parseOptionalConfiguredString(value, fieldName);
+  if (parsed === undefined) return undefined;
+  if (!parsed.startsWith('/') || parsed.includes('://') || parsed.includes('?') || parsed.includes('#')) {
+    throw new Error(`${fieldName} must be an absolute HTTP path without query string or fragment`);
+  }
+  return parsed;
+}
+
+function normalizeSha256Hex(value: string, fieldName: string): string {
+  const normalized = value.trim().toLowerCase().replace(/:/gu, '');
+  if (!HEX_SHA256_PATTERN.test(normalized)) {
+    throw new Error(`${fieldName} must be a SHA-256 hex digest`);
+  }
+  return normalized;
+}
+
+function parseAuthConfig(value: unknown, fieldName: string): SatelliteEndpointAuthConfig {
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  // Fail closed on unknown keys (H9/T1, 03-M2). These are the exact keys the
+  // C1/H4 per-endpoint credential logic reads: a typo'd `apiKeyPrincipalIds`
+  // or `clientCert*` binding must throw, never be silently dropped into an
+  // unauthenticated / over-broad auth posture.
+  assertNoUnknownKeys(
+    value,
+    [
+      'mode',
+      'apiKeyPrincipalIds',
+      'clientCertFingerprintSha256',
+      'clientCertSpkiSha256',
+      'clientCertSubject',
+      'clientCertSan',
+    ],
+    fieldName,
+  );
+  const mode = parseConfiguredString(value.mode, `${fieldName}.mode`);
+  if (mode !== 'api_key' && mode !== 'mtls') {
+    throw new Error(`${fieldName}.mode must be one of: api_key, mtls`);
+  }
+
+  const apiKeyPrincipalIds = value.apiKeyPrincipalIds === undefined
+    ? undefined
+    : parseStringArray(value.apiKeyPrincipalIds, `${fieldName}.apiKeyPrincipalIds`);
+  const clientCertFingerprintSha256 = parseOptionalConfiguredString(
+    value.clientCertFingerprintSha256,
+    `${fieldName}.clientCertFingerprintSha256`,
+  );
+  const clientCertSpkiSha256 = parseOptionalConfiguredString(
+    value.clientCertSpkiSha256,
+    `${fieldName}.clientCertSpkiSha256`,
+  );
+  const clientCertSubject = parseOptionalConfiguredString(value.clientCertSubject, `${fieldName}.clientCertSubject`);
+  const clientCertSan = parseOptionalConfiguredString(value.clientCertSan, `${fieldName}.clientCertSan`);
+
+  if (mode === 'mtls' && !clientCertFingerprintSha256 && !clientCertSpkiSha256 && !clientCertSubject && !clientCertSan) {
+    throw new Error(`${fieldName} mTLS mode requires at least one client certificate binding`);
+  }
+
+  return {
+    mode,
+    ...(apiKeyPrincipalIds ? { apiKeyPrincipalIds } : {}),
+    ...(clientCertFingerprintSha256
+      ? { clientCertFingerprintSha256: normalizeSha256Hex(clientCertFingerprintSha256, `${fieldName}.clientCertFingerprintSha256`) }
+      : {}),
+    ...(clientCertSpkiSha256
+      ? { clientCertSpkiSha256: normalizeSha256Hex(clientCertSpkiSha256, `${fieldName}.clientCertSpkiSha256`) }
+      : {}),
+    ...(clientCertSubject ? { clientCertSubject } : {}),
+    ...(clientCertSan ? { clientCertSan } : {}),
+  };
+}
+
+function parseCapabilities(value: unknown, fieldName: string): SatelliteCapability[] {
+  return parseStringArray(value, fieldName).map((entry) => {
+    if (!SATELLITE_CAPABILITY_SET.has(entry)) {
+      throw new Error(`${fieldName} contains unknown capability "${entry}"`);
+    }
+    return entry as SatelliteCapability;
+  });
+}
+
+function parseTelemetryScopes(value: unknown, fieldName: string): SatelliteTelemetryScope[] {
+  if (value === undefined) return [];
+  return parseStringArray(value, fieldName).map((entry) => {
+    if (!SATELLITE_TELEMETRY_SCOPE_SET.has(entry)) {
+      throw new Error(`${fieldName} contains unknown telemetry scope "${entry}"`);
+    }
+    return entry as SatelliteTelemetryScope;
+  });
+}
+
+function parseTransportMode(value: unknown, fieldName: string): SatelliteTransportMode {
+  const parsed = parseConfiguredString(value, fieldName);
+  if (!SATELLITE_TRANSPORT_MODE_SET.has(parsed)) {
+    throw new Error(`${fieldName} must be one of: ${SATELLITE_TRANSPORT_MODES.join(', ')}`);
+  }
+  return parsed as SatelliteTransportMode;
+}
+
+function parseRestartPolicy(value: unknown, fieldName: string): SatelliteConfigRestartPolicy {
+  const parsed = parseConfiguredString(value, fieldName);
+  if (!SATELLITE_CONFIG_RESTART_POLICY_SET.has(parsed)) {
+    throw new Error(`${fieldName} must be one of: ${SATELLITE_CONFIG_RESTART_POLICIES.join(', ')}`);
+  }
+  return parsed as SatelliteConfigRestartPolicy;
+}
+
+function parseEndpointTransportConfig(value: unknown, fieldName: string): SatelliteEndpointTransportConfig {
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  assertNoUnknownKeys(value, ['mode', 'chatCompletionsPath', 'voiceWebSocketPath'], fieldName);
+  const transport: SatelliteEndpointTransportConfig = {
+    mode: parseTransportMode(value.mode, `${fieldName}.mode`),
+    ...(value.chatCompletionsPath !== undefined
+      ? { chatCompletionsPath: parseEndpointPath(value.chatCompletionsPath, `${fieldName}.chatCompletionsPath`) }
+      : {}),
+    ...(value.voiceWebSocketPath !== undefined
+      ? { voiceWebSocketPath: parseEndpointPath(value.voiceWebSocketPath, `${fieldName}.voiceWebSocketPath`) }
+      : {}),
+  };
+
+  if (transport.mode === 'http_chat_completions' && !transport.chatCompletionsPath) {
+    throw new Error(`${fieldName}.chatCompletionsPath must be configured when mode is http_chat_completions`);
+  }
+  if (transport.mode === 'voice_websocket' && !transport.voiceWebSocketPath) {
+    throw new Error(`${fieldName}.voiceWebSocketPath must be configured when mode is voice_websocket`);
+  }
+  return transport;
+}
+
+function parseEndpointAudioRuntimeConfig(value: unknown, fieldName: string): SatelliteEndpointAudioRuntimeConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  assertNoUnknownKeys(
+    value,
+    ['inputDevice', 'outputDevice', 'sampleRateHz', 'channelCount', 'frameMs', 'wakeWordEnabled'],
+    fieldName,
+  );
+  return {
+    ...(value.inputDevice !== undefined
+      ? { inputDevice: parseConfiguredString(value.inputDevice, `${fieldName}.inputDevice`) }
+      : {}),
+    ...(value.outputDevice !== undefined
+      ? { outputDevice: parseConfiguredString(value.outputDevice, `${fieldName}.outputDevice`) }
+      : {}),
+    ...(value.sampleRateHz !== undefined
+      ? { sampleRateHz: parsePositiveInteger(value.sampleRateHz, `${fieldName}.sampleRateHz`) }
+      : {}),
+    ...(value.channelCount !== undefined
+      ? { channelCount: parsePositiveInteger(value.channelCount, `${fieldName}.channelCount`) }
+      : {}),
+    ...(value.frameMs !== undefined
+      ? { frameMs: parsePositiveInteger(value.frameMs, `${fieldName}.frameMs`) }
+      : {}),
+    ...(value.wakeWordEnabled !== undefined
+      ? { wakeWordEnabled: parseOptionalConfiguredBoolean(value.wakeWordEnabled, `${fieldName}.wakeWordEnabled`) }
+      : {}),
+  };
+}
+
+function parseEndpointRefreshConfig(value: unknown, fieldName: string): SatelliteEndpointRefreshConfig {
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  assertNoUnknownKeys(value, ['intervalMs', 'jitterMs', 'restartPolicy', 'restartGraceMs'], fieldName);
+  const refresh: SatelliteEndpointRefreshConfig = {
+    intervalMs: parsePositiveInteger(value.intervalMs, `${fieldName}.intervalMs`),
+    ...(value.jitterMs !== undefined
+      ? { jitterMs: parseOptionalPositiveInteger(value.jitterMs, `${fieldName}.jitterMs`) }
+      : {}),
+    restartPolicy: parseRestartPolicy(value.restartPolicy, `${fieldName}.restartPolicy`),
+    ...(value.restartGraceMs !== undefined
+      ? { restartGraceMs: parseOptionalPositiveInteger(value.restartGraceMs, `${fieldName}.restartGraceMs`) }
+      : {}),
+  };
+  if (refresh.jitterMs !== undefined && refresh.jitterMs >= refresh.intervalMs) {
+    throw new Error(`${fieldName}.jitterMs must be less than ${fieldName}.intervalMs`);
+  }
+  return refresh;
+}
+
+function parseEndpointRuntimeConfig(value: unknown, fieldName: string): SatelliteEndpointRuntimeConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  assertNoUnknownKeys(value, ['schemaVersion', 'transport', 'audio', 'refresh'], fieldName);
+  if (value.schemaVersion !== 1) {
+    throw new Error(`${fieldName}.schemaVersion must be 1`);
+  }
+  return {
+    schemaVersion: 1,
+    transport: parseEndpointTransportConfig(value.transport, `${fieldName}.transport`),
+    ...(value.audio !== undefined
+      ? { audio: parseEndpointAudioRuntimeConfig(value.audio, `${fieldName}.audio`) }
+      : {}),
+    refresh: parseEndpointRefreshConfig(value.refresh, `${fieldName}.refresh`),
+  };
+}
+
+function parseEndpointConfig(value: unknown, fieldName: string): SatelliteEndpointConfig {
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  assertNoUnknownKeys(
+    value,
+    [
+      'endpointId',
+      'displayName',
+      'claimTypes',
+      'promptChannelType',
+      'auth',
+      'defaultIdentity',
+      'maxCapabilities',
+      'telemetryScopes',
+      'hubDeviceEnrollment',
+      'runtime',
+    ],
+    fieldName,
+  );
+  const endpointId = assertIdToken(parseConfiguredString(value.endpointId, `${fieldName}.endpointId`), `${fieldName}.endpointId`);
+  const displayName = parseConfiguredString(value.displayName, `${fieldName}.displayName`);
+  const claimTypes = parseStringArray(value.claimTypes, `${fieldName}.claimTypes`)
+    .map((entry, index) => assertClaimType(entry, `${fieldName}.claimTypes[${index}]`));
+  const promptChannelType = assertClaimType(
+    parseConfiguredString(value.promptChannelType, `${fieldName}.promptChannelType`),
+    `${fieldName}.promptChannelType`,
+  );
+  const auth = parseAuthConfig(value.auth, `${fieldName}.auth`);
+  const maxCapabilities = parseCapabilities(value.maxCapabilities, `${fieldName}.maxCapabilities`);
+  const telemetryScopes = parseTelemetryScopes(value.telemetryScopes, `${fieldName}.telemetryScopes`);
+  const runtime = parseEndpointRuntimeConfig(value.runtime, `${fieldName}.runtime`);
+  const hubDeviceEnrollment = parseHubDeviceEnrollment(
+    value.hubDeviceEnrollment,
+    `${fieldName}.hubDeviceEnrollment`,
+  );
+  if (!isRecord(value.defaultIdentity)) {
+    throw new Error(`${fieldName}.defaultIdentity must be an object`);
+  }
+  // The identity object carries `channelPrivacy`; a typo'd key here would be
+  // the same privacy fail-open, so reject unknown keys (H9/T1).
+  assertNoUnknownKeys(
+    value.defaultIdentity,
+    ['authorId', 'authorName', 'canonicalContactId', 'channelPrivacy'],
+    `${fieldName}.defaultIdentity`,
+  );
+  const defaultIdentity = {
+    authorId: assertIdToken(
+      parseConfiguredString(value.defaultIdentity.authorId, `${fieldName}.defaultIdentity.authorId`),
+      `${fieldName}.defaultIdentity.authorId`,
+    ),
+    authorName: parseConfiguredString(value.defaultIdentity.authorName, `${fieldName}.defaultIdentity.authorName`),
+    canonicalContactId: assertIdToken(
+      parseConfiguredString(value.defaultIdentity.canonicalContactId, `${fieldName}.defaultIdentity.canonicalContactId`),
+      `${fieldName}.defaultIdentity.canonicalContactId`,
+    ),
+    channelPrivacy: parseChannelPrivacy(value.defaultIdentity.channelPrivacy, `${fieldName}.defaultIdentity.channelPrivacy`),
+  };
+
+  return {
+    endpointId,
+    displayName,
+    claimTypes,
+    promptChannelType,
+    auth,
+    defaultIdentity,
+    maxCapabilities,
+    telemetryScopes,
+    ...(hubDeviceEnrollment ? { hubDeviceEnrollment } : {}),
+    ...(runtime ? { runtime } : {}),
+  };
+}
+
+function parseHubDeviceEnrollment(
+  value: unknown,
+  fieldName: string,
+): SatelliteHubDeviceEnrollmentConfig | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error(`${fieldName} must be an object`);
+  assertNoUnknownKeys(value, ['deviceId', 'enrollmentVersion', 'enrollmentStatus', 'projection'], fieldName);
+  const deviceId = assertIdToken(
+    parseConfiguredString(value.deviceId, `${fieldName}.deviceId`),
+    `${fieldName}.deviceId`,
+  );
+  const enrollmentVersion = parsePositiveInteger(
+    value.enrollmentVersion,
+    `${fieldName}.enrollmentVersion`,
+  );
+  if (value.enrollmentStatus !== 'active' && value.enrollmentStatus !== 'revoked') {
+    throw new Error(`${fieldName}.enrollmentStatus must be one of: active, revoked`);
+  }
+  if (value.projection !== undefined
+    && value.projection !== 'human_surface'
+    && value.projection !== 'virtual_space') {
+    throw new Error(`${fieldName}.projection must be one of: human_surface, virtual_space`);
+  }
+  return {
+    deviceId,
+    enrollmentVersion,
+    enrollmentStatus: value.enrollmentStatus,
+    ...(value.projection !== undefined ? { projection: value.projection } : {}),
+  };
+}
+
+function parseTestingHarnessProvenance(
+  value: unknown,
+  fieldName: string,
+): SatelliteTestingHarnessProvenance | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error(`${fieldName} must be an object`);
+  assertNoUnknownKeys(value, ['schemaVersion', 'kind', 'runId', 'manifestId'], fieldName);
+  if (value.schemaVersion !== 1 || value.kind !== 'testing_harness') {
+    throw new Error(`${fieldName} must be a schemaVersion 1 testing_harness provenance record`);
+  }
+  return {
+    schemaVersion: 1,
+    kind: 'testing_harness',
+    runId: assertIdToken(
+      parseConfiguredString(value.runId, `${fieldName}.runId`),
+      `${fieldName}.runId`,
+    ),
+    manifestId: assertIdToken(
+      parseConfiguredString(value.manifestId, `${fieldName}.manifestId`),
+      `${fieldName}.manifestId`,
+    ),
+  };
+}
+
+function parseRetiredSatellite(value: unknown, fieldName: string): RetiredSatelliteConfig {
+  if (!isRecord(value)) throw new Error(`${fieldName} must be an object`);
+  assertNoUnknownKeys(
+    value,
+    [
+      'satelliteId',
+      'endpointIds',
+      'testProvenance',
+      'retiredAt',
+      'backupRef',
+      'backupDigest',
+    ],
+    fieldName,
+  );
+  const endpointIds = parseStringArray(value.endpointIds, `${fieldName}.endpointIds`)
+    .map((entry, index) => assertIdToken(entry, `${fieldName}.endpointIds[${index}]`));
+  if (endpointIds.length !== (value.endpointIds as unknown[]).length) {
+    throw new Error(`${fieldName}.endpointIds must not contain duplicates`);
+  }
+  const retiredAt = parseConfiguredString(value.retiredAt, `${fieldName}.retiredAt`);
+  if (!Number.isFinite(Date.parse(retiredAt)) || new Date(retiredAt).toISOString() !== retiredAt) {
+    throw new Error(`${fieldName}.retiredAt must be a canonical ISO timestamp`);
+  }
+  const backupDigest = parseConfiguredString(value.backupDigest, `${fieldName}.backupDigest`);
+  if (!/^sha256:[a-f0-9]{64}$/u.test(backupDigest)) {
+    throw new Error(`${fieldName}.backupDigest must be a sha256 digest`);
+  }
+  const testProvenance = parseTestingHarnessProvenance(
+    value.testProvenance,
+    `${fieldName}.testProvenance`,
+  );
+  if (!testProvenance) throw new Error(`${fieldName}.testProvenance is required`);
+  return {
+    satelliteId: assertIdToken(
+      parseConfiguredString(value.satelliteId, `${fieldName}.satelliteId`),
+      `${fieldName}.satelliteId`,
+    ),
+    endpointIds,
+    testProvenance,
+    retiredAt,
+    backupRef: assertIdToken(
+      parseConfiguredString(value.backupRef, `${fieldName}.backupRef`),
+      `${fieldName}.backupRef`,
+    ),
+    backupDigest,
+  };
+}
+
+function parseSatelliteConfig(value: unknown, fieldName: string): SatelliteConfig {
+  if (!isRecord(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+  assertNoUnknownKeys(
+    value,
+    [
+      'satelliteId',
+      'displayName',
+      'mobility',
+      'staticLocationLabel',
+      'placeId',
+      'sharedDevice',
+      'testProvenance',
+      'endpoints',
+    ],
+    fieldName,
+  );
+  const satelliteId = assertIdToken(
+    parseConfiguredString(value.satelliteId, `${fieldName}.satelliteId`),
+    `${fieldName}.satelliteId`,
+  );
+  const displayName = parseConfiguredString(value.displayName, `${fieldName}.displayName`);
+  const mobility = parseMobility(value.mobility, `${fieldName}.mobility`);
+  const staticLocationLabel = parseOptionalConfiguredString(value.staticLocationLabel, `${fieldName}.staticLocationLabel`);
+  const placeId = value.placeId === undefined
+    ? undefined
+    : assertIdToken(parseConfiguredString(value.placeId, `${fieldName}.placeId`), `${fieldName}.placeId`);
+  const sharedDevice = parseSharedDevicePolicy(value.sharedDevice, `${fieldName}.sharedDevice`);
+  const testProvenance = parseTestingHarnessProvenance(
+    value.testProvenance,
+    `${fieldName}.testProvenance`,
+  );
+  if (!Array.isArray(value.endpoints)) {
+    throw new Error(`${fieldName}.endpoints must be an array`);
+  }
+  if (value.endpoints.length === 0) {
+    throw new Error(`${fieldName}.endpoints must contain at least one endpoint`);
+  }
+  const endpoints = value.endpoints.map((endpoint, index) => parseEndpointConfig(endpoint, `${fieldName}.endpoints[${index}]`));
+  if (sharedDevice) {
+    const satelliteTelemetryScopes = new Set(
+      endpoints.flatMap(endpoint => endpoint.telemetryScopes),
+    );
+    for (const recipient of sharedDevice.observationRecipients) {
+      for (const scope of recipient.scopes) {
+        if (!satelliteTelemetryScopes.has(scope)) {
+          throw new Error(
+            `${fieldName}.sharedDevice grants observation scope "${scope}" `
+            + 'that no satellite endpoint permits',
+          );
+        }
+      }
+    }
+  }
+
+  return {
+    satelliteId,
+    displayName,
+    mobility,
+    ...(staticLocationLabel ? { staticLocationLabel } : {}),
+    ...(placeId ? { placeId } : {}),
+    ...(sharedDevice ? { sharedDevice } : {}),
+    ...(testProvenance ? { testProvenance } : {}),
+    endpoints,
+  };
+}
+
+function parseSharedDevicePolicy(
+  value: unknown,
+  fieldName: string,
+): SatelliteConfig['sharedDevice'] {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) throw new Error(`${fieldName} must be an object`);
+  assertNoUnknownKeys(
+    value,
+    ['primaryCompanionId', 'observationRecipients', 'emanationMemberIds', 'responseLease'],
+    fieldName,
+  );
+  const primaryCompanionId = createCompanionId(
+    value.primaryCompanionId,
+    `${fieldName}.primaryCompanionId`,
+  );
+  if (!Array.isArray(value.observationRecipients)) {
+    throw new Error(`${fieldName}.observationRecipients must be an array`);
+  }
+  const recipientIds = new Set<string>();
+  const observationRecipients = value.observationRecipients.map((recipient, index) => {
+    const recipientField = `${fieldName}.observationRecipients[${index}]`;
+    if (!isRecord(recipient)) throw new Error(`${recipientField} must be an object`);
+    assertNoUnknownKeys(recipient, ['companionId', 'scopes'], recipientField);
+    const companionId = createCompanionId(recipient.companionId, `${recipientField}.companionId`);
+    if (recipientIds.has(companionId)) {
+      throw new Error(`${fieldName}.observationRecipients contains duplicate companionId "${companionId}"`);
+    }
+    recipientIds.add(companionId);
+    if (!Array.isArray(recipient.scopes) || recipient.scopes.length === 0) {
+      throw new Error(`${recipientField}.scopes must be a non-empty array`);
+    }
+    const scopes = parseTelemetryScopes(recipient.scopes, `${recipientField}.scopes`);
+    if (scopes.length !== recipient.scopes.length) {
+      throw new Error(`${recipientField}.scopes must not contain duplicates`);
+    }
+    return { companionId, scopes };
+  });
+  if (!Array.isArray(value.emanationMemberIds) || value.emanationMemberIds.length === 0) {
+    throw new Error(`${fieldName}.emanationMemberIds must be a non-empty array`);
+  }
+  const emanationMemberIds = value.emanationMemberIds.map((memberId, index) => (
+    createCompanionId(memberId, `${fieldName}.emanationMemberIds[${index}]`)
+  ));
+  if (new Set(emanationMemberIds).size !== emanationMemberIds.length) {
+    throw new Error(`${fieldName}.emanationMemberIds must not contain duplicates`);
+  }
+  if (emanationMemberIds[0] !== primaryCompanionId) {
+    throw new Error(`${fieldName}.emanationMemberIds must list primaryCompanionId first`);
+  }
+  if (!isRecord(value.responseLease)) {
+    throw new Error(`${fieldName}.responseLease must be an object`);
+  }
+  assertNoUnknownKeys(
+    value.responseLease,
+    ['durationMs', 'activeConversationTtlMs'],
+    `${fieldName}.responseLease`,
+  );
+  const durationMs = parsePositiveInteger(
+    value.responseLease.durationMs,
+    `${fieldName}.responseLease.durationMs`,
+  );
+  const activeConversationTtlMs = parsePositiveInteger(
+    value.responseLease.activeConversationTtlMs,
+    `${fieldName}.responseLease.activeConversationTtlMs`,
+  );
+  // The lease is a hard cap on the agent turn (effectiveTimeoutMs = min(turn
+  // timeout, lease remaining)). A world-avatar turn that perceives and acts in
+  // a 3D world runs its tool calls inside that window and outgrew 60 s on the
+  // s12g beds (S13, psfn-framework-mech8), so the ceiling is two minutes.
+  if (durationMs > 120_000) {
+    throw new Error(`${fieldName}.responseLease.durationMs must be <= 120000`);
+  }
+  if (activeConversationTtlMs > 30 * 60_000) {
+    throw new Error(`${fieldName}.responseLease.activeConversationTtlMs must be <= 1800000`);
+  }
+  return {
+    primaryCompanionId,
+    observationRecipients,
+    emanationMemberIds,
+    responseLease: { durationMs, activeConversationTtlMs },
+  };
+}
+
+function assertUniqueRegistryBindings(config: SatelliteRegistryConfig): void {
+  const satelliteIds = new Set<string>();
+  const endpointKeys = new Set<string>();
+  const claimKeys = new Set<string>();
+  const hubDeviceIds = new Set<string>();
+
+  for (const satellite of config.satellites) {
+    if (satelliteIds.has(satellite.satelliteId)) {
+      throw new Error(`satellites.json has duplicate satelliteId "${satellite.satelliteId}"`);
+    }
+    satelliteIds.add(satellite.satelliteId);
+    for (const endpoint of satellite.endpoints) {
+      const endpointKey = `${satellite.satelliteId}:${endpoint.endpointId}`;
+      if (endpointKeys.has(endpointKey)) {
+        throw new Error(`satellites.json has duplicate endpoint "${endpointKey}"`);
+      }
+      endpointKeys.add(endpointKey);
+      if (endpoint.hubDeviceEnrollment) {
+        const { deviceId } = endpoint.hubDeviceEnrollment;
+        if (hubDeviceIds.has(deviceId)) {
+          throw new Error(`satellites.json has duplicate Hub deviceId "${deviceId}"`);
+        }
+        hubDeviceIds.add(deviceId);
+      }
+      for (const claimType of endpoint.claimTypes) {
+        const claimKey = `${satellite.satelliteId}:${endpoint.endpointId}:${claimType}`;
+        if (claimKeys.has(claimKey)) {
+          throw new Error(`satellites.json has duplicate claim binding "${claimKey}"`);
+        }
+        claimKeys.add(claimKey);
+      }
+    }
+  }
+  for (const retired of config.retiredSatellites ?? []) {
+    if (satelliteIds.has(retired.satelliteId)) {
+      throw new Error(`satellites.json has duplicate active or retired satelliteId "${retired.satelliteId}"`);
+    }
+    satelliteIds.add(retired.satelliteId);
+  }
+}
+
+export function parseSatelliteRegistryConfig(
+  rawConfig: unknown,
+  sourceLabel = SATELLITE_REGISTRY_FILE_NAME,
+): SatelliteRegistryConfig {
+  if (!isRecord(rawConfig)) {
+    throw new Error(`${sourceLabel} must contain a JSON object at the root`);
+  }
+  assertNoUnknownKeys(
+    rawConfig,
+    [
+      'schemaVersion',
+      'enabled',
+      'productivityCompanionId',
+      'hubDeviceAssertions',
+      'satellites',
+      'retiredSatellites',
+    ],
+    sourceLabel,
+  );
+  if (rawConfig.schemaVersion !== 1) {
+    throw new Error(`${sourceLabel}.schemaVersion must be 1`);
+  }
+  const enabled = rawConfig.enabled === undefined ? true : rawConfig.enabled;
+  if (typeof enabled !== 'boolean') {
+    throw new Error(`${sourceLabel}.enabled must be a boolean`);
+  }
+  if (!Array.isArray(rawConfig.satellites)) {
+    throw new Error(`${sourceLabel}.satellites must be an array`);
+  }
+  const satellites = rawConfig.satellites.map((satellite, index) => parseSatelliteConfig(satellite, `${sourceLabel}.satellites[${index}]`));
+  const retiredSatellites = rawConfig.retiredSatellites === undefined
+    ? []
+    : Array.isArray(rawConfig.retiredSatellites)
+      ? rawConfig.retiredSatellites.map((satellite, index) => (
+          parseRetiredSatellite(satellite, `${sourceLabel}.retiredSatellites[${index}]`)
+        ))
+      : (() => { throw new Error(`${sourceLabel}.retiredSatellites must be an array`); })();
+  const productivityCompanionId = rawConfig.productivityCompanionId === undefined
+    ? undefined
+    : createCompanionId(
+        rawConfig.productivityCompanionId,
+        `${sourceLabel}.productivityCompanionId`,
+      );
+  const hubDeviceAssertions = rawConfig.hubDeviceAssertions === undefined
+    ? undefined
+    : parseHubDeviceAssertionVerifierConfig(rawConfig.hubDeviceAssertions, {
+        field: `${sourceLabel}.hubDeviceAssertions`,
+      });
+  if (enabled && satellites.length === 0) {
+    throw new Error(`${sourceLabel}.satellites must contain at least one satellite when enabled`);
+  }
+
+  const config: SatelliteRegistryConfig = {
+    schemaVersion: 1,
+    enabled,
+    ...(productivityCompanionId ? { productivityCompanionId } : {}),
+    ...(hubDeviceAssertions ? { hubDeviceAssertions } : {}),
+    satellites,
+    retiredSatellites,
+  };
+  assertUniqueRegistryBindings(config);
+  return config;
+}
+
+/**
+ * Persist the satellite registry owner file (`satellites.json`) back to
+ * `dataDir`. The config is re-validated through {@link parseSatelliteRegistryConfig}
+ * before it touches disk so a malformed mutation fails closed and never
+ * corrupts the owner file. Written atomically via a temp file + rename so a
+ * crash mid-write cannot leave a partial registry. Returns the normalized
+ * config that was actually written.
+ *
+ * This is the single write path used by the Garden static satellite re-bind
+ * surface (Sprint 10 Workstream F1 / Decision 6). Cross-registry place/companion
+ * validation is the caller's responsibility —
+ * this function only owns the satellites.json owner-file contract.
+ */
+/**
+ * Reduce a parsed registry to its on-disk wire form. The parser fills optional
+ * arrays (notably `telemetryScopes`) to `[]` on load but REJECTS an empty array
+ * on parse, so a naive JSON round-trip of a parsed config is not re-loadable.
+ * Emitting the same optional fields the parser treats as omittable keeps the
+ * written file re-loadable (and re-validatable).
+ */
+function toSerializableSatelliteRegistry(config: SatelliteRegistryConfig): unknown {
+  return {
+    schemaVersion: config.schemaVersion,
+    enabled: config.enabled,
+    ...(config.productivityCompanionId
+      ? { productivityCompanionId: config.productivityCompanionId }
+      : {}),
+    ...(config.hubDeviceAssertions
+      ? {
+          hubDeviceAssertions: {
+            ...config.hubDeviceAssertions,
+            keys: config.hubDeviceAssertions.keys.map(key => ({ ...key })),
+          },
+        }
+      : {}),
+    satellites: config.satellites.map((satellite) => ({
+      satelliteId: satellite.satelliteId,
+      displayName: satellite.displayName,
+      mobility: satellite.mobility,
+      ...(satellite.staticLocationLabel ? { staticLocationLabel: satellite.staticLocationLabel } : {}),
+      ...(satellite.sharedDevice ? { sharedDevice: satellite.sharedDevice } : {}),
+      ...(satellite.testProvenance ? { testProvenance: satellite.testProvenance } : {}),
+      ...(satellite.placeId ? { placeId: satellite.placeId } : {}),
+      endpoints: satellite.endpoints.map((endpoint) => ({
+        endpointId: endpoint.endpointId,
+        displayName: endpoint.displayName,
+        claimTypes: endpoint.claimTypes,
+        promptChannelType: endpoint.promptChannelType,
+        auth: endpoint.auth,
+        defaultIdentity: endpoint.defaultIdentity,
+        maxCapabilities: endpoint.maxCapabilities,
+        ...(endpoint.telemetryScopes.length > 0 ? { telemetryScopes: endpoint.telemetryScopes } : {}),
+        ...(endpoint.hubDeviceEnrollment ? { hubDeviceEnrollment: endpoint.hubDeviceEnrollment } : {}),
+        ...(endpoint.runtime ? { runtime: endpoint.runtime } : {}),
+      })),
+    })),
+    retiredSatellites: config.retiredSatellites ?? [],
+  };
+}
+
+export function saveSatelliteRegistryConfig(
+  dataDir: string,
+  config: SatelliteRegistryConfig,
+  options: {
+    expectedDigest?: string;
+  } = {},
+): SatelliteRegistryConfig {
+  const wire = toSerializableSatelliteRegistry(config);
+  // Fail closed: the wire form must itself parse cleanly before it touches disk.
+  const validated = parseSatelliteRegistryConfig(wire, SATELLITE_REGISTRY_FILE_NAME);
+  const filePath = join(dataDir, SATELLITE_REGISTRY_FILE_NAME);
+  return withSessionJournalWriteLock(filePath, () => {
+    if (options.expectedDigest !== undefined) {
+      const currentDigest = existsSync(filePath)
+        ? `sha256:${createHash('sha256').update(readFileSync(filePath)).digest('hex')}`
+        : undefined;
+      if (currentDigest !== options.expectedDigest) {
+        throw new Error('Synthetic satellite registry changed after backup; refusing stale retirement');
+      }
+    }
+    const tempPath = `${filePath}.tmp`;
+    writeFileSync(tempPath, `${JSON.stringify(wire, null, 2)}\n`, 'utf8');
+    renameSync(tempPath, filePath);
+    return validated;
+  });
+}
+
+export function loadSatelliteRegistryConfig(dataDir: string): SatelliteRegistryConfig {
+  const filePath = join(dataDir, SATELLITE_REGISTRY_FILE_NAME);
+  if (!existsSync(filePath)) {
+    return EMPTY_SATELLITE_REGISTRY_CONFIG;
+  }
+
+  try {
+    const text = readFileSync(filePath, 'utf8');
+    return parseSatelliteRegistryConfig(JSON.parse(text), SATELLITE_REGISTRY_FILE_NAME);
+  } catch (error) {
+    throw new Error(`Failed to load satellite registry from ${filePath}: ${toErrorMessage(error)}`);
+  }
+}
+
+function firstHeader(value: string | string[] | undefined): string | undefined {
+  if (Array.isArray(value)) return value[0];
+  return value;
+}
+
+function readHeader(headers: HeaderMap, name: string, maxLength: number): string | undefined {
+  const raw = firstHeader(headers[name]);
+  const trimmed = raw?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.length > maxLength ? trimmed.slice(0, maxLength) : trimmed;
+}
+
+export function hasSatelliteClaimHeaders(headers: HeaderMap): boolean {
+  return Boolean(
+    readHeader(headers, SATELLITE_CLAIM_HEADERS.claimType, 64)
+    || readHeader(headers, SATELLITE_CLAIM_HEADERS.satelliteId, 128)
+    || readHeader(headers, SATELLITE_CLAIM_HEADERS.endpointId, 128)
+    || readHeader(headers, SATELLITE_CLAIM_HEADERS.sessionId, 128)
+    || readHeader(headers, SATELLITE_CLAIM_HEADERS.threadId, 128),
+  );
+}
+
+function parseHeaderList(raw: string | undefined, fieldName: string): string[] {
+  if (!raw) return [];
+  if (raw.startsWith('[')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      throw new Error(`${fieldName} must be JSON array or comma-separated list: ${toErrorMessage(error)}`);
+    }
+    return parseStringArray(parsed, fieldName);
+  }
+  return raw
+    .split(',')
+    .map(entry => entry.trim())
+    .filter(entry => entry.length > 0);
+}
+
+function parseClaimCapabilities(raw: string | undefined): SatelliteCapability[] {
+  const entries = parseHeaderList(raw, 'X-PSFN-Satellite-Capabilities');
+  const parsed: SatelliteCapability[] = [];
+  for (const entry of entries) {
+    if (!SATELLITE_CAPABILITY_SET.has(entry)) {
+      throw new Error(`X-PSFN-Satellite-Capabilities contains unknown capability "${entry}"`);
+    }
+    parsed.push(entry as SatelliteCapability);
+  }
+  return [...new Set(parsed)];
+}
+
+function parseClaimTelemetryScopes(raw: string | undefined): SatelliteTelemetryScope[] {
+  const entries = parseHeaderList(raw, 'X-PSFN-Satellite-Telemetry-Scopes');
+  const parsed: SatelliteTelemetryScope[] = [];
+  for (const entry of entries) {
+    if (!SATELLITE_TELEMETRY_SCOPE_SET.has(entry)) {
+      throw new Error(`X-PSFN-Satellite-Telemetry-Scopes contains unknown telemetry scope "${entry}"`);
+    }
+    parsed.push(entry as SatelliteTelemetryScope);
+  }
+  return [...new Set(parsed)];
+}
+
+function findEndpoint(input: {
+  registry: SatelliteRegistryConfig;
+  satelliteId: string;
+  endpointId: string;
+  claimType: string;
+}): { satellite: SatelliteConfig; endpoint: SatelliteEndpointConfig } | null {
+  const satellite = input.registry.satellites.find(candidate => candidate.satelliteId === input.satelliteId);
+  if (!satellite) return null;
+  const endpoint = satellite.endpoints.find(candidate => (
+    candidate.endpointId === input.endpointId
+    && candidate.claimTypes.includes(input.claimType)
+  ));
+  return endpoint ? { satellite, endpoint } : null;
+}
+
+function resolveEffectiveCapabilities(input: {
+  registryMax: readonly SatelliteCapability[];
+  advertised: readonly SatelliteCapability[];
+}): SatelliteRoutingMetadata['capabilities'] {
+  const registryMax = [...new Set(input.registryMax)];
+  const advertised = [...new Set(input.advertised)];
+  const advertisedOrMax = advertised.length > 0 ? advertised : registryMax;
+  const unauthorized = advertisedOrMax.filter(capability => !registryMax.includes(capability));
+  if (unauthorized.length > 0) {
+    throw new Error(`satellite advertised capabilities outside registry maximum: ${unauthorized.join(', ')}`);
+  }
+  const policyDenied = advertisedOrMax.filter(capability => !SATELLITE_RUNTIME_ENABLED_CAPABILITY_SET.has(capability));
+  const effective = advertisedOrMax.filter((capability): capability is SatelliteCapability => (
+    registryMax.includes(capability)
+    && SATELLITE_RUNTIME_ENABLED_CAPABILITY_SET.has(capability)
+  ));
+  return {
+    advertised,
+    registryMax,
+    effective,
+    policyDenied,
+  };
+}
+
+function resolveEffectiveTelemetryScopes(input: {
+  registryAllowed: readonly SatelliteTelemetryScope[];
+  requested: readonly SatelliteTelemetryScope[];
+}): SatelliteTelemetryScope[] {
+  const registryAllowed = [...new Set(input.registryAllowed)];
+  const requested = [...new Set(input.requested)];
+  const unauthorized = requested.filter(scope => !registryAllowed.includes(scope));
+  if (unauthorized.length > 0) {
+    throw new Error(`satellite requested telemetry scopes outside registry maximum: ${unauthorized.join(', ')}`);
+  }
+  return requested;
+}
+
+function stableHash(value: unknown): string {
+  return createHash('sha256')
+    .update(JSON.stringify(value))
+    .digest('hex');
+}
+
+function buildRuntimeCapabilityPolicy(endpoint: SatelliteEndpointConfig): SatelliteConfigPullResponse['capabilities'] {
+  const registryMax = [...new Set(endpoint.maxCapabilities)];
+  const runtimeEnabled = registryMax.filter((capability): capability is SatelliteCapability => (
+    SATELLITE_RUNTIME_ENABLED_CAPABILITY_SET.has(capability)
+  ));
+  const policyDenied = registryMax.filter(capability => !SATELLITE_RUNTIME_ENABLED_CAPABILITY_SET.has(capability));
+  return {
+    registryMax,
+    runtimeEnabled,
+    policyDenied,
+  };
+}
+
+function buildSatelliteConfigPullResponse(input: {
+  satellite: SatelliteConfig;
+  endpoint: SatelliteEndpointConfig;
+  claimType: string;
+  principal: ApiAuthPrincipal;
+}): SatelliteConfigPullResponse {
+  const { satellite, endpoint, claimType, principal } = input;
+  if (!endpoint.runtime) {
+    throw new Error('Satellite endpoint does not have runtime config');
+  }
+  const responseWithoutVersion = {
+    object: 'companion.satellite_config' as const,
+    schemaVersion: 1 as const,
+    satellite: {
+      satelliteId: satellite.satelliteId,
+      displayName: satellite.displayName,
+      mobility: satellite.mobility,
+      ...(satellite.staticLocationLabel ? { staticLocationLabel: satellite.staticLocationLabel } : {}),
+      ...(satellite.sharedDevice ? { sharedDevice: satellite.sharedDevice } : {}),
+    },
+    endpoint: {
+      endpointId: endpoint.endpointId,
+      displayName: endpoint.displayName,
+      promptChannelType: endpoint.promptChannelType,
+      claimType,
+      claimTypes: endpoint.claimTypes,
+    },
+    identity: endpoint.defaultIdentity,
+    session: {
+      channelType: 'api' as const,
+      routingSource: 'satellite' as const,
+      claimType,
+      channelIdTemplate: `satellite:${claimType}:{sessionId}`,
+      sessionIdHeader: SATELLITE_CLAIM_HEADERS.sessionId,
+      fixedHeaders: {
+        claimType,
+        satelliteId: satellite.satelliteId,
+        endpointId: endpoint.endpointId,
+      },
+      headerNames: {
+        claimType: SATELLITE_CLAIM_HEADERS.claimType,
+        satelliteId: SATELLITE_CLAIM_HEADERS.satelliteId,
+        endpointId: SATELLITE_CLAIM_HEADERS.endpointId,
+        sessionId: SATELLITE_CLAIM_HEADERS.sessionId,
+        threadId: SATELLITE_CLAIM_HEADERS.threadId,
+        capabilities: SATELLITE_CLAIM_HEADERS.capabilities,
+        telemetryScopes: SATELLITE_CLAIM_HEADERS.telemetryScopes,
+        addressedCompanionId: SATELLITE_CLAIM_HEADERS.addressedCompanionId,
+      },
+    },
+    capabilities: buildRuntimeCapabilityPolicy(endpoint),
+    telemetryScopes: endpoint.telemetryScopes,
+    auth: {
+      mode: endpoint.auth.mode,
+      principalId: principal.id,
+      certBound: endpoint.auth.mode === 'mtls',
+    },
+    runtime: endpoint.runtime,
+  };
+
+  return {
+    ...responseWithoutVersion,
+    configVersion: stableHash(responseWithoutVersion),
+  };
+}
+
+function verifyApiKeyAuth(auth: SatelliteEndpointAuthConfig, principal: ApiAuthPrincipal): SatelliteClaimErrorResolution | null {
+  if (principal.mode !== 'api_key') {
+    return {
+      ok: false,
+      status: 403,
+      type: 'satellite_claim_requires_api_key',
+      message: 'Satellite claims require API key authentication',
+    };
+  }
+  if (!satelliteEndpointAdmitsApiKeyPrincipal(auth, {
+    id: principal.id,
+    satelliteScoped: principal.scope === 'satellite',
+  })) {
+    return {
+      ok: false,
+      status: 403,
+      type: 'satellite_principal_not_allowed',
+      message: principal.scope === 'satellite'
+        ? 'Satellite-scoped API key principal is not registered for this satellite endpoint'
+        : 'API key principal is not allowed for this satellite endpoint',
+    };
+  }
+  return null;
+}
+
+/**
+ * mTLS endpoint verification (Sprint-10 C1): the identity comes from the
+ * terminated TLS peer certificate or a token-authenticated trusted proxy,
+ * never from raw request headers, and EVERY configured certificate binding
+ * must match — a single-attribute match does not pass.
+ */
+function verifyMtlsAuth(
+  auth: SatelliteEndpointAuthConfig,
+  clientCert: SatelliteClientCertIdentity | undefined,
+  principal: ApiAuthPrincipal,
+): SatelliteClaimErrorResolution | null {
+  const apiKeyError = verifyApiKeyAuth(auth, principal);
+  if (apiKeyError) return apiKeyError;
+
+  const match = satelliteClientCertMatchesBinding(auth, clientCert);
+  if (!match.ok) {
+    return {
+      ok: false,
+      status: 403,
+      type: clientCert ? 'satellite_certificate_not_allowed' : 'satellite_client_certificate_required',
+      message: match.reason,
+    };
+  }
+  return null;
+}
+
+function verifySatelliteAuth(
+  auth: SatelliteEndpointAuthConfig,
+  principal: ApiAuthPrincipal,
+  clientCert: SatelliteClientCertIdentity | undefined,
+): SatelliteClaimErrorResolution | null {
+  if (auth.mode === 'api_key') {
+    return verifyApiKeyAuth(auth, principal);
+  }
+  return verifyMtlsAuth(auth, clientCert, principal);
+}
+
+function satelliteClaimError(status: number, type: string, message: string): SatelliteClaimResolution {
+  return { ok: false, status, type, message };
+}
+
+function satelliteConfigPullError(status: number, type: string, message: string): SatelliteConfigPullResolution {
+  return { ok: false, status, type, message };
+}
+
+export function resolveSatelliteClaim(options: {
+  headers: HeaderMap;
+  principal: ApiAuthPrincipal;
+  registry?: SatelliteRegistryConfig;
+  /**
+   * Authenticated client-certificate identity derived at the ingress via
+   * `deriveClientCertIdentity`. Required for mTLS-bound endpoints; raw
+   * request headers are never a substitute.
+   */
+  clientCert?: SatelliteClientCertIdentity;
+}): SatelliteClaimResolution {
+  const { headers, principal, registry, clientCert } = options;
+  if (!hasSatelliteClaimHeaders(headers)) {
+    return satelliteClaimError(400, 'invalid_request', 'No satellite claim headers were provided');
+  }
+  if (!registry?.enabled) {
+    return satelliteClaimError(503, 'satellite_registry_not_configured', 'Satellite claims require an enabled satellites.json registry');
+  }
+
+  const claimTypeRaw = readHeader(headers, SATELLITE_CLAIM_HEADERS.claimType, 64);
+  const satelliteId = readHeader(headers, SATELLITE_CLAIM_HEADERS.satelliteId, 128);
+  const endpointId = readHeader(headers, SATELLITE_CLAIM_HEADERS.endpointId, 128);
+  const sessionIdRaw = readHeader(headers, SATELLITE_CLAIM_HEADERS.sessionId, 128)
+    ?? readHeader(headers, SATELLITE_CLAIM_HEADERS.threadId, 128);
+  if (!claimTypeRaw || !satelliteId || !endpointId || !sessionIdRaw) {
+    return satelliteClaimError(
+      400,
+      'invalid_satellite_claim',
+      'Satellite claims require X-PSFN-Satellite-Claim-Type, X-PSFN-Satellite-ID, X-PSFN-Satellite-Endpoint-ID, and X-PSFN-Satellite-Session-ID',
+    );
+  }
+
+  let claimType: string;
+  let sessionId: string;
+  try {
+    claimType = assertClaimType(claimTypeRaw, 'X-PSFN-Satellite-Claim-Type');
+    assertIdToken(satelliteId, 'X-PSFN-Satellite-ID');
+    assertIdToken(endpointId, 'X-PSFN-Satellite-Endpoint-ID');
+    sessionId = sessionIdRaw.trim();
+    if (!SESSION_ID_PATTERN.test(sessionId)) {
+      throw new Error('X-PSFN-Satellite-Session-ID must use only letters, numbers, dot, underscore, dash, or colon');
+    }
+  } catch (error) {
+    return satelliteClaimError(400, 'invalid_satellite_claim', toErrorMessage(error));
+  }
+
+  const match = findEndpoint({ registry, satelliteId, endpointId, claimType });
+  if (!match) {
+    return satelliteClaimError(403, 'satellite_claim_not_registered', 'Satellite claim is not registered for this satellite endpoint');
+  }
+
+  const authError = verifySatelliteAuth(match.endpoint.auth, principal, clientCert);
+  if (authError) return authError;
+
+  let capabilities: SatelliteRoutingMetadata['capabilities'];
+  let telemetryScopes: SatelliteTelemetryScope[];
+  let addressedCompanionId: ReturnType<typeof createCompanionId> | undefined;
+  try {
+    capabilities = resolveEffectiveCapabilities({
+      registryMax: match.endpoint.maxCapabilities,
+      advertised: parseClaimCapabilities(readHeader(headers, SATELLITE_CLAIM_HEADERS.capabilities, 1024)),
+    });
+    telemetryScopes = resolveEffectiveTelemetryScopes({
+      registryAllowed: match.endpoint.telemetryScopes,
+      requested: parseClaimTelemetryScopes(readHeader(headers, SATELLITE_CLAIM_HEADERS.telemetryScopes, 1024)),
+    });
+    const addressedRaw = readHeader(
+      headers,
+      SATELLITE_CLAIM_HEADERS.addressedCompanionId,
+      64,
+    );
+    if (addressedRaw !== undefined) {
+      addressedCompanionId = createCompanionId(
+        addressedRaw,
+        'X-PSFN-Satellite-Addressed-Companion-ID',
+      );
+      if (!match.satellite.sharedDevice?.emanationMemberIds.includes(addressedCompanionId)) {
+        throw new Error('explicitly addressed companion is not an Emanation Member for this satellite');
+      }
+    }
+  } catch (error) {
+    return satelliteClaimError(403, 'satellite_capability_not_allowed', toErrorMessage(error));
+  }
+
+  const satelliteMetadata: SatelliteRoutingMetadata = {
+    schemaVersion: 1,
+    satelliteId: match.satellite.satelliteId,
+    satelliteDisplayName: match.satellite.displayName,
+    endpointId: match.endpoint.endpointId,
+    endpointDisplayName: match.endpoint.displayName,
+    claimType,
+    sessionId,
+    mobility: match.satellite.mobility,
+    promptChannelType: match.endpoint.promptChannelType,
+    ...(match.satellite.staticLocationLabel ? { staticLocationLabel: match.satellite.staticLocationLabel } : {}),
+    ...(match.satellite.placeId ? { placeId: match.satellite.placeId } : {}),
+    ...(match.satellite.sharedDevice ? { sharedDevice: match.satellite.sharedDevice } : {}),
+    ...(addressedCompanionId ? { addressedCompanionId } : {}),
+    capabilities,
+    telemetryScopes,
+    auth: {
+      mode: match.endpoint.auth.mode,
+      principalId: principal.id,
+      certBound: match.endpoint.auth.mode === 'mtls',
+    },
+  };
+
+  // S13 MOVE: a relayed world participant spoke, not the endpoint's default
+  // human. The speaker gets its own contact identity under the endpoint's
+  // default author (so `visitor` in one world never collides with another
+  // endpoint's `visitor`), the default canonical-contact hint is withheld
+  // (it names the endpoint's human, who did not speak), and the world's own
+  // human/ai classification rides the routing metadata.
+  const speakerIdRaw = readHeader(headers, SATELLITE_CLAIM_HEADERS.speakerId, 128);
+  const speakerKindRaw = readHeader(headers, SATELLITE_CLAIM_HEADERS.speakerKind, 16);
+  const speakerNameRaw = readHeader(headers, SATELLITE_CLAIM_HEADERS.speakerName, 128);
+  if (speakerIdRaw || speakerKindRaw || speakerNameRaw) {
+    if (!speakerIdRaw || !speakerKindRaw) {
+      return satelliteClaimError(
+        400,
+        'invalid_satellite_claim',
+        'A satellite speaker claim requires X-PSFN-Satellite-Speaker-ID and X-PSFN-Satellite-Speaker-Kind',
+      );
+    }
+    try {
+      assertIdToken(speakerIdRaw, 'X-PSFN-Satellite-Speaker-ID');
+    } catch (error) {
+      return satelliteClaimError(400, 'invalid_satellite_claim', toErrorMessage(error));
+    }
+    if (speakerKindRaw !== 'human' && speakerKindRaw !== 'ai') {
+      return satelliteClaimError(400, 'invalid_satellite_claim', 'X-PSFN-Satellite-Speaker-Kind must be human or ai');
+    }
+    const speaker: SatelliteSpeakerIdentity = {
+      id: speakerIdRaw,
+      name: speakerNameRaw ?? speakerIdRaw,
+      kind: speakerKindRaw,
+    };
+    return {
+      ok: true,
+      value: {
+        channelId: `satellite:${claimType}:${sessionId}`,
+        authorId: `${match.endpoint.defaultIdentity.authorId}:${speaker.id}`,
+        authorName: speaker.name,
+        // Per-speaker contact (psfn-framework-ugstg): the endpoint's canonical
+        // contact names its human, who did not speak, so the hint is withheld
+        // and the agent resolves-or-creates a contact from the speaker's own
+        // channel identity (`satellite:<claimType>` + the authorId above),
+        // tagging it machine intelligence when the world flagged the speaker
+        // `ai`. The chat path admits the missing hint because `satellite.speaker`
+        // is the contact mapping; contact-level fatigue is then charged to that
+        // speaker's contact inside the turn, never to the operator's.
+        canonicalContactId: '',
+        channelPrivacy: match.endpoint.defaultIdentity.channelPrivacy,
+        satellite: { ...satelliteMetadata, speaker },
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    value: {
+      channelId: `satellite:${claimType}:${sessionId}`,
+      authorId: match.endpoint.defaultIdentity.authorId,
+      authorName: match.endpoint.defaultIdentity.authorName,
+      canonicalContactId: match.endpoint.defaultIdentity.canonicalContactId,
+      channelPrivacy: match.endpoint.defaultIdentity.channelPrivacy,
+      satellite: satelliteMetadata,
+    },
+  };
+}
+
+export function resolveSatelliteConfigPull(options: {
+  principal: ApiAuthPrincipal;
+  registry?: SatelliteRegistryConfig;
+  satelliteId: string | undefined;
+  endpointId: string | undefined;
+  claimType: string | undefined;
+  /** Authenticated client-certificate identity (see `resolveSatelliteClaim`). */
+  clientCert?: SatelliteClientCertIdentity;
+}): SatelliteConfigPullResolution {
+  const { principal, registry, clientCert } = options;
+  if (!registry?.enabled) {
+    return satelliteConfigPullError(503, 'satellite_registry_not_configured', 'Satellite config pulls require an enabled satellites.json registry');
+  }
+  if (!options.satelliteId || !options.endpointId || !options.claimType) {
+    return satelliteConfigPullError(
+      400,
+      'invalid_satellite_config_request',
+      'Satellite config pulls require satelliteId, endpointId, and claimType query parameters',
+    );
+  }
+
+  let satelliteId: string;
+  let endpointId: string;
+  let claimType: string;
+  try {
+    satelliteId = assertIdToken(options.satelliteId.trim(), 'satelliteId');
+    endpointId = assertIdToken(options.endpointId.trim(), 'endpointId');
+    claimType = assertClaimType(options.claimType, 'claimType');
+  } catch (error) {
+    return satelliteConfigPullError(400, 'invalid_satellite_config_request', toErrorMessage(error));
+  }
+
+  const match = findEndpoint({ registry, satelliteId, endpointId, claimType });
+  if (!match) {
+    return satelliteConfigPullError(403, 'satellite_config_not_registered', 'Satellite config pull is not registered for this satellite endpoint');
+  }
+
+  const authError = verifySatelliteAuth(match.endpoint.auth, principal, clientCert);
+  if (authError) {
+    return satelliteConfigPullError(authError.status, authError.type, authError.message);
+  }
+
+  try {
+    return {
+      ok: true,
+      value: buildSatelliteConfigPullResponse({
+        satellite: match.satellite,
+        endpoint: match.endpoint,
+        claimType,
+        principal,
+      }),
+    };
+  } catch (error) {
+    return satelliteConfigPullError(503, 'satellite_runtime_config_not_configured', toErrorMessage(error));
+  }
+}
+
+// ── Companion event relay access (w9hj.1) ──
+
+export interface CompanionRelayAccess {
+  satellite: SatelliteConfig;
+  endpoint: SatelliteEndpointConfig;
+  telemetryScopes: SatelliteTelemetryScope[];
+}
+
+export type CompanionRelayAccessResolution = { ok: true; value: CompanionRelayAccess } | {
+  ok: false;
+  status: number;
+  type: string;
+  message: string;
+};
+
+function companionRelayError(status: number, type: string, message: string): CompanionRelayAccessResolution {
+  return { ok: false, status, type, message };
+}
+
+/**
+ * Resolves which registry endpoint an authenticated caller of the companion
+ * relay surface is acting as (`GET /v1/companion/events`, artifact preview).
+ * Deny by default: unknown satellites/endpoints, principals not allowed for
+ * the endpoint, and mismatched claim types are all rejected. The caller then
+ * gates event kinds on the returned `telemetryScopes`.
+ */
+export function resolveCompanionRelayAccess(options: {
+  principal: ApiAuthPrincipal;
+  registry?: SatelliteRegistryConfig;
+  clientCert?: SatelliteClientCertIdentity;
+  satelliteId: string | undefined;
+  endpointId: string | undefined;
+  claimType: string | undefined;
+}): CompanionRelayAccessResolution {
+  const { principal, registry, clientCert } = options;
+  if (!registry?.enabled) {
+    return companionRelayError(503, 'satellite_registry_not_configured', 'Companion relay access requires an enabled satellites.json registry');
+  }
+  if (!options.satelliteId || !options.endpointId || !options.claimType) {
+    return companionRelayError(
+      400,
+      'invalid_companion_relay_request',
+      'Companion relay access requires satelliteId, endpointId, and claimType query parameters',
+    );
+  }
+
+  let satelliteId: string;
+  let endpointId: string;
+  let claimType: string;
+  try {
+    satelliteId = assertIdToken(options.satelliteId.trim(), 'satelliteId');
+    endpointId = assertIdToken(options.endpointId.trim(), 'endpointId');
+    claimType = assertClaimType(options.claimType, 'claimType');
+  } catch (error) {
+    return companionRelayError(400, 'invalid_companion_relay_request', toErrorMessage(error));
+  }
+
+  const match = findEndpoint({ registry, satelliteId, endpointId, claimType });
+  if (!match) {
+    return companionRelayError(403, 'companion_relay_not_registered', 'Companion relay access is not registered for this satellite endpoint');
+  }
+
+  const authError = verifySatelliteAuth(match.endpoint.auth, principal, clientCert);
+  if (authError) {
+    return companionRelayError(authError.status, authError.type, authError.message);
+  }
+
+  return {
+    ok: true,
+    value: {
+      satellite: match.satellite,
+      endpoint: match.endpoint,
+      telemetryScopes: [...new Set(match.endpoint.telemetryScopes)],
+    },
+  };
+}
+
+/**
+ * Resolves the acting endpoint for an approval decision, where the hub sends
+ * only `satelliteId` in the request body (per the hub protocol contract).
+ * The decision is authorized when the satellite has at least one endpoint
+ * whose auth admits the presented principal AND that is granted the
+ * `approvals` telemetry scope. Deny by default.
+ */
+export function resolveCompanionApprovalActor(options: {
+  principal: ApiAuthPrincipal;
+  registry?: SatelliteRegistryConfig;
+  clientCert?: SatelliteClientCertIdentity;
+  satelliteId: string | undefined;
+}): CompanionRelayAccessResolution {
+  const { principal, registry, clientCert } = options;
+  if (!registry?.enabled) {
+    return companionRelayError(503, 'satellite_registry_not_configured', 'Companion approval decisions require an enabled satellites.json registry');
+  }
+  if (!options.satelliteId) {
+    return companionRelayError(400, 'invalid_companion_approval_request', 'Companion approval decisions require satelliteId');
+  }
+
+  let satelliteId: string;
+  try {
+    satelliteId = assertIdToken(options.satelliteId.trim(), 'satelliteId');
+  } catch (error) {
+    return companionRelayError(400, 'invalid_companion_approval_request', toErrorMessage(error));
+  }
+
+  const satellite = registry.satellites.find((candidate) => candidate.satelliteId === satelliteId);
+  if (!satellite) {
+    return companionRelayError(403, 'companion_relay_not_registered', 'Companion approval decision is not registered for this satellite');
+  }
+
+  for (const endpoint of satellite.endpoints) {
+    if (!endpoint.telemetryScopes.includes('approvals')) continue;
+    const authError = verifySatelliteAuth(endpoint.auth, principal, clientCert);
+    if (authError) continue;
+    return {
+      ok: true,
+      value: {
+        satellite,
+        endpoint,
+        telemetryScopes: [...new Set(endpoint.telemetryScopes)],
+      },
+    };
+  }
+
+  return companionRelayError(
+    403,
+    'companion_approvals_not_allowed',
+    'No satellite endpoint authorizes this principal for approval decisions',
+  );
+}

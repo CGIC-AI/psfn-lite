@@ -1,0 +1,2513 @@
+import { createHash } from 'node:crypto';
+import { appendFileSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fork } from 'node:child_process';
+import { build } from 'tsup';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { ToolSchema, TurnRecord } from '../../shared/contracts/runtime.js';
+import { DUPLICATE_TOOL_CALL_SKIP_RESULT } from '../../shared/contracts/tool-call-outcome.js';
+import type { TurnSnapshotRecord } from '../../core/turns/observability.js';
+import type {
+  TurnRecordRecoveryScanStats,
+  TurnRecordStorePort,
+} from './turn-record-store-port.js';
+import { backfillLegacyTurnId } from '../../core/turns/id.js';
+import {
+  createBackgroundWorkIdentity,
+  fingerprintBackgroundWorkPayload,
+  fingerprintBackgroundWorkTurnRecord,
+  stableBackgroundWorkStringify,
+} from '../../core/agent/background-work/types.js';
+import { createTurnRecordSharedStore } from './turn-record-shared-store.js';
+import { sanitizeChannelId } from './store-file-contracts.js';
+import {
+  appendTurnRecordWithRotation,
+  createFilesystemTurnRecordStorePort,
+  getQuarantinedTurnRecordLineCount,
+  lookupTurnRecordIdentityAcrossSegments,
+  readRecentTurnRecordsAcrossSegments,
+  readTurnRecordPageAcrossSegments,
+  type TurnRecordIdentityLookupStats,
+  type TurnRecordTailStats,
+} from './turn-records.js';
+
+/**
+ * Deterministic fault injection for the concurrency tests: `node:fs` delegates
+ * to the real implementation unless a specific failure is armed. openSync
+ * ENOENT simulates a rotation deleting a listed file mid-read; linkSync EEXIST
+ * (which first CREATES the destination, like the racing writer would) simulates
+ * a concurrent rotation claiming the same segment number.
+ */
+const fsFaults = vi.hoisted(() => ({
+  openSyncEnoent: { path: null as string | null, remaining: 0 },
+  linkSyncClaim: { remaining: 0, claimContent: '' },
+  readdirSyncError: { path: null as string | null, remaining: 0 },
+  trackedOpen: {
+    path: null as string | null,
+    fd: null as number | null,
+    closed: false,
+  },
+  opendirSyncCallback: {
+    path: null as string | null,
+    callback: null as (() => void) | null,
+  },
+}));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  const enoent = (path: unknown): NodeJS.ErrnoException => {
+    const error = new Error(`ENOENT: no such file or directory, open '${String(path)}'`) as NodeJS.ErrnoException;
+    error.code = 'ENOENT';
+    return error;
+  };
+  return {
+    ...actual,
+    openSync: ((path, flags, mode) => {
+      if (fsFaults.openSyncEnoent.remaining > 0 && String(path) === fsFaults.openSyncEnoent.path) {
+        fsFaults.openSyncEnoent.remaining -= 1;
+        throw enoent(path);
+      }
+      const fd = actual.openSync(path, flags, mode);
+      if (String(path) === fsFaults.trackedOpen.path) {
+        fsFaults.trackedOpen.fd = fd;
+      }
+      return fd;
+    }) as typeof actual.openSync,
+    closeSync: ((fd) => {
+      if (fd === fsFaults.trackedOpen.fd) {
+        fsFaults.trackedOpen.closed = true;
+      }
+      return actual.closeSync(fd);
+    }) as typeof actual.closeSync,
+    readdirSync: ((path, options) => {
+      if (fsFaults.readdirSyncError.remaining > 0
+        && String(path) === fsFaults.readdirSyncError.path) {
+        fsFaults.readdirSyncError.remaining -= 1;
+        throw new Error(`Injected readdir failure for ${String(path)}`);
+      }
+      return actual.readdirSync(path, options as never);
+    }) as typeof actual.readdirSync,
+    opendirSync: ((path, options) => {
+      if (String(path) === fsFaults.opendirSyncCallback.path) {
+        const callback = fsFaults.opendirSyncCallback.callback;
+        fsFaults.opendirSyncCallback.path = null;
+        fsFaults.opendirSyncCallback.callback = null;
+        callback?.();
+      }
+      return actual.opendirSync(path, options);
+    }) as typeof actual.opendirSync,
+    linkSync: ((existingPath, newPath) => {
+      if (fsFaults.linkSyncClaim.remaining > 0) {
+        fsFaults.linkSyncClaim.remaining -= 1;
+        // The racing writer claims the destination first...
+        actual.writeFileSync(newPath, fsFaults.linkSyncClaim.claimContent, 'utf-8');
+        // ...so the exclusive create observes EEXIST, exactly as on POSIX.
+        const error = new Error(`EEXIST: file already exists, link '${String(existingPath)}' -> '${String(newPath)}'`) as NodeJS.ErrnoException;
+        error.code = 'EEXIST';
+        throw error;
+      }
+      return actual.linkSync(existingPath, newPath);
+    }) as typeof actual.linkSync,
+  };
+});
+
+afterEach(() => {
+  fsFaults.openSyncEnoent.path = null;
+  fsFaults.openSyncEnoent.remaining = 0;
+  fsFaults.linkSyncClaim.remaining = 0;
+  fsFaults.linkSyncClaim.claimContent = '';
+  fsFaults.readdirSyncError.path = null;
+  fsFaults.readdirSyncError.remaining = 0;
+  fsFaults.trackedOpen.path = null;
+  fsFaults.trackedOpen.fd = null;
+  fsFaults.trackedOpen.closed = false;
+  fsFaults.opendirSyncCallback.path = null;
+  fsFaults.opendirSyncCallback.callback = null;
+});
+
+const TURN_RECORDS_DIR = '_turn_records';
+
+function activeSegmentPathFor(sessionsDir: string, channelId: string): string {
+  return join(sessionsDir, TURN_RECORDS_DIR, `${sanitizeChannelId(channelId)}.jsonl`);
+}
+
+function sealedSegmentPathFor(activePath: string, segmentNumber: number): string {
+  return `${activePath.slice(0, -'.jsonl'.length)}.${String(segmentNumber).padStart(5, '0')}.jsonl`;
+}
+
+function createTurnRecord(overrides: Partial<TurnRecord> = {}): TurnRecord {
+  return {
+    schemaVersion: 1,
+    turnId: '019d2326-d9e1-701d-bcee-250d2cbb0e4e',
+    requestId: 'req-psfn-amica',
+    channelId: 'psfn-amica:test:pi5',
+    channelType: 'psfn-amica',
+    startedAt: 1_742_000_000_000,
+    completedAt: 1_742_000_000_500,
+    status: 'completed',
+    userMessage: {
+      role: 'user',
+      content: 'hello',
+      timestamp: 1_742_000_000_000,
+      authorId: 'pi5',
+      authorName: 'Pi5',
+    },
+    assistantMessage: {
+      role: 'assistant',
+      content: 'ok',
+      timestamp: 1_742_000_000_500,
+      authorId: 'companion',
+      authorName: 'Companion',
+    },
+    toolCalls: [],
+    extractedMemoryIds: [],
+    concernDeltaRefs: [],
+    contactDeltaRefs: [],
+    versionPointers: {
+      model: 'psfn',
+    },
+    provenanceRefs: [],
+    ...overrides,
+  };
+}
+
+function withRecoveryHandoff(record: TurnRecord): TurnRecord {
+  const logicalSessionId = record.sessionId ?? record.channelId;
+  const payload = {
+    schemaVersion: 1 as const,
+    kind: 'memory_extraction' as const,
+    source: {
+      schemaVersion: 1 as const,
+      logicalSessionId,
+      channelId: record.channelId,
+      turnId: record.turnId,
+      requestId: record.requestId,
+      turnRecordFingerprint: fingerprintBackgroundWorkTurnRecord(record),
+      createdAtMs: record.completedAt,
+    },
+  };
+  const job = {
+    ...createBackgroundWorkIdentity({
+      logicalSessionId,
+      turnId: record.turnId,
+      kind: payload.kind,
+    }),
+    logicalSessionId,
+    kind: payload.kind,
+    payload,
+    payloadFingerprint: fingerprintBackgroundWorkPayload(payload),
+    sourceTurnId: record.turnId,
+    sourceRequestId: record.requestId,
+    sourceChannelId: record.channelId,
+    createdAtMs: record.completedAt,
+    maxAttempts: 3,
+  };
+  return { ...record, backgroundWorkHandoff: { schemaVersion: 1, jobs: [job] } };
+}
+
+function withLegacyEmotionAppraisalHandoff(record: TurnRecord): TurnRecord {
+  const current = withRecoveryHandoff(record);
+  const logicalSessionId = record.sessionId ?? record.channelId;
+  const payload = {
+    schemaVersion: 1 as const,
+    kind: 'emotion_appraisal' as const,
+    source: {
+      schemaVersion: 1 as const,
+      logicalSessionId,
+      channelId: record.channelId,
+      turnId: record.turnId,
+      requestId: record.requestId,
+      turnRecordFingerprint: fingerprintBackgroundWorkTurnRecord(record),
+      createdAtMs: record.completedAt,
+    },
+    emotionSessionId: logicalSessionId,
+    internalStateSnapshotRef: 'internal-state-v1:legacy-appraisal',
+    appraisalState: {
+      schemaVersion: 1 as const,
+      emotional: {
+        vad: { valence: 0.2, arousal: 0.3, dominance: 0.4 },
+        mood: { valence: 0.1, arousal: 0.2, dominance: 0.3 },
+        discreteEmotions: { joy: 0.7 },
+        confidence: 0.8,
+        telemetry: {
+          status: 'trusted' as const,
+          source: 'runtime_state' as const,
+          reasons: [],
+          weight: 1,
+        },
+      },
+      cognitive: { certaintyLevel: 0.6, topicEngagement: 0.7, processingQuality: 'fluent' as const },
+      attention: {
+        activeConcernCount: 2,
+        salientEntityCount: 1,
+        conversationTrajectory: 'deepening' as const,
+      },
+      relational: { contactId: 'contact-1', trustLevel: 'regular' as const, moodDrift: 0.1 },
+    },
+    personalityOwnerRef: 'character-card' as const,
+    personalityProjectionHash: 'a'.repeat(64),
+  };
+  const legacyEmotionJob = {
+    ...createBackgroundWorkIdentity({
+      logicalSessionId,
+      turnId: record.turnId,
+      kind: payload.kind,
+    }),
+    logicalSessionId,
+    kind: payload.kind,
+    payload,
+    payloadFingerprint: createHash('sha256')
+      .update(stableBackgroundWorkStringify(payload))
+      .digest('hex'),
+    sourceTurnId: record.turnId,
+    sourceRequestId: record.requestId,
+    sourceChannelId: record.channelId,
+    createdAtMs: record.completedAt,
+    maxAttempts: 3,
+  };
+  return {
+    ...current,
+    backgroundWorkHandoff: {
+      schemaVersion: 1,
+      jobs: [legacyEmotionJob, ...current.backgroundWorkHandoff!.jobs],
+    },
+  };
+}
+
+describe('turn-records', () => {
+  it('round-trips tool-call fields through the journal persistence boundary', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tool-call-fields-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const record = createTurnRecord({
+      toolCalls: [{
+        toolName: 'world',
+        toolCallId: 'call-world-list',
+        outcome: 'success',
+        isError: false,
+        provenanceRefs: ['source:tool:world|invocation:call-world-list'],
+        arguments: { action: 'list', place_id: 'living_room' },
+        resultText: 'The living room is quiet.',
+        details: { placeCount: 1 },
+        rationale: 'Inspect the available world state.',
+        thoughtSignature: 'sig-world-list',
+      }],
+    });
+
+    turnRecordStore.appendTurnRecord(record);
+
+    const rawRows = readFileSync(
+      activeSegmentPathFor(sessionsDir, record.channelId),
+      'utf8',
+    ).trim().split('\n');
+    const persisted = JSON.parse(rawRows[0]!) as TurnRecord;
+    expect(persisted.toolCalls).toEqual(record.toolCalls);
+    expect(turnRecordStore.readRecentTurnRecords(record.channelId, 5)[0]?.toolCalls)
+      .toEqual(record.toolCalls);
+  });
+
+  it('round-trips the tool-call custody edge and its admitting envelope', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tool-custody-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const record = createTurnRecord({
+      custodySnapshotRef: 'turn:019d2326-d9e1-701d-bcee-250d2cbb0e4e',
+      toolCalls: [{
+        toolName: 'wiki_read',
+        toolCallId: 'call-wiki-1',
+        outcome: 'success',
+        isError: false,
+        intakeEnvelope: {
+          envelopeId: '019d2326-0000-7000-8000-0000000000aa',
+          sourceClass: 'tool_output',
+          sourceRiskTier: 'untrusted',
+          state: 'released',
+          riskLabels: [],
+          subject: { kind: 'body' },
+        },
+        resultCustody: {
+          envelopeId: '019d2326-0000-7000-8000-0000000000aa',
+          contentSha256: createHash('sha256').update('admitted result', 'utf8').digest('hex'),
+        },
+      }],
+    });
+
+    turnRecordStore.appendTurnRecord(record);
+
+    const reloaded = turnRecordStore.readRecentTurnRecords(record.channelId, 5)[0];
+    expect(reloaded?.custodySnapshotRef).toBe('turn:019d2326-d9e1-701d-bcee-250d2cbb0e4e');
+    expect(reloaded?.toolCalls[0]?.intakeEnvelope).toEqual(record.toolCalls[0]?.intakeEnvelope);
+    expect(reloaded?.toolCalls[0]?.resultCustody).toEqual(record.toolCalls[0]?.resultCustody);
+  });
+
+  it('refuses a custody edge that claims neither a hash nor a reason', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tool-custody-empty-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const malformed = createTurnRecord({
+      toolCalls: [{
+        toolName: 'wiki_read',
+        toolCallId: 'call-wiki-1',
+        resultCustody: { envelopeId: '019d2326-0000-7000-8000-0000000000aa' },
+      }] as unknown as TurnRecord['toolCalls'],
+    });
+
+    expect(() => turnRecordStore.appendTurnRecord(malformed))
+      .toThrow(/must carry exactly one of contentSha256 or absenceReason/);
+  });
+
+  it('refuses a custody edge bound to a different envelope than its snapshot', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tool-custody-crossbind-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const crossBound = createTurnRecord({
+      toolCalls: [{
+        toolName: 'wiki_read',
+        toolCallId: 'call-wiki-1',
+        intakeEnvelope: {
+          envelopeId: '019d2326-0000-7000-8000-0000000000aa',
+          sourceClass: 'tool_output',
+          sourceRiskTier: 'untrusted',
+          state: 'released',
+          riskLabels: [],
+          subject: { kind: 'body' },
+        },
+        resultCustody: {
+          envelopeId: '019d2326-0000-7000-8000-0000000000bb',
+          contentSha256: createHash('sha256').update('admitted result', 'utf8').digest('hex'),
+        },
+      }] as unknown as TurnRecord['toolCalls'],
+    });
+
+    expect(() => turnRecordStore.appendTurnRecord(crossBound))
+      .toThrow(/names a different envelope than its snapshot/);
+  });
+
+  it('round-trips a named custody absence instead of a bare missing ref', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-custody-absence-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const record = createTurnRecord({ custodySnapshotAbsence: 'write_failed' });
+
+    turnRecordStore.appendTurnRecord(record);
+
+    const reloaded = turnRecordStore.readRecentTurnRecords(record.channelId, 5)[0];
+    expect(reloaded?.custodySnapshotAbsence).toBe('write_failed');
+    expect(reloaded?.custodySnapshotRef).toBeUndefined();
+  });
+
+  it('refuses an unknown custody absence reason rather than dropping it', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-custody-absence-bad-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const malformed = createTurnRecord({
+      custodySnapshotAbsence: 'store_was_grumpy' as never,
+    });
+
+    expect(() => turnRecordStore.appendTurnRecord(malformed))
+      .toThrow(/must be a known absence reason/);
+  });
+
+  it('refuses a turn that claims both a custody ref and a custody absence', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-custody-both-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const contradictory = createTurnRecord({
+      custodySnapshotRef: 'turn:019d2326-d9e1-701d-bcee-250d2cbb0e4e',
+      custodySnapshotAbsence: 'write_failed',
+    });
+
+    expect(() => turnRecordStore.appendTurnRecord(contradictory))
+      .toThrow(/exactly one is allowed/);
+  });
+
+  it('refuses a custody snapshot ref that names a different turn', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-custody-ref-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const crossBound = createTurnRecord({
+      custodySnapshotRef: 'turn:019d2326-d9e1-701d-bcee-ffffffffffff',
+    });
+
+    expect(() => turnRecordStore.appendTurnRecord(crossBound))
+      .toThrow(/must be turn:<turnId> for this turn/);
+  });
+
+  it('rejects malformed tool-call fields instead of silently dropping them', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tool-call-malformed-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const malformed = createTurnRecord({
+      toolCalls: [{
+        toolName: 'world',
+        arguments: ['list'],
+      }] as unknown as TurnRecord['toolCalls'],
+    });
+
+    expect(() => turnRecordStore.appendTurnRecord(malformed))
+      .toThrow('TurnRecord field "toolCalls[0].arguments" must be an object');
+  });
+
+  it('projects huge tool results into bounded content-free usage signals', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-usage-projection-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const hugeResult = `private-result:${'x'.repeat(2 * 1024 * 1024)}`;
+    const record = createTurnRecord({
+      toolCalls: [{
+        toolName: 'repo',
+        toolCallId: 'call-huge-result',
+        isError: true,
+        resultText: hugeResult,
+      }, {
+        toolName: 'memory',
+        toolCallId: 'call-legacy-duplicate',
+        isError: true,
+        resultText: DUPLICATE_TOOL_CALL_SKIP_RESULT,
+      }],
+    });
+    turnRecordStore.appendTurnRecord(record);
+    const readUsage = turnRecordStore.readRecentTurnRecordUsage;
+    expect(readUsage).toBeDefined();
+
+    const usage = readUsage!.call(turnRecordStore, record.channelId, 1);
+
+    expect(usage).toEqual([{
+      turnId: record.turnId,
+      startedAt: record.startedAt,
+      toolCalls: [{
+        toolName: 'repo',
+        outcome: 'execution_failure',
+        isError: true,
+      }, {
+        toolName: 'memory',
+        outcome: 'duplicate_skip',
+        isError: true,
+      }],
+    }]);
+    expect(JSON.stringify(usage)).not.toContain('private-result');
+    expect(JSON.stringify(usage).length).toBeLessThan(512);
+  });
+
+  it('streams a large recovery archive without monopolizing the event loop', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-stream-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    for (let index = 0; index < 64; index += 1) {
+      turnRecordStore.appendTurnRecord(withRecoveryHandoff(createTurnRecord({
+        turnId: backfillLegacyTurnId(`recovery-stream-${String(index)}`),
+        requestId: `request-${String(index)}`,
+        startedAt: 1_742_000_000_000 + index,
+        completedAt: 1_742_000_000_500 + index,
+      })));
+    }
+    const stream = turnRecordStore.streamTurnRecordsForRecovery;
+    expect(stream).toBeDefined();
+    let eventLoopPulseObserved = false;
+    setImmediate(() => {
+      eventLoopPulseObserved = true;
+    });
+
+    let recovered = 0;
+    for await (const _record of stream!.call(
+      turnRecordStore,
+      ['psfn-amica:test:pi5'],
+    )) {
+      recovered += 1;
+    }
+
+    expect(recovered).toBe(64);
+    expect(eventLoopPulseObserved).toBe(true);
+  });
+
+  it('looks up one exact identity without synchronously normalizing a large archive', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-large-'));
+    const channelId = 'psfn-amica:test:exact-large';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const target = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-large-target'),
+      requestId: 'exact-large-target',
+    });
+    const largeBody = 'x'.repeat(128 * 1024);
+    const records = Array.from({ length: 1_024 }, (_, index) => createTurnRecord({
+      channelId,
+      turnId: index === 731
+        ? target.turnId
+        : backfillLegacyTurnId(`exact-large-${String(index)}`),
+      requestId: `exact-large-${String(index)}`,
+      userMessage: {
+        ...target.userMessage,
+        content: largeBody,
+      },
+    }));
+    writeFileSync(
+      activePath,
+      `${records.map(record => JSON.stringify(record)).join('\n')}\n`,
+      'utf8',
+    );
+    const stats: TurnRecordIdentityLookupStats = {
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 0,
+    };
+    let eventLoopPulseObserved = false;
+    setImmediate(() => {
+      eventLoopPulseObserved = true;
+    });
+
+    const lookup = await lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+      { stats },
+    );
+
+    expect(lookup).toEqual({ kind: 'unique', record: records[731] });
+    expect(stats).toMatchObject({
+      linesScanned: 1_024,
+      recordsNormalized: 1,
+      cacheHits: 0,
+    });
+    expect(stats.bytesRead).toBeGreaterThan(128 * 1024 * 1_024);
+    expect(stats.maxReadChunkBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(eventLoopPulseObserved).toBe(true);
+  });
+
+  it('time-slices one huge unrelated row without buffering it and caches a warm lookup', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-huge-row-'));
+    const channelId = 'psfn-amica:test:exact-huge-row';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const unrelated = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-huge-unrelated'),
+      requestId: 'exact-huge-unrelated',
+      userMessage: {
+        ...createTurnRecord().userMessage,
+        content: 'x'.repeat(16 * 1024 * 1024),
+      },
+    });
+    const target = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-huge-target'),
+      requestId: 'exact-huge-target',
+    });
+    writeFileSync(activePath, `${JSON.stringify(unrelated)}\n${JSON.stringify(target)}\n`, 'utf8');
+    const coldStats: TurnRecordIdentityLookupStats = {
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 0,
+    };
+    let pulseCount = 0;
+    const pulse = setInterval(() => {
+      pulseCount += 1;
+    }, 0);
+
+    const cold = await lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+      { stats: coldStats },
+    );
+    clearInterval(pulse);
+
+    expect(cold).toEqual({ kind: 'unique', record: target });
+    expect(coldStats.recordsNormalized).toBe(1);
+    expect(coldStats.bytesRead).toBeGreaterThan(16 * 1024 * 1024);
+    expect(coldStats.maxReadChunkBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(pulseCount).toBeGreaterThan(1);
+
+    const warmStats: TurnRecordIdentityLookupStats = {
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 0,
+    };
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+      { stats: warmStats },
+    )).resolves.toEqual({ kind: 'unique', record: target });
+    expect(warmStats).toEqual({
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 1,
+    });
+  });
+
+  it('cancels an exact identity scan between bounded chunks', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-abort-'));
+    const channelId = 'psfn-amica:test:exact-abort';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const unrelated = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-abort-unrelated'),
+      requestId: 'exact-abort-unrelated',
+      userMessage: {
+        ...createTurnRecord().userMessage,
+        content: 'x'.repeat(4 * 1024 * 1024),
+      },
+    });
+    const target = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-abort-target'),
+      requestId: 'exact-abort-target',
+    });
+    writeFileSync(activePath, `${JSON.stringify(unrelated)}\n${JSON.stringify(target)}\n`, 'utf8');
+    const stats: TurnRecordIdentityLookupStats = {
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 0,
+    };
+    const controller = new AbortController();
+    setImmediate(() => controller.abort());
+
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+      { signal: controller.signal, stats },
+    )).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(stats.bytesRead).toBeLessThan(4 * 1024 * 1024);
+    expect(stats.recordsNormalized).toBe(0);
+  });
+
+  it('fails closed when a malformed row claims the matching TurnID', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-malformed-match-'));
+    const channelId = 'psfn-amica:test:exact-malformed-match';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const target = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-malformed-match'),
+      requestId: 'exact-malformed-match',
+    });
+    writeFileSync(
+      activePath,
+      `${JSON.stringify(target)}\n{"turnId":"${target.turnId}","requestId":}\n`,
+      'utf8',
+    );
+
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+    )).resolves.toEqual({ kind: 'duplicated' });
+  });
+
+  it('fails closed when a malformed row becomes undecidable before its identity', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-undecidable-'));
+    const channelId = 'psfn-amica:test:exact-undecidable';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const target = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-undecidable'),
+      requestId: 'exact-undecidable',
+    });
+    writeFileSync(
+      activePath,
+      `${JSON.stringify(target)}\n{"bad" 0,"turnId":"${target.turnId}"}\n`,
+      'utf8',
+    );
+
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+    )).resolves.toEqual({ kind: 'duplicated' });
+  });
+
+  it('fails closed instead of missing an oversized legacy identity token', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-legacy-large-'));
+    const channelId = 'psfn-amica:test:exact-legacy-large';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const requestId = `legacy-${'x'.repeat(2 * 1024)}`;
+    const record = createTurnRecord({ channelId, requestId });
+    const legacy = { ...record, turnId: undefined };
+    const expectedTurnId = backfillLegacyTurnId(
+      `${channelId}:${requestId}:${String(record.startedAt)}:${String(record.completedAt)}`,
+    );
+    writeFileSync(activePath, `${JSON.stringify(legacy)}\n`, 'utf8');
+
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      expectedTurnId,
+    )).resolves.toEqual({ kind: 'duplicated' });
+  });
+
+  it('does not retain an old-fat unique record in the warm lookup cache', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-cache-bound-'));
+    const channelId = 'psfn-amica:test:exact-cache-bound';
+    const activePath = activeSegmentPathFor(sessionsDir, channelId);
+    mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+    const target = createTurnRecord({
+      channelId,
+      turnId: backfillLegacyTurnId('exact-cache-bound'),
+      requestId: 'exact-cache-bound',
+      userMessage: {
+        ...createTurnRecord().userMessage,
+        content: 'x'.repeat(2 * 1024 * 1024),
+      },
+    });
+    writeFileSync(activePath, `${JSON.stringify(target)}\n`, 'utf8');
+
+    await lookupTurnRecordIdentityAcrossSegments(sessionsDir, channelId, target.turnId);
+    const stats: TurnRecordIdentityLookupStats = {
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 0,
+    };
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      channelId,
+      target.turnId,
+      { stats },
+    )).resolves.toEqual({ kind: 'unique', record: target });
+    expect(stats.cacheHits).toBe(0);
+    expect(stats.bytesRead).toBeGreaterThan(2 * 1024 * 1024);
+  });
+
+  it('evicts warm identities at the cumulative retained-byte bound', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-cache-total-'));
+    const records = Array.from({ length: 72 }, (_, index) => createTurnRecord({
+      channelId: `psfn-amica:test:exact-cache-total-${String(index)}`,
+      turnId: backfillLegacyTurnId(`exact-cache-total-${String(index)}`),
+      requestId: `exact-cache-total-${String(index)}`,
+      userMessage: {
+        ...createTurnRecord().userMessage,
+        content: 'x'.repeat(240 * 1024),
+      },
+    }));
+    for (const record of records) {
+      const activePath = activeSegmentPathFor(sessionsDir, record.channelId);
+      mkdirSync(join(sessionsDir, TURN_RECORDS_DIR), { recursive: true });
+      writeFileSync(activePath, `${JSON.stringify(record)}\n`, 'utf8');
+      await lookupTurnRecordIdentityAcrossSegments(
+        sessionsDir,
+        record.channelId,
+        record.turnId,
+      );
+    }
+    const stats: TurnRecordIdentityLookupStats = {
+      linesScanned: 0,
+      recordsNormalized: 0,
+      bytesRead: 0,
+      maxReadChunkBytes: 0,
+      cacheHits: 0,
+    };
+
+    await expect(lookupTurnRecordIdentityAcrossSegments(
+      sessionsDir,
+      records[0]!.channelId,
+      records[0]!.turnId,
+      { stats },
+    )).resolves.toEqual({ kind: 'unique', record: records[0] });
+    expect(stats.cacheHits).toBe(0);
+    expect(stats.bytesRead).toBeGreaterThan(240 * 1024);
+  });
+
+  it('distinguishes missing, unique, and duplicated exact identities', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-states-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const unique = createTurnRecord({
+      turnId: backfillLegacyTurnId('exact-state-unique'),
+      requestId: 'exact-state-unique',
+    });
+    const duplicated = createTurnRecord({
+      turnId: backfillLegacyTurnId('exact-state-duplicated'),
+      requestId: 'exact-state-duplicated-a',
+    });
+    store.appendTurnRecord(unique);
+    store.appendTurnRecord(duplicated);
+    store.appendTurnRecord({
+      ...duplicated,
+      requestId: 'exact-state-duplicated-b',
+    });
+
+    const lookup = store.lookupTurnRecordIdentity;
+    expect(lookup).toBeDefined();
+    await expect(lookup!.call(store, unique.channelId, backfillLegacyTurnId('missing')))
+      .resolves.toEqual({ kind: 'missing' });
+    await expect(lookup!.call(store, unique.channelId, unique.turnId))
+      .resolves.toEqual({ kind: 'unique', record: unique });
+    await expect(lookup!.call(store, duplicated.channelId, duplicated.turnId))
+      .resolves.toEqual({ kind: 'duplicated' });
+  });
+
+  it('keeps one exact lookup on its pinned generation when a writer appends a duplicate', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-exact-generation-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 8 });
+    const target = createTurnRecord({
+      turnId: backfillLegacyTurnId('exact-generation-target'),
+      requestId: 'exact-generation-target',
+    });
+    store.appendTurnRecord(target);
+    for (let index = 0; index < 64; index += 1) {
+      store.appendTurnRecord(createTurnRecord({
+        turnId: backfillLegacyTurnId(`exact-generation-padding-${String(index)}`),
+        requestId: `exact-generation-padding-${String(index)}`,
+      }));
+    }
+    const lookup = store.lookupTurnRecordIdentity;
+    expect(lookup).toBeDefined();
+    const firstLookup = lookup!.call(store, target.channelId, target.turnId);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const siblingWriter = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: 8,
+    });
+    siblingWriter.appendTurnRecord({ ...target, requestId: 'exact-generation-duplicate' });
+
+    await expect(firstLookup).resolves.toEqual({ kind: 'unique', record: target });
+    await expect(lookup!.call(store, target.channelId, target.turnId))
+      .resolves.toEqual({ kind: 'duplicated' });
+  });
+
+  it('cancels a pinned recovery snapshot promptly', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-fd-'));
+    const record = createTurnRecord();
+    const abortController = new AbortController();
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      recoverySnapshotHook: () => { abortController.abort(); },
+    });
+    turnRecordStore.appendTurnRecord(record);
+    const stream = turnRecordStore.streamTurnRecordsForRecovery;
+    expect(stream).toBeDefined();
+    const startedAt = Date.now();
+
+    await expect((async () => {
+      for await (const _record of stream!.call(
+        turnRecordStore,
+        [record.channelId],
+        { signal: abortController.signal },
+      )) {
+        // The snapshot hook aborts before physical scanning starts.
+      }
+    })()).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+  });
+
+  it('rejects duplicate handoffs across rotated segments from the same snapshot', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-duplicate-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: 1,
+    });
+    const record = withRecoveryHandoff(createTurnRecord());
+    turnRecordStore.appendTurnRecord(record);
+    turnRecordStore.appendTurnRecord(record);
+
+    const recovered: TurnRecord[] = [];
+    for await (const candidate of turnRecordStore.streamTurnRecordsForRecovery!(
+      [record.channelId],
+    )) {
+      recovered.push(candidate);
+    }
+
+    expect(recovered).toEqual([]);
+  });
+
+  it('holds one source boundary when two post-boundary appends trigger rotation', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-snapshot-'));
+    const record = withRecoveryHandoff(createTurnRecord());
+    appendTurnRecordWithRotation(sessionsDir, record, Number.MAX_SAFE_INTEGER);
+    const activePath = activeSegmentPathFor(sessionsDir, record.channelId);
+    const initialSize = statSync(activePath).size;
+    let snapshots = 0;
+    let turnRecordStore!: TurnRecordStorePort;
+    turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: initialSize + 1,
+      recoverySnapshotHook: () => {
+        if (snapshots++ !== 0) return;
+        turnRecordStore.appendTurnRecord(record);
+        expect(existsSync(sealedSegmentPathFor(activePath, 1))).toBe(false);
+        turnRecordStore.appendTurnRecord(record);
+        expect(existsSync(sealedSegmentPathFor(activePath, 1))).toBe(true);
+      },
+    });
+
+    const first: TurnRecord[] = [];
+    for await (const candidate of turnRecordStore.streamTurnRecordsForRecovery!(
+      [record.channelId],
+    )) {
+      first.push(candidate);
+    }
+    const second: TurnRecord[] = [];
+    for await (const candidate of turnRecordStore.streamTurnRecordsForRecovery!(
+      [record.channelId],
+    )) {
+      second.push(candidate);
+    }
+
+    expect(first.map(candidate => candidate.turnId)).toEqual([record.turnId]);
+    expect(second).toEqual([]);
+  });
+
+  it('scans a pinned active boundary once across an interrupted hard-link rotation', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-link-'));
+    const record = withRecoveryHandoff(createTurnRecord());
+    appendTurnRecordWithRotation(sessionsDir, record, Number.MAX_SAFE_INTEGER);
+    const activePath = activeSegmentPathFor(sessionsDir, record.channelId);
+    const sealedPath = sealedSegmentPathFor(activePath, 1);
+    linkSync(activePath, sealedPath);
+    expect(statSync(activePath).ino).toBe(statSync(sealedPath).ino);
+
+    const recovered: TurnRecord[] = [];
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    for await (const candidate of store.streamTurnRecordsForRecovery!([record.channelId])) {
+      recovered.push(candidate);
+    }
+
+    expect(recovered.map(candidate => candidate.turnId)).toEqual([record.turnId]);
+  });
+
+  it('fails closed on missing, gapped, and multiply-aliased fenced segments', async () => {
+    const scenarios = [
+      {
+        name: 'missing',
+        expectedCode: 'ENOENT',
+        arrange: (activePath: string) => {
+          const sealedPath = sealedSegmentPathFor(activePath, 1);
+          writeFileSync(sealedPath, readFileSync(activePath));
+          return () => { rmSync(sealedPath); };
+        },
+      },
+      {
+        name: 'gap',
+        expectedCode: 'ESTRUCTURAL',
+        arrange: (activePath: string) => {
+          writeFileSync(sealedSegmentPathFor(activePath, 2), readFileSync(activePath));
+          return () => undefined;
+        },
+      },
+      {
+        name: 'identity',
+        expectedCode: 'ESTRUCTURAL',
+        arrange: (activePath: string) => {
+          linkSync(activePath, sealedSegmentPathFor(activePath, 1));
+          linkSync(activePath, sealedSegmentPathFor(activePath, 2));
+          return () => undefined;
+        },
+      },
+    ] as const;
+    for (const scenario of scenarios) {
+      const sessionsDir = mkdtempSync(
+        join(tmpdir(), `psfn-turn-records-recovery-fence-${scenario.name}-`),
+      );
+      const record = withRecoveryHandoff(createTurnRecord());
+      appendTurnRecordWithRotation(sessionsDir, record, Number.MAX_SAFE_INTEGER);
+      const activePath = activeSegmentPathFor(sessionsDir, record.channelId);
+      const afterBoundary = scenario.arrange(activePath);
+      const store = createFilesystemTurnRecordStorePort(sessionsDir, {
+        recoverySnapshotHook: afterBoundary,
+      });
+
+      await expect((async () => {
+        for await (const _candidate of store.streamTurnRecordsForRecovery!([record.channelId])) {
+          // Ambiguous physical evidence must fail the complete snapshot.
+        }
+      })()).rejects.toMatchObject({
+        name: 'TurnRecordRecoveryEvidenceError',
+        code: scenario.expectedCode,
+      });
+    }
+  });
+
+  it('cancels promptly while waiting for the bounded rotation lock', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-lock-cancel-'));
+    const record = withRecoveryHandoff(createTurnRecord());
+    appendTurnRecordWithRotation(sessionsDir, record, Number.MAX_SAFE_INTEGER);
+    const activePath = activeSegmentPathFor(sessionsDir, record.channelId);
+    mkdirSync(`${activePath}.rotate-lock`);
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    setTimeout(() => { controller.abort(); }, 25);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    await expect((async () => {
+      for await (const _candidate of store.streamTurnRecordsForRecovery!(
+        [record.channelId],
+        { signal: controller.signal },
+      )) {
+        // Cancellation kills the isolated waiter without touching the held lock.
+      }
+    })()).rejects.toMatchObject({ name: 'AbortError' });
+
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(existsSync(`${activePath}.rotate-lock`)).toBe(true);
+  });
+
+  it('orders recovery globally even when physical source rows are out of order', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-order-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const records = [
+      withRecoveryHandoff(createTurnRecord({
+        channelId: 'api:order-a',
+        channelType: 'api',
+        turnId: backfillLegacyTurnId('order-latest'),
+        requestId: 'request-latest',
+        completedAt: 300,
+      })),
+      withRecoveryHandoff(createTurnRecord({
+        channelId: 'api:order-a',
+        channelType: 'api',
+        turnId: backfillLegacyTurnId('order-earliest'),
+        requestId: 'request-earliest',
+        completedAt: 100,
+      })),
+      withRecoveryHandoff(createTurnRecord({
+        channelId: 'discord:order-b',
+        channelType: 'discord',
+        turnId: backfillLegacyTurnId('order-middle'),
+        requestId: 'request-middle',
+        completedAt: 200,
+      })),
+      withRecoveryHandoff(createTurnRecord({
+        channelId: 'api:order-a',
+        channelType: 'api',
+        turnId: backfillLegacyTurnId('order-middle'),
+        requestId: 'request-middle-tie',
+        completedAt: 200,
+      })),
+    ];
+    records.forEach(record => turnRecordStore.appendTurnRecord(record));
+
+    const recovered: TurnRecord[] = [];
+    for await (const candidate of turnRecordStore.streamTurnRecordsForRecovery!(
+      ['discord:order-b', 'api:order-a'],
+    )) {
+      recovered.push(candidate);
+    }
+
+    const expectedOrder = [...records].sort((left, right) => (
+      left.completedAt - right.completedAt
+      || left.turnId.localeCompare(right.turnId)
+      || left.channelId.localeCompare(right.channelId)
+    ));
+    expect(recovered.map(candidate => candidate.requestId))
+      .toEqual(expectedOrder.map(candidate => candidate.requestId));
+  });
+
+  it('keeps the main event loop responsive for one huge old-fat row', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-huge-row-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      scanChunkBytes: 64 * 1024,
+    });
+    const base = createTurnRecord();
+    const hugeUserContent = `old-fat-user:${'u'.repeat(8 * 1024 * 1024)}`;
+    const hugeAssistantContent = `old-fat-assistant:${'a'.repeat(4 * 1024 * 1024)}`;
+    const hugeResult = `old-fat-result:${'x'.repeat(4 * 1024 * 1024)}`;
+    const record = withRecoveryHandoff(createTurnRecord({
+      userMessage: { ...base.userMessage, content: hugeUserContent },
+      assistantMessage: { ...base.assistantMessage!, content: hugeAssistantContent },
+      toolCalls: [{
+        toolName: 'repo',
+        toolCallId: 'call-huge-recovery',
+        resultText: hugeResult,
+      }],
+    }));
+    turnRecordStore.appendTurnRecord(record);
+    const stats: TurnRecordRecoveryScanStats = {
+      bytesRead: 0,
+      rowsScanned: 0,
+      filesScanned: 0,
+      candidatesYielded: 0,
+      peakIdentityRowsInMemory: 0,
+      sqliteCacheBytes: 0,
+      maxRowBytes: 0,
+    };
+    let pulses = 0;
+    let lastPulse = Date.now();
+    let maxPulseGap = 0;
+    const heartbeat = setInterval(() => {
+      const now = Date.now();
+      maxPulseGap = Math.max(maxPulseGap, now - lastPulse);
+      lastPulse = now;
+      pulses += 1;
+    }, 5);
+    const recovered: TurnRecord[] = [];
+    try {
+      for await (const candidate of turnRecordStore.streamTurnRecordsForRecovery!(
+        [record.channelId],
+        { stats },
+      )) {
+        recovered.push(candidate);
+      }
+    } finally {
+      clearInterval(heartbeat);
+    }
+
+    expect(pulses).toBeGreaterThan(5);
+    expect(maxPulseGap).toBeLessThan(100);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]!.userMessage.content).toBe('');
+    expect(recovered[0]!.assistantMessage).toBeUndefined();
+    expect(recovered[0]!.toolCalls).toEqual([]);
+    const recoveredJson = JSON.stringify(recovered[0]);
+    expect(recoveredJson).not.toContain('old-fat-user');
+    expect(recoveredJson).not.toContain('old-fat-assistant');
+    expect(recoveredJson).not.toContain('old-fat-result');
+    expect(recoveredJson.length).toBeLessThan(64 * 1024);
+    expect(stats).toMatchObject({
+      rowsScanned: 1,
+      candidatesYielded: 1,
+      peakIdentityRowsInMemory: 1,
+      sqliteCacheBytes: 4 * 1024 * 1024,
+      maxRowBytes: 128 * 1024 * 1024,
+    });
+    expect(stats.bytesRead).toBeGreaterThan(16 * 1024 * 1024);
+  });
+
+  it('quarantines semantically poisoned recovery handoffs before yielding', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-poison-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const poisoned = withRecoveryHandoff(createTurnRecord());
+    poisoned.backgroundWorkHandoff!.jobs[0]!.payloadFingerprint = '0'.repeat(64);
+    store.appendTurnRecord(poisoned);
+    const yielded: TurnRecord[] = [];
+
+    await expect((async () => {
+      for await (const candidate of store.streamTurnRecordsForRecovery!([poisoned.channelId])) {
+        yielded.push(candidate);
+      }
+    })()).resolves.toBeUndefined();
+
+    expect(yielded).toEqual([]);
+    const quarantinePath = `${activeSegmentPathFor(sessionsDir, poisoned.channelId)}.quarantine`;
+    const firstEvidence = readFileSync(quarantinePath, 'utf8');
+    expect(firstEvidence).not.toContain('payloadFingerprint');
+    expect(JSON.parse(firstEvidence)).toMatchObject({
+      channelId: poisoned.channelId,
+      reason: 'invalid_turn_record_recovery_row',
+    });
+
+    for await (const _candidate of store.streamTurnRecordsForRecovery!([poisoned.channelId])) {
+      // A terminally quarantined row never becomes recoverable work.
+    }
+    expect(readFileSync(quarantinePath, 'utf8')).toBe(firstEvidence);
+  });
+
+  it('retires an exact pre-drift appraisal without poisoning sibling recovery jobs', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-legacy-appraisal-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const record = withLegacyEmotionAppraisalHandoff(createTurnRecord());
+    store.appendTurnRecord(record);
+    const stats: TurnRecordRecoveryScanStats = {
+      bytesRead: 0,
+      rowsScanned: 0,
+      filesScanned: 0,
+      candidatesYielded: 0,
+      peakIdentityRowsInMemory: 0,
+      sqliteCacheBytes: 0,
+      maxRowBytes: 0,
+    };
+    const recovered: TurnRecord[] = [];
+
+    for await (const candidate of store.streamTurnRecordsForRecovery!(
+      [record.channelId],
+      { stats },
+    )) {
+      recovered.push(candidate);
+    }
+
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.backgroundWorkHandoff?.jobs.map(job => job.kind))
+      .toEqual(['memory_extraction']);
+    expect(stats.legacyEmotionAppraisalJobsRetired).toBe(1);
+  });
+
+  it('quarantines malformed rows and fails closed on rows beyond the declared byte cap', async () => {
+    const malformedDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-malformed-'));
+    const malformedStore = createFilesystemTurnRecordStorePort(malformedDir);
+    const record = withRecoveryHandoff(createTurnRecord());
+    malformedStore.appendTurnRecord(record);
+    appendFileSync(activeSegmentPathFor(malformedDir, record.channelId), '{"broken":\n');
+
+    const recovered: TurnRecord[] = [];
+    const quarantineStats: TurnRecordRecoveryScanStats = {
+      bytesRead: 0,
+      rowsScanned: 0,
+      filesScanned: 0,
+      candidatesYielded: 0,
+      peakIdentityRowsInMemory: 0,
+      sqliteCacheBytes: 0,
+      maxRowBytes: 0,
+    };
+    await expect((async () => {
+      for await (const candidate of malformedStore.streamTurnRecordsForRecovery!(
+        [record.channelId],
+        { stats: quarantineStats },
+      )) {
+        recovered.push(candidate);
+      }
+    })()).resolves.toBeUndefined();
+    expect(recovered.map(candidate => candidate.turnId)).toEqual([record.turnId]);
+    expect(quarantineStats.quarantinedTurnRecordRows).toBe(1);
+    expect(JSON.parse(readFileSync(
+      `${activeSegmentPathFor(malformedDir, record.channelId)}.quarantine`,
+      'utf8',
+    ))).toMatchObject({
+      channelId: record.channelId,
+      reason: 'invalid_turn_record_recovery_row',
+    });
+
+    const cappedDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-recovery-row-cap-'));
+    const cappedStore = createFilesystemTurnRecordStorePort(cappedDir, {
+      recoveryMaxRowBytes: 1_024,
+    });
+    const oversized = withRecoveryHandoff(createTurnRecord({
+      toolCalls: [{
+        toolName: 'repo',
+        toolCallId: 'call-over-cap',
+        resultText: 'x'.repeat(2_048),
+      }],
+    }));
+    cappedStore.appendTurnRecord(oversized);
+
+    await expect((async () => {
+      for await (const _candidate of cappedStore.streamTurnRecordsForRecovery!(
+        [oversized.channelId],
+      )) {
+        // Oversized physical evidence is rejected, never skipped.
+      }
+    })()).rejects.toMatchObject({
+      name: 'TurnRecordRecoveryEvidenceError',
+      code: 'ESTRUCTURAL',
+      message: expect.stringContaining('exceeds 1024 bytes'),
+    });
+  });
+
+  it('launches the compiled recovery worker with the dynamic Node SQLite builtin', async () => {
+    const cacheRoot = join(process.cwd(), 'node_modules', '.cache');
+    mkdirSync(cacheRoot, { recursive: true });
+    const buildDir = mkdtempSync(join(cacheRoot, 'psfn-recovery-worker-smoke-'));
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-recovery-worker-smoke-data-'));
+    const workerPath = join(buildDir, 'worker.js');
+    try {
+      await build({
+        entry: {
+          worker: join(process.cwd(), 'src/persistence/sessions/turn-record-recovery-worker.ts'),
+        },
+        outDir: buildDir,
+        clean: false,
+        dts: false,
+        format: ['esm'],
+        target: 'node24',
+        splitting: false,
+        skipNodeModulesBundle: true,
+        silent: true,
+      });
+      const compiled = readFileSync(workerPath, 'utf8');
+      expect(compiled).not.toMatch(/from ["']sqlite["']/u);
+
+      await new Promise<void>((resolve, reject) => {
+        const child = fork(workerPath, [], {
+          execArgv: ['--no-warnings'],
+          serialization: 'advanced',
+          stdio: ['ignore', 'ignore', 'inherit', 'ipc'],
+        });
+        const fail = (error: Error): void => {
+          clearTimeout(timeout);
+          child.kill();
+          reject(error);
+        };
+        const timeout = setTimeout(() => {
+          fail(new Error('Compiled TurnRecord recovery worker did not complete'));
+        }, 3_000);
+        child.once('error', fail);
+        child.on('message', (message: unknown) => {
+          if ((message as { type?: string }).type !== 'complete') return;
+          clearTimeout(timeout);
+          child.kill();
+          resolve();
+        });
+        child.send({
+          type: 'start',
+          input: {
+            abortPath: join(sessionsDir, 'abort'),
+            databasePath: join(sessionsDir, 'snapshot.sqlite'),
+            maxRowBytes: 1_024,
+            scanChunkBytes: 256,
+            sessionsDir,
+            sourceChannelIds: [],
+            sqliteCacheBytes: 4_096,
+          },
+        });
+      });
+    } finally {
+      rmSync(buildDir, { recursive: true, force: true });
+      rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
+
+  it('persists and reads psfn-amica turn records', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-psfn-amica-turn-records-'));
+    const record = createTurnRecord();
+    const turnRecordStore: TurnRecordStorePort = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+
+    expect(turnRecordStore.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+  });
+
+  it('round-trips a bounded background handoff and rejects cross-turn bindings', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-background-handoff-'));
+    const base = createTurnRecord();
+    const job = {
+      jobId: 'bgw_test',
+      idempotencyKey: 'background-work:v1:test',
+      logicalSessionId: base.channelId,
+      kind: 'memory_extraction' as const,
+      payload: { schemaVersion: 1, kind: 'memory_extraction' },
+      payloadFingerprint: 'a'.repeat(64),
+      sourceTurnId: base.turnId,
+      sourceRequestId: base.requestId,
+      sourceChannelId: base.channelId,
+      createdAtMs: base.completedAt,
+      maxAttempts: 5,
+    };
+    const record = createTurnRecord({
+      backgroundWorkHandoff: { schemaVersion: 1, jobs: [job] },
+    });
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+    expect(turnRecordStore.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+    expect(() => turnRecordStore.appendTurnRecord(createTurnRecord({
+      turnId: backfillLegacyTurnId('different-turn'),
+      backgroundWorkHandoff: { schemaVersion: 1, jobs: [job] },
+    }))).toThrow('does not bind to its owning turn');
+  });
+
+  it('round-trips the typed content-free parent-turn continuation stop', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-continuation-stop-'));
+    const record = createTurnRecord({
+      status: 'failed',
+      assistantMessage: undefined,
+      continuationStop: {
+        schemaVersion: 1,
+        reason: 'wall_clock_limit',
+        outcome: 'failed',
+        promptEntries: 9,
+        maxPromptEntries: 36,
+        elapsedMs: 300_000,
+        maxWallTimeMs: 300_000,
+      },
+    });
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+
+    expect(turnRecordStore.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+    expect(JSON.stringify(record.continuationStop)).not.toContain(record.userMessage.content);
+  });
+
+  it('round-trips a durable satellite/place location', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-location-'));
+    const record = createTurnRecord({
+      location: { placeId: 'living_room', satelliteId: 'pi-voice' },
+    });
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+
+    const read = turnRecordStore.readRecentTurnRecords(record.channelId, 5);
+    expect(read).toEqual([record]);
+    expect(read[0]?.location).toEqual({ placeId: 'living_room', satelliteId: 'pi-voice' });
+  });
+
+  it('round-trips a durable ICP suppression correlation', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-icp-correlation-'));
+    const companionA = '11111111-1111-4111-8111-111111111111';
+    const companionB = '22222222-2222-4222-8222-222222222222';
+    const channelId = `companion-dm:${companionA}:${companionB}`;
+    const turnId = '019d2326-d9e1-701d-bcee-250d2cbb0e4e';
+    const requestId = 'companion-reply-11111111-1111-4111-8111-111111111111-prior-turn';
+    const record = createTurnRecord({
+      channelId,
+      channelType: 'companion',
+      turnId,
+      requestId,
+      assistantMessage: undefined,
+      icpCorrelation: {
+        conversationId: '33333333-3333-4333-8333-333333333333',
+        rootInitiationId: '44444444-4444-4444-8444-444444444444',
+        initiatedByCompanionId: companionA,
+        localCompanionId: companionB,
+        peerCompanionId: companionA,
+        peerContactId: 'contact-a',
+        channelId,
+        turnId,
+        messageId: requestId,
+        requestId,
+        chargeLane: 'companion_social',
+        surface: 'companion_dm',
+        costPurpose: 'conversation_turn',
+        costOriginStage: 'reply',
+        fatigueDecision: 'suppress',
+        fatigueReasonCode: 'fatigue_exhausted',
+      },
+    });
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+
+    expect(turnRecordStore.readRecentTurnRecords(channelId, 5)).toEqual([record]);
+  });
+
+  it('round-trips logical session provenance through a bounded snapshot cursor', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'turn-records-session-provenance-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    const records = Array.from({ length: 4 }, (_, index) => createTurnRecord({
+      turnId: `019d2326-d9e1-701d-bcee-250d2cbb0e${index + 1}e`,
+      requestId: `request-${index + 1}`,
+      sessionId: 'session:logical-after-reset',
+      completedAt: 1_700_000_000_100 + index,
+    }));
+    for (const record of records) turnRecordStore.appendTurnRecord(record);
+
+    const first = await turnRecordStore.readTurnRecordPage?.(records[0]!.channelId, 2);
+    expect(first).toMatchObject({ records: records.slice(2), exhausted: false });
+    const second = await turnRecordStore.readTurnRecordPage?.(
+      records[0]!.channelId,
+      2,
+      first?.nextCursor,
+    );
+    expect(second).toEqual({ records: records.slice(0, 2), exhausted: true });
+    expect(turnRecordStore.readRecentTurnRecords(records[0]!.channelId, 1)[0]?.sessionId)
+      .toBe('session:logical-after-reset');
+  });
+
+  it('omits location for turns that carried no place binding (legacy rows load fine)', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-nolocation-'));
+    const record = createTurnRecord();
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+
+    const read = turnRecordStore.readRecentTurnRecords(record.channelId, 5);
+    expect(read).toEqual([record]);
+    expect(read[0]).not.toHaveProperty('location');
+  });
+
+  it('finds an old durable completion marker without a recent-record cap', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-marker-'));
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: 8,
+    });
+    const old = createTurnRecord({ turnId: backfillLegacyTurnId('old-completion-marker') });
+    turnRecordStore.appendTurnRecord(old);
+    for (let index = 0; index < 40; index += 1) {
+      turnRecordStore.appendTurnRecord(createTurnRecord({
+        turnId: backfillLegacyTurnId(`newer-turn-${index}`),
+        requestId: `newer-request-${index}`,
+        startedAt: old.startedAt + index + 1,
+        completedAt: old.completedAt + index + 1,
+      }));
+    }
+
+    expect(turnRecordStore.findTurnRecord(old.channelId, old.turnId)).toEqual(old);
+  });
+
+  it('round-trips assistant runtime fallback provenance', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-runtime-fallback-'));
+    const record = createTurnRecord({
+      assistantMessage: {
+        role: 'assistant',
+        content: 'The image reader failed before I could inspect the attachment.',
+        timestamp: 1_742_000_000_500,
+        runtimeFallbackProvenance: {
+          schemaVersion: 1,
+          authoredBy: 'runtime',
+          model: 'runtime-fallback',
+          strategy: 'runtime_nonfabricating_notice',
+        },
+      },
+    });
+    const turnRecordStore = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    turnRecordStore.appendTurnRecord(record);
+
+    expect(turnRecordStore.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+  });
+});
+
+const ROTATION_CHANNEL = 'psfn-amica:rotation:pi5';
+
+function sequencedRecord(index: number, channelId = ROTATION_CHANNEL): TurnRecord {
+  const startedAt = 1_742_000_000_000 + index * 1_000;
+  return createTurnRecord({
+    channelId,
+    requestId: `req-${index}`,
+    startedAt,
+    completedAt: startedAt + 500,
+    userMessage: {
+      role: 'user',
+      content: `message-${index}`,
+      timestamp: startedAt,
+      authorId: 'device',
+      authorName: 'Device',
+    },
+    assistantMessage: {
+      role: 'assistant',
+      content: `reply-${index}`,
+      timestamp: startedAt + 500,
+      authorId: 'companion',
+      authorName: 'Companion',
+    },
+  });
+}
+
+describe('turn-records rotation and bounded tail reads', () => {
+  it('rotates past the cap and reads records spanning segment boundaries in order', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-rotation-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 10 });
+
+    const records = [0, 1, 2, 3].map((i) => sequencedRecord(i));
+    for (const record of records) store.appendTurnRecord(record);
+
+    // A tiny cap forces a rotation on every append after the first, so multiple
+    // numbered segments plus an active file must exist.
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    const names = readdirSync(dir);
+    expect(names).toContain(`${sanitized}.jsonl`);
+    const segmentNames = names.filter((n) => /\.\d{5}\.jsonl$/.test(n));
+    expect(segmentNames.length).toBeGreaterThanOrEqual(2);
+
+    // The stream reads as one logical sequence across every segment, oldest-first.
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual(records);
+
+    // A limit smaller than the total returns only the newest, still ordered.
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 2)).toEqual([records[2], records[3]]);
+  });
+
+  it('reads correctly from a pre-existing file larger than the cap and rotates on next append', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-oversized-'));
+    // Build one oversized active file BEFORE any rotation knowledge exists.
+    const bigStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: 1024 * 1024,
+    });
+    const existing = [0, 1, 2, 3, 4].map((i) => sequencedRecord(i));
+    for (const record of existing) bigStore.appendTurnRecord(record);
+
+    const activePath = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    const oversizedBytes = statSync(activePath).size;
+    expect(oversizedBytes).toBeGreaterThan(0);
+
+    // Reads work on the oversized file regardless of the (now smaller) cap.
+    const smallCapStore = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: 8,
+    });
+    expect(smallCapStore.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual(existing);
+
+    // Next append notices the oversized active file and rotates it into a segment.
+    const next = sequencedRecord(5);
+    smallCapStore.appendTurnRecord(next);
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    expect(readdirSync(dir).some((n) => new RegExp(`^${sanitized}\\.\\d{5}\\.jsonl$`).test(n))).toBe(true);
+    expect(smallCapStore.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual([...existing, next]);
+  });
+
+  it('reads only a bounded number of bytes from the tail of a large file', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-bounded-'));
+    // No rotation: a single large file, so the tail read must not touch the head.
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, {
+      segmentMaxBytes: 1024 * 1024 * 1024,
+    });
+    const total = 200;
+    for (let i = 0; i < total; i++) store.appendTurnRecord(sequencedRecord(i));
+
+    const activePath = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    const fileSize = statSync(activePath).size;
+    expect(fileSize).toBeGreaterThan(20_000);
+
+    const stats: TurnRecordTailStats = { bytesRead: 0 };
+    const read = readRecentTurnRecordsAcrossSegments(sessionsDir, ROTATION_CHANNEL, 2, {
+      scanChunkBytes: 512,
+      stats,
+    });
+
+    expect(read).toEqual([sequencedRecord(total - 2), sequencedRecord(total - 1)]);
+    // Reading the last 2 of 200 records must scan far fewer bytes than the file.
+    expect(stats.bytesRead).toBeGreaterThan(0);
+    expect(stats.bytesRead).toBeLessThan(fileSize / 4);
+    expect(stats.bytesRead).toBeLessThan(4_096);
+  });
+
+  it('pins a rotation snapshot without duplicating the moved active inode or admitting newer rows', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-rotation-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 1_024 });
+    const records = Array.from({ length: 4 }, (_, index) => sequencedRecord(index));
+    for (const record of records) store.appendTurnRecord(record);
+
+    const first = await store.readTurnRecordPage?.(ROTATION_CHANNEL, 1);
+    expect(first).toMatchObject({
+      records: records.slice(3),
+      exhausted: false,
+    });
+    expect(first?.nextCursor).toBeDefined();
+
+    // The snapshot's active inode rotates to a numbered segment and a new
+    // active record appears between pages. Continuation still has one row in
+    // the moved active inode: it must relocate that inode, count it once, and
+    // exclude the post-snapshot append.
+    const postSnapshot = sequencedRecord(4);
+    store.appendTurnRecord(postSnapshot);
+    const second = await store.readTurnRecordPage?.(
+      ROTATION_CHANNEL,
+      3,
+      first?.nextCursor,
+    );
+    expect(second).toEqual({
+      records: records.slice(0, 3),
+      exhausted: true,
+    });
+
+    // Supplying no cursor is an explicit reset and begins a fresh snapshot.
+    await expect(store.readTurnRecordPage?.(ROTATION_CHANNEL, 2)).resolves.toMatchObject({
+      records: [records[3], postSnapshot],
+      exhausted: false,
+    });
+  });
+
+  it('fences two rotations during capture immediately after the pinned active inode', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-capture-race-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 8 });
+    const records = Array.from({ length: 4 }, (_, index) => sequencedRecord(index));
+    store.appendTurnRecord(records[0]!);
+    store.appendTurnRecord(records[1]!);
+
+    fsFaults.opendirSyncCallback.path = join(sessionsDir, TURN_RECORDS_DIR);
+    fsFaults.opendirSyncCallback.callback = () => {
+      store.appendTurnRecord(records[2]!);
+      store.appendTurnRecord(records[3]!);
+    };
+
+    // The capture pinned record 1 before the callback rotates record 1 and
+    // then record 2. Record 2 and the new active record 3 are post-snapshot.
+    await expect(store.readTurnRecordPage?.(ROTATION_CHANNEL, 10)).resolves.toEqual({
+      records: records.slice(0, 2),
+      exhausted: true,
+    });
+    await expect(store.readTurnRecordPage?.(ROTATION_CHANNEL, 10)).resolves.toEqual({
+      records,
+      exhausted: true,
+    });
+  });
+
+  it('fails closed when segment 1 is missing but a higher sealed segment survives', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-leading-gap-'));
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, `${sanitized}.00005.jsonl`),
+      `${JSON.stringify(sequencedRecord(5))}\n`,
+      'utf8',
+    );
+
+    await expect(createFilesystemTurnRecordStorePort(sessionsDir)
+      .readTurnRecordPage?.(ROTATION_CHANNEL, 2))
+      .rejects.toThrow(/sealed segments are non-contiguous.*minimum=5.*maximum=5/);
+  });
+
+  it('fails closed when a middle sealed segment is missing', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-middle-gap-'));
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    mkdirSync(dir, { recursive: true });
+    for (const segmentNumber of [1, 3]) {
+      writeFileSync(
+        join(dir, `${sanitized}.${String(segmentNumber).padStart(5, '0')}.jsonl`),
+        `${JSON.stringify(sequencedRecord(segmentNumber))}\n`,
+        'utf8',
+      );
+    }
+
+    await expect(createFilesystemTurnRecordStorePort(sessionsDir)
+      .readTurnRecordPage?.(ROTATION_CHANNEL, 2))
+      .rejects.toThrow(/sealed segments are non-contiguous.*count=2.*maximum=3/);
+  });
+
+  it('keeps every later old-fat multi-segment cursor page bounded by its physical page size', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-old-fat-'));
+    const recordCount = 48;
+    const pageSize = 3;
+    const oldFatBody = 'x'.repeat(128 * 1024);
+    const records = Array.from({ length: recordCount }, (_, index) => ({
+      ...sequencedRecord(index),
+      turnId: backfillLegacyTurnId(`bounded-page-old-fat-${String(index)}`),
+      assistantMessage: {
+        role: 'assistant' as const,
+        content: `${String(index)}:${oldFatBody}`,
+        timestamp: 1_742_000_000_500 + index * 1_000,
+      },
+    }));
+    for (const record of records) {
+      appendTurnRecordWithRotation(sessionsDir, record, 200 * 1024);
+    }
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    expect(readdirSync(dir).filter(name => name.startsWith(`${sanitized}.`)).length)
+      .toBeGreaterThan(10);
+
+    let cursor: Parameters<typeof readTurnRecordPageAcrossSegments>[3];
+    let exhausted = false;
+    const seen: string[] = [];
+    const cursorBytes: number[] = [];
+    let pages = 0;
+    fsFaults.readdirSyncError.path = dir;
+    fsFaults.readdirSyncError.remaining = 100;
+    while (!exhausted) {
+      const stats = { bytesRead: 0, linesRead: 0, normalizedRecords: 0 };
+      const page = await readTurnRecordPageAcrossSegments(
+        sessionsDir,
+        ROTATION_CHANNEL,
+        pageSize,
+        cursor,
+        { scanChunkBytes: 4 * 1024, stats },
+      );
+      pages += 1;
+      seen.push(...page.records.map(record => record.turnId));
+      expect(page.records.length).toBeLessThanOrEqual(pageSize);
+      expect(stats.linesRead).toBeLessThanOrEqual(pageSize);
+      expect(stats.normalizedRecords).toBeLessThanOrEqual(pageSize);
+      expect(stats.bytesRead).toBeLessThan(512 * 1024);
+      exhausted = page.exhausted;
+      cursor = page.nextCursor;
+      if (cursor) cursorBytes.push(Buffer.byteLength(cursor, 'utf8'));
+    }
+
+    expect(pages).toBe(recordCount / pageSize);
+    expect(Math.max(...cursorBytes)).toBeLessThan(1_024);
+    expect(new Set(seen)).toEqual(new Set(records.map(record => record.turnId)));
+    expect(seen).toHaveLength(recordCount);
+  });
+
+  it('yields to primary callbacks and fails before retaining an oversized physical row', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-oversized-row-'));
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    mkdirSync(dir, { recursive: true });
+    const oversized = {
+      ...sequencedRecord(0),
+      assistantMessage: {
+        role: 'assistant' as const,
+        content: `oversized:${'x'.repeat(5 * 1024 * 1024)}`,
+        timestamp: 1_742_000_000_500,
+      },
+    };
+    writeFileSync(
+      activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL),
+      `${JSON.stringify(oversized)}\n`,
+      'utf8',
+    );
+
+    const stats = {
+      bytesRead: 0,
+      readCalls: 0,
+      filesRead: 0,
+      linesRead: 0,
+      normalizedRecords: 0,
+      maxRetainedLineBytes: 0,
+      eventLoopYields: 0,
+    };
+    let primaryTimerRan = false;
+    const primaryTimer = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        primaryTimerRan = true;
+        resolve();
+      }, 0);
+    });
+    const read = readTurnRecordPageAcrossSegments(
+      sessionsDir,
+      ROTATION_CHANNEL,
+      1,
+      undefined,
+      { scanChunkBytes: 64 * 1024, stats },
+    );
+    const rejected = expect(read).rejects.toThrow(
+      /exceeds the 2097152-byte cursor safety limit.*refusing to truncate or retain/,
+    );
+
+    await primaryTimer;
+    expect(primaryTimerRan).toBe(true);
+    await rejected;
+    expect(stats.eventLoopYields).toBeGreaterThan(0);
+    expect(stats.maxRetainedLineBytes).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(stats.bytesRead).toBeLessThanOrEqual((2 * 1024 * 1024) + (64 * 1024));
+    expect(stats.normalizedRecords).toBe(0);
+    expect(stats.linesRead).toBe(0);
+  });
+
+  it('preserves UTF-8 rows split across asynchronous cursor chunks', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-page-utf8-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const content = `prefix-${'🙂'.repeat(20_000)}-suffix`;
+    const expected = {
+      ...sequencedRecord(0),
+      assistantMessage: {
+        role: 'assistant' as const,
+        content,
+        timestamp: 1_742_000_000_500,
+      },
+    };
+    store.appendTurnRecord(expected);
+
+    const page = await readTurnRecordPageAcrossSegments(
+      sessionsDir,
+      ROTATION_CHANNEL,
+      1,
+      undefined,
+      { scanChunkBytes: 127 },
+    );
+
+    expect(page).toEqual({ records: [expected], exhausted: true });
+  });
+
+  it('quarantines a trailing partial line from an interrupted append, keeping valid records', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-partial-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const good = sequencedRecord(0);
+    store.appendTurnRecord(good);
+
+    // Simulate a crash mid-append: a truncated JSON fragment with no trailing newline.
+    const activePath = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    appendFileSync(activePath, '{"schemaVersion":1,"turnId":"019d2326-d9e1', 'utf-8');
+
+    // The valid record still loads; the partial is quarantined, not fatal.
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 5)).toEqual([good]);
+    expect(existsSync(`${activePath}.quarantine`)).toBe(true);
+  });
+
+  it('quarantines an interior corrupt line and continues reading surrounding records', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-interior-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const first = sequencedRecord(0);
+    const second = sequencedRecord(1);
+    store.appendTurnRecord(first);
+
+    // Inject a fully-terminated but unparseable line between two valid records.
+    const activePath = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    appendFileSync(activePath, 'this-is-not-json\n', 'utf-8');
+    store.appendTurnRecord(second);
+
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 5)).toEqual([first, second]);
+    expect(existsSync(`${activePath}.quarantine`)).toBe(true);
+  });
+
+  it('increments the process-lifetime quarantine counter event when a line is quarantined', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-quarantine-counter-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(sequencedRecord(0));
+    const activePath = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    appendFileSync(activePath, 'not-json-either\n', 'utf-8');
+
+    const before = getQuarantinedTurnRecordLineCount();
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 5)).toEqual([sequencedRecord(0)]);
+    expect(getQuarantinedTurnRecordLineCount()).toBe(before + 1);
+  });
+
+  it('directly exercises rotation via appendTurnRecordWithRotation', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-direct-'));
+    appendTurnRecordWithRotation(sessionsDir, sequencedRecord(0), 8);
+    appendTurnRecordWithRotation(sessionsDir, sequencedRecord(1), 8);
+
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    expect(readdirSync(dir).filter((n) => new RegExp(`^${sanitized}\\.\\d{5}\\.jsonl$`).test(n)).length)
+      .toBe(1);
+    expect(readRecentTurnRecordsAcrossSegments(sessionsDir, ROTATION_CHANNEL, 5)).toEqual([
+      sequencedRecord(0),
+      sequencedRecord(1),
+    ]);
+  });
+});
+describe('turn-records rotation/read concurrency (hgw3 review findings)', () => {
+  it('rotates around a pre-existing destination segment without clobbering it', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-preexisting-'));
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+
+    // A completed segment already occupies the first number (e.g. written by
+    // another process); its bytes must survive the next rotation untouched.
+    const preexisting = `${JSON.stringify(sequencedRecord(90))}\n`;
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${sanitized}.00001.jsonl`), preexisting, 'utf-8');
+
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 8 });
+    store.appendTurnRecord(sequencedRecord(0));
+    store.appendTurnRecord(sequencedRecord(1)); // triggers rotation of record 0
+
+    expect(readFileSync(join(dir, `${sanitized}.00001.jsonl`), 'utf-8')).toBe(preexisting);
+    expect(readFileSync(join(dir, `${sanitized}.00002.jsonl`), 'utf-8')).toContain('"message-0"');
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual([
+      sequencedRecord(90),
+      sequencedRecord(0),
+      sequencedRecord(1),
+    ]);
+  });
+
+  it('retries with the next number when a concurrent writer claims the destination between scan and link', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-linkrace-'));
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 8 });
+    store.appendTurnRecord(sequencedRecord(0));
+
+    // Arm the race: the first exclusive-create attempt finds the destination
+    // freshly claimed by "another writer" and must NOT clobber it.
+    const claimed = `${JSON.stringify(sequencedRecord(91))}\n`;
+    fsFaults.linkSyncClaim.remaining = 1;
+    fsFaults.linkSyncClaim.claimContent = claimed;
+
+    store.appendTurnRecord(sequencedRecord(1)); // rotation collides, then retries
+
+    expect(readFileSync(join(dir, `${sanitized}.00001.jsonl`), 'utf-8')).toBe(claimed);
+    expect(readFileSync(join(dir, `${sanitized}.00002.jsonl`), 'utf-8')).toContain('"message-0"');
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual([
+      sequencedRecord(91),
+      sequencedRecord(0),
+      sequencedRecord(1),
+    ]);
+  });
+
+  it('completes an interrupted rotation (active hard-linked to a segment) without duplicating records', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-interrupted-'));
+    const dir = join(sessionsDir, TURN_RECORDS_DIR);
+    const sanitized = sanitizeChannelId(ROTATION_CHANNEL);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 8 });
+    store.appendTurnRecord(sequencedRecord(0));
+
+    // Simulate a crash between linkSync and unlinkSync: the active name and a
+    // segment name now point at the same inode.
+    const activePath = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    linkSync(activePath, join(dir, `${sanitized}.00001.jsonl`));
+
+    // Reads must not double-count the shared inode ((dev, ino) dedupe).
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual([sequencedRecord(0)]);
+    await expect(store.lookupTurnRecordIdentity!(
+      ROTATION_CHANNEL,
+      sequencedRecord(0).turnId,
+    )).resolves.toEqual({ kind: 'unique', record: sequencedRecord(0) });
+
+    // The next over-cap append completes the rotation (drops the active name)
+    // instead of linking the same content under a second segment number.
+    store.appendTurnRecord(sequencedRecord(1));
+    expect(existsSync(join(dir, `${sanitized}.00002.jsonl`))).toBe(false);
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual([
+      sequencedRecord(0),
+      sequencedRecord(1),
+    ]);
+  });
+
+  it('restarts a tail read when a listed file vanishes under a concurrent rotation (ENOENT)', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-enoent-retry-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir, { segmentMaxBytes: 8 });
+    const records = [0, 1, 2].map((i) => sequencedRecord(i));
+    for (const record of records) store.appendTurnRecord(record);
+
+    // First open of the active file fails as if a rotation just renamed it;
+    // the retry re-lists segments and serves a coherent window.
+    fsFaults.openSyncEnoent.path = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    fsFaults.openSyncEnoent.remaining = 1;
+
+    expect(store.readRecentTurnRecords(ROTATION_CHANNEL, 10)).toEqual(records);
+  });
+
+  it('fails loudly when a tail read keeps losing races with rotation past the retry bound', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-enoent-loud-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(sequencedRecord(0));
+
+    fsFaults.openSyncEnoent.path = activeSegmentPathFor(sessionsDir, ROTATION_CHANNEL);
+    fsFaults.openSyncEnoent.remaining = 100;
+
+    expect(() => store.readRecentTurnRecords(ROTATION_CHANNEL, 10))
+      .toThrow(/kept losing races with segment rotation/);
+  });
+});
+
+function buildToolDefinitions(marker: string): ToolSchema[] {
+  return [
+    {
+      name: `fixture_tool_${marker}`,
+      description: `Fixture tool ${marker} description.`,
+      inputSchema: {
+        type: 'object',
+        properties: { query: { type: 'string', description: 'Generic fixture query.' } },
+        required: ['query'],
+      },
+    },
+  ];
+}
+
+function buildSnapshotWithPlan(record: TurnRecord, toolDefinitions: ToolSchema[]): TurnSnapshotRecord {
+  return {
+    turnId: record.turnId,
+    requestId: record.requestId,
+    channelId: record.channelId,
+    capturedAt: record.startedAt,
+    trustLevel: 'regular',
+    plan: {
+      schemaVersion: 1,
+      blocks: [],
+      variables: {},
+      messages: [],
+      toolDefinitions,
+      scope: { scopeKey: 'dm:fixture', kind: 'dm' },
+    } as unknown as TurnSnapshotRecord['plan'],
+  };
+}
+
+function createSnapshotTurnRecord(
+  toolDefinitions: ToolSchema[],
+  overrides: Partial<TurnRecord> = {},
+): TurnRecord {
+  const record = createTurnRecord(overrides);
+  return {
+    ...record,
+    observability: {
+      stages: [],
+      retrievals: [],
+      snapshot: buildSnapshotWithPlan(record, toolDefinitions),
+    },
+  };
+}
+
+function tooldefsDir(sessionsDir: string): string {
+  return join(sessionsDir, '_turn_records', '_shared', 'tooldefs');
+}
+
+
+describe('turn-records content-addressed tool definitions (bead hgw3.3)', () => {
+  it('persists toolDefinitionsRef with the defs in the sidecar and resolves transparently on read', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tooldefs-'));
+    const record = createSnapshotTurnRecord(buildToolDefinitions('alpha'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    store.appendTurnRecord(record);
+
+    const rawLine = readFileSync(join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl'), 'utf-8');
+    expect(rawLine).toContain('"toolDefinitionsRef"');
+    expect(rawLine).not.toContain('fixture_tool_alpha');
+    const sidecarFiles = readdirSync(tooldefsDir(sessionsDir));
+    expect(sidecarFiles).toHaveLength(1);
+
+    expect(store.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+  });
+
+  it('stores identical tool-definition sets once and distinct sets separately', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tooldefs-dedupe-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const sharedDefs = buildToolDefinitions('shared');
+
+    store.appendTurnRecord(createSnapshotTurnRecord(sharedDefs, { requestId: 'req-1' }));
+    store.appendTurnRecord(createSnapshotTurnRecord(sharedDefs, {
+      requestId: 'req-2',
+      turnId: '019d2326-d9e1-701d-bcee-250d2cbb0e4f',
+    }));
+    expect(readdirSync(tooldefsDir(sessionsDir))).toHaveLength(1);
+
+    store.appendTurnRecord(createSnapshotTurnRecord(buildToolDefinitions('other'), {
+      requestId: 'req-3',
+      turnId: '019d2326-d9e1-701d-bcee-250d2cbb0e50',
+    }));
+    expect(readdirSync(tooldefsDir(sessionsDir))).toHaveLength(2);
+  });
+
+  it('is write-once: an existing hash file is never rewritten, and hash mismatches fail loudly', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tooldefs-once-'));
+    const sharedStore = createTurnRecordSharedStore(join(sessionsDir, '_turn_records'));
+    const defs = buildToolDefinitions('immutable');
+
+    const hash = sharedStore.internToolDefinitions(defs);
+    const path = join(tooldefsDir(sessionsDir), `${hash}.json`);
+    const sentinel = JSON.stringify(buildToolDefinitions('tampered'));
+    writeFileSync(path, sentinel, 'utf-8');
+
+    // Interning the same set again skips the write (the file already exists).
+    expect(sharedStore.internToolDefinitions(defs)).toBe(hash);
+    expect(readFileSync(path, 'utf-8')).toBe(sentinel);
+
+    // A fresh store hits the disk and fails closed on the content mismatch.
+    const freshStore = createTurnRecordSharedStore(join(sessionsDir, '_turn_records'));
+    expect(() => freshStore.resolveToolDefinitions(hash)).toThrow(/corrupt/);
+  });
+
+  it('fails closed when interning against an existing sidecar whose content no longer matches its hash', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tooldefs-tampered-intern-'));
+    const sharedStore = createTurnRecordSharedStore(join(sessionsDir, '_turn_records'));
+    const defs = buildToolDefinitions('verified');
+
+    const hash = sharedStore.internToolDefinitions(defs);
+    writeFileSync(
+      join(tooldefsDir(sessionsDir), `${hash}.json`),
+      JSON.stringify(buildToolDefinitions('rewritten')),
+      'utf-8',
+    );
+
+    // A fresh process (cache miss) must verify the existing file and refuse to
+    // keep referencing content-addressed data that was rewritten underneath it.
+    const freshStore = createTurnRecordSharedStore(join(sessionsDir, '_turn_records'));
+    expect(() => freshStore.internToolDefinitions(defs))
+      .toThrow(/corrupt.*does not match ref/);
+
+    // Appends through a fresh port fail closed the same way instead of
+    // emitting records whose ref every fresh reader would then choke on.
+    const freshPort = createFilesystemTurnRecordStorePort(sessionsDir);
+    expect(() => freshPort.appendTurnRecord(createSnapshotTurnRecord(defs)))
+      .toThrow(/corrupt.*does not match ref/);
+  });
+
+  it('fails loudly on a dangling toolDefinitionsRef', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tooldefs-dangling-'));
+    const record = createSnapshotTurnRecord(buildToolDefinitions('gone'));
+    createFilesystemTurnRecordStorePort(sessionsDir).appendTurnRecord(record);
+
+    const [sidecarFile] = readdirSync(tooldefsDir(sessionsDir));
+    rmSync(join(tooldefsDir(sessionsDir), sidecarFile!));
+
+    // Fresh port: no in-memory memoization of the interned set.
+    const freshStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    expect(() => freshStore.readRecentTurnRecords(record.channelId, 5))
+      .toThrow(/toolDefinitionsRef .* is dangling/);
+    await expect(freshStore.readTurnRecordPage?.(record.channelId, 5))
+      .rejects.toThrow(/toolDefinitionsRef .* is dangling/);
+  });
+
+  it('rejects a record carrying both inline toolDefinitions and a ref', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-tooldefs-ambiguous-'));
+    const record = createSnapshotTurnRecord(buildToolDefinitions('both'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(record);
+
+    const path = join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl');
+    const persisted = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+    const snapshot = (persisted.observability as Record<string, unknown>).snapshot as Record<string, unknown>;
+    const plan = snapshot.plan as Record<string, unknown>;
+    plan.toolDefinitions = buildToolDefinitions('both');
+    writeFileSync(path, `${JSON.stringify(persisted)}\n`, 'utf-8');
+
+    expect(() => createFilesystemTurnRecordStorePort(sessionsDir).readRecentTurnRecords(record.channelId, 5))
+      .toThrow(/both inline toolDefinitions/);
+  });
+
+  it('reads old fat records (inline defs, wire messages, activeTools) exactly as written', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-fat-compat-'));
+    const defs = buildToolDefinitions('fat');
+    const record = createSnapshotTurnRecord(defs);
+    const snapshot = record.observability!.snapshot! as TurnSnapshotRecord & Record<string, unknown>;
+    snapshot.promptContext = {
+      currentTurnInput: 'fixture input',
+      providerObservability: {
+        routeKind: 'registered_model',
+        requestedProvider: 'fixture-provider',
+        requestedModel: 'fixture-model',
+        backendProvider: 'fixture-provider',
+        backendModel: 'fixture-model',
+        backendApi: 'anthropic-messages',
+        systemRole: {
+          transport: 'anthropic_system',
+          supportsSystemRole: true,
+          supportsDeveloperRole: false,
+          usesOutOfBandSystemPrompt: false,
+        },
+        promptCaching: { configured: false, engaged: false },
+        providerWireMessages: [
+          { role: 'system', source: 'system_prompt', content: 'fixture system prompt' },
+          { role: 'user', source: 'message', content: 'fixture input' },
+        ],
+      },
+    };
+    snapshot.toolContext = { activeTools: buildToolDefinitions('fat') };
+
+    // Historical fat line: written directly, bypassing the slimming append.
+    const path = join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl');
+    mkdirSync(join(sessionsDir, '_turn_records'), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(record)}\n`, 'utf-8');
+
+    const [readBack] = createFilesystemTurnRecordStorePort(sessionsDir).readRecentTurnRecords(record.channelId, 5);
+    expect(readBack).toEqual(record);
+    const readSnapshot = readBack!.observability!.snapshot!;
+    expect(readSnapshot.promptContext?.providerObservability?.providerWireMessages).toHaveLength(2);
+    expect(readSnapshot.toolContext?.activeTools?.[0]?.name).toBe('fixture_tool_fat');
+    expect(readSnapshot.plan?.toolDefinitions[0]?.name).toBe('fixture_tool_fat');
+  });
+});
+
+function wirebodiesDir(sessionsDir: string): string {
+  return join(sessionsDir, '_turn_records', '_shared', 'wirebodies');
+}
+
+function createWireCaptureTurnRecord(
+  body: unknown,
+  overrides: Partial<TurnRecord> = {},
+): TurnRecord {
+  const record = createSnapshotTurnRecord(buildToolDefinitions('wire'), overrides);
+  const snapshot = record.observability!.snapshot! as TurnSnapshotRecord & Record<string, unknown>;
+  snapshot.promptContext = {
+    currentTurnInput: 'wire fixture input',
+    providerObservability: {
+      routeKind: 'registered_model',
+      requestedProvider: 'fixture-provider',
+      requestedModel: 'fixture-model',
+      backendProvider: 'fixture-provider',
+      backendModel: 'fixture-model',
+      backendApi: 'anthropic-messages',
+      systemRole: {
+        transport: 'anthropic_system',
+        supportsSystemRole: true,
+        supportsDeveloperRole: false,
+        usesOutOfBandSystemPrompt: false,
+      },
+      promptCaching: { configured: false, engaged: false },
+      capturedWirePayload: {
+        api: 'anthropic-messages',
+        model: 'fixture-model',
+        capturedAtMs: 1_700_000_000_000,
+        byteLength: Buffer.byteLength(JSON.stringify(body), 'utf8'),
+        toolCount: 2,
+        body,
+      },
+    },
+  };
+  return record;
+}
+
+/**
+ * Byte-identity is the turn-record STORE PORT contract: with no L0 access and no
+ * redaction, the port round-trips the captured body verbatim from the sidecar.
+ * CogSec redaction gating of the wire body (bead psfn-framework-eb14) lives one
+ * layer up, at the SessionManager store read boundary (resolveTurnRecordSessionEntries
+ * → gateRenderedViews), which owns L0 tombstone authority; a body is withheld
+ * there only when a source L0 entry it embedded is redacted/removed. These
+ * port-level tests therefore stay byte-identical — the gated contract reduces to
+ * "verbatim" whenever nothing is redacted. See store-turn-record-session-refs.test.ts
+ * for the redaction-gating coverage.
+ */
+describe('turn-records content-addressed captured wire payload (bead hgw3-80f6)', () => {
+  const wireBody = {
+    model: 'fixture-model',
+    max_tokens: 1024,
+    system: 'a big static system prompt',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ name: 'search', input_schema: {} }, { name: 'recall', input_schema: {} }],
+  };
+
+  it('persists bodyRef with the body in the sidecar, keeps the summary inline, and resolves on read', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-wire-'));
+    const record = createWireCaptureTurnRecord(wireBody);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    store.appendTurnRecord(record);
+
+    const rawLine = readFileSync(join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl'), 'utf-8');
+    expect(rawLine).toContain('"bodyRef"');
+    // The big body left the hot JSONL; the summary attestation stays inline.
+    expect(rawLine).not.toContain('a big static system prompt');
+    expect(rawLine).toContain('"byteLength"');
+    expect(rawLine).toContain('"toolCount":2');
+    expect(readdirSync(wirebodiesDir(sessionsDir))).toHaveLength(1);
+
+    // Read restores the inline body transparently — byte-identical round-trip.
+    expect(store.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+    const [readBack] = store.readRecentTurnRecords(record.channelId, 5);
+    const captured = readBack!.observability!.snapshot!.promptContext?.providerObservability?.capturedWirePayload;
+    expect(JSON.stringify(captured?.body)).toBe(JSON.stringify(wireBody));
+  });
+
+  it('resolves the bodyRef transparently via findTurnRecord too', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-wire-find-'));
+    const record = createWireCaptureTurnRecord(wireBody);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(record);
+    expect(store.findTurnRecord(record.channelId, record.turnId)).toEqual(record);
+  });
+
+  it('fails loudly on a dangling bodyRef', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-wire-dangling-'));
+    const record = createWireCaptureTurnRecord(wireBody);
+    createFilesystemTurnRecordStorePort(sessionsDir).appendTurnRecord(record);
+
+    const [sidecarFile] = readdirSync(wirebodiesDir(sessionsDir));
+    rmSync(join(wirebodiesDir(sessionsDir), sidecarFile!));
+
+    const freshStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    expect(() => freshStore.readRecentTurnRecords(record.channelId, 5))
+      .toThrow(/bodyRef .* is dangling/);
+  });
+
+  it('rejects a record carrying both an inline body and a bodyRef', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-wire-ambiguous-'));
+    const record = createWireCaptureTurnRecord(wireBody);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(record);
+
+    const path = join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl');
+    const persisted = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+    const snapshot = (persisted.observability as Record<string, unknown>).snapshot as Record<string, unknown>;
+    const promptContext = snapshot.promptContext as Record<string, unknown>;
+    const providerObservability = promptContext.providerObservability as Record<string, unknown>;
+    (providerObservability.capturedWirePayload as Record<string, unknown>).body = wireBody;
+    writeFileSync(path, `${JSON.stringify(persisted)}\n`, 'utf-8');
+
+    expect(() => createFilesystemTurnRecordStorePort(sessionsDir).readRecentTurnRecords(record.channelId, 5))
+      .toThrow(/both an inline body and bodyRef/);
+  });
+});
+
+function staticpromptsDir(sessionsDir: string): string {
+  return join(sessionsDir, '_turn_records', '_shared', 'staticprompts');
+}
+
+function buildStaticPrefixTemplate(marker: string): string {
+  // A realistically-sized, session-stable static prefix: the amplified,
+  // byte-identical-across-turns material bead auiu content-addresses.
+  return [
+    `<character marker="${marker}">`,
+    'You are a long-lived companion. Your identity lives in data, not weights.',
+    ...Array.from({ length: 40 }, (_, index) => `Static operator directive line ${index}: {{companion_name}} holds continuity.`),
+    '</character>',
+  ].join('\n');
+}
+
+function createStaticPromptTurnRecord(
+  template: string,
+  overrides: Partial<TurnRecord> = {},
+): TurnRecord {
+  const record = createSnapshotTurnRecord(buildToolDefinitions('static'), overrides);
+  const snapshot = record.observability!.snapshot! as TurnSnapshotRecord & Record<string, unknown>;
+  snapshot.prompt = {
+    staticPrefixTemplate: template,
+    dynamicSuffixTemplate: 'Per-turn dynamic suffix for {{channel_id}}.',
+    staticHash: 'fixture-static-hash',
+    versionPointer: 'fixture-version-pointer',
+  } as unknown as TurnSnapshotRecord['prompt'];
+  return record;
+}
+
+describe('turn-records content-addressed static prompt prefix (bead auiu)', () => {
+  it('persists staticPrefixTemplateRef, drops the inline template, and resolves byte-identically on read', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-'));
+    const template = buildStaticPrefixTemplate('alpha');
+    const record = createStaticPromptTurnRecord(template);
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+
+    store.appendTurnRecord(record);
+
+    const rawLine = readFileSync(join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl'), 'utf-8');
+    expect(rawLine).toContain('"staticPrefixTemplateRef"');
+    // The big session-stable template left the hot JSONL.
+    expect(rawLine).not.toContain('Static operator directive line 0');
+    expect(rawLine).not.toContain(template);
+    // The per-turn dynamic suffix stays inline (non-goal).
+    expect(rawLine).toContain('Per-turn dynamic suffix');
+    expect(readdirSync(staticpromptsDir(sessionsDir))).toHaveLength(1);
+
+    // Read restores the inline template transparently — byte-identical round-trip.
+    expect(store.readRecentTurnRecords(record.channelId, 5)).toEqual([record]);
+    const [readBack] = store.readRecentTurnRecords(record.channelId, 5);
+    expect(readBack!.observability!.snapshot!.prompt?.staticPrefixTemplate).toBe(template);
+  });
+
+  it('stores an identical static prefix once and distinct prefixes separately', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-dedupe-'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    const shared = buildStaticPrefixTemplate('shared');
+
+    store.appendTurnRecord(createStaticPromptTurnRecord(shared, { requestId: 'req-1' }));
+    store.appendTurnRecord(createStaticPromptTurnRecord(shared, {
+      requestId: 'req-2',
+      turnId: '019d2326-d9e1-701d-bcee-250d2cbb0e4f',
+    }));
+    expect(readdirSync(staticpromptsDir(sessionsDir))).toHaveLength(1);
+
+    store.appendTurnRecord(createStaticPromptTurnRecord(buildStaticPrefixTemplate('other'), {
+      requestId: 'req-3',
+      turnId: '019d2326-d9e1-701d-bcee-250d2cbb0e50',
+    }));
+    expect(readdirSync(staticpromptsDir(sessionsDir))).toHaveLength(2);
+  });
+
+  it('resolves the staticPrefixTemplateRef transparently via findTurnRecord too', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-find-'));
+    const record = createStaticPromptTurnRecord(buildStaticPrefixTemplate('find'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(record);
+    expect(store.findTurnRecord(record.channelId, record.turnId)).toEqual(record);
+  });
+
+  it('fails loudly on a dangling staticPrefixTemplateRef', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-dangling-'));
+    const record = createStaticPromptTurnRecord(buildStaticPrefixTemplate('gone'));
+    createFilesystemTurnRecordStorePort(sessionsDir).appendTurnRecord(record);
+
+    const [sidecarFile] = readdirSync(staticpromptsDir(sessionsDir));
+    rmSync(join(staticpromptsDir(sessionsDir), sidecarFile!));
+
+    const freshStore = createFilesystemTurnRecordStorePort(sessionsDir);
+    expect(() => freshStore.readRecentTurnRecords(record.channelId, 5))
+      .toThrow(/staticPrefixTemplateRef .* is dangling/);
+  });
+
+  it('rejects a record carrying both an inline template and a staticPrefixTemplateRef', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-ambiguous-'));
+    const record = createStaticPromptTurnRecord(buildStaticPrefixTemplate('both'));
+    const store = createFilesystemTurnRecordStorePort(sessionsDir);
+    store.appendTurnRecord(record);
+
+    const path = join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl');
+    const persisted = JSON.parse(readFileSync(path, 'utf-8')) as Record<string, unknown>;
+    const snapshot = (persisted.observability as Record<string, unknown>).snapshot as Record<string, unknown>;
+    (snapshot.prompt as Record<string, unknown>).staticPrefixTemplate = buildStaticPrefixTemplate('both');
+    writeFileSync(path, `${JSON.stringify(persisted)}\n`, 'utf-8');
+
+    expect(() => createFilesystemTurnRecordStorePort(sessionsDir).readRecentTurnRecords(record.channelId, 5))
+      .toThrow(/both an inline staticPrefixTemplate/);
+  });
+
+  it('fails closed when interning against a static-prefix sidecar that was rewritten', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-tampered-'));
+    const sharedStore = createTurnRecordSharedStore(join(sessionsDir, '_turn_records'));
+    const template = buildStaticPrefixTemplate('verified');
+
+    const hash = sharedStore.internStaticPrompt(template);
+    writeFileSync(
+      join(staticpromptsDir(sessionsDir), `${hash}.json`),
+      JSON.stringify(buildStaticPrefixTemplate('rewritten')),
+      'utf-8',
+    );
+
+    const freshStore = createTurnRecordSharedStore(join(sessionsDir, '_turn_records'));
+    expect(() => freshStore.internStaticPrompt(template))
+      .toThrow(/corrupt.*does not match ref/);
+    expect(() => freshStore.resolveStaticPrompt(hash)).toThrow(/corrupt/);
+  });
+
+  it('reads old fat records with an inline staticPrefixTemplate exactly as written', () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-records-static-fat-compat-'));
+    const template = buildStaticPrefixTemplate('fat');
+    const record = createStaticPromptTurnRecord(template);
+
+    // Historical fat line: written directly, bypassing the slimming append.
+    const path = join(sessionsDir, '_turn_records', 'psfn-amica%3Atest%3Api5.jsonl');
+    mkdirSync(join(sessionsDir, '_turn_records'), { recursive: true });
+    appendFileSync(path, `${JSON.stringify(record)}\n`, 'utf-8');
+
+    const [readBack] = createFilesystemTurnRecordStorePort(sessionsDir).readRecentTurnRecords(record.channelId, 5);
+    expect(readBack).toEqual(record);
+    expect(readBack!.observability!.snapshot!.prompt?.staticPrefixTemplate).toBe(template);
+    // No sidecar was created for a directly-written fat record.
+    expect(existsSync(staticpromptsDir(sessionsDir))).toBe(false);
+  });
+});

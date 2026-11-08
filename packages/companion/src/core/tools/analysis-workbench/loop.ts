@@ -1,0 +1,1153 @@
+// ── RLM Iteration Loop ──
+// Runs an ephemeral analysis workbench cycle: LLM → code → output → repeat until FINAL.
+
+import type { CapabilityTier } from '../../../system/config/runtime-config-contracts.js';
+import type { ContextMessage, CorrelationMetadata, LLMContext, LLMResponse } from '../../../shared/contracts/runtime.js';
+import type { LLMRequestMetadata } from '../../agent/contracts.js';
+import type {
+  BudgetStatus,
+  NestedAnalysisOptions,
+  REPLDeps,
+  REPLConfig,
+  AnalysisWorkbenchDiagnostics,
+  AnalysisWorkbenchBudget,
+  AnalysisWorkbenchLimitPolicy,
+  AnalysisWorkbenchResult,
+  AnalysisWorkbenchStep,
+} from './types.js';
+import {
+  createEmptyAnalysisWorkbenchDiagnostics,
+  validateAnalysisWorkbenchDirectResponseTimeoutMs,
+} from './types.js';
+import { REPLSandbox } from './sandbox.js';
+import type { SandboxBudgetRef } from './sandbox.js';
+import { buildRLMSystemPrompt } from './prompt.js';
+import type { AnalysisWorkbenchContextMetadata } from './prompt.js';
+import { parseResponse } from './parse.js';
+import {
+  buildStep,
+  checkBudget,
+  createBudgetStatus,
+  flattenEvidence,
+  formatExecutionFeedback,
+  isBoundedAnalysisWorkerRequest,
+  makeBudgetResult,
+  runAbortableAnalysisOperation,
+  updateBudgetProgress,
+  updateBudgetRuntime,
+} from './loop-helpers.js';
+import { getRequestContext } from '../../../primitives/llm/request-context.js';
+import { buildLLMWorkSpec, completeWithWorkSpec } from '../../../primitives/llm/work-spec.js';
+import { evaluateCompositionalPolicyForChannelId } from '../../../system/capabilities/compositional-policy.js';
+import {
+  getRunChargeContext,
+  inspectChargeSurface,
+  runWithChargeContext,
+  runWithChargedSurface,
+} from '../../../shared/telemetry/run-charge.js';
+import {
+  resolveCorrelationMetadata,
+  type ResolvedCorrelationMetadata,
+} from '../../../primitives/llm/correlation.js';
+import { deriveChildIcpConversationCostCorrelation } from '../../../shared/contracts/icp-autonomy.js';
+import {
+  createSubjectAuthorizedMemoryStore,
+  memorySubjectAccessContextFromCorrelation,
+} from '../../../faculties/memory/subject-authorized-store.js';
+import { abortError } from '../../../shared/utils/errors.js';
+
+const LLM_TIMEOUT_BUFFER_MS = 25;
+const LLM_TIMEOUT_REASON = 'llm timeout';
+const LLM_TIMEOUT_ANSWER = '[Analysis workbench loop timed out waiting for LLM response]';
+const INVOCATION_RATE_LIMIT_REASON = 'invocation rate limit';
+const NURSERY_DAILY_COST_REASON = 'daily cost cap';
+const CHARGE_QUOTA_REASON = 'charge quota';
+const RATE_LIMIT_ANSWER = '[Analysis workbench invocation rate limit exceeded; try again shortly]';
+const NURSERY_DAILY_CAP_ANSWER = '[Analysis workbench daily cost cap reached for nursery tier]';
+const CHARGE_QUOTA_ANSWER = '[Analysis workbench extension charge quota exhausted before the next iteration]';
+const MAX_NESTED_ANALYSIS_DEPTH = 2;
+
+interface DailyCostSnapshot {
+  dayKey: string;
+  totalUsd: number;
+}
+
+interface ReplGovernanceState {
+  invocationTimestampsMs: number[];
+  dailyCostByTier: Record<CapabilityTier, DailyCostSnapshot>;
+}
+
+interface SharedAnalysisExecutionState {
+  readonly startTime: number;
+  readonly rootBudget: AnalysisWorkbenchBudget;
+  readonly directResponseDeadlineAtMs: number | null;
+  readonly budgetRef: SandboxBudgetRef;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  consumedIterations: number;
+  sessionCostUsd: number;
+  warnings: string[];
+  autonomousCostWarningSent: boolean;
+  nextNestedAnalysisId: number;
+  diagnostics: AnalysisWorkbenchDiagnostics;
+}
+
+interface AnalysisRunOptions {
+  depth?: number;
+  sharedState?: SharedAnalysisExecutionState;
+  skipInvocationRateLimit?: boolean;
+  signal?: AbortSignal;
+}
+
+const GOVERNANCE_DEFAULT_DAY = '1970-01-01';
+const GOVERNANCE_DEFAULT_COST: DailyCostSnapshot = { dayKey: GOVERNANCE_DEFAULT_DAY, totalUsd: 0 };
+const REPL_GOVERNANCE_BY_PROVIDER = new WeakMap<object, ReplGovernanceState>();
+
+class LLMIterationTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`LLM iteration timed out after ${timeoutMs}ms`);
+    this.name = 'LLMIterationTimeoutError';
+  }
+}
+
+function getRemainingWallTimeMs(startTime: number, budget: AnalysisWorkbenchBudget): number | null {
+  if (!budget.maxWallTimeMs) return null;
+  return budget.maxWallTimeMs - (Date.now() - startTime);
+}
+
+function pickMostConstrainedRemainingWallTimeMs(...values: Array<number | null>): number | null {
+  const finiteValues = values.filter((value): value is number => value !== null);
+  if (finiteValues.length === 0) {
+    return null;
+  }
+  return Math.min(...finiteValues);
+}
+
+function resolveDirectResponseTimeoutMs(config: REPLConfig): number {
+  return validateAnalysisWorkbenchDirectResponseTimeoutMs(config.directResponseTimeoutMs);
+}
+
+function throwIfAnalysisAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw abortError(signal.reason, 'Analysis Workbench parent cancelled');
+  }
+}
+
+function resolveTierKey(tier: CapabilityTier): 'nursery' | 'apprentice' | 'autonomous' {
+  if (tier === 'nursery' || tier === 'apprentice' || tier === 'autonomous') {
+    return tier;
+  }
+  return 'autonomous';
+}
+
+function toDayKey(nowMs: number): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+function getOrCreateGovernanceState(provider: object): ReplGovernanceState {
+  const existing = REPL_GOVERNANCE_BY_PROVIDER.get(provider);
+  if (existing) return existing;
+  const created: ReplGovernanceState = {
+    invocationTimestampsMs: [],
+    dailyCostByTier: {
+      nursery: { ...GOVERNANCE_DEFAULT_COST },
+      apprentice: { ...GOVERNANCE_DEFAULT_COST },
+      autonomous: { ...GOVERNANCE_DEFAULT_COST },
+      custom: { ...GOVERNANCE_DEFAULT_COST },
+    },
+  };
+  REPL_GOVERNANCE_BY_PROVIDER.set(provider, created);
+  return created;
+}
+
+function getDailyCostSnapshot(
+  state: ReplGovernanceState,
+  tier: CapabilityTier,
+  dayKey: string,
+): DailyCostSnapshot {
+  const current = state.dailyCostByTier[tier];
+  if (current.dayKey !== dayKey) {
+    const reset = { dayKey, totalUsd: 0 };
+    state.dailyCostByTier[tier] = reset;
+    return reset;
+  }
+  return current;
+}
+
+function estimateIterationCostUsd(
+  config: REPLConfig,
+  inputTokens: number,
+  outputTokens: number,
+): number {
+  const inputRate = Number.isFinite(config.cost.inputUsdPerMillionTokens)
+    ? Math.max(0, config.cost.inputUsdPerMillionTokens)
+    : 0;
+  const outputRate = Number.isFinite(config.cost.outputUsdPerMillionTokens)
+    ? Math.max(0, config.cost.outputUsdPerMillionTokens)
+    : 0;
+
+  return ((inputTokens * inputRate) + (outputTokens * outputRate)) / 1_000_000;
+}
+
+function resolveEffectiveBudget(config: REPLConfig, tier: CapabilityTier): AnalysisWorkbenchBudget {
+  const tierKey = resolveTierKey(tier);
+  const tierBudget = config.tierBudgets[tierKey];
+
+  const baseIterations = Number.isFinite(config.budget.maxIterations)
+    ? Math.max(1, Math.floor(config.budget.maxIterations))
+    : tierBudget.maxIterations;
+
+  const baseWallTime = typeof config.budget.maxWallTimeMs === 'number' && Number.isFinite(config.budget.maxWallTimeMs)
+    ? Math.max(1, Math.floor(config.budget.maxWallTimeMs))
+    : tierBudget.maxWallTimeMs;
+
+  const baseSubQueries = typeof config.budget.maxSubQueries === 'number' && Number.isFinite(config.budget.maxSubQueries)
+    ? Math.max(1, Math.floor(config.budget.maxSubQueries))
+    : tierBudget.maxSubQueries;
+  const baseToolCalls = typeof config.budget.maxToolCalls === 'number' && Number.isFinite(config.budget.maxToolCalls)
+    ? Math.max(1, Math.floor(config.budget.maxToolCalls))
+    : tierBudget.maxToolCalls;
+
+  return {
+    ...config.budget,
+    maxIterations: Math.min(baseIterations, tierBudget.maxIterations),
+    maxWallTimeMs: Math.min(baseWallTime, tierBudget.maxWallTimeMs),
+    maxSubQueries: Math.min(baseSubQueries, tierBudget.maxSubQueries),
+    maxToolCalls: Math.min(baseToolCalls, tierBudget.maxToolCalls),
+  };
+}
+
+function resolveMemoryCeilingBytes(config: REPLConfig, tier: CapabilityTier): number | undefined {
+  const tierLimitMb = config.tierBudgets[resolveTierKey(tier)].memoryCeilingMb;
+  if (!Number.isFinite(tierLimitMb) || tierLimitMb <= 0) {
+    return undefined;
+  }
+  return Math.floor(tierLimitMb * 1024 * 1024);
+}
+
+function createSharedAnalysisExecutionState(
+  startTime: number,
+  rootBudget: AnalysisWorkbenchBudget,
+  directResponseDeadlineAtMs: number | null,
+  budgetRef: SandboxBudgetRef,
+): SharedAnalysisExecutionState {
+  return {
+    startTime,
+    rootBudget,
+    directResponseDeadlineAtMs,
+    budgetRef,
+    totalInputTokens: 0,
+    totalOutputTokens: 0,
+    consumedIterations: 0,
+    sessionCostUsd: 0,
+    warnings: [],
+    autonomousCostWarningSent: false,
+    nextNestedAnalysisId: 0,
+    diagnostics: createEmptyAnalysisWorkbenchDiagnostics(),
+  };
+}
+
+function syncBudgetStatusFromSharedState(
+  budgetStatus: BudgetStatus,
+  sharedState: SharedAnalysisExecutionState,
+  dayCostUsd: number,
+): void {
+  budgetStatus.sessionCostUsd = sharedState.sessionCostUsd;
+  budgetStatus.dayCostUsd = dayCostUsd;
+  budgetStatus.warnings = sharedState.warnings;
+}
+
+function normalizePositiveBudgetOverride(
+  value: number | undefined,
+  field: keyof NestedAnalysisOptions,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`nested_analysis ${field} must be a positive number`);
+  }
+  return Math.floor(value);
+}
+
+function computeRemainingTokenBudget(sharedState: SharedAnalysisExecutionState): number | undefined {
+  if (sharedState.rootBudget.maxTokens === undefined) {
+    return undefined;
+  }
+
+  return sharedState.rootBudget.maxTokens
+    - (sharedState.totalInputTokens + sharedState.totalOutputTokens);
+}
+
+function checkSharedBudgetExceeded(sharedState: SharedAnalysisExecutionState): BudgetStatus['exceeded'] {
+  const totalTokens = sharedState.totalInputTokens + sharedState.totalOutputTokens;
+  if (sharedState.consumedIterations >= sharedState.rootBudget.maxIterations) {
+    return 'max iterations';
+  }
+  if (
+    sharedState.rootBudget.maxTokens !== undefined
+    && totalTokens >= sharedState.rootBudget.maxTokens
+  ) {
+    return 'token budget';
+  }
+  if (
+    sharedState.rootBudget.maxWallTimeMs !== undefined
+    && Date.now() - sharedState.startTime >= sharedState.rootBudget.maxWallTimeMs
+  ) {
+    return 'wall time';
+  }
+  if (
+    sharedState.rootBudget.maxSubQueries !== undefined
+    && sharedState.budgetRef.subQueries >= sharedState.rootBudget.maxSubQueries
+  ) {
+    return 'sub-query limit';
+  }
+  if (
+    sharedState.rootBudget.maxToolCalls !== undefined
+    && (sharedState.budgetRef.toolCalls ?? 0) >= sharedState.rootBudget.maxToolCalls
+  ) {
+    return 'tool-call limit';
+  }
+  return null;
+}
+
+function buildNestedAnalysisConfig(
+  config: REPLConfig,
+  sharedState: SharedAnalysisExecutionState,
+  options: NestedAnalysisOptions | undefined,
+): REPLConfig {
+  const maxIterationsOverride = normalizePositiveBudgetOverride(options?.maxIterations, 'maxIterations');
+  const maxTokensOverride = normalizePositiveBudgetOverride(options?.maxTokens, 'maxTokens');
+  const maxWallTimeOverride = normalizePositiveBudgetOverride(options?.maxWallTimeMs, 'maxWallTimeMs');
+
+  const remainingIterations = sharedState.rootBudget.maxIterations - sharedState.consumedIterations;
+  if (remainingIterations <= 0) {
+    throw new Error('nested_analysis budget exhausted: no iterations remaining');
+  }
+
+  const remainingTokens = computeRemainingTokenBudget(sharedState);
+  if (remainingTokens !== undefined && remainingTokens <= 0) {
+    throw new Error('nested_analysis budget exhausted: no tokens remaining');
+  }
+
+  const remainingWallTimeMs = getRemainingWallTimeMs(sharedState.startTime, sharedState.rootBudget);
+  if (remainingWallTimeMs !== null && remainingWallTimeMs <= 0) {
+    throw new Error('nested_analysis budget exhausted: no wall time remaining');
+  }
+
+  const childBudget: AnalysisWorkbenchBudget = {
+    ...config.budget,
+    maxIterations: maxIterationsOverride === undefined
+      ? remainingIterations
+      : Math.min(remainingIterations, maxIterationsOverride),
+  };
+
+  if (remainingTokens !== undefined) {
+    childBudget.maxTokens = maxTokensOverride === undefined
+      ? remainingTokens
+      : Math.min(remainingTokens, maxTokensOverride);
+  } else if (maxTokensOverride !== undefined) {
+    childBudget.maxTokens = maxTokensOverride;
+  }
+
+  if (remainingWallTimeMs !== null) {
+    childBudget.maxWallTimeMs = maxWallTimeOverride === undefined
+      ? remainingWallTimeMs
+      : Math.min(remainingWallTimeMs, maxWallTimeOverride);
+  } else if (maxWallTimeOverride !== undefined) {
+    childBudget.maxWallTimeMs = maxWallTimeOverride;
+  }
+
+  return {
+    ...config,
+    budget: childBudget,
+  };
+}
+
+interface BuildResultOptions {
+  answer: string;
+  iterations: number;
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  startTime: number;
+  truncated: boolean;
+  budgetStatus: BudgetStatus;
+  steps: AnalysisWorkbenchStep[];
+  diagnostics: AnalysisWorkbenchDiagnostics;
+  budget: AnalysisWorkbenchBudget;
+}
+
+function projectLimitPolicy(budget: AnalysisWorkbenchBudget): AnalysisWorkbenchLimitPolicy {
+  return {
+    maxIterations: budget.maxIterations,
+    maxTokens: budget.maxTokens ?? null,
+    maxWallTimeMs: budget.maxWallTimeMs ?? null,
+    maxSubQueries: budget.maxSubQueries ?? null,
+    maxToolCalls: budget.maxToolCalls ?? null,
+  };
+}
+
+function buildAnalysisWorkbenchResult(options: BuildResultOptions): AnalysisWorkbenchResult {
+  const allEvidence = flattenEvidence(options.steps);
+  return makeBudgetResult(
+    {
+      answer: options.answer,
+      iterations: options.iterations,
+      totalInputTokens: options.totalInputTokens,
+      totalOutputTokens: options.totalOutputTokens,
+      durationMs: Date.now() - options.startTime,
+      truncated: options.truncated,
+      budgetStatus: options.budgetStatus,
+      limitPolicy: projectLimitPolicy(options.budget),
+      steps: options.steps,
+      evidence: allEvidence,
+      diagnostics: options.diagnostics,
+    },
+  );
+}
+
+function buildBudgetFallbackAnswer(reason: BudgetStatus['exceeded']): string {
+  if (reason === LLM_TIMEOUT_REASON) {
+    return LLM_TIMEOUT_ANSWER;
+  }
+  if (reason === INVOCATION_RATE_LIMIT_REASON) {
+    return RATE_LIMIT_ANSWER;
+  }
+  if (reason === NURSERY_DAILY_COST_REASON) {
+    return NURSERY_DAILY_CAP_ANSWER;
+  }
+  if (reason === CHARGE_QUOTA_REASON) {
+    return CHARGE_QUOTA_ANSWER;
+  }
+  if (reason) {
+    return `[Analysis workbench loop stopped: ${reason}]`;
+  }
+  return '[Analysis workbench loop stopped before producing a final answer]';
+}
+
+function pushPassiveStep(
+  steps: AnalysisWorkbenchStep[],
+  iteration: number,
+  response: LLMResponse,
+  cumulativeTokens: number,
+  iterationStart: number,
+  output = '',
+): void {
+  steps.push(buildStep({
+    iteration,
+    code: '',
+    output,
+    error: null,
+    evidenceCollected: [],
+    inputTokens: response.inputTokens,
+    outputTokens: response.outputTokens,
+    cumulativeTokens,
+    durationMs: Date.now() - iterationStart,
+    variablesChanged: [],
+  }));
+}
+
+type ResolvedAnalysisRequestMetadata = ResolvedCorrelationMetadata;
+
+function normalizeMetadataValue(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function resolveAnalysisRequestMetadata(
+  deps: REPLDeps,
+  toolInvocationMetadata: Partial<LLMRequestMetadata> | undefined,
+): ResolvedAnalysisRequestMetadata {
+  const contextMetadata = getRequestContext();
+  const merged = {
+    ...(contextMetadata ?? {}),
+    ...(deps.requestMetadata ?? {}),
+    ...(toolInvocationMetadata ?? {}),
+  };
+
+  const turnId = normalizeMetadataValue(merged.turnId);
+  const requestId = normalizeMetadataValue(merged.requestId)
+    ?? turnId
+    ?? `repl-analysis-${Date.now()}`;
+  return resolveCorrelationMetadata({
+    ...merged,
+    requestId,
+    ...(turnId ? { turnId } : {}),
+    toolName: normalizeMetadataValue(merged.toolName) ?? 'analysis_workbench',
+  }, undefined, 'reasoning');
+}
+
+function buildAnalysisCorrelation(
+  metadata: ResolvedAnalysisRequestMetadata,
+  originStage: string,
+  requestSuffix: string,
+): CorrelationMetadata {
+  const requestId = `${metadata.requestId}:${requestSuffix}`;
+  return {
+    ...metadata,
+    requestId,
+    callType: 'tool',
+    purpose: originStage,
+    originType: 'tool',
+    originStage,
+    ...(metadata.icpCorrelation
+      ? {
+          icpCorrelation: deriveChildIcpConversationCostCorrelation(
+            metadata.icpCorrelation,
+            {
+              requestId,
+              costPurpose: 'tool',
+              costOriginStage: metadata.icpCorrelation.costOriginStage,
+            },
+          ),
+        }
+      : {}),
+  };
+}
+
+function buildNestedAnalysisRequestMetadata(
+  metadata: ResolvedAnalysisRequestMetadata,
+  childId: number,
+): Partial<LLMRequestMetadata> {
+  const suffix = `nested-analysis-${childId}`;
+  const requestId = `${metadata.requestId}:${suffix}`;
+  const { callType: _callType, purpose: _purpose, ...requestMetadata } = metadata;
+  return {
+    ...requestMetadata,
+    requestId,
+    toolName: metadata.toolName ?? 'analysis_workbench',
+    ...(metadata.toolCallId ? { toolCallId: `${metadata.toolCallId}:${suffix}` } : {}),
+    originType: 'tool',
+    originStage: 'repl.analysis_workbench.subcall',
+    ...(metadata.icpCorrelation
+      ? {
+          icpCorrelation: deriveChildIcpConversationCostCorrelation(
+            metadata.icpCorrelation,
+            {
+              requestId,
+              costPurpose: 'tool',
+              costOriginStage: metadata.icpCorrelation.costOriginStage,
+            },
+          ),
+        }
+      : {}),
+  };
+}
+
+export async function runRLMLoop(
+  task: string,
+  deps: REPLDeps,
+  toolInvocationMetadata?: Partial<LLMRequestMetadata>,
+  runOptions: AnalysisRunOptions = {},
+): Promise<AnalysisWorkbenchResult> {
+  const requestMetadata = resolveAnalysisRequestMetadata(deps, toolInvocationMetadata);
+  const activeChargeContext = getRunChargeContext();
+  if (!activeChargeContext && deps.chargePolicy) {
+    return runWithChargeContext({
+      chargePolicy: deps.chargePolicy,
+      eventBus: deps.eventBus ?? null,
+      lane: 'interactive',
+      runId: requestMetadata.requestId,
+      correlation: getRequestContext(),
+    }, async () => runRLMLoop(task, deps, toolInvocationMetadata, runOptions));
+  }
+
+  const startTime = Date.now();
+  const { config, llmProvider } = deps;
+  throwIfAnalysisAborted(runOptions.signal);
+  const depth = runOptions.depth ?? 0;
+  const isNestedRun = depth > 0;
+  const chargePolicy = deps.chargePolicy ?? activeChargeContext?.chargePolicy;
+  const tier = deps.getCapabilityTier?.() ?? 'autonomous';
+  const budget = resolveEffectiveBudget(config, tier);
+  const sharedState = runOptions.sharedState ?? (() => {
+    const directResponseDeadlineAtMs = isBoundedAnalysisWorkerRequest(requestMetadata)
+      ? null
+      : startTime + resolveDirectResponseTimeoutMs(config);
+    return createSharedAnalysisExecutionState(
+      startTime,
+      budget,
+      directResponseDeadlineAtMs,
+      {
+        subQueries: 0,
+        maxSubQueries: budget.maxSubQueries ?? 20,
+        toolCalls: 0,
+        maxToolCalls: budget.maxToolCalls ?? 50,
+      },
+    );
+  })();
+
+  const budgetStatus = createBudgetStatus();
+  budgetStatus.warnings = sharedState.warnings;
+  const governanceState = getOrCreateGovernanceState(llmProvider);
+  const dayKey = toDayKey(sharedState.startTime);
+  const dayCost = getDailyCostSnapshot(governanceState, tier, dayKey);
+  syncBudgetStatusFromSharedState(budgetStatus, sharedState, dayCost.totalUsd);
+
+  const rateWindowMs = Number.isFinite(config.rateLimit.windowMs)
+    ? Math.max(1, Math.floor(config.rateLimit.windowMs))
+    : 60_000;
+  const maxInvocationsPerWindow = Number.isFinite(config.rateLimit.maxInvocationsPerMinute)
+    ? Math.floor(config.rateLimit.maxInvocationsPerMinute)
+    : 5;
+
+  if (!runOptions.skipInvocationRateLimit && maxInvocationsPerWindow > 0) {
+    const cutoff = sharedState.startTime - rateWindowMs;
+    governanceState.invocationTimestampsMs = governanceState.invocationTimestampsMs
+      .filter(ts => ts > cutoff);
+    if (governanceState.invocationTimestampsMs.length >= maxInvocationsPerWindow) {
+      updateBudgetRuntime(budgetStatus, startTime, 0, 0);
+      budgetStatus.exceeded = INVOCATION_RATE_LIMIT_REASON;
+      return buildAnalysisWorkbenchResult({
+        answer: RATE_LIMIT_ANSWER,
+        iterations: 0,
+        totalInputTokens: 0,
+        totalOutputTokens: 0,
+        startTime,
+        truncated: true,
+        budgetStatus,
+        budget,
+        steps: [],
+        diagnostics: sharedState.diagnostics,
+      });
+    }
+    governanceState.invocationTimestampsMs.push(sharedState.startTime);
+  }
+
+  const nurseryDailyCapUsd = Number.isFinite(config.cost.nurseryDailyCapUsd)
+    ? Math.max(0, config.cost.nurseryDailyCapUsd)
+    : 0;
+  if (tier === 'nursery' && nurseryDailyCapUsd > 0 && dayCost.totalUsd >= nurseryDailyCapUsd) {
+    updateBudgetRuntime(budgetStatus, startTime, 0, 0);
+    budgetStatus.exceeded = NURSERY_DAILY_COST_REASON;
+    return buildAnalysisWorkbenchResult({
+      answer: NURSERY_DAILY_CAP_ANSWER,
+      iterations: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      startTime,
+      truncated: true,
+      budgetStatus,
+      budget,
+      steps: [],
+      diagnostics: sharedState.diagnostics,
+    });
+  }
+
+  const sandboxTokenUsage = {
+    inputTokens: 0,
+    outputTokens: 0,
+  };
+  const nestedAnalysisPolicy = requestMetadata.channelId
+    ? evaluateCompositionalPolicyForChannelId({
+      policy: deps.compositionalPolicy,
+      capabilityTier: tier,
+      channelId: requestMetadata.channelId,
+      purpose: 'analysis_workbench',
+    })
+    : { allowed: false, reason: 'channel_type_not_allowed' as const };
+  const getCompletionTimeoutMs = (): number | null => pickMostConstrainedRemainingWallTimeMs(
+    getRemainingWallTimeMs(startTime, budget),
+    getRemainingWallTimeMs(sharedState.startTime, sharedState.rootBudget),
+    sharedState.directResponseDeadlineAtMs === null
+      ? null
+      : sharedState.directResponseDeadlineAtMs - Date.now(),
+  );
+  const sandboxLLMProvider = Object.create(llmProvider) as typeof llmProvider;
+  sandboxLLMProvider.complete = async (context, purpose, options) => {
+    const incomingCorrelation = context.correlation;
+    const originStage = normalizeMetadataValue(incomingCorrelation?.originStage)
+      ?? normalizeMetadataValue(incomingCorrelation?.purpose)
+      ?? `repl.sandbox.${purpose}`;
+    const correlationBase = buildAnalysisCorrelation(
+      requestMetadata,
+      originStage,
+      `sandbox-${purpose}-${Date.now()}`,
+    );
+    const requestId = normalizeMetadataValue(incomingCorrelation?.requestId)
+      ?? correlationBase.requestId
+      ?? `repl-analysis-${Date.now()}`;
+    const correlatedContext: LLMContext = {
+      ...context,
+      correlation: {
+        ...correlationBase,
+        ...(incomingCorrelation ?? {}),
+        requestId,
+        callType: 'tool',
+        purpose: incomingCorrelation?.purpose
+          ?? incomingCorrelation?.originStage
+          ?? correlationBase.purpose,
+        originType: 'tool',
+        originStage: incomingCorrelation?.originStage
+          ?? incomingCorrelation?.purpose
+          ?? correlationBase.originStage,
+        ...(requestMetadata.icpCorrelation
+          ? {
+              icpCorrelation: deriveChildIcpConversationCostCorrelation(
+                requestMetadata.icpCorrelation,
+                {
+                  requestId,
+                  costPurpose: 'tool',
+                  costOriginStage: requestMetadata.icpCorrelation.costOriginStage,
+                },
+              ),
+            }
+          : {}),
+      },
+    };
+    const { correlation: sandboxCorrelation, ...contextWithoutCorrelation } = correlatedContext;
+    const response = await runAbortableAnalysisOperation({
+      timeoutMs: getCompletionTimeoutMs(),
+      parentSignals: [runOptions.signal, options?.signal],
+      createTimeoutReason: timeoutMs => new LLMIterationTimeoutError(timeoutMs),
+      run: async signal => await completeWithWorkSpec(
+        llmProvider,
+        contextWithoutCorrelation,
+        buildLLMWorkSpec({ purpose, durable: false, correlation: sandboxCorrelation }),
+        {
+          signal,
+          ...(options?.modelHint ? { modelHint: options.modelHint } : {}),
+        },
+      ),
+    });
+    sandboxTokenUsage.inputTokens += response.inputTokens;
+    sandboxTokenUsage.outputTokens += response.outputTokens;
+    return response;
+  };
+
+  const steps: AnalysisWorkbenchStep[] = [];
+  const memoryCeilingBytes = resolveMemoryCeilingBytes(config, tier);
+  const nestedAnalysisRunner = async (
+    nestedTask: string,
+    nestedOptions?: NestedAnalysisOptions,
+  ): Promise<string> => {
+    sharedState.diagnostics.nestedAnalysisCallCount += 1;
+    sharedState.diagnostics.maxNestedAnalysisDepthReached = Math.max(
+      sharedState.diagnostics.maxNestedAnalysisDepthReached,
+      depth + 1,
+    );
+    if (!nestedAnalysisPolicy.allowed) {
+      sharedState.diagnostics.nestedAnalysisFailureCount += 1;
+      throw new Error(`nested_analysis is disabled by compositional policy (${nestedAnalysisPolicy.reason})`);
+    }
+    if (depth >= MAX_NESTED_ANALYSIS_DEPTH) {
+      sharedState.diagnostics.nestedAnalysisFailureCount += 1;
+      throw new Error(`nested_analysis depth limit reached (${MAX_NESTED_ANALYSIS_DEPTH})`);
+    }
+    try {
+      const childId = ++sharedState.nextNestedAnalysisId;
+      const childConfig = buildNestedAnalysisConfig(config, sharedState, nestedOptions);
+      const nestedRequestMetadata = buildNestedAnalysisRequestMetadata(requestMetadata, childId);
+      const runChild = async () => runRLMLoop(
+        nestedTask,
+        {
+          ...deps,
+          config: childConfig,
+        },
+        nestedRequestMetadata,
+        {
+          depth: depth + 1,
+          sharedState,
+          skipInvocationRateLimit: true,
+          signal: runOptions.signal,
+        },
+      );
+      const childResult = deps.chargePolicy
+        ? await runWithChargeContext({
+          chargePolicy: deps.chargePolicy,
+          eventBus: deps.eventBus ?? null,
+          lane: activeChargeContext?.lane ?? 'interactive',
+          runId: nestedRequestMetadata.requestId,
+          correlation: nestedRequestMetadata,
+        }, runChild)
+        : await runChild();
+      sharedState.diagnostics.nestedAnalysisSuccessCount += 1;
+      return childResult.answer;
+    } catch (error) {
+      sharedState.diagnostics.nestedAnalysisFailureCount += 1;
+      throw error;
+    }
+  };
+
+  const sandbox = new REPLSandbox({
+    llmProvider: sandboxLLMProvider,
+    fileRead: deps.fileRead,
+    ...(deps.fsReadMaxBytes !== undefined
+      ? { fsReadMaxBytes: deps.fsReadMaxBytes }
+      : {}),
+    executionPort: deps.executionPort ?? null,
+    embeddingService: deps.embeddingService,
+    memoryStore: deps.memoryStore,
+    episodeSearch: deps.episodeSearch ?? null,
+    sessionManager: deps.sessionManager,
+    scheduler: deps.scheduler,
+    eventBus: deps.eventBus,
+    getCapabilityTier: deps.getCapabilityTier,
+    runNestedAnalysis: nestedAnalysisRunner,
+    moduleInstallConfirmationQueue: deps.moduleInstallConfirmationQueue,
+    onModuleRegistryMutation: deps.onModuleRegistryMutation,
+    requestMetadata,
+  }, sharedState.budgetRef, { memoryCeilingBytes });
+
+  // Gather context metadata for system prompt
+  const subjectMemoryStore = deps.memoryStore
+    ? createSubjectAuthorizedMemoryStore(
+      deps.memoryStore,
+      () => memorySubjectAccessContextFromCorrelation(getRequestContext()),
+    )
+    : null;
+  const stats = subjectMemoryStore
+    ? await subjectMemoryStore.getStats()
+    : null;
+  const metadata: AnalysisWorkbenchContextMetadata = {
+    memoryCount: stats?.total ?? 0,
+    memoryBreakdown: stats
+      ? Object.entries(stats.byType)
+        .filter(([, n]) => (n as number) > 0)
+        .map(([type, n]) => `${n} ${type}`)
+        .join(', ')
+      : 'none',
+    channelCount: 0,
+    currentChannelMessages: 0,
+    nestedAnalysisAvailable: nestedAnalysisPolicy.allowed && depth < MAX_NESTED_ANALYSIS_DEPTH,
+  };
+
+  const systemPrompt = buildRLMSystemPrompt(metadata, deps.mutationPolicy, {
+    shellExecAvailable: sandbox.hasHelper('shell_exec'),
+  });
+
+  const messages: ContextMessage[] = [
+    { role: 'user', content: task },
+  ];
+
+  let totalInputTokens = 0;
+  let totalOutputTokens = 0;
+  let localIterations = 0;
+  const autonomousWarningUsd = Number.isFinite(config.cost.autonomousDailyWarningUsd)
+    ? Math.max(0, config.cost.autonomousDailyWarningUsd)
+    : 0;
+  const applyCostCharge = (inputTokens: number, outputTokens: number): void => {
+    const iterationCostUsd = estimateIterationCostUsd(
+      config,
+      inputTokens,
+      outputTokens,
+    );
+    sharedState.sessionCostUsd += iterationCostUsd;
+    dayCost.totalUsd += iterationCostUsd;
+    syncBudgetStatusFromSharedState(budgetStatus, sharedState, dayCost.totalUsd);
+
+    if (
+      tier === 'autonomous'
+      && autonomousWarningUsd > 0
+      && !sharedState.autonomousCostWarningSent
+      && dayCost.totalUsd >= autonomousWarningUsd
+    ) {
+      sharedState.warnings.push(
+        `Autonomous daily analysis workbench spend warning: $${dayCost.totalUsd.toFixed(4)} >= $${autonomousWarningUsd.toFixed(4)}`,
+      );
+      sharedState.autonomousCostWarningSent = true;
+    }
+  };
+
+  const finalizeBudgetStatus = (): void => {
+    if (isNestedRun) {
+      updateBudgetRuntime(
+        budgetStatus,
+        startTime,
+        sharedState.budgetRef.subQueries,
+        sharedState.budgetRef.toolCalls ?? 0,
+      );
+    } else {
+      updateBudgetProgress(
+        budgetStatus,
+        sharedState.consumedIterations,
+        sharedState.totalInputTokens,
+        sharedState.totalOutputTokens,
+        startTime,
+        sharedState.budgetRef.subQueries,
+        sharedState.budgetRef.toolCalls ?? 0,
+      );
+    }
+    syncBudgetStatusFromSharedState(budgetStatus, sharedState, dayCost.totalUsd);
+  };
+
+  const refreshBudgetStatus = (): void => {
+    updateBudgetProgress(
+      budgetStatus,
+      localIterations,
+      totalInputTokens,
+      totalOutputTokens,
+      startTime,
+      sharedState.budgetRef.subQueries,
+      sharedState.budgetRef.toolCalls ?? 0,
+    );
+    syncBudgetStatusFromSharedState(budgetStatus, sharedState, dayCost.totalUsd);
+  };
+
+  const enforceBudgets = (): void => {
+    refreshBudgetStatus();
+    checkBudget(budgetStatus, budget);
+    if (!budgetStatus.exceeded) {
+      budgetStatus.exceeded = checkSharedBudgetExceeded(sharedState);
+    }
+  };
+
+  while (localIterations < budget.maxIterations) {
+    throwIfAnalysisAborted(runOptions.signal);
+    if (localIterations > 0) {
+      const chargeInspection = inspectChargeSurface('analysisWorkbenchExtensionBand', {
+        chargePolicy,
+      });
+      if (chargeInspection && !chargeInspection.allowed) {
+        finalizeBudgetStatus();
+        budgetStatus.exceeded = CHARGE_QUOTA_REASON;
+        return buildAnalysisWorkbenchResult({
+          answer: buildBudgetFallbackAnswer(CHARGE_QUOTA_REASON),
+          iterations: isNestedRun ? localIterations : sharedState.consumedIterations,
+          totalInputTokens: isNestedRun ? totalInputTokens : sharedState.totalInputTokens,
+          totalOutputTokens: isNestedRun ? totalOutputTokens : sharedState.totalOutputTokens,
+          startTime,
+          truncated: true,
+          budgetStatus,
+          budget,
+          steps,
+          diagnostics: sharedState.diagnostics,
+        });
+      }
+    }
+
+    if (tier === 'nursery' && nurseryDailyCapUsd > 0 && dayCost.totalUsd >= nurseryDailyCapUsd) {
+      finalizeBudgetStatus();
+      budgetStatus.exceeded = NURSERY_DAILY_COST_REASON;
+      break;
+    }
+
+    const iterationStart = Date.now();
+    const remainingBeforeLLM = getCompletionTimeoutMs();
+    if (remainingBeforeLLM !== null && remainingBeforeLLM <= 0) {
+      finalizeBudgetStatus();
+      budgetStatus.exceeded = sharedState.directResponseDeadlineAtMs !== null
+        && Date.now() >= sharedState.directResponseDeadlineAtMs
+        ? LLM_TIMEOUT_REASON
+        : 'wall time';
+      break;
+    }
+
+    let response: LLMResponse;
+    const iterationNumber = localIterations + 1;
+    try {
+      const timeoutMs = remainingBeforeLLM === null
+        ? null
+        : Math.floor(remainingBeforeLLM - LLM_TIMEOUT_BUFFER_MS);
+      if (timeoutMs !== null && timeoutMs <= 0) {
+        finalizeBudgetStatus();
+        budgetStatus.exceeded = 'wall time';
+        break;
+      }
+
+      const runCompletion = async () => await runAbortableAnalysisOperation({
+        timeoutMs,
+        parentSignals: [runOptions.signal],
+        createTimeoutReason: timeoutMs => new LLMIterationTimeoutError(timeoutMs),
+        run: async signal => await completeWithWorkSpec(
+          llmProvider,
+          {
+            systemPrompt,
+            messages,
+          },
+          buildLLMWorkSpec({
+            purpose: 'reasoning',
+            durable: false,
+            correlation: buildAnalysisCorrelation(
+              requestMetadata,
+              'repl.analysis_workbench.iteration',
+              `iteration-${iterationNumber}`,
+            ),
+          }),
+          { signal },
+        ),
+      });
+      const completion = iterationNumber > 1
+        ? runWithChargedSurface('analysisWorkbenchExtensionBand', {
+            chargePolicy,
+            details: {
+              iteration: iterationNumber,
+              depth,
+              ...(requestMetadata.turnId ? { turnId: requestMetadata.turnId } : {}),
+            },
+          }, runCompletion)
+        : runCompletion();
+      response = await completion;
+    } catch (error) {
+      finalizeBudgetStatus();
+      if (error instanceof LLMIterationTimeoutError) {
+        budgetStatus.exceeded = LLM_TIMEOUT_REASON;
+        break;
+      }
+      throw error;
+    }
+
+    localIterations = iterationNumber;
+    sharedState.consumedIterations += 1;
+    totalInputTokens += response.inputTokens;
+    totalOutputTokens += response.outputTokens;
+    sharedState.totalInputTokens += response.inputTokens;
+    sharedState.totalOutputTokens += response.outputTokens;
+
+    applyCostCharge(response.inputTokens, response.outputTokens);
+    refreshBudgetStatus();
+
+    const text = response.content;
+    messages.push({ role: 'assistant', content: text });
+
+    const action = parseResponse(text);
+
+    switch (action.type) {
+      case 'final': {
+        pushPassiveStep(
+          steps,
+          iterationNumber,
+          response,
+          sharedState.totalInputTokens + sharedState.totalOutputTokens,
+          iterationStart,
+          action.answer,
+        );
+        finalizeBudgetStatus();
+        return buildAnalysisWorkbenchResult({
+          answer: action.answer,
+          iterations: isNestedRun ? localIterations : sharedState.consumedIterations,
+          totalInputTokens: isNestedRun ? totalInputTokens : sharedState.totalInputTokens,
+          totalOutputTokens: isNestedRun ? totalOutputTokens : sharedState.totalOutputTokens,
+          startTime,
+          truncated: false,
+          budgetStatus,
+          budget,
+          steps,
+          diagnostics: sharedState.diagnostics,
+        });
+      }
+
+      case 'final_var': {
+        const locals = sandbox.getLocals();
+        const value = locals[action.varName];
+        const answer = value !== undefined ? String(value) : `[Variable "${action.varName}" not found]`;
+        pushPassiveStep(
+          steps,
+          iterationNumber,
+          response,
+          sharedState.totalInputTokens + sharedState.totalOutputTokens,
+          iterationStart,
+          answer,
+        );
+        finalizeBudgetStatus();
+        return buildAnalysisWorkbenchResult({
+          answer,
+          iterations: isNestedRun ? localIterations : sharedState.consumedIterations,
+          totalInputTokens: isNestedRun ? totalInputTokens : sharedState.totalInputTokens,
+          totalOutputTokens: isNestedRun ? totalOutputTokens : sharedState.totalOutputTokens,
+          startTime,
+          truncated: false,
+          budgetStatus,
+          budget,
+          steps,
+          diagnostics: sharedState.diagnostics,
+        });
+      }
+
+      case 'code': {
+        const sandboxInputBefore = sandboxTokenUsage.inputTokens;
+        const sandboxOutputBefore = sandboxTokenUsage.outputTokens;
+        const result = await sandbox.execute(action.code, config.executionTimeoutMs, config.outputTruncation);
+        throwIfAnalysisAborted(runOptions.signal);
+        const sandboxInputDelta = sandboxTokenUsage.inputTokens - sandboxInputBefore;
+        const sandboxOutputDelta = sandboxTokenUsage.outputTokens - sandboxOutputBefore;
+        if (sandboxInputDelta > 0 || sandboxOutputDelta > 0) {
+          applyCostCharge(sandboxInputDelta, sandboxOutputDelta);
+        }
+        const stepEvidence = sandbox.collectEvidence();
+        const stepTokens = response.inputTokens + response.outputTokens;
+
+        const step = buildStep({
+          iteration: iterationNumber,
+          code: action.code,
+          output: result.output,
+          error: result.error,
+          evidenceCollected: stepEvidence,
+          inputTokens: response.inputTokens,
+          outputTokens: response.outputTokens,
+          cumulativeTokens: isNestedRun
+            ? totalInputTokens + totalOutputTokens
+            : sharedState.totalInputTokens + sharedState.totalOutputTokens,
+          durationMs: Date.now() - iterationStart,
+          variablesChanged: result.variablesChanged,
+        });
+        steps.push(step);
+
+        if (result.finalAnswer !== null) {
+          finalizeBudgetStatus();
+          return buildAnalysisWorkbenchResult({
+            answer: result.finalAnswer,
+            iterations: isNestedRun ? localIterations : sharedState.consumedIterations,
+            totalInputTokens: isNestedRun ? totalInputTokens : sharedState.totalInputTokens,
+            totalOutputTokens: isNestedRun ? totalOutputTokens : sharedState.totalOutputTokens,
+            startTime,
+            truncated: false,
+            budgetStatus,
+            budget,
+            steps,
+            diagnostics: sharedState.diagnostics,
+          });
+        }
+
+        const feedback = formatExecutionFeedback(
+          result.output,
+          result.error,
+          iterationNumber,
+          stepTokens,
+          result.variablesChanged,
+        );
+
+        messages.push({ role: 'user', content: feedback });
+        break;
+      }
+
+      case 'none':
+        {
+        pushPassiveStep(
+          steps,
+          iterationNumber,
+          response,
+          sharedState.totalInputTokens + sharedState.totalOutputTokens,
+          iterationStart,
+        );
+        messages.push({
+          role: 'user',
+          content: 'Please write a ```repl code block to execute, or call FINAL("your answer") when done.',
+        });
+        break;
+        }
+    }
+
+    enforceBudgets();
+    if (budgetStatus.exceeded) break;
+  }
+
+  // Budget or max iterations exhausted
+  finalizeBudgetStatus();
+  if (!budgetStatus.exceeded) {
+    budgetStatus.exceeded = 'max iterations';
+  }
+  return buildAnalysisWorkbenchResult({
+    answer: buildBudgetFallbackAnswer(budgetStatus.exceeded),
+    iterations: isNestedRun ? localIterations : sharedState.consumedIterations,
+    totalInputTokens: isNestedRun ? totalInputTokens : sharedState.totalInputTokens,
+    totalOutputTokens: isNestedRun ? totalOutputTokens : sharedState.totalOutputTokens,
+    startTime,
+    truncated: true,
+    budgetStatus,
+    budget,
+    steps,
+    diagnostics: sharedState.diagnostics,
+  });
+}

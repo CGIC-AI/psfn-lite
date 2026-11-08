@@ -1,0 +1,339 @@
+import { isSocialOutreachChannelId } from '../../shared/contracts/social-outreach-channel.js';
+import type { ChargePolicyRuntimeLane } from '../../system/config/charge-policy-config.js';
+import type {
+  CompletionPurpose,
+  ObservabilityCallType,
+  ModelPurpose,
+} from '../../shared/contracts/runtime.js';
+import {
+  RUNTIME_LANE_CLASSES,
+  type BackgroundContinuationRuntimeClass,
+  type ForegroundChatRuntimeClass,
+  type MaintenanceReflectionRuntimeClass,
+  type PostTurnAppraisalRuntimeClass,
+  type RuntimeLaneClass,
+} from '../../shared/contracts/runtime-lanes.js';
+
+/**
+ * Worker lanes are semantic runtime roles, not implementation shortcuts.
+ *
+ * Subagents are bounded task-focused workers.
+ * Whisper is the internal metacognitive lane for self-directed appraisals,
+ * reminders, and reflective notes.
+ *
+ * They stay separate so task delegation cannot accidentally reuse the whisper
+ * path and so metacognitive work does not get mislabeled as subagent work.
+ */
+const WORKER_LANES = {
+  subagent: 'subagent',
+  whisper: 'whisper',
+} as const;
+
+export type WorkerLane = typeof WORKER_LANES[keyof typeof WORKER_LANES];
+export type SubagentWorkerLane = typeof WORKER_LANES.subagent;
+export type WhisperWorkerLane = typeof WORKER_LANES.whisper;
+export type TaskFocusedWorkerProfileClass = 'task_focused';
+export type SubconsciousWorkerProfileClass = 'subconscious';
+export type WorkerProfileClass = TaskFocusedWorkerProfileClass | SubconsciousWorkerProfileClass;
+
+export interface WorkerExecutionPolicy {
+  lane: WorkerLane;
+  profileClass: WorkerProfileClass;
+  modelPurpose: ModelPurpose;
+  failClosed: boolean;
+}
+
+export const SUBAGENT_WORKER_LANE: SubagentWorkerLane = WORKER_LANES.subagent;
+export const WHISPER_WORKER_LANE: WhisperWorkerLane = WORKER_LANES.whisper;
+export const TASK_FOCUSED_WORKER_PROFILE_CLASS: TaskFocusedWorkerProfileClass = 'task_focused';
+export const SUBCONSCIOUS_WORKER_PROFILE_CLASS: SubconsciousWorkerProfileClass = 'subconscious';
+
+/**
+ * Runtime classes describe how the live scheduler should treat cognitive work.
+ *
+ * They are intentionally broader than worker lanes:
+ * - worker lanes classify dedicated worker identities like subagents/whisper
+ * - runtime classes classify foreground and background cognition across the main runtime
+ */
+export type ModelCallRuntimePurpose = CompletionPurpose | ModelPurpose | 'chat';
+
+export const FOREGROUND_CHAT_RUNTIME_CLASS: ForegroundChatRuntimeClass = RUNTIME_LANE_CLASSES.foregroundChat;
+export const POST_TURN_APPRAISAL_RUNTIME_CLASS: PostTurnAppraisalRuntimeClass = (
+  RUNTIME_LANE_CLASSES.postTurnAppraisal
+);
+export const BACKGROUND_CONTINUATION_RUNTIME_CLASS: BackgroundContinuationRuntimeClass = (
+  RUNTIME_LANE_CLASSES.backgroundContinuation
+);
+export const MAINTENANCE_REFLECTION_RUNTIME_CLASS: MaintenanceReflectionRuntimeClass = (
+  RUNTIME_LANE_CLASSES.maintenanceReflection
+);
+// The heartbeat prefix is telemetry-visible and retained for historical traces.
+const MAINTENANCE_REFLECTION_ORIGIN_STAGE_PREFIXES = [
+  'heartbeat.deliberation',
+  'reflection.deliberation',
+] as const;
+
+export interface RuntimeLaneBudgetProfile {
+  runtimeClass: RuntimeLaneClass;
+  priority: number;
+  /**
+   * Whether an in-flight model call in this lane may be preempted (aborted) by a
+   * higher-priority acquire at the model-call gate. Foreground and post-turn
+   * appraisal are never preempted; background continuation and maintenance
+   * reflection are. Single home for this policy (Law 12.4): the gate is the only
+   * mechanism, fairness/anti-starvation lives elsewhere.
+   */
+  preemptable: boolean;
+  /**
+   * Anti-starvation welfare reserve (mmo9.7.4). The per-lane count of bounded
+   * welfare-reserve slots the background-work supervisor may admit an aged,
+   * repeatedly-preempted job of this lane class into, past the foreground
+   * exclusion, so sustained foreground turns cannot starve it forever. Zero for
+   * the never-preempted foreground/appraisal lanes (they never defer, so they
+   * cannot starve); a small conservative reserve for the preemptable background
+   * and maintenance lanes. This is the per-lane policy declaration; a deployment
+   * numeric cap may override it through the scheduler owner file. It is NOT a
+   * second scheduler — the reservation is enforced in the existing claimNext
+   * admission choke (Law 12.4).
+   */
+  welfareReserveSlots: number;
+  chargeLane: ChargePolicyRuntimeLane;
+  modelPurpose: ModelPurpose;
+  maxQueuedActions: number;
+  maxRunsPerSchedulerTick: number;
+  maxPendingSessionDeliveries: number;
+  maxDeliveriesPerForegroundTurn: number;
+  requiresForegroundIdle: boolean;
+  degradationMode:
+    | 'preserve_foreground'
+    | 'drop_oldest_queued'
+    | 'deliver_on_next_foreground_turn'
+    | 'defer_until_idle';
+}
+
+const RUNTIME_LANE_BUDGET_PROFILES: Record<RuntimeLaneClass, RuntimeLaneBudgetProfile> = {
+  [FOREGROUND_CHAT_RUNTIME_CLASS]: {
+    runtimeClass: FOREGROUND_CHAT_RUNTIME_CLASS,
+    priority: 0,
+    preemptable: false,
+    welfareReserveSlots: 0,
+    chargeLane: 'interactive',
+    modelPurpose: 'chat',
+    maxQueuedActions: 0,
+    maxRunsPerSchedulerTick: 0,
+    maxPendingSessionDeliveries: 0,
+    maxDeliveriesPerForegroundTurn: 0,
+    requiresForegroundIdle: false,
+    degradationMode: 'preserve_foreground',
+  },
+  [POST_TURN_APPRAISAL_RUNTIME_CLASS]: {
+    runtimeClass: POST_TURN_APPRAISAL_RUNTIME_CLASS,
+    priority: 1,
+    preemptable: false,
+    welfareReserveSlots: 0,
+    chargeLane: 'background',
+    modelPurpose: 'background',
+    maxQueuedActions: 12,
+    maxRunsPerSchedulerTick: 2,
+    maxPendingSessionDeliveries: 0,
+    maxDeliveriesPerForegroundTurn: 0,
+    requiresForegroundIdle: false,
+    degradationMode: 'drop_oldest_queued',
+  },
+  [BACKGROUND_CONTINUATION_RUNTIME_CLASS]: {
+    runtimeClass: BACKGROUND_CONTINUATION_RUNTIME_CLASS,
+    priority: 2,
+    preemptable: true,
+    welfareReserveSlots: 1,
+    chargeLane: 'background',
+    modelPurpose: 'background',
+    maxQueuedActions: 4,
+    maxRunsPerSchedulerTick: 1,
+    maxPendingSessionDeliveries: 2,
+    maxDeliveriesPerForegroundTurn: 1,
+    requiresForegroundIdle: false,
+    degradationMode: 'deliver_on_next_foreground_turn',
+  },
+  [MAINTENANCE_REFLECTION_RUNTIME_CLASS]: {
+    runtimeClass: MAINTENANCE_REFLECTION_RUNTIME_CLASS,
+    priority: 3,
+    preemptable: true,
+    welfareReserveSlots: 1,
+    chargeLane: 'maintenance',
+    modelPurpose: 'memory',
+    maxQueuedActions: 3,
+    maxRunsPerSchedulerTick: 1,
+    maxPendingSessionDeliveries: 0,
+    maxDeliveriesPerForegroundTurn: 0,
+    requiresForegroundIdle: true,
+    degradationMode: 'defer_until_idle',
+  },
+};
+
+export function isSubagentWorkerLane(lane: WorkerLane): lane is SubagentWorkerLane {
+  return lane === WORKER_LANES.subagent;
+}
+
+export function isWhisperWorkerLane(lane: WorkerLane): lane is WhisperWorkerLane {
+  return lane === WORKER_LANES.whisper;
+}
+
+export function isRuntimeLaneClass(value: string): value is RuntimeLaneClass {
+  return Object.values(RUNTIME_LANE_CLASSES).includes(value as RuntimeLaneClass);
+}
+
+export function resolveRuntimeLaneBudgetProfile(
+  runtimeClass: RuntimeLaneClass,
+): RuntimeLaneBudgetProfile {
+  return RUNTIME_LANE_BUDGET_PROFILES[runtimeClass];
+}
+
+export function compareRuntimeLanePriority(
+  left: RuntimeLaneClass,
+  right: RuntimeLaneClass,
+): number {
+  return resolveRuntimeLaneBudgetProfile(left).priority - resolveRuntimeLaneBudgetProfile(right).priority;
+}
+
+export function resolveRuntimeLaneClassForTurn(input: {
+  callType: ObservabilityCallType;
+  channelId: string;
+  taskKind?: string;
+  deferredContinuationId?: string | null;
+}): RuntimeLaneClass {
+  if (input.callType === 'background' || input.deferredContinuationId) {
+    return BACKGROUND_CONTINUATION_RUNTIME_CLASS;
+  }
+  // A per-contact social-outreach turn is the companion deciding whether to
+  // speak to someone, with her persona loaded: chat priority by design, even
+  // though its internal channel infers a scheduled call type.
+  if (isSocialOutreachChannelId(input.channelId)) {
+    return FOREGROUND_CHAT_RUNTIME_CLASS;
+  }
+  if (
+    input.callType === 'scheduled'
+    || input.taskKind === 'heartbeat'
+    || input.taskKind === 'reflection'
+    || input.channelId === 'internal:heartbeat'
+    || input.channelId.startsWith('internal:heartbeat:')
+    || input.channelId.startsWith('internal:reflection:')
+  ) {
+    return MAINTENANCE_REFLECTION_RUNTIME_CLASS;
+  }
+  return FOREGROUND_CHAT_RUNTIME_CLASS;
+}
+
+export function resolveRuntimeLaneClassForModelCall(input: {
+  purpose: ModelCallRuntimePurpose;
+  callType: ObservabilityCallType;
+  channelId?: string;
+  originStage?: string;
+}): RuntimeLaneClass {
+  const originStage = input.originStage?.trim() ?? '';
+  if (input.purpose === 'chat' || input.callType === 'chat' || input.callType === 'tool'
+    || isSocialOutreachChannelId(input.channelId)) {
+    return FOREGROUND_CHAT_RUNTIME_CLASS;
+  }
+  if (
+    input.callType === 'scheduled'
+    || input.purpose === 'memory'
+    || input.purpose === 'extraction'
+    || input.channelId === 'internal:heartbeat'
+    || input.channelId?.startsWith('internal:heartbeat:')
+    || input.channelId?.startsWith('internal:reflection:')
+    || MAINTENANCE_REFLECTION_ORIGIN_STAGE_PREFIXES.some(prefix => originStage.startsWith(prefix))
+    || originStage === 'heartbeat.run_template'
+    || originStage === 'memory.sleeptime.run'
+  ) {
+    return MAINTENANCE_REFLECTION_RUNTIME_CLASS;
+  }
+  // Intention appraisal and concern-candidate review decide whether concerns
+  // and follow-ups exist at all (psfn-framework-vcq8v.5). On the preemptable
+  // background lane a foreground turn discarded them as a failed-closed no-op
+  // with no retry, so they run on the non-preemptable appraisal lane.
+  if (
+    input.callType === 'summary'
+    || input.purpose === 'summary'
+    || originStage === 'intention.follow_up'
+    || originStage.startsWith('intention.appraisal.')
+    || originStage === 'intention.concern_candidate_review'
+    // se807: the participation appraisal decides whether an inbound ICP (or
+    // room) message is answered at all. On the preemptable background lane
+    // the companion's own post-turn appraisal preempted it, and the aborted
+    // call fail-closed and ended the conversation.
+    || originStage === 'participation.appraisal'
+  ) {
+    return POST_TURN_APPRAISAL_RUNTIME_CLASS;
+  }
+  return BACKGROUND_CONTINUATION_RUNTIME_CLASS;
+}
+
+export function resolveRuntimeLaneClassForPostTurnActionKind(
+  actionKind: string,
+): RuntimeLaneClass {
+  const normalized = actionKind.trim();
+  if (!normalized) {
+    return POST_TURN_APPRAISAL_RUNTIME_CLASS;
+  }
+  if (
+    // Durable queued actions already persist this compatibility discriminator.
+    normalized === 'heartbeat.run_template'
+    || normalized === 'memory.sleeptime.run'
+    || normalized === 'memory.near-turn.run'
+    || normalized === 'memory.episode-synthesis.run'
+    || normalized === 'memory.external.process'
+  ) {
+    return MAINTENANCE_REFLECTION_RUNTIME_CLASS;
+  }
+  return POST_TURN_APPRAISAL_RUNTIME_CLASS;
+}
+
+export function resolveWorkerProfileClassForLane(
+  lane: WorkerLane,
+): WorkerProfileClass {
+  if (isSubagentWorkerLane(lane)) {
+    return TASK_FOCUSED_WORKER_PROFILE_CLASS;
+  }
+  return SUBCONSCIOUS_WORKER_PROFILE_CLASS;
+}
+
+export function createWorkerExecutionPolicy(
+  lane: WorkerLane,
+): WorkerExecutionPolicy {
+  if (isSubagentWorkerLane(lane)) {
+    return {
+      lane,
+      profileClass: TASK_FOCUSED_WORKER_PROFILE_CLASS,
+      modelPurpose: 'background',
+      failClosed: true,
+    };
+  }
+
+  return {
+    lane,
+    profileClass: SUBCONSCIOUS_WORKER_PROFILE_CLASS,
+    modelPurpose: 'memory',
+    failClosed: true,
+  };
+}
+
+/**
+ * Charge lane for a turn that runs without an inherited run-charge context
+ * (6da92). A worker-execution turn (whisper: sleeptime review, dream pass,
+ * reflection templates) is internal metacognitive work: it charges the lane
+ * of its runtime class (maintenance for internal reflection channels, whose
+ * owner-file quota admits no paid surface) instead of the interactive lane, so
+ * the charge gate refuses paid work nobody asked for. Every other turn keeps
+ * the interactive lane.
+ */
+export function resolveUncontextedTurnChargeLane(input: {
+  channelId: string;
+  workerExecution: boolean;
+  callType: ObservabilityCallType;
+}): ChargePolicyRuntimeLane {
+  if (!input.workerExecution) return 'interactive';
+  return resolveRuntimeLaneBudgetProfile(resolveRuntimeLaneClassForTurn({
+    callType: input.callType,
+    channelId: input.channelId,
+  })).chargeLane;
+}

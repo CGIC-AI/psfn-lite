@@ -1,0 +1,1003 @@
+import { createHash } from 'node:crypto';
+import type { SessionEntry } from '../../../core/session/types.js';
+import { shouldPersistSessionChannel } from '../../../core/session/session-channel-persistence.js';
+import { resolveSessionEntryTurnContext } from '../../../core/session/turn-provenance.js';
+import {
+  isTurnRecordRecoveryEvidenceError,
+  type CorruptTurnRecordRecoveryEvidenceSkip,
+} from '../../../core/agent/background-work/recovery-contract.js';
+import type { TurnRecord } from '../../../shared/contracts/runtime.js';
+import { createComponentLogger } from '../../../shared/logger.js';
+import { journalToTurnTombstoneEntry } from '../../journals/journal-utils.js';
+import { readTurnTombstoneAuthoritySnapshot } from '../turn-tombstone-authority.js';
+import { createCorruptTurnRecordRecoveryEvidence } from '../background-work-handoff-recovery-owner-evidence.js';
+import { fingerprintJournalArchiveGenerationIdentity } from './journal-chain-runtime.js';
+import {
+  slimTurnRecordSessionEntriesForAppend,
+  resolveTurnRecordSessionEntries,
+} from '../turn-record-session-refs.js';
+import { slimTurnRecordMemoryCandidatesForAppend } from '../turn-record-memory-refs.js';
+import type {
+  TurnRecordPage,
+  TurnRecordPageCursor,
+  TurnRecordRecoveryScanOptions,
+  TurnRecordStorePort,
+  TurnRecordUsageRecord,
+} from '../turn-record-store-port.js';
+import type { TurnRecordEligibilityFencePort } from '../turn-record-eligibility-fence-port.js';
+import {
+  selectEligibleTurnRecordSnapshotEntries,
+  sessionEntrySnapshotMatches,
+  TurnRecordEligibilitySnapshotChangedError,
+  TurnRecordEligibilitySnapshotInvalidError,
+  type SourceTurnRecordEligibility,
+} from '../turn-record-eligibility-snapshot.js';
+
+import {
+  normalizeOptionalNonNegativeNumber,
+  type ChannelCache,
+  type ChannelIndexEntry,
+} from '../store-primitives.js';
+import type { ResolvedIndexedSession } from './channel-index.js';
+import type { SessionJournalRuntime } from './journal-runtime.js';
+import { syncLightweightSessionCacheFromIndex } from './session-chain-cache.js';
+import {
+  TurnRecordReadTelemetryWindow,
+  type TurnRecordReadWindowProvenance,
+} from './turn-record-read-telemetry.js';
+
+const log = createComponentLogger('SessionStore');
+
+/** Initial overscan multiplier for tombstone-filtered turn-record reads. */
+const TURN_RECORD_TOMBSTONE_OVERSCAN_FACTOR = 4;
+/** Hard bound preventing a post-turn effect from turning one session into an unbounded lock set. */
+const MAX_TURN_RECORD_ELIGIBILITY_SNAPSHOT_FENCES = 512;
+
+/**
+ * Shared L0 authority scan budget: the recovery path and the off-primary
+ * startup priming in startup-tombstone-authority.ts run the same forked worker
+ * over the same journals, so they share one bound rather than drifting.
+ */
+export const RECOVERY_AUTHORITY_LIMITS = Object.freeze({
+  cacheOwners: 8,
+  maxActionBytes: 256 * 1024,
+  maxActions: 4_096,
+  maxResultBytes: 2 * 1024 * 1024,
+  maxRowBytes: 32 * 1024 * 1024,
+  maxTombstones: 4_096,
+  scanChunkBytes: 64 * 1024,
+});
+
+export interface SessionTurnRecordOperationsContext {
+  readonly sessionsDir: string;
+  readonly journalRuntime: SessionJournalRuntime;
+  readonly turnRecordStore: TurnRecordStorePort;
+  readonly turnRecordEligibilityFence: TurnRecordEligibilityFencePort | null;
+  readonly recoveryAuthoritySnapshotHook:
+    | ((ownerSessionId: string) => void | Promise<void>)
+    | undefined;
+  isCorruptRecoveryOwnerRetired(skip: CorruptTurnRecordRecoveryEvidenceSkip): boolean;
+  resolveSessionId(channelId: string): string | null;
+  resolveExistingSession(channelId: string): ResolvedIndexedSession | null;
+  getChannelIndexEntry(sessionId: string): ChannelIndexEntry | undefined;
+  ensureChannelIndexEntry(
+    sessionId: string,
+    channelId: string,
+    filePaths: readonly string[],
+  ): ChannelIndexEntry;
+  getLoadedCache(channelId: string): ChannelCache | undefined;
+  loadExistingChannelCache(channelId: string): ChannelCache | null;
+  ensureChannelFullyLoaded(channelId: string): ChannelCache | null;
+  resolveJournalAuthoritativeTurnTombstones(params: {
+    sessionId: string;
+    channelId: string;
+    filePaths: readonly string[];
+    cache?: ChannelCache;
+  }): ReadonlySet<string>;
+  syncTranscriptProjectionForChannel(
+    channelId: string,
+    entries: readonly SessionEntry[],
+    options?: { redaction?: boolean },
+  ): void;
+  upsertChannelIndex(sessionId: string, entry: ChannelIndexEntry): void;
+  getEntriesInRange(channelId: string, startId: number, endId: number): SessionEntry[];
+  refreshChannelIndexFromDisk(): void;
+  assertSessionWritable(sessionId: string, channelId: string): void;
+}
+
+export class SessionTurnRecordOperations {
+  private readonly recoveryTombstoneAuthority = new Map<string, {
+    archiveFingerprint: string;
+    baselineFingerprint: string;
+    tombstones: Set<string>;
+  }>();
+
+  constructor(private readonly context: SessionTurnRecordOperationsContext) {}
+
+  async appendTurnRecord(record: TurnRecord): Promise<void> {
+    await this.withTurnRecordEligibilityMutationFence(
+      record.sessionId ?? record.channelId,
+      record.turnId,
+      async () => {
+        this.context.assertSessionWritable(record.sessionId ?? record.channelId, record.channelId);
+        this.context.turnRecordStore.appendTurnRecord(
+          slimTurnRecordMemoryCandidatesForAppend(
+            slimTurnRecordSessionEntriesForAppend(record),
+          ),
+        );
+      },
+    );
+  }
+
+  async withSourceTurnRecordEligibilityFence<T>(
+    sourceChannelId: string,
+    logicalSessionId: string,
+    turnId: string,
+    operation: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!sourceChannelId.trim()) {
+      throw new Error('TurnRecord eligibility fence sourceChannelId cannot be empty');
+    }
+    if (!this.context.turnRecordEligibilityFence) {
+      throw new Error('TurnRecord eligibility fence is not configured');
+    }
+    return this.context.turnRecordEligibilityFence.withTurnRecordEligibilityFence({
+      logicalSessionId,
+      turnId,
+    }, operation, { signal });
+  }
+
+  /**
+   * Captures a bounded content window, locks every TurnID represented in that
+   * window plus the required source IDs, then re-reads and validates the exact
+   * snapshot before exposing it to a durable effect.
+   */
+  async withStableTurnRecordEligibilitySnapshot<T>(
+    logicalSessionId: string,
+    requiredTurnIds: readonly string[],
+    readSnapshot: () => SessionEntry[],
+    operation: (entries: readonly SessionEntry[]) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const normalizedSessionId = logicalSessionId.trim();
+    if (!normalizedSessionId) {
+      throw new TurnRecordEligibilitySnapshotInvalidError(
+        'TurnRecord eligibility snapshot logicalSessionId cannot be empty',
+      );
+    }
+    if (!this.context.turnRecordEligibilityFence) {
+      throw new TurnRecordEligibilitySnapshotInvalidError(
+        'TurnRecord eligibility fence is not configured',
+      );
+    }
+
+    const initial = readSnapshot();
+    const consumed = initial.map((entry) => ({
+      sourceChannelId: entry.originChannelId?.trim() || entry.channelId,
+      turnId: resolveSessionEntryTurnContext(entry).turnId,
+    }));
+    const turnIds = new Set<string>();
+    for (const turnId of requiredTurnIds) {
+      const normalized = turnId.trim();
+      if (!normalized) {
+        throw new TurnRecordEligibilitySnapshotInvalidError(
+          'TurnRecord eligibility snapshot required TurnID cannot be empty',
+        );
+      }
+      turnIds.add(normalized);
+    }
+    for (const reference of consumed) turnIds.add(reference.turnId);
+    if (turnIds.size === 0) {
+      throw new TurnRecordEligibilitySnapshotInvalidError(
+        'TurnRecord eligibility snapshot must contain at least one TurnID',
+      );
+    }
+    if (turnIds.size > MAX_TURN_RECORD_ELIGIBILITY_SNAPSHOT_FENCES) {
+      throw new TurnRecordEligibilitySnapshotInvalidError(
+        `TurnRecord eligibility snapshot exceeds ${MAX_TURN_RECORD_ELIGIBILITY_SNAPSHOT_FENCES} TurnIDs`,
+      );
+    }
+
+    return this.context.turnRecordEligibilityFence.withTurnRecordEligibilityFences(
+      [...turnIds].map(turnId => ({ logicalSessionId: normalizedSessionId, turnId })),
+      async () => {
+        const current = readSnapshot();
+        if (!sessionEntrySnapshotMatches(initial, current)) {
+          throw new TurnRecordEligibilitySnapshotChangedError();
+        }
+
+        const eligibleEntries = await selectEligibleTurnRecordSnapshotEntries({
+          entries: current,
+          logicalSessionId: normalizedSessionId,
+          lookupEligibility: (sourceChannelId, logicalOwnerSessionId, turnId) => (
+            this.lookupSourceTurnRecordEligibility(
+              sourceChannelId,
+              logicalOwnerSessionId,
+              turnId,
+            )
+          ),
+        });
+        return operation(eligibleEntries);
+      },
+      { signal },
+    );
+  }
+
+  async withTurnRecordEligibilityMutationFence<T>(
+    logicalSessionId: string,
+    turnId: string,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (!this.context.turnRecordEligibilityFence) return operation();
+    return this.context.turnRecordEligibilityFence.withTurnRecordEligibilityFence({
+      logicalSessionId,
+      turnId,
+    }, operation);
+  }
+
+  /**
+   * Reconstruct L0-referenced session entries and redaction-gate the rendered
+   * view (bead psfn-framework-9ree) at the persistence read boundary, so every
+   * consumer above the store sees fully inline, journal-current records. Pre-9ree
+   * "old fat" records (inline recentEntries, no ref) are redaction-gated against
+   * L0 here too (bead psfn-framework-hgw3.10); id-backed heal-drops emit
+   * structured telemetry via emitRecentEntryHealDrop. The captured provider wire
+   * body is withheld here if a source L0 entry it embedded was redacted/removed
+   * (bead psfn-framework-eb14), emitting telemetry via emitWireBodyWithheld.
+   */
+  private resolveTurnRecordSessionRefs(
+    record: TurnRecord,
+    provenance: TurnRecordReadWindowProvenance,
+  ): TurnRecord {
+    return this.resolveTurnRecordSessionRefsInWindow([record], provenance)[0]!;
+  }
+
+  /**
+   * Resolves every record of ONE bounded read under a single telemetry window
+   * (bead psfn-framework-ylu4i), so a page that legitimately touches thousands
+   * of old-fat / ref-missing rows emits O(1) truthful aggregates instead of one
+   * info event per row. Resolution itself is unchanged: the same resolver, the
+   * same per-record decisions, and any thrown resolver error propagates
+   * untouched after the partial window is flushed as `windowCompleted: false`.
+   */
+  private resolveTurnRecordSessionRefsInWindow(
+    records: readonly TurnRecord[],
+    provenance: TurnRecordReadWindowProvenance,
+    outcome?: { readonly exhausted?: boolean },
+  ): TurnRecord[] {
+    const window = new TurnRecordReadTelemetryWindow(provenance);
+    let completed = false;
+    try {
+      const resolved = records.map((record) => {
+        const next = resolveTurnRecordSessionEntries(
+          record,
+          (channelId, minId, maxId) => this.context.getEntriesInRange(channelId, minId, maxId),
+          window.onHealDrop,
+          window.onWireBodyWithheld,
+          window.onMessageWithheld,
+          window.onContinuityWithheld,
+        );
+        window.countResolvedRecord();
+        return next;
+      });
+      completed = true;
+      return resolved;
+    } finally {
+      window.flush({
+        completed,
+        ...(outcome?.exhausted === undefined ? {} : { exhausted: outcome.exhausted }),
+      });
+    }
+  }
+
+  findTurnRecord(channelId: string, turnId: string): TurnRecord | null {
+    const sessionId = this.context.resolveSessionId(channelId) ?? channelId;
+    const record = this.context.turnRecordStore.findTurnRecord(sessionId, turnId);
+    return record
+      ? this.resolveTurnRecordSessionRefs(record, {
+        readOperation: 'findTurnRecord',
+        channelId,
+      })
+      : null;
+  }
+
+  /**
+   * Find one canonical turn by its physical source channel while proving that
+   * it belongs to the expected logical session. Background work uses this
+   * exact scope so a later route reset cannot redirect an old durable job to a
+   * newer logical session on the same transport channel.
+   */
+  findSourceTurnRecord(
+    sourceChannelId: string,
+    logicalSessionId: string,
+    turnId: string,
+  ): TurnRecord | null {
+    const record = this.context.turnRecordStore.findTurnRecord(sourceChannelId, turnId);
+    if (!record || record.channelId !== sourceChannelId) return null;
+    return (record.sessionId ?? sourceChannelId) === logicalSessionId
+      ? this.resolveTurnRecordSessionRefs(record, {
+        readOperation: 'findSourceTurnRecord',
+        channelId: sourceChannelId,
+      })
+      : null;
+  }
+
+  /**
+   * Resolves the sole eligible durable owner for an exact physical source and
+   * turn. Recovery callers do not yet know the logical owner, so this lookup
+   * derives it from the canonical record while preserving the same duplicate
+   * and tombstone fences used by background work. Null means no record exists;
+   * an existing ambiguous or ineligible source fails closed.
+   */
+  private async lookupSourceTurnRecordIdentity(
+    sourceChannelId: string,
+    turnId: string,
+    signal?: AbortSignal,
+  ) {
+    const normalizedSourceChannelId = sourceChannelId.trim();
+    const normalizedTurnId = turnId.trim();
+    if (!normalizedSourceChannelId || !normalizedTurnId) {
+      throw new Error('Source TurnRecord lookup requires a physical channel and turn id');
+    }
+    const lookup = this.context.turnRecordStore.lookupTurnRecordIdentity;
+    if (!lookup) {
+      throw new Error('TurnRecord store does not support snapshot-consistent exact identity lookup');
+    }
+    return await lookup.call(
+      this.context.turnRecordStore,
+      normalizedSourceChannelId,
+      normalizedTurnId,
+      { signal },
+    );
+  }
+
+  private resolveEligibleSourceTurnRecord(
+    sourceChannelId: string,
+    ownerSessionId: string | null,
+    turnId: string,
+    record: TurnRecord,
+    purpose?: 'scratch_reflection_intention',
+  ): TurnRecord | null {
+    const normalizedSourceChannelId = sourceChannelId.trim();
+    const normalizedTurnId = turnId.trim();
+    const declaredOwnerSessionId = record.sessionId ?? normalizedSourceChannelId;
+    if (record.channelId !== normalizedSourceChannelId
+      || (ownerSessionId !== null && declaredOwnerSessionId !== ownerSessionId.trim())) {
+      return null;
+    }
+    const owner = this.context.ensureChannelFullyLoaded(declaredOwnerSessionId);
+    if (owner?.turnTombstones.has(normalizedTurnId)) return null;
+    // Scratch intention hooks consume their durable TurnRecord without an L0 window.
+    if (owner === null && (
+      purpose !== 'scratch_reflection_intention'
+      || shouldPersistSessionChannel(declaredOwnerSessionId)
+      || this.context.getChannelIndexEntry(declaredOwnerSessionId) !== undefined
+      || declaredOwnerSessionId !== normalizedSourceChannelId
+      || record.status !== 'completed'
+      || record.userMessage.sessionEntryId !== undefined
+      || record.assistantMessage?.sessionEntryId !== undefined
+    )) return null;
+    return this.resolveTurnRecordSessionRefs(record, {
+      readOperation: 'resolveEligibleSourceTurnRecord',
+      channelId: normalizedSourceChannelId,
+    });
+  }
+
+  async findUniqueSourceTurnRecord(
+    sourceChannelId: string,
+    turnId: string,
+  ): Promise<TurnRecord | null> {
+    const lookup = await this.lookupSourceTurnRecordIdentity(sourceChannelId, turnId);
+    if (lookup.kind === 'missing') return null;
+    if (lookup.kind === 'duplicated') {
+      throw new Error('Source TurnRecord is duplicated and cannot establish a recovery identity');
+    }
+    const eligible = this.resolveEligibleSourceTurnRecord(
+      sourceChannelId,
+      null,
+      turnId,
+      lookup.record,
+    );
+    if (!eligible) {
+      throw new Error('Source TurnRecord is tombstoned, missing its owner, or belongs to another source');
+    }
+    return eligible;
+  }
+
+  async findEligibleSourceTurnRecord(
+    sourceChannelId: string,
+    ownerSessionId: string,
+    turnId: string,
+    signal?: AbortSignal,
+  ): Promise<TurnRecord | null> {
+    const eligibility = await this.lookupSourceTurnRecordEligibility(
+      sourceChannelId,
+      ownerSessionId,
+      turnId,
+      signal,
+    );
+    return eligibility.kind === 'eligible' ? eligibility.record : null;
+  }
+
+  async lookupSourceTurnRecordEligibility(
+    sourceChannelId: string,
+    ownerSessionId: string,
+    turnId: string,
+    signal?: AbortSignal,
+    purpose?: 'scratch_reflection_intention',
+  ): Promise<SourceTurnRecordEligibility> {
+    if (!ownerSessionId.trim()) {
+      throw new Error('Source TurnRecord eligibility requires an owner session id');
+    }
+    const lookup = await this.lookupSourceTurnRecordIdentity(sourceChannelId, turnId, signal);
+    signal?.throwIfAborted();
+    if (lookup.kind === 'missing') return { kind: 'missing' };
+    if (lookup.kind === 'duplicated') return { kind: 'ineligible' };
+    const record = this.resolveEligibleSourceTurnRecord(
+      sourceChannelId,
+      ownerSessionId,
+      turnId,
+      lookup.record,
+      purpose,
+    );
+    return record
+      ? { kind: 'eligible', record }
+      : { kind: 'ineligible' };
+  }
+
+  getRecentTurnRecords(channelId: string, limit: number): TurnRecord[] {
+    if (limit <= 0) return [];
+    this.context.refreshChannelIndexFromDisk();
+    const sessionId = this.context.resolveSessionId(channelId) ?? channelId;
+    const cached = this.context.getLoadedCache(channelId)
+      ?? this.context.loadExistingChannelCache(channelId);
+    const resolved = this.context.resolveExistingSession(channelId) ?? (cached
+      ? {
+        sessionId,
+        channelId: cached.channelId,
+        filePaths: cached.archivePaths,
+      }
+      : null);
+    if (!resolved) {
+      return this.resolveRecentTurnRecordWindow(
+        channelId,
+        limit,
+        this.context.turnRecordStore.readRecentTurnRecords(sessionId, limit),
+      );
+    }
+    const indexEntry = this.context.ensureChannelIndexEntry(
+      resolved.sessionId,
+      resolved.channelId,
+      resolved.filePaths,
+    );
+    if (cached) {
+      syncLightweightSessionCacheFromIndex({
+        cache: cached,
+        indexEntry,
+        sessionsDir: this.context.sessionsDir,
+      });
+    }
+    const tombstones = this.context.resolveJournalAuthoritativeTurnTombstones({
+      sessionId: resolved.sessionId,
+      channelId: resolved.channelId,
+      filePaths: resolved.filePaths,
+      cache: cached ?? undefined,
+    });
+    if (tombstones.size === 0) {
+      return this.resolveRecentTurnRecordWindow(
+        channelId,
+        limit,
+        this.context.turnRecordStore.readRecentTurnRecords(sessionId, limit),
+      );
+    }
+    return this.resolveRecentTurnRecordWindow(
+      channelId,
+      limit,
+      this.readTombstoneFilteredTurnRecords(sessionId, limit, tombstones),
+    );
+  }
+
+  /** One bounded `getRecentTurnRecords` page shares one telemetry window. */
+  private resolveRecentTurnRecordWindow(
+    channelId: string,
+    limit: number,
+    records: readonly TurnRecord[],
+  ): TurnRecord[] {
+    return this.resolveTurnRecordSessionRefsInWindow(
+      records,
+      { readOperation: 'getRecentTurnRecords', channelId, limit },
+      { exhausted: records.length < limit },
+    );
+  }
+
+  /**
+   * Content-free deterministic-analytics read. Unlike getRecentTurnRecords,
+   * this path never reconstructs session context or captured provider bodies,
+   * so a metadata-only background task cannot resurrect, retain, or repeatedly
+   * heal historical conversation content.
+   */
+  getRecentTurnRecordUsage(channelId: string, limit: number): TurnRecordUsageRecord[] {
+    if (limit <= 0) return [];
+    const readUsage = this.context.turnRecordStore.readRecentTurnRecordUsage;
+    if (!readUsage) {
+      throw new Error('TurnRecord store does not support the content-free usage projection');
+    }
+    this.context.refreshChannelIndexFromDisk();
+    const sessionId = this.context.resolveSessionId(channelId) ?? channelId;
+    const cached = this.context.getLoadedCache(channelId)
+      ?? this.context.loadExistingChannelCache(channelId);
+    const resolved = this.context.resolveExistingSession(channelId) ?? (cached
+      ? {
+        sessionId,
+        channelId: cached.channelId,
+        filePaths: cached.archivePaths,
+      }
+      : null);
+    if (!resolved) {
+      return readUsage.call(this.context.turnRecordStore, sessionId, limit);
+    }
+    const indexEntry = this.context.ensureChannelIndexEntry(
+      resolved.sessionId,
+      resolved.channelId,
+      resolved.filePaths,
+    );
+    if (cached) {
+      syncLightweightSessionCacheFromIndex({
+        cache: cached,
+        indexEntry,
+        sessionsDir: this.context.sessionsDir,
+      });
+    }
+    const tombstones = this.context.resolveJournalAuthoritativeTurnTombstones({
+      sessionId: resolved.sessionId,
+      channelId: resolved.channelId,
+      filePaths: resolved.filePaths,
+      cache: cached ?? undefined,
+    });
+    if (tombstones.size === 0) {
+      return readUsage.call(this.context.turnRecordStore, sessionId, limit);
+    }
+    return this.readTombstoneFilteredTurnRecordUsage(
+      sessionId,
+      limit,
+      tombstones,
+      readUsage,
+    );
+  }
+
+  /**
+   * Bounded iterative overscan for tombstone-filtered turn-record reads:
+   * request a small multiple of the limit, filter tombstoned turns, and only
+   * widen (doubling) while the segment files still have older records to
+   * offer. Exactness wins when an unusually dense tombstone window requires
+   * reading farther back: returning a partial logical window would violate
+   * the public limit contract.
+   */
+  private readTombstoneFilteredTurnRecords(
+    sessionId: string,
+    limit: number,
+    tombstones: ReadonlySet<string>,
+  ): TurnRecord[] {
+    let requested = Math.max(limit, limit * TURN_RECORD_TOMBSTONE_OVERSCAN_FACTOR);
+    for (;;) {
+      const records = this.context.turnRecordStore.readRecentTurnRecords(sessionId, requested);
+      const filtered = records.filter(record => !tombstones.has(record.turnId));
+      // Fewer records than requested means the whole archive is already read.
+      const exhaustedHistory = records.length < requested;
+      if (filtered.length >= limit || exhaustedHistory) {
+        return filtered.length > limit ? filtered.slice(-limit) : filtered;
+      }
+      requested = Math.min(Number.MAX_SAFE_INTEGER, requested * 2);
+    }
+  }
+
+  private readTombstoneFilteredTurnRecordUsage(
+    sessionId: string,
+    limit: number,
+    tombstones: ReadonlySet<string>,
+    readUsage: NonNullable<TurnRecordStorePort['readRecentTurnRecordUsage']>,
+  ): TurnRecordUsageRecord[] {
+    let requested = Math.max(limit, limit * TURN_RECORD_TOMBSTONE_OVERSCAN_FACTOR);
+    for (;;) {
+      const records = readUsage.call(this.context.turnRecordStore, sessionId, requested);
+      const filtered = records.filter(record => !tombstones.has(record.turnId));
+      const exhaustedHistory = records.length < requested;
+      if (filtered.length >= limit || exhaustedHistory) {
+        return filtered.length > limit ? filtered.slice(-limit) : filtered;
+      }
+      requested = Math.min(Number.MAX_SAFE_INTEGER, requested * 2);
+    }
+  }
+
+  /**
+   * Reads the physical turn-record stream for an exact source channel without
+   * resolving it through a logical-session alias. Introspection consent is
+   * channel-exact, so routed sessions must use this path instead of widening a
+   * source-channel decision to the whole logical session.
+   */
+  getRecentSourceTurnRecords(sourceChannelId: string, limit: number): TurnRecord[] {
+    if (limit <= 0) return [];
+    const target = limit;
+    let requested = Math.min(
+      Number.MAX_SAFE_INTEGER,
+      Math.max(target, target * TURN_RECORD_TOMBSTONE_OVERSCAN_FACTOR),
+    );
+    for (;;) {
+      const records = this.context.turnRecordStore.readRecentTurnRecords(
+        sourceChannelId,
+        requested,
+      );
+      const filtered = records.filter((record) => {
+        const ownerSessionId = record.sessionId ?? sourceChannelId;
+        const owner = this.context.ensureChannelFullyLoaded(ownerSessionId);
+        if (!owner) return false;
+        return !owner.turnTombstones.has(record.turnId);
+      });
+      const exhaustedHistory = records.length < requested;
+      if (filtered.length >= target || exhaustedHistory) {
+        return this.resolveTurnRecordSessionRefsInWindow(
+          filtered.slice(-limit),
+          { readOperation: 'getRecentSourceTurnRecords', channelId: sourceChannelId, limit },
+          { exhausted: exhaustedHistory },
+        );
+      }
+      requested = Math.min(Number.MAX_SAFE_INTEGER, requested * 2);
+    }
+  }
+
+  private async isRecoveryTurnEligible(
+    ownerSessionId: string,
+    turnId: string,
+    options: TurnRecordRecoveryScanOptions,
+    retiredEvidenceChecks: Map<string, boolean>,
+  ): Promise<boolean> {
+    const limits = RECOVERY_AUTHORITY_LIMITS;
+    const resolveEvidence = (): {
+      archiveFingerprint: string;
+      archives: ReturnType<SessionJournalRuntime['openArchive']>[];
+      baselineFingerprint: string;
+      baselineTombstones: Set<string>;
+      channelId: string;
+      filePaths: string[];
+      sessionId: string;
+    } | null => {
+      this.context.refreshChannelIndexFromDisk();
+      const resolved = this.context.resolveExistingSession(ownerSessionId);
+      if (!resolved) return null;
+      const indexed = this.context.getChannelIndexEntry(resolved.sessionId);
+      const indexedCount = normalizeOptionalNonNegativeNumber(
+        indexed?.activeTurnTombstoneCount,
+      ) ?? 0;
+      const baselineTombstones = new Set(indexed?.activeTurnTombstoneIds ?? []);
+      if (baselineTombstones.size !== indexedCount) {
+        throw this.recoveryAuthorityError(
+          `Unsigned L0 index tombstone evidence is inconsistent for ${ownerSessionId}`,
+        );
+      }
+      if (baselineTombstones.size > limits.maxTombstones) {
+        throw this.recoveryAuthorityError(
+          `L0 tombstone authority for ${ownerSessionId} exceeds `
+          + `${limits.maxTombstones} retained ids`,
+          'EOVERFLOW',
+        );
+      }
+      const archives = resolved.filePaths.map(filePath => (
+        this.context.journalRuntime.openArchive(resolved.channelId, filePath)
+      ));
+      const archiveFingerprint = this.context.journalRuntime.fingerprintArchiveChain(archives);
+      if (!archiveFingerprint) return null;
+      const baselineFingerprint = createHash('sha256')
+        .update([...baselineTombstones].sort().join('\0'))
+        .digest('hex');
+      return {
+        archiveFingerprint,
+        archives,
+        baselineFingerprint,
+        baselineTombstones,
+        channelId: resolved.channelId,
+        filePaths: [...resolved.filePaths],
+        sessionId: resolved.sessionId,
+      };
+    };
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      options.signal?.throwIfAborted();
+      const before = resolveEvidence();
+      if (!before) return false;
+      const corruptOwnerEvidence = createCorruptTurnRecordRecoveryEvidence(
+        ownerSessionId,
+        before.channelId,
+        before.filePaths,
+        fingerprintJournalArchiveGenerationIdentity(before.archiveFingerprint),
+      );
+      let retired = retiredEvidenceChecks.get(corruptOwnerEvidence.sourceFingerprint);
+      if (retired === undefined) {
+        retired = this.context.isCorruptRecoveryOwnerRetired(corruptOwnerEvidence);
+        retiredEvidenceChecks.set(corruptOwnerEvidence.sourceFingerprint, retired);
+      }
+      if (retired) {
+        const after = resolveEvidence();
+        if (
+          !after
+          || after.sessionId !== before.sessionId
+          || after.channelId !== before.channelId
+          || after.archiveFingerprint !== before.archiveFingerprint
+          || after.baselineFingerprint !== before.baselineFingerprint
+        ) {
+          if (attempt === 0) continue;
+          throw this.recoveryAuthorityError(
+            `L0 tombstone authority for ${ownerSessionId} changed repeatedly during recovery`,
+            'ESTALE',
+          );
+        }
+        options.onEvidenceOwnerSkipped?.({ ...corruptOwnerEvidence, retired: true });
+        return false;
+      }
+      const cached = this.recoveryTombstoneAuthority.get(before.sessionId);
+      if (
+        cached?.archiveFingerprint === before.archiveFingerprint
+        && cached.baselineFingerprint === before.baselineFingerprint
+      ) {
+        this.recoveryTombstoneAuthority.delete(before.sessionId);
+        this.recoveryTombstoneAuthority.set(before.sessionId, cached);
+        return !cached.tombstones.has(turnId);
+      }
+
+      let snapshot;
+      try {
+        snapshot = await readTurnTombstoneAuthoritySnapshot({
+          channelId: before.channelId,
+          ownerSessionId: before.sessionId,
+          filePaths: before.filePaths,
+          maxActionBytes: limits.maxActionBytes,
+          maxActions: limits.maxActions,
+          maxResultBytes: limits.maxResultBytes,
+          maxRowBytes: limits.maxRowBytes,
+          onSnapshot: async () => {
+            await this.context.recoveryAuthoritySnapshotHook?.(ownerSessionId);
+          },
+          scanChunkBytes: limits.scanChunkBytes,
+          signal: options.signal,
+        });
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code === 'ESTALE' && attempt === 0) continue;
+        if (code === 'EBADMSG') {
+          const after = resolveEvidence();
+          if (
+            !after
+            || after.sessionId !== before.sessionId
+            || after.channelId !== before.channelId
+            || after.archiveFingerprint !== before.archiveFingerprint
+            || after.baselineFingerprint !== before.baselineFingerprint
+          ) {
+            if (attempt === 0) continue;
+            throw this.recoveryAuthorityError(
+              `L0 tombstone authority for ${ownerSessionId} changed repeatedly during recovery`,
+              'ESTALE',
+            );
+          }
+          throw this.recoveryAuthorityError(
+            `L0 tombstone authority for ${ownerSessionId} is structurally invalid`,
+            'EBADMSG',
+            corruptOwnerEvidence,
+          );
+        }
+        throw error;
+      }
+      const after = resolveEvidence();
+      if (
+        !after
+        || after.sessionId !== before.sessionId
+        || after.channelId !== before.channelId
+        || after.archiveFingerprint !== before.archiveFingerprint
+        || after.baselineFingerprint !== before.baselineFingerprint
+      ) {
+        if (attempt === 0) continue;
+        throw this.recoveryAuthorityError(
+          `L0 tombstone authority for ${ownerSessionId} changed repeatedly during recovery`,
+          'ESTALE',
+        );
+      }
+
+      const tombstones = new Set(before.baselineTombstones);
+      for (const action of snapshot.actions) {
+        const normalized = this.context.journalRuntime.verifyAndNormalizeEntry(
+          action.entry,
+          [action.previousHmac],
+        );
+        const tombstone = journalToTurnTombstoneEntry(normalized.entry);
+        if (!tombstone) {
+          throw this.recoveryAuthorityError(
+            `L0 authority action for ${ownerSessionId} is not a valid turn tombstone`,
+            'EBADMSG',
+            corruptOwnerEvidence,
+          );
+        }
+        if (tombstone.action === 'redact' || !normalized.verified) {
+          tombstones.add(tombstone.targetId);
+        } else {
+          tombstones.delete(tombstone.targetId);
+        }
+        if (tombstones.size > limits.maxTombstones) {
+          throw this.recoveryAuthorityError(
+            `L0 tombstone authority for ${ownerSessionId} exceeds `
+            + `${limits.maxTombstones} retained ids`,
+            'EOVERFLOW',
+          );
+        }
+      }
+
+      this.recoveryTombstoneAuthority.delete(before.sessionId);
+      this.recoveryTombstoneAuthority.set(before.sessionId, {
+        archiveFingerprint: before.archiveFingerprint,
+        baselineFingerprint: before.baselineFingerprint,
+        tombstones,
+      });
+      while (this.recoveryTombstoneAuthority.size > limits.cacheOwners) {
+        const oldest = this.recoveryTombstoneAuthority.keys().next().value as string | undefined;
+        if (!oldest) break;
+        this.recoveryTombstoneAuthority.delete(oldest);
+      }
+      const stats = options.stats;
+      if (stats) {
+        stats.authorityActionsReturned = (stats.authorityActionsReturned ?? 0)
+          + snapshot.stats.actionsReturned;
+        stats.authorityBytesRead = (stats.authorityBytesRead ?? 0) + snapshot.stats.bytesRead;
+        stats.authorityFilesScanned = (stats.authorityFilesScanned ?? 0)
+          + snapshot.stats.filesScanned;
+        stats.authorityMainMessageBytesRetained = 0;
+        stats.authorityOwnersScanned = (stats.authorityOwnersScanned ?? 0) + 1;
+        stats.authorityPeakOpenFilesOffPrimary = Math.max(
+          stats.authorityPeakOpenFilesOffPrimary ?? 0,
+          snapshot.stats.peakOpenFiles,
+        );
+        stats.authorityPeakCachedOwners = Math.max(
+          stats.authorityPeakCachedOwners ?? 0,
+          this.recoveryTombstoneAuthority.size,
+        );
+        stats.authorityPeakCachedTombstones = Math.max(
+          stats.authorityPeakCachedTombstones ?? 0,
+          ...[...this.recoveryTombstoneAuthority.values()].map(value => value.tombstones.size),
+        );
+        stats.authorityPeakResultBytes = Math.max(
+          stats.authorityPeakResultBytes ?? 0,
+          snapshot.stats.actionBytesReturned,
+        );
+        stats.authorityPeakRowBytesOffPrimary = Math.max(
+          stats.authorityPeakRowBytesOffPrimary ?? 0,
+          snapshot.stats.peakRowBytes,
+        );
+        stats.authorityRowsScanned = (stats.authorityRowsScanned ?? 0)
+          + snapshot.stats.rowsScanned;
+      }
+      return !tombstones.has(turnId);
+    }
+    return false;
+  }
+
+  private recoveryAuthorityError(
+    message: string,
+    code?: string,
+    corruptOwnerEvidence?: CorruptTurnRecordRecoveryEvidenceSkip,
+  ): Error {
+    const error = new Error(message) as NodeJS.ErrnoException & {
+      corruptOwnerEvidence?: CorruptTurnRecordRecoveryEvidenceSkip;
+    };
+    error.name = 'TurnRecordRecoveryEvidenceError';
+    if (code) error.code = code;
+    if (corruptOwnerEvidence) error.corruptOwnerEvidence = corruptOwnerEvidence;
+    return error;
+  }
+
+  /**
+   * Bounded physical paging for introspection/metacognition.
+   *
+   * Tombstoned or missing-owner rows consume their physical page slot instead
+   * of triggering overscan. `exhausted` and `nextCursor` therefore describe
+   * the complete fixed persistence snapshot, even when every returned record
+   * is filtered out. Shared refs and L0 session refs resolve only for the
+   * retained rows in this one page.
+   */
+  async readSourceTurnRecordPage(
+    sourceChannelId: string,
+    limit: number,
+    cursor?: TurnRecordPageCursor,
+  ): Promise<TurnRecordPage> {
+    const readPage = this.context.turnRecordStore.readTurnRecordPage;
+    if (!readPage) {
+      throw new Error('TurnRecord store does not support bounded cursor paging');
+    }
+    const page = await readPage.call(this.context.turnRecordStore, sourceChannelId, limit, cursor);
+    const records = this.resolveTurnRecordSessionRefsInWindow(
+      page.records.filter((record) => {
+        if (record.channelId !== sourceChannelId) return false;
+        const ownerSessionId = record.sessionId ?? sourceChannelId;
+        const owner = this.context.ensureChannelFullyLoaded(ownerSessionId);
+        return owner !== null && !owner.turnTombstones.has(record.turnId);
+      }),
+      { readOperation: 'readSourceTurnRecordPage', channelId: sourceChannelId, limit },
+      { exhausted: page.exhausted },
+    );
+    return {
+      records,
+      exhausted: page.exhausted,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    };
+  }
+
+  /**
+   * One process-lifetime historical handoff snapshot. The filesystem adapter
+   * proves physical uniqueness and global order in one disk-backed pass, so no
+   * per-identity state or old-fat archive is retained on the main thread.
+   *
+   * Owner/tombstone state is re-read from the authoritative L0 journal before a
+   * candidate is returned. No history is truncated or accepted on partial
+   * evidence.
+   */
+  async *streamRecoverableBackgroundWorkTurnRecords(
+    sourceChannelIds: readonly string[],
+    options: TurnRecordRecoveryScanOptions = {},
+  ): AsyncGenerator<TurnRecord> {
+    const streamSource = this.context.turnRecordStore.streamTurnRecordsForRecovery;
+    if (!streamSource) {
+      throw new Error('TurnRecord store does not support bounded background-work recovery scans');
+    }
+    const uniqueSourceSet = new Set(sourceChannelIds);
+    const uniqueSources = [...uniqueSourceSet];
+    const evidenceBlockedOwners = new Set<string>();
+    const retiredEvidenceChecks = new Map<string, boolean>();
+    for await (const record of streamSource.call(this.context.turnRecordStore, uniqueSources, options)) {
+      const sourceChannelId = record.channelId;
+      if (!uniqueSourceSet.has(sourceChannelId)) continue;
+      const logicalSessionId = record.sessionId ?? sourceChannelId;
+      if (evidenceBlockedOwners.has(logicalSessionId)) continue;
+      try {
+        if (!await this.isRecoveryTurnEligible(
+          logicalSessionId,
+          record.turnId,
+          options,
+          retiredEvidenceChecks,
+        )) continue;
+      } catch (error) {
+        if (!isTurnRecordRecoveryEvidenceError(error)) throw error;
+        evidenceBlockedOwners.add(logicalSessionId);
+        const rawCode = (error as NodeJS.ErrnoException).code;
+        const errno = typeof rawCode === 'string' && rawCode ? rawCode : 'UNKNOWN';
+        const corruptOwnerEvidence = (
+          error as NodeJS.ErrnoException & {
+            corruptOwnerEvidence?: CorruptTurnRecordRecoveryEvidenceSkip;
+          }
+        ).corruptOwnerEvidence;
+        if (errno === 'EBADMSG' && !corruptOwnerEvidence) throw error;
+        const skip = corruptOwnerEvidence ?? { errno, ownerSessionId: logicalSessionId };
+        log.warn(
+          `Skipping background-work handoff recovery owner ${logicalSessionId} (${errno})`,
+          { errno, ownerSessionId: logicalSessionId },
+        );
+        options.onEvidenceOwnerSkipped?.(skip);
+        continue;
+      }
+      yield record;
+    }
+  }
+
+  async isSourceTurnRecordEligible(
+    sourceChannelId: string,
+    ownerSessionId: string,
+    turnId: string,
+  ): Promise<boolean> {
+    return await this.findEligibleSourceTurnRecord(
+      sourceChannelId,
+      ownerSessionId,
+      turnId,
+    ) !== null;
+  }
+}
+
+export {
+  TurnRecordEligibilitySnapshotChangedError,
+  TurnRecordEligibilitySnapshotInvalidError,
+};
+export type { SourceTurnRecordEligibility };

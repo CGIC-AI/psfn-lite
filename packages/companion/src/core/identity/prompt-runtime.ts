@@ -1,0 +1,1367 @@
+import {
+  existsSync,
+  readFileSync,
+  statSync,
+} from 'node:fs';
+import { join } from 'node:path';
+import {
+  formatActiveDate,
+  formatActiveDateTimeIso,
+  formatActiveTime,
+} from '../../shared/time/active-timezone.js';
+import { writeJsonAtomic } from '../../shared/utils/fs.js';
+
+import {
+  CHARACTER_CARD_PRODUCER,
+  CLOCK_MACRO_PRODUCER,
+  PROMPT_RUNTIME_MACRO_HINTS,
+} from './prompt-runtime/macro-hints.js';
+import type {
+  PromptMacroVolatility,
+  PromptRuntimeMacroHint,
+} from './prompt-runtime/macro-hints.js';
+
+export {
+  CLOCK_MACRO_PRODUCER,
+  PROMPT_RUNTIME_MACRO_HINTS,
+  PROMPT_RUNTIME_TOKEN_HINT,
+} from './prompt-runtime/macro-hints.js';
+export type {
+  PromptMacroVolatility,
+  PromptRuntimeMacroHint,
+} from './prompt-runtime/macro-hints.js';
+
+export interface PromptRuntimeContext {
+  now?: Date;
+  variables?: Record<string, unknown>;
+  onUnresolvedToken?: (token: string) => void;
+}
+
+function activeIso(now: Date): string {
+  return formatActiveDateTimeIso(now);
+}
+
+function activeDate(now: Date): string {
+  return formatActiveDate(now);
+}
+
+function activeTime(now: Date): string {
+  return formatActiveTime(now);
+}
+
+function unixTimestamp(now: Date): string {
+  return String(Math.floor(now.getTime() / 1000));
+}
+
+type TokenResolver = (now: Date) => string;
+const EMPTY_WRAPPED_SECTION_PATTERN = /<([a-z0-9_]+)>\s*<\/\1>/g;
+const CONDITIONAL_BLOCK_PATTERN = /\{\{#if\s+([a-zA-Z0-9_.-]+(?:\(\))?)\s*\}\}([\s\S]*?)\{\{\/if\}\}/g;
+
+// One canonical spelling per clock datum (E2.5 macro consolidation). The
+// removed alias spellings ({{now}}, {{date}}, {{time}}, {{timestamp}}, ...)
+// live in REMOVED_PROMPT_MACROS so persisted layers that still use them fail
+// closed with a clear message naming the canonical replacement.
+const TOKEN_RESOLVERS: Array<[RegExp, TokenResolver]> = [
+  [/\{\{\s*current_datetime\s*\}\}/gi, activeIso],
+  [/\{\{\s*current_date\s*\}\}/gi, activeDate],
+  [/\{\{\s*current_time\s*\}\}/gi, activeTime],
+  [/\{\{\s*unix_timestamp\s*\}\}/gi, unixTimestamp],
+];
+
+// ── Prompt macro manifest ──
+// PROMPT_RUNTIME_MACRO_HINTS is the single registry for prompt template variables
+// (charter 12.4: one registry). The manifest below is derived from it and is the
+// authority for macro name resolution, volatility classification, and producers.
+// The volatile-token and stable-variable rules in prompt-lifecycle.ts and the
+// turn prompt variable namespace both derive from this manifest.
+
+export interface PromptMacroManifestEntry {
+  /** Canonical normalized macro name (lowercase, no braces, no trailing `()`). */
+  name: string;
+  group: PromptRuntimeMacroHint['group'];
+  volatility: PromptMacroVolatility;
+  producer: string;
+  /** Display token from the registering hint, or the matched prefix rule. */
+  source: string;
+}
+
+/**
+ * Prefix rules for open-ended macro families that cannot be enumerated ahead of
+ * time (character card extension fields). Exact manifest entries win over rules.
+ */
+export interface PromptMacroPrefixRule {
+  prefix: string;
+  volatility: PromptMacroVolatility;
+  producer: string;
+  description: string;
+}
+
+export const PROMPT_MACRO_PREFIX_RULES: readonly PromptMacroPrefixRule[] = Object.freeze([
+  {
+    prefix: 'character.',
+    volatility: 'static',
+    producer: CHARACTER_CARD_PRODUCER,
+    description: 'Dotted character card fields, including flattened card extensions.',
+  },
+  {
+    prefix: 'extensions_',
+    volatility: 'static',
+    producer: CHARACTER_CARD_PRODUCER,
+    description: 'Snake-cased character card extension fields.',
+  },
+]);
+
+const MACRO_NAME_IN_TOKEN_PATTERN = /\{\{\s*([a-zA-Z0-9_.-]+(?:\(\))?)\s*\}\}/g;
+
+/** Normalize a macro name or variable key for manifest lookup. */
+export function normalizePromptMacroName(raw: string): string {
+  const trimmed = raw.trim().toLowerCase();
+  return trimmed.endsWith('()') ? trimmed.slice(0, -2) : trimmed;
+}
+
+function collectMacroNamesFromHintToken(token: string): string[] {
+  const names: string[] = [];
+  for (const match of token.matchAll(MACRO_NAME_IN_TOKEN_PATTERN)) {
+    if (match[1]) names.push(normalizePromptMacroName(match[1]));
+  }
+  return names;
+}
+
+/**
+ * Build the macro manifest from registered hints. Fails closed: registering the
+ * same macro name (or alias) twice throws so a conflicting registration can never
+ * silently shadow an existing one.
+ */
+export function buildPromptMacroManifest(
+  hints: readonly PromptRuntimeMacroHint[],
+): Map<string, PromptMacroManifestEntry> {
+  const manifest = new Map<string, PromptMacroManifestEntry>();
+  for (const hint of hints) {
+    const names = [
+      ...collectMacroNamesFromHintToken(hint.token),
+      ...(hint.aliases ?? []).map(normalizePromptMacroName),
+    ];
+    if (names.length === 0) {
+      throw new Error(`Prompt macro hint has no parseable macro name: ${hint.token}`);
+    }
+    for (const name of names) {
+      const existing = manifest.get(name);
+      if (existing) {
+        throw new Error(
+          `Duplicate prompt macro registration: "${name}" is already registered by ${existing.producer} `
+          + `(${existing.source}) and cannot be re-registered by ${hint.producer} (${hint.token})`,
+        );
+      }
+      manifest.set(name, {
+        name,
+        group: hint.group,
+        volatility: hint.volatility,
+        producer: hint.producer,
+        source: hint.token,
+      });
+    }
+  }
+  return manifest;
+}
+
+const PROMPT_MACRO_MANIFEST: ReadonlyMap<string, PromptMacroManifestEntry> =
+  buildPromptMacroManifest(PROMPT_RUNTIME_MACRO_HINTS);
+
+/**
+ * Resolve a macro name or variable key against the manifest. Exact entries win;
+ * otherwise the longest matching prefix rule applies. Returns null for
+ * unregistered names (callers must fail closed).
+ */
+export function resolvePromptMacroManifestEntry(name: string): PromptMacroManifestEntry | null {
+  const normalized = normalizePromptMacroName(name);
+  if (!normalized) return null;
+  const exact = PROMPT_MACRO_MANIFEST.get(normalized);
+  if (exact) return exact;
+
+  let matched: PromptMacroPrefixRule | null = null;
+  for (const rule of PROMPT_MACRO_PREFIX_RULES) {
+    if (!normalized.startsWith(rule.prefix)) continue;
+    if (!matched || rule.prefix.length > matched.prefix.length) {
+      matched = rule;
+    }
+  }
+  if (!matched) return null;
+  return {
+    name: normalized,
+    group: 'global_aliases',
+    volatility: matched.volatility,
+    producer: matched.producer,
+    source: `prefix:${matched.prefix}`,
+  };
+}
+
+export function getPromptMacroManifestEntries(): PromptMacroManifestEntry[] {
+  return [...PROMPT_MACRO_MANIFEST.values()].map(entry => ({ ...entry }));
+}
+
+/**
+ * Names of the clock alias macros resolved by TOKEN_RESOLVERS. These are the only
+ * macros that re-render from the wall clock even inside an otherwise cached static
+ * prefix render, so the template cacheability "volatile" classification derives
+ * from this set. All other turn-volatile macros are rejected from static-class
+ * layers outright by assertStaticPromptLayerMacroVolatility.
+ */
+export function getVolatileClockPromptMacroNames(): string[] {
+  return [...PROMPT_MACRO_MANIFEST.values()]
+    .filter(entry => entry.producer === CLOCK_MACRO_PRODUCER)
+    .map(entry => entry.name);
+}
+
+/**
+ * True when the variable key is 'static'-volatility per the manifest. Unknown keys
+ * fail closed to non-stable so they can never freeze into a cached static render.
+ */
+export function isStaticVolatilityPromptVariable(key: string): boolean {
+  return resolvePromptMacroManifestEntry(key)?.volatility === 'static';
+}
+
+/** Collect the turn-volatile macro tokens referenced by a prompt template. */
+export function collectTurnVolatilePromptMacroTokens(content: string): string[] {
+  const offending = new Set<string>();
+  for (const match of content.matchAll(MACRO_NAME_IN_TOKEN_PATTERN)) {
+    const name = normalizePromptMacroName(match[1] ?? '');
+    if (!name) continue;
+    if (resolvePromptMacroManifestEntry(name)?.volatility === 'turn') {
+      offending.add(name);
+    }
+  }
+  return [...offending];
+}
+
+/**
+ * Volatility enforcement for static-class prompt layers (base/operator). A
+ * turn-volatile macro in the static prefix would render per-turn values into the
+ * byte-stable cached prefix, silently going stale and busting provider prompt
+ * caching — exactly the "variables where it should be static" contamination bug.
+ * Fail closed with a clear message instead.
+ */
+export function assertStaticPromptLayerMacroVolatility(content: string, layerLabel: string): void {
+  const offending = collectTurnVolatilePromptMacroTokens(content);
+  if (offending.length === 0) return;
+  throw new Error(
+    `Static prompt layer "${layerLabel}" references turn-volatile macro(s): ${offending.map(name => `{{${name}}}`).join(', ')}. `
+    + 'Turn-volatile macros re-render every turn and would contaminate the byte-stable static prompt prefix. '
+    + 'Move them to a runtime, channel, or task layer (dynamic suffix), or use a static/session-stable macro instead.',
+  );
+}
+
+// ── Removed prompt macros (E2.5 macro consolidation) ──
+// One canonical macro per datum: the alias spellings and prose/convenience
+// macros below were removed with a clean break. This table exists ONLY to
+// produce clear validation errors naming the canonical replacement when a
+// persisted operator-customized layer still references a removed name. It is
+// NOT a runtime alias map — removed names never resolve.
+
+export interface RemovedPromptMacroInfo {
+  /** The canonical macro (or macros/technique) to use instead. */
+  canonical: string;
+}
+
+export const REMOVED_PROMPT_MACROS: ReadonlyMap<string, RemovedPromptMacroInfo> = new Map<string, RemovedPromptMacroInfo>([
+  // Clock alias spellings (canonical: one spelling per format).
+  ['now', { canonical: '{{current_datetime}}' }],
+  ['current_datetime_iso', { canonical: '{{current_datetime}}' }],
+  ['date', { canonical: '{{current_date}}' }],
+  ['time', { canonical: '{{current_time}}' }],
+  ['current_timestamp', { canonical: '{{unix_timestamp}}' }],
+  ['timestamp', { canonical: '{{unix_timestamp}}' }],
+  ['now_iso', { canonical: '{{current_datetime}}' }],
+  // Session-scope alias spellings.
+  ['channel', { canonical: '{{channel_id}}' }],
+  ['model_id', { canonical: '{{model}}' }],
+  // Exact-duplicate turn variables.
+  ['runtime_trust_level', { canonical: '{{trust_level}}' }],
+  ['runtime_affect_profile_intensity', { canonical: '{{runtime_affect_intensity}}' }],
+  ['runtime_affect_profile_variability', { canonical: '{{runtime_affect_variability}}' }],
+  ['runtime_affect_profile_control', { canonical: '{{runtime_affect_control}}' }],
+  ['runtime_affect_profile_display_range_min', { canonical: '{{runtime_affect_display_range_min}}' }],
+  ['runtime_affect_profile_display_range_max', { canonical: '{{runtime_affect_display_range_max}}' }],
+  ['runtime_affect_snapshot_vad_valence', { canonical: '{{runtime_affect_valence}}' }],
+  ['runtime_affect_snapshot_vad_arousal', { canonical: '{{runtime_affect_arousal}}' }],
+  ['runtime_affect_snapshot_vad_dominance', { canonical: '{{runtime_affect_dominance}}' }],
+  ['runtime_emotion_appraisal_body', { canonical: '{{runtime_emotion_appraisal_recent_lines}}' }],
+  ['runtime_behavioral_notes_body_raw', { canonical: '{{runtime_behavioral_notes_body}}' }],
+  // Prose/convenience macros migrated to editable layer text (purity rule).
+  ['runtime_last_message_received_human', { canonical: '{{runtime_last_message_received_date_human}} + {{runtime_last_message_received_time_human}} + {{runtime_last_message_received_timezone}} + {{runtime_last_message_received_ago}} with your own phrasing' }],
+  ['runtime_last_message_received_missing_notice', { canonical: '{{#if runtime_last_message_received_missing}}your own wording{{/if}}' }],
+  ['runtime_internal_turn_context', { canonical: '{{runtime_internal_turn_kind}} with your own phrasing' }],
+  ['runtime_affect_privacy_guidance', { canonical: '{{runtime_affect_mode_is_honne}} / {{runtime_affect_mode_is_tatemae}} conditionals with your own wording' }],
+  ['runtime_internal_state_emotional_prefix', { canonical: '{{runtime_internal_state_emotional_secondary_emotions}} with your own phrasing' }],
+  ['runtime_internal_state_emotional_secondary_clause', { canonical: '{{runtime_internal_state_emotional_secondary_emotions}} with your own phrasing' }],
+  ['runtime_internal_state_emotional_validation_clause', { canonical: '{{runtime_internal_state_emotional_telemetry_status}} + {{runtime_internal_state_emotional_telemetry_reasons}} with your own phrasing' }],
+  ['runtime_tooling_summary', { canonical: '{{runtime_tooling_active_count}} and the other runtime_tooling_*_count values with your own phrasing' }],
+]);
+
+// Fail closed at module init: a removed macro name must never also resolve in
+// the live manifest — that would silently turn the error table into an alias.
+for (const removedName of REMOVED_PROMPT_MACROS.keys()) {
+  if (PROMPT_MACRO_MANIFEST.has(removedName)) {
+    throw new Error(
+      `Removed prompt macro "${removedName}" is still registered in PROMPT_RUNTIME_MACRO_HINTS. `
+      + 'A name may live in the manifest or in REMOVED_PROMPT_MACROS, never both.',
+    );
+  }
+}
+
+export interface RemovedPromptMacroReference {
+  name: string;
+  canonical: string;
+}
+
+/** Collect references to removed macros in template content (includes {{#if}} conditions). */
+export function collectRemovedPromptMacroReferences(content: string): RemovedPromptMacroReference[] {
+  const seen = new Map<string, RemovedPromptMacroReference>();
+  const record = (rawName: string): void => {
+    const name = normalizePromptMacroName(rawName);
+    const removed = REMOVED_PROMPT_MACROS.get(name);
+    if (removed && !seen.has(name)) {
+      seen.set(name, { name, canonical: removed.canonical });
+    }
+  };
+  for (const match of content.matchAll(MACRO_NAME_IN_TOKEN_PATTERN)) {
+    if (match[1]) record(match[1]);
+  }
+  for (const match of content.matchAll(new RegExp(CONDITIONAL_BLOCK_PATTERN.source, 'g'))) {
+    if (match[1]) record(match[1]);
+  }
+  return [...seen.values()];
+}
+
+/**
+ * Persisted-layer safety valve (E2.5): a layer that still references a removed
+ * macro fails validation with a clear error naming the canonical replacement.
+ * Applied at layer create/update and at compose time — fail closed but
+ * recoverable (the operator edits the layer; nothing is silently rewritten).
+ */
+export function assertNoRemovedPromptMacros(content: string, layerLabel: string): void {
+  const references = collectRemovedPromptMacroReferences(content);
+  if (references.length === 0) return;
+  const detail = references
+    .map(reference => `{{${reference.name}}} (removed; use ${reference.canonical})`)
+    .join(', ');
+  throw new Error(
+    `Prompt layer "${layerLabel}" references removed prompt macro(s): ${detail}. `
+    + 'These names were consolidated in the macro diet and are no longer runtime aliases. '
+    + 'Edit the layer to use the canonical macro; see docs/prompt-macros.md ("Removed macros").',
+  );
+}
+
+export type PromptRuntimeBlockPlacement =
+  | 'system_prompt'
+  | 'context_messages'
+  | 'tool_schemas';
+
+export type PromptRuntimeBlockVisibility =
+  | 'hidden'
+  | 'runtime_generated'
+  | 'provider_managed';
+
+export type PromptRuntimeBlockSchemaClassification =
+  | 'required_runtime_aware'
+  | 'optional_runtime_aware'
+  | 'immutable_provider_managed';
+
+export interface PromptRuntimeBlockSchema {
+  classification: PromptRuntimeBlockSchemaClassification;
+  required: boolean;
+  immutable: boolean;
+  providerManaged: boolean;
+}
+
+export type PromptRuntimeBlockId =
+  | 'runtime.persona_adaptation'
+  | 'runtime.context'
+  | 'runtime.scratchpad'
+  | 'runtime.current_datetime'
+  | 'memory.core'
+  | 'memory.retrieval'
+  | 'session.compaction_summary'
+  | 'session.focus_knowledge'
+  | 'session.orientation'
+  | 'session.continuity'
+  | 'session.cogsec_notices'
+  | 'session.current_messages'
+  | 'tools.active_schemas';
+
+export interface PromptRuntimeBlockDefinition {
+  id: PromptRuntimeBlockId;
+  label: string;
+  description: string;
+  source: string;
+  schema: PromptRuntimeBlockSchema;
+  placement: PromptRuntimeBlockPlacement;
+  visibility: PromptRuntimeBlockVisibility;
+  reorderable: boolean;
+  contentVisible: boolean;
+  companionEditable?: boolean;
+  lockedReason?: string;
+}
+
+export type PromptRuntimeImmutableAnchorId =
+  | 'constitution.immutable_human_safety_amendments'
+  | 'foundation.card_backed_sections'
+  | 'persona.card_backed_identity';
+
+export interface PromptRuntimeImmutableAnchorDefinition {
+  id: PromptRuntimeImmutableAnchorId;
+  label: string;
+  description: string;
+  classification: 'immutable_identity_anchor';
+  immutable: true;
+}
+
+export type PromptRuntimeSystemPromptBlockId = Extract<
+  PromptRuntimeBlockId,
+  | 'runtime.persona_adaptation'
+  | 'runtime.context'
+  | 'runtime.scratchpad'
+  | 'memory.core'
+  | 'memory.retrieval'
+  | 'session.compaction_summary'
+  | 'session.focus_knowledge'
+  | 'session.orientation'
+  | 'session.continuity'
+  | 'session.cogsec_notices'
+>;
+
+export interface PromptRuntimeLayout {
+  version: number;
+  systemPromptBlockOrder: PromptRuntimeSystemPromptBlockId[];
+  editableBlockContent: Partial<Record<PromptRuntimeEditableBlockId, string>>;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+export type PromptRuntimeEditableBlockId =
+  | 'runtime.persona_adaptation'
+  | 'runtime.context';
+
+export interface PromptRuntimeEditableBlockValidationIssue {
+  id: PromptRuntimeEditableBlockId;
+  label: string;
+  reason: 'missing' | 'empty';
+}
+
+export interface PromptRuntimeEditableBlockValidationResult {
+  ok: boolean;
+  issues: PromptRuntimeEditableBlockValidationIssue[];
+}
+
+const PROMPT_RUNTIME_LAYOUT_VERSION = 1;
+
+const REQUIRED_RUNTIME_AWARE_SCHEMA: PromptRuntimeBlockSchema = Object.freeze({
+  classification: 'required_runtime_aware',
+  required: true,
+  immutable: false,
+  providerManaged: false,
+});
+
+const OPTIONAL_RUNTIME_AWARE_SCHEMA: PromptRuntimeBlockSchema = Object.freeze({
+  classification: 'optional_runtime_aware',
+  required: false,
+  immutable: false,
+  providerManaged: false,
+});
+
+const IMMUTABLE_PROVIDER_MANAGED_SCHEMA: PromptRuntimeBlockSchema = Object.freeze({
+  classification: 'immutable_provider_managed',
+  required: true,
+  immutable: true,
+  providerManaged: true,
+});
+
+const PROMPT_RUNTIME_BLOCKS: readonly PromptRuntimeBlockDefinition[] = Object.freeze([
+  {
+    id: 'runtime.persona_adaptation',
+    label: 'Persona Adaptation',
+    description: 'Companion-authored persona overlay appended after prompt-owned runtime layers.',
+    source: 'turn-execution-runtime:getPersonaAdaptation',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: true,
+    companionEditable: true,
+  },
+  {
+    id: 'runtime.context',
+    label: 'Runtime Context',
+    description: 'Companion-authored runtime overlay appended after prompt-owned runtime layers.',
+    source: 'turn-execution-runtime:buildRuntimeContext',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: true,
+    companionEditable: true,
+  },
+  {
+    id: 'runtime.scratchpad',
+    label: 'Scratchpad Context',
+    description: 'Scratchpad-derived notes included when available.',
+    source: 'turn-execution-runtime:buildScratchpadContextBlock',
+    schema: OPTIONAL_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: false,
+  },
+  {
+    id: 'memory.core',
+    label: 'Core Memory',
+    description: 'Core persona and durable operator-maintained memory injected into context.',
+    source: 'session-manager:coreMemoryProvider',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: false,
+  },
+  {
+    id: 'memory.retrieval',
+    label: 'Retrieved Memory',
+    description: 'L2 retrieval block served from the cached active-memory context for the turn.',
+    source: 'turn-execution-runtime:activeMemoryContext',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: false,
+  },
+  {
+    id: 'session.compaction_summary',
+    label: 'Previous Conversation Summary',
+    description: 'Compaction summaries surfaced from prior context windows.',
+    source: 'session-context:compaction summaries',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: false,
+  },
+  {
+    id: 'session.focus_knowledge',
+    label: 'Focus Knowledge',
+    description: 'Focus session knowledge block derived from prior work.',
+    source: 'session-context:focus knowledge store',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: false,
+  },
+  {
+    id: 'session.orientation',
+    label: 'Wake Orientation',
+    description: 'Idle-gap welcome-back note with elapsed time and recent continuity when the channel has been inactive long enough.',
+    source: 'session-context:orientation telemetry',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: true,
+  },
+  {
+    id: 'session.continuity',
+    label: 'Cross-Channel Continuity',
+    description: 'Recent activity from other eligible channels.',
+    source: 'session-context:continuity store',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: false,
+  },
+  {
+    id: 'session.cogsec_notices',
+    label: 'CogSec Notices',
+    description: 'Safe cognitive-security notices explaining intentionally sealed context without exposing the sealed material.',
+    source: 'session-context:cogsec safe event log',
+    schema: OPTIONAL_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: true,
+    contentVisible: true,
+  },
+  {
+    id: 'runtime.current_datetime',
+    label: 'Current Date & Time',
+    description: 'Fresh per-turn clock anchor rendered as the final system prompt block immediately before conversation messages.',
+    source: 'turn-execution-runtime:current datetime anchor',
+    schema: REQUIRED_RUNTIME_AWARE_SCHEMA,
+    placement: 'system_prompt',
+    visibility: 'runtime_generated',
+    reorderable: false,
+    contentVisible: true,
+    lockedReason: 'Fixed last so date-sensitive reminders and temporal instructions stay grounded.',
+  },
+  {
+    id: 'session.current_messages',
+    label: 'Current Conversation Messages',
+    description: 'Current-session transcript passed as provider chat messages, not system prompt text.',
+    source: 'session-context:entriesToMessages',
+    schema: IMMUTABLE_PROVIDER_MANAGED_SCHEMA,
+    placement: 'context_messages',
+    visibility: 'provider_managed',
+    reorderable: false,
+    contentVisible: false,
+    lockedReason: 'Provider message sequencing is fixed by the chat API boundary.',
+  },
+  {
+    id: 'tools.active_schemas',
+    label: 'Active Tool Schemas',
+    description: 'Tool schema payload attached to the provider request.',
+    source: 'tool-runtime:active turn tools',
+    schema: IMMUTABLE_PROVIDER_MANAGED_SCHEMA,
+    placement: 'tool_schemas',
+    visibility: 'provider_managed',
+    reorderable: false,
+    contentVisible: false,
+    lockedReason: 'Tool schema delivery is provider-managed and not part of system prompt text.',
+  },
+]);
+
+const PROMPT_RUNTIME_IMMUTABLE_ANCHORS: readonly PromptRuntimeImmutableAnchorDefinition[] = Object.freeze([
+  {
+    id: 'constitution.immutable_human_safety_amendments',
+    label: 'Immutable Human Safety Amendments',
+    description: 'Constitution-layer human safety amendments that must remain fixed.',
+    classification: 'immutable_identity_anchor',
+    immutable: true,
+  },
+  {
+    id: 'foundation.card_backed_sections',
+    label: 'Card-Backed Foundation Sections',
+    description: 'Canonical Character Foundation sections mirrored from the authoritative card fields.',
+    classification: 'immutable_identity_anchor',
+    immutable: true,
+  },
+  {
+    id: 'persona.card_backed_identity',
+    label: 'Card-Backed Persona Identity',
+    description: 'Canonical persona anchors such as identity and personality that come from card-backed prompt soil.',
+    classification: 'immutable_identity_anchor',
+    immutable: true,
+  },
+]);
+
+const PROMPT_RUNTIME_BLOCK_MAP = new Map(
+  PROMPT_RUNTIME_BLOCKS.map(block => [block.id, block]),
+);
+
+const DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER: PromptRuntimeSystemPromptBlockId[] = PROMPT_RUNTIME_BLOCKS
+  .filter(
+    (block): block is PromptRuntimeBlockDefinition & { id: PromptRuntimeSystemPromptBlockId } =>
+      block.placement === 'system_prompt' && block.reorderable,
+  )
+  .map(block => block.id);
+
+function isPromptRuntimeSystemPromptBlockId(value: string): value is PromptRuntimeSystemPromptBlockId {
+  return DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER.includes(value as PromptRuntimeSystemPromptBlockId);
+}
+
+function clonePromptRuntimeLayout(layout: PromptRuntimeLayout): PromptRuntimeLayout {
+  return {
+    ...layout,
+    systemPromptBlockOrder: [...layout.systemPromptBlockOrder],
+    editableBlockContent: { ...layout.editableBlockContent },
+  };
+}
+
+function normalizePromptRuntimeUpdatedBy(value: unknown): string {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : 'system';
+}
+
+function buildDefaultPromptRuntimeLayout(): PromptRuntimeLayout {
+  return {
+    version: PROMPT_RUNTIME_LAYOUT_VERSION,
+    systemPromptBlockOrder: [...DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER],
+    editableBlockContent: {},
+    updatedAt: new Date().toISOString(),
+    updatedBy: 'system',
+  };
+}
+
+function isPromptRuntimeEditableBlockId(value: string): value is PromptRuntimeEditableBlockId {
+  const block = PROMPT_RUNTIME_BLOCK_MAP.get(value as PromptRuntimeBlockId);
+  return block?.companionEditable === true;
+}
+
+function normalizeSystemPromptBlockOrder(value: unknown): PromptRuntimeSystemPromptBlockId[] {
+  if (!Array.isArray(value)) {
+    return [...DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER];
+  }
+
+  const seen = new Set<PromptRuntimeSystemPromptBlockId>();
+  const normalized: PromptRuntimeSystemPromptBlockId[] = [];
+  let invalidEntryFound = false;
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !isPromptRuntimeSystemPromptBlockId(entry) || seen.has(entry)) {
+      invalidEntryFound = true;
+      continue;
+    }
+    seen.add(entry);
+    normalized.push(entry);
+  }
+
+  if (invalidEntryFound || normalized.length === 0) {
+    return [...DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER];
+  }
+
+  for (const defaultId of DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER) {
+    if (seen.has(defaultId)) continue;
+
+    let insertAt = normalized.length;
+    const defaultIndex = DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER.indexOf(defaultId);
+    for (let index = defaultIndex + 1; index < DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER.length; index += 1) {
+      const nextDefaultId = DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER[index];
+      if (!nextDefaultId) continue;
+      const nextDefaultIndex = normalized.indexOf(nextDefaultId);
+      if (nextDefaultIndex >= 0) {
+        insertAt = nextDefaultIndex;
+        break;
+      }
+    }
+    if (insertAt === normalized.length) {
+      for (let index = defaultIndex - 1; index >= 0; index -= 1) {
+        const previousDefaultId = DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER[index];
+        if (!previousDefaultId) continue;
+        const previousDefaultIndex = normalized.indexOf(previousDefaultId);
+        if (previousDefaultIndex >= 0) {
+          insertAt = previousDefaultIndex + 1;
+          break;
+        }
+      }
+    }
+
+    normalized.splice(insertAt, 0, defaultId);
+    seen.add(defaultId);
+  }
+
+  return normalized;
+}
+
+function isCompleteSystemPromptBlockOrder(value: readonly unknown[]): value is PromptRuntimeSystemPromptBlockId[] {
+  if (value.length !== DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER.length) {
+    return false;
+  }
+
+  const seen = new Set<PromptRuntimeSystemPromptBlockId>();
+  for (const entry of value) {
+    if (typeof entry !== 'string' || !isPromptRuntimeSystemPromptBlockId(entry) || seen.has(entry)) {
+      return false;
+    }
+    seen.add(entry);
+  }
+  return DEFAULT_SYSTEM_PROMPT_BLOCK_ORDER.every(id => seen.has(id));
+}
+
+function normalizeEditableBlockContent(value: unknown): Partial<Record<PromptRuntimeEditableBlockId, string>> {
+  if (!value || typeof value !== 'object') {
+    return {};
+  }
+
+  const parsed = value as Record<string, unknown>;
+  const normalized: Partial<Record<PromptRuntimeEditableBlockId, string>> = {};
+  for (const [key, rawContent] of Object.entries(parsed)) {
+    if (!isPromptRuntimeEditableBlockId(key) || typeof rawContent !== 'string') {
+      continue;
+    }
+    const trimmed = rawContent.trim();
+    if (trimmed.length > 0) {
+      normalized[key] = trimmed;
+    }
+  }
+  return normalized;
+}
+
+function parsePromptRuntimeLayout(raw: string): PromptRuntimeLayout {
+  const parsed = JSON.parse(raw) as Partial<PromptRuntimeLayout> | null;
+  return {
+    version: PROMPT_RUNTIME_LAYOUT_VERSION,
+    systemPromptBlockOrder: normalizeSystemPromptBlockOrder(parsed?.systemPromptBlockOrder),
+    editableBlockContent: normalizeEditableBlockContent(parsed?.editableBlockContent),
+    updatedAt: typeof parsed?.updatedAt === 'string' && parsed.updatedAt.trim().length > 0
+      ? parsed.updatedAt
+      : new Date().toISOString(),
+    updatedBy: normalizePromptRuntimeUpdatedBy(parsed?.updatedBy),
+  };
+}
+
+export function getPromptRuntimeBlockDefinitions(): PromptRuntimeBlockDefinition[] {
+  return PROMPT_RUNTIME_BLOCKS.map(block => ({
+    ...block,
+    schema: { ...block.schema },
+  }));
+}
+
+export function getPromptRuntimeImmutableAnchorDefinitions(): PromptRuntimeImmutableAnchorDefinition[] {
+  return PROMPT_RUNTIME_IMMUTABLE_ANCHORS.map(anchor => ({ ...anchor }));
+}
+
+export function getPromptRuntimeRequiredBlockIds(options?: {
+  includeImmutable?: boolean;
+}): PromptRuntimeBlockId[] {
+  const includeImmutable = options?.includeImmutable ?? true;
+  return PROMPT_RUNTIME_BLOCKS
+    .filter(block => block.schema.required && (includeImmutable || !block.schema.immutable))
+    .map(block => block.id);
+}
+
+export function getPromptRuntimeBlockIdsByClassification(
+  classification: PromptRuntimeBlockSchemaClassification,
+): PromptRuntimeBlockId[] {
+  return PROMPT_RUNTIME_BLOCKS
+    .filter(block => block.schema.classification === classification)
+    .map(block => block.id);
+}
+
+export function isPromptRuntimeBlockRequired(
+  blockOrId: PromptRuntimeBlockDefinition | PromptRuntimeBlockId,
+): boolean {
+  return resolvePromptRuntimeBlockDefinition(blockOrId)?.schema.required ?? false;
+}
+
+export function isPromptRuntimeBlockImmutable(
+  blockOrId: PromptRuntimeBlockDefinition | PromptRuntimeBlockId,
+): boolean {
+  return resolvePromptRuntimeBlockDefinition(blockOrId)?.schema.immutable ?? false;
+}
+
+export function isPromptRuntimeBlockCompanionEditable(
+  blockOrId: PromptRuntimeBlockDefinition | PromptRuntimeBlockId,
+): boolean {
+  const block = resolvePromptRuntimeBlockDefinition(blockOrId);
+  return block?.companionEditable === true && !block.schema.immutable;
+}
+
+export function validatePromptRuntimeEditableBlockContents(
+  contentByBlockId: Partial<Record<PromptRuntimeEditableBlockId, string>>,
+): PromptRuntimeEditableBlockValidationResult {
+  const issues: PromptRuntimeEditableBlockValidationIssue[] = [];
+
+  for (const block of PROMPT_RUNTIME_BLOCKS) {
+    if (block.companionEditable !== true || !block.schema.required) {
+      continue;
+    }
+
+    const editableId = block.id as PromptRuntimeEditableBlockId;
+    const content = contentByBlockId[editableId];
+    if (content == null) {
+      issues.push({
+        id: editableId,
+        label: block.label,
+        reason: 'missing',
+      });
+      continue;
+    }
+
+    if (typeof content !== 'string' || content.trim().length === 0) {
+      issues.push({
+        id: editableId,
+        label: block.label,
+        reason: 'empty',
+      });
+    }
+  }
+
+  return {
+    ok: issues.length === 0,
+    issues,
+  };
+}
+
+const PROMPT_RUNTIME_RELOAD_INTERVAL_MS = 30000;
+
+export interface PromptRuntimeLayoutStoreOptions {
+  onMutation?: (reason: string) => void;
+}
+
+export class PromptRuntimeLayoutStore {
+  private readonly filePath: string;
+  private layout: PromptRuntimeLayout;
+  private lastLoadedMtimeMs: number;
+  private lastReloadCheckAtMs: number;
+  private fileExists = false;
+  private readonly onMutation: ((reason: string) => void) | undefined;
+
+  constructor(filePath: string, options: PromptRuntimeLayoutStoreOptions = {}) {
+    this.filePath = filePath;
+    this.onMutation = options.onMutation;
+    this.layout = buildDefaultPromptRuntimeLayout();
+    this.lastLoadedMtimeMs = 0;
+    this.lastReloadCheckAtMs = 0;
+    this.load();
+  }
+
+  getLayout(): PromptRuntimeLayout {
+    this.maybeReload();
+    return clonePromptRuntimeLayout(this.layout);
+  }
+
+  getSystemPromptBlockOrder(): PromptRuntimeSystemPromptBlockId[] {
+    this.maybeReload();
+    return [...this.layout.systemPromptBlockOrder];
+  }
+
+  getEditableBlockContent(blockId: PromptRuntimeEditableBlockId): string {
+    this.maybeReload();
+    return this.layout.editableBlockContent[blockId] ?? '';
+  }
+
+  getEditableBlockContentMap(): Partial<Record<PromptRuntimeEditableBlockId, string>> {
+    this.maybeReload();
+    return { ...this.layout.editableBlockContent };
+  }
+
+  setEditableBlockContents(
+    updates: Partial<Record<PromptRuntimeEditableBlockId, string>>,
+    updatedBy: string,
+  ): PromptRuntimeLayout {
+    const nextContent = { ...this.layout.editableBlockContent };
+
+    for (const [blockId, content] of Object.entries(updates)) {
+      if (!isPromptRuntimeEditableBlockId(blockId)) {
+        throw new Error(`Prompt runtime block is not companion-editable: ${blockId}`);
+      }
+      if (typeof content !== 'string') {
+        throw new Error(`Prompt runtime block content must be a string: ${blockId}`);
+      }
+
+      const trimmed = content.trim();
+      if (trimmed.length > 0) {
+        nextContent[blockId] = trimmed;
+      } else {
+        delete nextContent[blockId];
+      }
+    }
+
+    this.layout = {
+      version: PROMPT_RUNTIME_LAYOUT_VERSION,
+      systemPromptBlockOrder: [...this.layout.systemPromptBlockOrder],
+      editableBlockContent: nextContent,
+      updatedAt: new Date().toISOString(),
+      updatedBy: normalizePromptRuntimeUpdatedBy(updatedBy),
+    };
+    this.save();
+    this.notifyMutation('prompt-runtime-layout-editable-blocks');
+    return this.getLayout();
+  }
+
+  reorderSystemPromptBlocks(
+    blockIds: PromptRuntimeSystemPromptBlockId[],
+    updatedBy: string,
+  ): PromptRuntimeLayout {
+    if (!isCompleteSystemPromptBlockOrder(blockIds)) {
+      throw new Error('systemPromptBlockOrder must include each reorderable runtime block exactly once');
+    }
+    const normalized = normalizeSystemPromptBlockOrder(blockIds);
+
+    this.layout = {
+      version: PROMPT_RUNTIME_LAYOUT_VERSION,
+      systemPromptBlockOrder: normalized,
+      editableBlockContent: { ...this.layout.editableBlockContent },
+      updatedAt: new Date().toISOString(),
+      updatedBy: normalizePromptRuntimeUpdatedBy(updatedBy),
+    };
+    this.save();
+    this.notifyMutation('prompt-runtime-layout-system-order');
+    return this.getLayout();
+  }
+
+  setEditableBlockContent(
+    blockId: PromptRuntimeEditableBlockId,
+    content: string,
+    updatedBy: string,
+  ): PromptRuntimeLayout {
+    return this.setEditableBlockContents({ [blockId]: content }, updatedBy);
+  }
+
+  private load(): void {
+    if (!existsSync(this.filePath)) {
+      this.fileExists = false;
+      this.layout = buildDefaultPromptRuntimeLayout();
+      return;
+    }
+
+    this.fileExists = true;
+    const raw = readFileSync(this.filePath, 'utf-8');
+    this.layout = parsePromptRuntimeLayout(raw);
+    this.lastLoadedMtimeMs = statSync(this.filePath).mtimeMs;
+  }
+
+  private maybeReload(): void {
+    const now = Date.now();
+    if (now - this.lastReloadCheckAtMs < PROMPT_RUNTIME_RELOAD_INTERVAL_MS) return;
+    this.lastReloadCheckAtMs = now;
+    if (!this.fileExists && !existsSync(this.filePath)) return;
+    this.fileExists = true;
+    const nextMtime = statSync(this.filePath).mtimeMs;
+    if (nextMtime <= this.lastLoadedMtimeMs) return;
+    this.load();
+  }
+
+  private save(): void {
+    writeJsonAtomic(this.filePath, this.layout, { trailingNewline: true });
+    if (existsSync(this.filePath)) {
+      this.fileExists = true;
+      this.lastLoadedMtimeMs = statSync(this.filePath).mtimeMs;
+    }
+  }
+
+  private notifyMutation(reason: string): void {
+    this.onMutation?.(reason);
+  }
+}
+
+export function resolvePromptRuntimeLayoutPath(companionDataDir: string): string {
+  return join(companionDataDir, 'prompt-runtime-layout.json');
+}
+
+export function orderPromptRuntimeSystemPromptSections<T extends { id: PromptRuntimeSystemPromptBlockId }>(
+  sections: readonly T[],
+  layout: PromptRuntimeLayout | PromptRuntimeLayoutStore,
+): T[] {
+  const order = layout instanceof PromptRuntimeLayoutStore
+    ? layout.getSystemPromptBlockOrder()
+    : layout.systemPromptBlockOrder;
+  const orderMap = new Map(order.map((id, index) => [id, index]));
+  return [...sections].sort((left, right) => {
+    return (orderMap.get(left.id) ?? Number.MAX_SAFE_INTEGER)
+      - (orderMap.get(right.id) ?? Number.MAX_SAFE_INTEGER);
+  });
+}
+
+export function getPromptRuntimeBlockDefinition(
+  id: PromptRuntimeBlockId,
+): PromptRuntimeBlockDefinition | null {
+  const block = PROMPT_RUNTIME_BLOCK_MAP.get(id);
+  return block ? { ...block, schema: { ...block.schema } } : null;
+}
+
+function resolvePromptRuntimeBlockDefinition(
+  blockOrId: PromptRuntimeBlockDefinition | PromptRuntimeBlockId,
+): PromptRuntimeBlockDefinition | null {
+  return typeof blockOrId === 'string'
+    ? PROMPT_RUNTIME_BLOCK_MAP.get(blockOrId) ?? null
+    : blockOrId;
+}
+
+function toSnakeCase(value: string): string {
+  return value
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[\s-]+/g, '_')
+    .toLowerCase();
+}
+
+function normalizeLookupKey(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function normalizeTokenName(rawToken: string): string {
+  const trimmed = rawToken.trim();
+  if (trimmed.endsWith('()')) {
+    return trimmed.slice(0, -2);
+  }
+  return trimmed;
+}
+
+function stringifyVariableValue(value: unknown): string | null {
+  if (value == null) return null;
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') {
+    return String(value);
+  }
+  return null;
+}
+
+function setVariableLookup(lookup: Map<string, string>, key: string, value: string): void {
+  if (!key) return;
+  const normalized = normalizeLookupKey(key);
+  if (!lookup.has(normalized)) {
+    lookup.set(normalized, value);
+  }
+}
+
+function addVariable(
+  lookup: Map<string, string>,
+  key: string,
+  value: string,
+): void {
+  setVariableLookup(lookup, key, value);
+  setVariableLookup(lookup, toSnakeCase(key), value);
+}
+
+function buildVariableLookup(variables: Record<string, unknown>): Map<string, string> {
+  const lookup = new Map<string, string>();
+
+  const walk = (obj: Record<string, unknown>, prefix?: string): void => {
+    for (const [rawKey, rawValue] of Object.entries(obj)) {
+      if (!rawKey.trim()) continue;
+
+      const dottedKey = prefix ? `${prefix}.${rawKey}` : rawKey;
+      const primitive = stringifyVariableValue(rawValue);
+      if (primitive != null) {
+        addVariable(lookup, dottedKey, primitive);
+      }
+
+      if (rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue) && !(rawValue instanceof Date)) {
+        walk(rawValue as Record<string, unknown>, dottedKey);
+      }
+    }
+  };
+
+  walk(variables);
+  return lookup;
+}
+
+// Empty-section pruning iterates to a fixpoint so wrappers that only become
+// empty after an inner wrapper is pruned still collapse (bounded; E1.3
+// legacy-layer pruning semantics preserved).
+const EMPTY_SECTION_PRUNE_MAX_ROUNDS = 8;
+
+function pruneEmptyWrappedSections(text: string): string {
+  let output = text;
+  for (let round = 0; round < EMPTY_SECTION_PRUNE_MAX_ROUNDS; round += 1) {
+    const next = output
+      .replace(EMPTY_WRAPPED_SECTION_PATTERN, '')
+      .replace(/\n{3,}/g, '\n\n');
+    if (next === output) break;
+    output = next;
+  }
+  return output.trim();
+}
+
+function isConditionTruthy(value: string | undefined): boolean {
+  if (value === undefined) return false;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'null') {
+    return false;
+  }
+  return true;
+}
+
+function resolveConditionalBlocks(text: string, lookup: Map<string, string>): string {
+  return text.replace(CONDITIONAL_BLOCK_PATTERN, (_full, rawToken: string, content: string) => {
+    const normalizedToken = normalizeLookupKey(normalizeTokenName(rawToken));
+    return isConditionTruthy(lookup.get(normalizedToken)) ? content : '';
+  });
+}
+
+export interface PromptRuntimeRenderResult {
+  text: string;
+  unresolvedTokens: string[];
+}
+
+// ── Renderer (E2.5): single token-resolution pass ──
+// The previous fixed-point loop ran up to three whole-template passes so that
+// macros nested inside substituted VALUES (e.g. a card scenario containing
+// {{user}}) would eventually resolve. The single-pass design walks the
+// template exactly once; a substituted value that itself contains macro syntax
+// is expanded recursively with a bounded depth (fail closed on cycles).
+// Conditional blocks resolve before token substitution; conditionals
+// introduced by substituted values resolve inside the recursive expansion.
+// Empty-section pruning then iterates to a fixpoint. Unresolved tokens are
+// preserved in the returned text (template-composition callers rely on this)
+// and reported via unresolvedTokens — final render sites enforce the
+// no-silent-leak invariant through renderFinalPromptSection.
+
+const MACRO_VALUE_EXPANSION_MAX_DEPTH = 8;
+const CONDITIONAL_RESOLUTION_MAX_ROUNDS = 8;
+const VARIABLE_TOKEN_PATTERN = /\{\{\s*([a-zA-Z0-9_.-]+(?:\(\))?)\s*\}\}/g;
+const LEFTOVER_CONDITIONAL_MARKER_PATTERN = /\{\{\s*(?:#if\b[^}]*|\/if)\s*\}\}/;
+
+function resolvePromptTextOnce(
+  text: string,
+  now: Date,
+  lookup: Map<string, string>,
+  unresolved: Set<string>,
+  expanding: Set<string>,
+  depth: number,
+): string {
+  if (depth > MACRO_VALUE_EXPANSION_MAX_DEPTH) {
+    throw new Error(
+      `Prompt macro expansion exceeded max depth (${MACRO_VALUE_EXPANSION_MAX_DEPTH}); `
+      + 'a variable value most likely references itself (macro cycle).',
+    );
+  }
+
+  let output = text;
+  // Sequential (non-nested) conditionals resolve in one round; a bounded loop
+  // covers conditionals whose markers only pair up after an earlier round.
+  for (let round = 0; round < CONDITIONAL_RESOLUTION_MAX_ROUNDS; round += 1) {
+    const next = resolveConditionalBlocks(output, lookup);
+    if (next === output) break;
+    output = next;
+  }
+
+  for (const [pattern, resolver] of TOKEN_RESOLVERS) {
+    output = output.replace(pattern, () => resolver(now));
+  }
+
+  output = output.replace(VARIABLE_TOKEN_PATTERN, (fullToken, rawName: string) => {
+    const cleaned = normalizeTokenName(rawName);
+    const normalized = normalizeLookupKey(cleaned);
+    // Cycle guard: a variable expanding inside its own value (including the
+    // template-composition idiom user='{{user}}') terminates as an unresolved
+    // literal token instead of recursing.
+    if (expanding.has(normalized)) {
+      unresolved.add(cleaned);
+      return fullToken;
+    }
+    const resolved = lookup.get(normalized);
+    if (resolved === undefined) {
+      unresolved.add(cleaned);
+      return fullToken;
+    }
+    if (!resolved.includes('{{')) {
+      return resolved;
+    }
+    expanding.add(normalized);
+    try {
+      return resolvePromptTextOnce(resolved, now, lookup, unresolved, expanding, depth + 1);
+    } finally {
+      expanding.delete(normalized);
+    }
+  });
+
+  return output;
+}
+
+/**
+ * Render prompt macros in template text: one pass over the template with
+ * bounded recursive expansion of substituted values, then fixpoint
+ * empty-section pruning. Unresolved tokens stay in the output text; callers
+ * that produce FINAL prompt bytes must go through renderFinalPromptSection.
+ */
+export function renderPromptRuntimeTokens(
+  text: string,
+  context: PromptRuntimeContext = {},
+): PromptRuntimeRenderResult {
+  if (!text) return { text, unresolvedTokens: [] };
+
+  const now = context.now ?? new Date();
+  const variableLookup = buildVariableLookup(context.variables ?? {});
+  const unresolved = new Set<string>();
+
+  const resolvedText = resolvePromptTextOnce(text, now, variableLookup, unresolved, new Set<string>(), 0);
+  const output = pruneEmptyWrappedSections(resolvedText);
+
+  const unresolvedTokens = [...unresolved];
+  if (context.onUnresolvedToken) {
+    for (const token of unresolvedTokens) {
+      context.onUnresolvedToken(token);
+    }
+  }
+
+  return {
+    text: output,
+    unresolvedTokens,
+  };
+}
+
+/**
+ * Helper that returns only rendered text (template-composition stages where
+ * unresolved tokens legitimately remain for a later render).
+ */
+export function injectPromptRuntimeTokens(
+  text: string,
+  context: PromptRuntimeContext = {},
+): string {
+  return renderPromptRuntimeTokens(text, context).text;
+}
+
+// ── Final-render enforcement (E2.5 no-silent-leak invariant) ──
+// A token that is still unresolved when prompt BYTES are produced never leaks
+// into the assembled prompt:
+// - required section  -> hard error (the turn fails loudly);
+// - optional section  -> the whole section is dropped and reported via
+//   onSectionDrop (telemetry), the prompt continues without it.
+
+export class PromptRuntimeRenderError extends Error {
+  readonly sectionLabel: string;
+  readonly unresolvedTokens: string[];
+
+  constructor(message: string, sectionLabel: string, unresolvedTokens: string[]) {
+    super(message);
+    this.name = 'PromptRuntimeRenderError';
+    this.sectionLabel = sectionLabel;
+    this.unresolvedTokens = unresolvedTokens;
+  }
+}
+
+export interface PromptRuntimeSectionDrop {
+  sectionLabel: string;
+  unresolvedTokens: string[];
+}
+
+export interface RenderFinalPromptSectionOptions {
+  now?: Date;
+  variables?: Record<string, unknown>;
+  /** Label used in errors/telemetry (layer identifier or section name). */
+  sectionLabel: string;
+  /** Required sections fail the render loudly; optional sections drop. */
+  required: boolean;
+  /** Telemetry hook invoked when an optional section is dropped. */
+  onSectionDrop?: (drop: PromptRuntimeSectionDrop) => void;
+}
+
+function describeUnresolvedTokens(tokens: readonly string[]): string {
+  return tokens
+    .map((token) => {
+      const removed = REMOVED_PROMPT_MACROS.get(normalizePromptMacroName(token));
+      return removed
+        ? `{{${token}}} (removed macro; use ${removed.canonical})`
+        : `{{${token}}} (no value produced for this turn)`;
+    })
+    .join(', ');
+}
+
+/**
+ * Render one final prompt section with the no-silent-leak invariant. Returns
+ * the rendered text, or '' when an optional section was dropped.
+ */
+export function renderFinalPromptSection(
+  text: string,
+  options: RenderFinalPromptSectionOptions,
+): string {
+  const { text: rendered, unresolvedTokens } = renderPromptRuntimeTokens(text, {
+    ...(options.now ? { now: options.now } : {}),
+    ...(options.variables ? { variables: options.variables } : {}),
+  });
+
+  const leftoverConditional = LEFTOVER_CONDITIONAL_MARKER_PATTERN.test(rendered);
+  if (unresolvedTokens.length === 0 && !leftoverConditional) {
+    return rendered;
+  }
+
+  const tokens = leftoverConditional && unresolvedTokens.length === 0
+    ? ['#if (unbalanced conditional markers)']
+    : unresolvedTokens;
+
+  if (options.required) {
+    throw new PromptRuntimeRenderError(
+      `Unresolved prompt macro(s) in required prompt section "${options.sectionLabel}": `
+      + `${describeUnresolvedTokens(tokens)}. `
+      + 'No unresolved token may reach the assembled prompt (fail closed). '
+      + 'Fix the layer template or produce the variable; see docs/prompt-macros.md.',
+      options.sectionLabel,
+      tokens,
+    );
+  }
+
+  options.onSectionDrop?.({
+    sectionLabel: options.sectionLabel,
+    unresolvedTokens: tokens,
+  });
+  return '';
+}

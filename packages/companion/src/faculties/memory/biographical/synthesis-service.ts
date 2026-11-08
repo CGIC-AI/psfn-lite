@@ -1,0 +1,758 @@
+// ── Portable biography candidate synthesis (o61vb.12) ──
+//
+// One maintenance pass that mines already-authorized memory silos for durable,
+// typed biography candidates and stages them for review. Everything it emits is
+// a candidate: this service has no activation authority and never writes an
+// active claim.
+//
+// Privacy shape, in order:
+//   1. `collectAuthorizedBiographicalSources` applies subject authorization in
+//      SQL and owner candidate policy in process. No excluded body reaches this
+//      module at all.
+//   2. Synthesis sees only those admitted bodies, for one canonical subject at
+//      a time. Two silos are never in the same prompt.
+//   3. `resolveLiveBiographicalCandidates` re-reads every cited source and
+//      rejects any candidate whose evidence drifted since collection, so a
+//      source revoked mid-run cannot be persisted.
+//   4. `writeCandidate` re-applies the same owner policy at the persistence
+//      boundary, so a caller that skipped step 1 still fails closed.
+//
+// Grouping is by canonical subject and explicit dyad, never by channel: the
+// same dyad seen in two rooms is one social context.
+
+import type { LLMProviderPort } from '../../../core/agent/contracts.js';
+import {
+  BIOGRAPHY_CANDIDATE_SYNTHESIS_PROMPT_KEY,
+  getDefaultPromptText,
+} from '../../../core/identity/prompt-registry.js';
+import type { PromptRegistryStatePort } from '../../../core/identity/prompt-state-port.js';
+import { injectPromptRuntimeTokens } from '../../../core/identity/prompt-runtime.js';
+import { buildLLMWorkSpec, completeWithWorkSpec } from '../../../primitives/llm/work-spec.js';
+import { createComponentLogger } from '../../../shared/logger.js';
+import { computeStageInputDigest } from './stage-cursor.js';
+import { toErrorMessage } from '../../../shared/utils/errors.js';
+import type { BiographicalCandidatePolicy } from '../../../system/config/biographical-candidate-policy.js';
+import type { BiographicalDepthPolicy } from '../../../system/config/biographical-depth-policy.js';
+import type { MemoryStorePort } from '../memory-store-port.js';
+import type { PurrMemory } from '../types.js';
+import { collectAuthorizedBiographicalSources } from './authorized-sources.js';
+import { claimConflictKey } from './claim-kinds.js';
+import { resolveLiveBiographicalCandidates } from './live-source-rebuild.js';
+import { PORTABLE_BIOGRAPHY_CANDIDATE_KINDS } from './stable-candidate.js';
+import { prepareBiographicalClaim } from './store-port.js';
+import type {
+  BiographicalClaimWriteInput,
+  BiographicalProfileStorePort,
+} from './store-port.js';
+import type {
+  BiographicalCandidateRationale,
+  BiographicalCandidateSocialContext,
+  BiographicalClaimKind,
+  BiographicalClaimSource,
+  BiographicalCollectionDepth,
+  BiographicalSubjectRef,
+  BiographyEvidenceScope,
+} from './types.js';
+
+const log = createComponentLogger('Biography');
+
+/** Only these kinds are dyadic; a companion-self scan cannot propose them. */
+const DYADIC_CANDIDATE_KINDS: readonly BiographicalClaimKind[] = [
+  'relationship',
+  'shared-language',
+];
+
+/**
+ * The only kind an n-ary group claim may take (o61vb.15 / uz787). This is the
+ * claim shape talking, not a tuning choice: `assertRelatedSubjectShape` refuses
+ * a participant set on any other kind precisely so a group fact can never come
+ * to read as a singular one.
+ */
+const GROUP_CANDIDATE_KINDS: readonly BiographicalClaimKind[] = ['shared-language'];
+
+/**
+ * One canonical subject to scan, with the social context its candidates are
+ * grouped under. Subject selection is runtime authority: the synthesizer never
+ * chooses whom it is writing about.
+ */
+export interface BiographySynthesisTarget {
+  readonly subject: BiographicalSubjectRef;
+  readonly socialContext: BiographicalCandidateSocialContext;
+  readonly depth: BiographicalCollectionDepth;
+  /**
+   * Which governed contexts this target's evidence may come from
+   * (psfn-framework-zu8d2). Absent for a subject-scoped target — the
+   * autobiography and every dyad — where the subject IS the boundary.
+   *
+   * REQUIRED for a `companion_group` target and enforced below: a group scan
+   * runs under the companion's own subject, so without a scope the subject gate
+   * would admit her whole private silo as evidence for a fact that binds other
+   * people. Kept off `socialContext` deliberately: that is persisted with every
+   * candidate and describes WHO the claim is about, not where it was mined.
+   */
+  readonly evidenceScope?: BiographyEvidenceScope;
+}
+
+/**
+ * Bounded target enumeration. The epic's collection-depth rule lives here:
+ * recognition-depth contacts keep only their Recent Contact Shape and are not
+ * mined for durable claims.
+ */
+export interface BiographySynthesisTargetPort {
+  listTargets(limit: number): Promise<readonly BiographySynthesisTarget[]>;
+}
+
+/** Content-free run telemetry. No subject id, claim value, or source body. */
+/**
+ * How a resumable background stage finished (o61vb.16). `complete` means the
+ * stage drained its work and may release the fleet baton; `yield` means it
+ * stopped at a safe boundary with work left and must be resumed.
+ */
+export type BiographyStageOutcome = 'complete' | 'yield';
+
+/**
+ * Safe-boundary hook. A stage calls this between whole targets — never mid
+ * write — and stops when it is told to yield, so foreground work preempts
+ * without losing durable progress.
+ */
+export interface BiographyStageControl {
+  onSafeBoundary?: () => Promise<'continue' | 'yield'>;
+}
+
+export interface BiographySynthesisTelemetry {
+  readonly automataRunId: string;
+  readonly outcome: BiographyStageOutcome;
+  /** Targets skipped because their admitted evidence has not changed. */
+  readonly targetsUnchanged: number;
+  readonly targetsRemaining: number;
+  readonly targetsScanned: number;
+  readonly targetsSynthesized: number;
+  readonly sourcesScanned: number;
+  readonly sourcesAdmitted: number;
+  readonly sourcesWithheldByPolicy: number;
+  readonly candidatesEmitted: number;
+  readonly candidatesStaged: number;
+  readonly candidatesSuperseded: number;
+  readonly candidatesCoalesced: number;
+  readonly candidatesWithheld: number;
+  readonly candidatesDuplicate: number;
+  readonly targetsFailed: number;
+  /**
+   * Pass declined before any model call because the fleet-wide pending budget
+   * was already full (a18qq). An operator draining `human_review` is what
+   * reopens synthesis; until then the pass costs one count query.
+   */
+  readonly pendingBudgetExhausted: boolean;
+}
+
+export interface BiographySynthesisServiceOptions {
+  readonly memoryStore: MemoryStorePort;
+  readonly profileStore: BiographicalProfileStorePort;
+  readonly llmClient: LLMProviderPort;
+  readonly promptRegistry: PromptRegistryStatePort | null;
+  readonly targets: BiographySynthesisTargetPort;
+  readonly companionSubject: Extract<BiographicalSubjectRef, { kind: 'companion' }>;
+  /** Read per run so an owner-file edit takes effect on the next pass. */
+  readonly candidatePolicy: () => BiographicalCandidatePolicy;
+  readonly depthPolicy: () => BiographicalDepthPolicy;
+  readonly onComplete?: (telemetry: BiographySynthesisTelemetry) => void;
+  readonly now?: () => Date;
+  readonly newRunId?: () => string;
+}
+
+interface CoalescedCandidate {
+  readonly write: BiographicalClaimWriteInput;
+  readonly claimDigest: string;
+  readonly sourceSetDigest: string;
+  readonly mergedCount: number;
+}
+
+/**
+ * uz787: which claim kinds a scan may propose, decided by the target's social
+ * context rather than by the subject alone.
+ *
+ * A `companion_group` target is anchored on the companion subject but is NOT an
+ * autobiography scan: `shared-language` is the only n-ary kind the claim shape
+ * admits (`assertRelatedSubjectShape`), so a group scan proposes that and
+ * nothing else. Without the group context a companion-subject scan keeps its
+ * existing rule: no dyadic kinds at all.
+ */
+function admittedKindsForTarget(
+  target: BiographySynthesisTarget,
+): readonly BiographicalClaimKind[] {
+  if (target.socialContext.kind === 'companion_group') {
+    return GROUP_CANDIDATE_KINDS;
+  }
+  return target.subject.kind === 'companion'
+    ? PORTABLE_BIOGRAPHY_CANDIDATE_KINDS.filter(kind => !DYADIC_CANDIDATE_KINDS.includes(kind))
+    : PORTABLE_BIOGRAPHY_CANDIDATE_KINDS;
+}
+
+/**
+ * The exact canonical participant set a group target binds, as canonical
+ * contact subjects. Sourced from the target's authority-issued social context —
+ * never from the model, which cannot name who was in the room.
+ */
+function groupParticipantsForTarget(
+  target: BiographySynthesisTarget,
+): readonly BiographicalSubjectRef[] | undefined {
+  if (target.socialContext.kind !== 'companion_group') return undefined;
+  return target.socialContext.contactIds.map(contactId => ({
+    kind: 'contact' as const,
+    contactId,
+    subjectVersion: 1,
+  }));
+}
+
+function subjectContextBlock(target: BiographySynthesisTarget): string {
+  // uz787: a group scan is anchored on the companion but is not autobiography.
+  // The participant set is stated as a fact of the scan, not as something to
+  // propose: the runtime already decided who was in the group, and a candidate
+  // that tries to name a different set is rejected by the claim shape.
+  if (target.socialContext.kind === 'companion_group') {
+    return [
+      'Subject kind: a group the companion is part of',
+      `Canonical companion id: ${target.socialContext.companionId}`,
+      `Canonical group participants: ${target.socialContext.contactIds.join(', ')}`,
+      'Only shared-language claims about this exact group are available in this scan.',
+      'The participant set is fixed by the runtime; do not propose a different one.',
+    ].join('\n');
+  }
+  return target.subject.kind === 'companion'
+    ? [
+        'Subject kind: the companion themself (autobiography)',
+        `Canonical companion id: ${target.subject.companionId}`,
+        'Dyadic kinds are not available in this scan.',
+      ].join('\n')
+    : [
+        'Subject kind: a canonical human contact',
+        `Canonical contact id: ${target.subject.contactId}`,
+        'Dyadic kinds describe this contact and the companion running the scan.',
+      ].join('\n');
+}
+
+function formatSourceMemory(memory: PurrMemory): string {
+  return `- [${memory.id}] [${memory.type}] ${memory.text} `
+    + `(sensitivity=${memory.sensitivity}, importance=${memory.importance.toFixed(2)}, `
+    + `confidence=${memory.confidence.toFixed(2)})`;
+}
+
+/**
+ * Union two source sets by exact snapshot identity. Returns undefined when the
+ * union would exceed the owner's per-candidate source budget: coalescing must
+ * never silently drop provenance, so an over-budget pair stays separate.
+ */
+function unionSources(
+  left: readonly BiographicalClaimSource[],
+  right: readonly BiographicalClaimSource[],
+  limit: number,
+): readonly BiographicalClaimSource[] | undefined {
+  const byIdentity = new Map<string, BiographicalClaimSource>();
+  for (const source of [...left, ...right]) {
+    byIdentity.set(`${source.ref}@${source.revision}@${source.evidenceDigest}`, source);
+  }
+  return byIdentity.size > limit ? undefined : [...byIdentity.values()];
+}
+
+/**
+ * Durable cursor key for one canonical biography subject. Canonical identity
+ * only: a cursor must survive restart and mean the same thing to whichever
+ * companion holds the fleet baton next.
+ */
+export function stageCursorKeyForSubject(subject: BiographicalSubjectRef): string {
+  return subject.kind === 'companion'
+    ? `companion:${subject.companionId}`
+    : `contact:${subject.contactId}`;
+}
+
+/**
+ * Durable no-change cursor key for one target (uz787). Group targets share the
+ * companion subject, so keying on the subject alone would make every group
+ * overwrite the autobiography's cursor and each other's. The exact canonical
+ * participant set — which the group authority, not the model, decides — is what
+ * distinguishes them.
+ *
+ * The governed evidence scope joins the key for the same reason (zu8d2): once
+ * a group's evidence is scoped to its own context, the same people in two
+ * group chats are two targets over two different bodies of evidence. Sharing
+ * one cursor between them would make each pass invalidate the other's digest
+ * and re-synthesize both on every tick.
+ */
+export function stageCursorKeyForTarget(target: BiographySynthesisTarget): string {
+  const subjectKey = stageCursorKeyForSubject(target.subject);
+  if (target.socialContext.kind !== 'companion_group') return subjectKey;
+  const scopeKey = [...(target.evidenceScope?.governedContextIds ?? [])]
+    .map(contextId => contextId.trim())
+    .filter(contextId => contextId.length > 0)
+    .sort((left, right) => left.localeCompare(right))
+    .join(',');
+  return `${subjectKey}|group:${target.socialContext.contactIds.join(',')}|context:${scopeKey}`;
+}
+
+export class BiographySynthesisService {
+  constructor(private readonly options: BiographySynthesisServiceOptions) {}
+
+  private now(): Date {
+    return this.options.now?.() ?? new Date();
+  }
+
+  /**
+   * One synthesis pass. Every target is isolated: a target that throws is
+   * counted and skipped so one unreadable silo cannot stop the pass, but the
+   * failure is never swallowed silently.
+   */
+  async run(control: BiographyStageControl = {}): Promise<BiographySynthesisTelemetry> {
+    const policy = this.options.candidatePolicy();
+    const automataRunId = this.options.newRunId?.() ?? `biography-synthesis:${crypto.randomUUID()}`;
+    // a18qq: spend nothing on work the pending cap is already certain to
+    // reject. `writeCandidate` throws 'biography candidate pending budget
+    // exhausted' AFTER the model call and coalescing, so without this read a
+    // saturated human-review backlog made every tick re-synthesize every
+    // changed target, throw at staging, and repeat on the next tick.
+    //
+    // This read is ADVISORY: it takes no lock, so the count can move before a
+    // candidate is staged. That is fine and deliberate — the authoritative
+    // check still runs under the capacity advisory lock inside writeCandidate,
+    // and it is the only thing that admits or refuses. This only decides
+    // whether spending a model call is worth attempting.
+    const pendingCount = await this.options.profileStore.countPendingCandidates();
+    const pendingHeadroom = policy.budgets.maxPendingCandidates - pendingCount;
+    const pendingBudgetExhausted = pendingHeadroom <= 0;
+    if (pendingBudgetExhausted) {
+      log.info('Biography synthesis pass skipped: pending candidate budget exhausted', {
+        pendingCount,
+        maxPendingCandidates: policy.budgets.maxPendingCandidates,
+      });
+    }
+    // Enumerating targets is pointless work when nothing can be staged, and it
+    // keeps the telemetry honest: zero targets scanned, zero model calls.
+    const targets = pendingBudgetExhausted
+      ? []
+      : await this.options.targets.listTargets(policy.budgets.maxCandidatesPerAutomataRun);
+    let targetsSynthesized = 0;
+    let sourcesScanned = 0;
+    let sourcesAdmitted = 0;
+    let sourcesWithheld = 0;
+    let candidatesEmitted = 0;
+    let candidatesStaged = 0;
+    let candidatesSuperseded = 0;
+    let candidatesCoalesced = 0;
+    let candidatesWithheld = 0;
+    let candidatesDuplicate = 0;
+    let targetsFailed = 0;
+    let targetsUnchanged = 0;
+    // The run budget is now bounded by BOTH the per-run cap and the remaining
+    // fleet-wide pending headroom, so a partially-full backlog stops the pass at
+    // the last candidate the cap could actually accept instead of synthesizing
+    // into a guaranteed staging failure.
+    let runBudget = Math.min(policy.budgets.maxCandidatesPerAutomataRun, pendingHeadroom);
+    let outcomeState: BiographyStageOutcome = 'complete';
+    let processed = 0;
+
+    for (const target of targets) {
+      if (runBudget <= 0) break;
+      // Safe boundary: between whole targets, never mid write. A yield here
+      // leaves every durable cursor exactly where the last finished target put
+      // it, so the next pass resumes rather than repeats.
+      if (processed > 0 && await control.onSafeBoundary?.() === 'yield') {
+        outcomeState = 'yield';
+        break;
+      }
+      processed += 1;
+      try {
+        const outcome = await this.synthesizeTarget({ target, policy, automataRunId, runBudget });
+        if (outcome.unchanged) targetsUnchanged += 1;
+        sourcesScanned += outcome.sourcesScanned;
+        sourcesAdmitted += outcome.sourcesAdmitted;
+        sourcesWithheld += outcome.sourcesWithheldByPolicy;
+        candidatesEmitted += outcome.candidatesEmitted;
+        candidatesStaged += outcome.candidatesStaged;
+        candidatesSuperseded += outcome.candidatesSuperseded;
+        candidatesCoalesced += outcome.candidatesCoalesced;
+        candidatesWithheld += outcome.candidatesWithheld;
+        candidatesDuplicate += outcome.candidatesDuplicate;
+        if (outcome.synthesized) targetsSynthesized += 1;
+        runBudget -= outcome.candidatesStaged;
+      } catch (error) {
+        targetsFailed += 1;
+        // Content-free: the subject kind and the failure text only. A subject
+        // id would make an error log a cross-silo disclosure channel.
+        log.warn('Biography synthesis target failed', {
+          subjectKind: target.subject.kind,
+          error: toErrorMessage(error),
+        });
+      }
+    }
+
+    const telemetry: BiographySynthesisTelemetry = {
+      automataRunId,
+      outcome: outcomeState,
+      targetsUnchanged,
+      targetsRemaining: Math.max(0, targets.length - processed),
+      targetsScanned: targets.length,
+      targetsSynthesized,
+      sourcesScanned,
+      sourcesAdmitted,
+      sourcesWithheldByPolicy: sourcesWithheld,
+      candidatesEmitted,
+      candidatesStaged,
+      candidatesSuperseded,
+      candidatesCoalesced,
+      candidatesWithheld,
+      candidatesDuplicate,
+      targetsFailed,
+      pendingBudgetExhausted,
+    };
+    this.options.onComplete?.(telemetry);
+    return telemetry;
+  }
+
+  private async synthesizeTarget(input: {
+    readonly target: BiographySynthesisTarget;
+    readonly policy: BiographicalCandidatePolicy;
+    readonly automataRunId: string;
+    readonly runBudget: number;
+  }): Promise<{
+    synthesized: boolean;
+    /** The admitted evidence digest matched the durable cursor: no model call. */
+    unchanged: boolean;
+    sourcesScanned: number;
+    sourcesAdmitted: number;
+    sourcesWithheldByPolicy: number;
+    candidatesEmitted: number;
+    candidatesStaged: number;
+    candidatesSuperseded: number;
+    candidatesCoalesced: number;
+    candidatesWithheld: number;
+    candidatesDuplicate: number;
+  }> {
+    const { target, policy } = input;
+    // Fail closed (zu8d2). A group target without a governed evidence scope
+    // would silently widen to the companion's whole silo, which is exactly the
+    // defect this guard exists to make impossible — so it is refused here
+    // rather than being repaired with a default.
+    if (target.socialContext.kind === 'companion_group' && target.evidenceScope === undefined) {
+      throw new Error(
+        'biography group synthesis requires an authority-issued governed evidence scope',
+      );
+    }
+    const depth = this.options.depthPolicy()[target.depth];
+    // A run can never consume more sources than its own candidate and
+    // per-candidate source budgets allow, so the scan bound is derived from
+    // owner policy rather than being an independent tuning value.
+    const scanLimit = policy.budgets.maxSourcesPerCandidate
+      * policy.budgets.maxCandidatesPerAutomataRun;
+    const cursorKey = stageCursorKeyForTarget(target);
+    const cursor = await this.options.profileStore.getStageCursor('biography_synthesis', cursorKey);
+    const pageIndex = cursor?.sourceScan?.pageIndex ?? 0;
+    const collection = await collectAuthorizedBiographicalSources({
+      memoryStore: this.options.memoryStore,
+      subject: target.subject,
+      policy,
+      scanLimit,
+      before: cursor?.sourceScan?.before,
+      ...(target.evidenceScope ? { evidenceScope: target.evidenceScope } : {}),
+    });
+    const withheldByPolicy = Object.values(collection.withheldByPolicy)
+      .reduce((total, count) => total + count, 0);
+    const empty = {
+      synthesized: false,
+      unchanged: false,
+      sourcesScanned: collection.scannedCount,
+      sourcesAdmitted: collection.evidence.length,
+      sourcesWithheldByPolicy: withheldByPolicy,
+      candidatesEmitted: 0,
+      candidatesStaged: 0,
+      candidatesSuperseded: 0,
+      candidatesCoalesced: 0,
+      candidatesWithheld: 0,
+      candidatesDuplicate: 0,
+    };
+    const candidateLimit = Math.min(depth.candidateLimitPerRefresh, input.runBudget);
+    if (candidateLimit <= 0) return empty;
+
+    // Durable no-change gate (o61vb.16). The digest covers exactly the admitted
+    // source snapshots this target would have reasoned over, so an unchanged
+    // silo costs one cursor read and zero model calls. It is checked after the
+    // policy filter on purpose: a source becoming inadmissible changes the
+    // digest and correctly re-opens the target.
+    const evidenceDigest = computeStageInputDigest(collection.evidence.map(
+      entry => `${entry.source.ref}@${entry.source.revision}@${entry.source.evidenceDigest}`,
+    ));
+    // Reuse page-ordinal attestations on every traversal. New head arrivals
+    // cannot create a new cursor row per pass or displace an in-flight keyset.
+    const pageKey = pageIndex === 0 ? cursorKey : JSON.stringify([cursorKey, pageIndex]);
+    const pageCursor = pageIndex === 0 ? cursor
+      : await this.options.profileStore.getStageCursor('biography_synthesis', pageKey);
+    const advance = async () => {
+      const sourceScan = collection.nextBefore === undefined ? undefined : {
+        pageIndex: pageIndex + 1, before: collection.nextBefore,
+      };
+      if (pageIndex !== 0) {
+        // Commit the page attestation first: a crash before progress repeats
+        // this page cheaply rather than skipping unstaged work.
+        await this.options.profileStore.writeStageCursor({
+          stage: 'biography_synthesis', cursorKey: pageKey,
+          observedDigest: evidenceDigest, now: this.now(),
+        });
+      }
+      await this.options.profileStore.writeStageCursor({
+        stage: 'biography_synthesis', cursorKey,
+        observedDigest: pageIndex === 0 ? evidenceDigest : cursor!.observedDigest,
+        sourceScan, now: this.now(),
+      });
+    };
+    // A policy-empty page still consumed its bounded source window. Moving
+    // past it is required to ever discover older eligible identity evidence.
+    if (collection.evidence.length === 0) {
+      await advance();
+      return empty;
+    }
+    if (pageCursor?.observedDigest === evidenceDigest) {
+      await advance();
+      return { ...empty, unchanged: true };
+    }
+
+    const admittedKinds = admittedKindsForTarget(target);
+    const groupParticipants = groupParticipantsForTarget(target);
+    const now = this.now();
+    const response = await this.synthesize({ target, collection, candidateLimit, admittedKinds });
+    const resolution = await resolveLiveBiographicalCandidates({
+      responseContent: response,
+      memoryStore: this.options.memoryStore,
+      subject: target.subject,
+      companionSubject: this.options.companionSubject,
+      availableEvidence: collection.evidence,
+      depth: target.depth,
+      candidateLimit,
+      admittedKinds,
+      // Authority-issued, so a model that names its own participants cannot
+      // change who a group claim binds.
+      ...(groupParticipants ? { participants: groupParticipants } : {}),
+      // Re-applied on the drift re-read, so a source that left the group's
+      // governed context mid-run cannot be persisted (zu8d2).
+      ...(target.evidenceScope ? { evidenceScope: target.evidenceScope } : {}),
+      now,
+    });
+
+    const coalesced = this.coalesce(resolution.resolved.map(entry => entry.write), policy);
+    let staged = 0;
+    let superseded = 0;
+    let duplicate = 0;
+    for (const candidate of coalesced) {
+      const disposition = await this.stageCandidate({
+        candidate,
+        target,
+        policy,
+        automataRunId: input.automataRunId,
+        now,
+      });
+      if (disposition === 'staged') staged += 1;
+      if (disposition === 'superseded') {
+        staged += 1;
+        superseded += 1;
+      }
+      if (disposition === 'duplicate') duplicate += 1;
+    }
+    // The cursor advances only after the whole target's candidates are durably
+    // staged, so a crash mid-target re-runs it rather than silently skipping it.
+    await advance();
+    return {
+      synthesized: true,
+      unchanged: false,
+      sourcesScanned: collection.scannedCount,
+      sourcesAdmitted: collection.evidence.length,
+      sourcesWithheldByPolicy: withheldByPolicy,
+      candidatesEmitted: resolution.emittedCount,
+      candidatesStaged: staged,
+      candidatesSuperseded: superseded,
+      candidatesCoalesced: coalesced.reduce(
+        (total, entry) => total + (entry.mergedCount > 1 ? 1 : 0),
+        0,
+      ),
+      candidatesWithheld: resolution.withheld.length,
+      candidatesDuplicate: duplicate,
+    };
+  }
+
+  private async synthesize(input: {
+    readonly target: BiographySynthesisTarget;
+    readonly collection: Awaited<ReturnType<typeof collectAuthorizedBiographicalSources>>;
+    readonly candidateLimit: number;
+    readonly admittedKinds: readonly BiographicalClaimKind[];
+  }): Promise<string> {
+    const template = this.options.promptRegistry?.getPrompt(
+      BIOGRAPHY_CANDIDATE_SYNTHESIS_PROMPT_KEY,
+    ) ?? getDefaultPromptText(BIOGRAPHY_CANDIDATE_SYNTHESIS_PROMPT_KEY);
+    const prompt = injectPromptRuntimeTokens(template)
+      .replace('{subject_context}', subjectContextBlock(input.target))
+      .replace('{biographical_candidate_limit}', String(input.candidateLimit))
+      .replace('{admitted_kinds}', input.admittedKinds.join(', '))
+      .replace(
+        '{memory_facts}',
+        input.collection.evidence.map(entry => formatSourceMemory(entry.memory)).join('\n'),
+      );
+    const response = await completeWithWorkSpec(
+      this.options.llmClient,
+      {
+        systemPrompt: prompt,
+        messages: [{
+          role: 'user',
+          content: 'Propose the structured biography candidates now.',
+        }],
+      },
+      buildLLMWorkSpec({
+        purpose: 'memory',
+        durable: true,
+        correlation: {
+          requestId: `biography-candidate-synthesis:${this.now().getTime()}`,
+          channelId: 'internal:biography-synthesis',
+          callType: 'scheduled',
+          purpose: 'memory.biography.candidate_synthesis',
+          originType: 'scheduled',
+          originStage: 'memory.biography.candidate_synthesis',
+        },
+      }),
+    );
+    return response.content;
+  }
+
+  /**
+   * Coalesce candidates that reduce to the same canonical claim within one run.
+   * Duplicate evidence merges into a single candidate whose source set is the
+   * union of both proposals, so no provenance is lost; genuinely different
+   * values stay separate candidates for review to arbitrate.
+   */
+  private coalesce(
+    writes: readonly BiographicalClaimWriteInput[],
+    policy: BiographicalCandidatePolicy,
+  ): CoalescedCandidate[] {
+    const byClaimDigest = new Map<string, CoalescedCandidate>();
+    for (const write of writes) {
+      const prepared = prepareBiographicalClaim({ ...write, status: 'candidate' });
+      const existing = byClaimDigest.get(prepared.claimDigest);
+      if (existing === undefined) {
+        byClaimDigest.set(prepared.claimDigest, {
+          write,
+          claimDigest: prepared.claimDigest,
+          sourceSetDigest: prepared.sourceSetDigest,
+          mergedCount: 1,
+        });
+        continue;
+      }
+      const sources = unionSources(
+        existing.write.sources,
+        write.sources,
+        policy.budgets.maxSourcesPerCandidate,
+      );
+      if (sources === undefined) continue;
+      const merged: BiographicalClaimWriteInput = { ...existing.write, sources };
+      const mergedPrepared = prepareBiographicalClaim({ ...merged, status: 'candidate' });
+      byClaimDigest.set(prepared.claimDigest, {
+        write: merged,
+        claimDigest: mergedPrepared.claimDigest,
+        sourceSetDigest: mergedPrepared.sourceSetDigest,
+        mergedCount: existing.mergedCount + 1,
+      });
+    }
+    return [...byClaimDigest.values()];
+  }
+
+  /**
+   * Stage one coalesced candidate.
+   *
+   * Restart safety lives here: an identical claim already active, or already
+   * staged over the identical source set, writes nothing. The same claim over a
+   * drifted source set supersedes its predecessor rather than accumulating,
+   * so a re-run after a partial pass converges instead of duplicating.
+   */
+  private async stageCandidate(input: {
+    readonly candidate: CoalescedCandidate;
+    readonly target: BiographySynthesisTarget;
+    readonly policy: BiographicalCandidatePolicy;
+    readonly automataRunId: string;
+    readonly now: Date;
+  }): Promise<'staged' | 'superseded' | 'duplicate'> {
+    const { candidate, target, policy } = input;
+    return await this.options.profileStore.runClaimTransaction(
+      candidate.write.subject,
+      candidate.write.kind,
+      async store => {
+        const active = await store.listClaims({
+          subject: candidate.write.subject,
+          kind: candidate.write.kind,
+          status: 'active',
+        });
+        if (active.some(claim => claim.claimDigest === candidate.claimDigest)) {
+          return 'duplicate';
+        }
+        const staged = await store.listCandidates({
+          claimDigest: candidate.claimDigest,
+          limit: policy.budgets.maxPendingCandidates,
+        });
+        const open = staged.filter(
+          record => !['active', 'rejected', 'superseded'].includes(record.stage),
+        );
+        const identical = open.find(
+          record => record.sourceSetDigest === candidate.sourceSetDigest,
+        );
+        if (identical !== undefined) return 'duplicate';
+        const prior = open[0];
+        const rationale = this.rationaleFor({ candidate, active, recurring: prior !== undefined });
+        const { status: _ignoredStatus, portabilityScope: _ignoredScope, ...claimWrite } =
+          candidate.write;
+        const written = await store.writeCandidate({
+          claim: { ...claimWrite, now: input.now },
+          automataRunId: input.automataRunId,
+          automataAuthorityRef: `maintenance:biography-synthesis:${input.automataRunId}`,
+          policy,
+          socialContext: target.socialContext,
+          rationale,
+          ...(prior !== undefined ? { supersedesCandidateId: prior.id } : {}),
+        });
+        if (prior === undefined) return 'staged';
+        // Append-only: the predecessor becomes terminal under the owner policy
+        // that authorized this synthesis, and its receipts stay intact.
+        await store.transitionCandidate({
+          candidateId: prior.id,
+          expectedRevision: prior.revision,
+          to: 'superseded',
+          receipts: [{
+            authority: 'owner_policy',
+            decision: 'superseded',
+            actorAuthorityRef: `owner-policy:${written.policyDigest}`,
+            reason: 'owner_policy_supersession',
+          }],
+          now: input.now,
+        });
+        return 'superseded';
+      },
+    );
+  }
+
+  private rationaleFor(input: {
+    readonly candidate: CoalescedCandidate;
+    readonly active: readonly { claimDigest: string; kind: BiographicalClaimKind;
+      subject: BiographicalSubjectRef; value: unknown;
+      relatedSubject?: BiographicalSubjectRef }[];
+    readonly recurring: boolean;
+  }): BiographicalCandidateRationale {
+    if (input.candidate.mergedCount > 1) return 'coalesced_duplicate_evidence';
+    if (input.recurring) return 'recurring_evidence';
+    const key = claimConflictKey(
+      input.candidate.write.kind,
+      input.candidate.write.subject,
+      input.candidate.write.value,
+      input.candidate.write.relatedSubject,
+    );
+    const contradicts = input.active.some(claim => (
+      claimConflictKey(
+        claim.kind,
+        claim.subject,
+        claim.value as never,
+        claim.relatedSubject,
+      ) === key
+    ));
+    return contradicts ? 'contradicts_active_claim' : 'new_subject_claim';
+  }
+}

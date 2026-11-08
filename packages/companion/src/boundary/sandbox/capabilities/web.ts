@@ -1,0 +1,143 @@
+import type { AnalysisWorkbenchEvidence } from '../../../core/tools/analysis-workbench/types.js';
+import type { GatewayREPLCapabilities, SandboxBudgetRef } from './contracts.js';
+import {
+  addEvidence,
+  consumeToolCallBudget,
+  normalizeErrorMessage,
+  TOOL_CALL_BUDGET_EXCEEDED_MESSAGE,
+} from './common.js';
+import { planWebSearchUrls } from '../../integrations/web/search.js';
+
+export interface WebCapabilities {
+  web(
+    action: 'fetch',
+    target: string,
+    options?: { prompt?: string },
+  ): Promise<string>;
+  web(
+    action: 'search',
+    target: string,
+    options?: { maxUrls?: number },
+  ): Promise<Array<{ url: string; content: string }>>;
+  web_fetch: (url: string, prompt?: string) => Promise<string>;
+  web_research: (query: string, maxUrls?: number) => Promise<Array<{ url: string; content: string }>>;
+}
+
+interface CreateWebCapabilitiesOptions {
+  gatewayCaps: GatewayREPLCapabilities;
+  pushEvidence: (entry: AnalysisWorkbenchEvidence) => void;
+  budgetRef?: SandboxBudgetRef;
+  llm_query_json: (prompt: string, maxRetries?: number) => Promise<unknown>;
+}
+
+export function createWebCapabilities(options: CreateWebCapabilitiesOptions): WebCapabilities {
+  const fetchViaGateway = async (
+    url: string,
+    labels: {
+      unavailable: string;
+      missingTarget: string;
+      failurePrefix: string;
+    },
+    prompt?: string,
+  ): Promise<string> => {
+    if (!consumeToolCallBudget(options.budgetRef)) {
+      return `[${labels.failurePrefix}: ${TOOL_CALL_BUDGET_EXCEEDED_MESSAGE}]`;
+    }
+
+    if (typeof options.gatewayCaps.webFetch !== 'function') {
+      return `[${labels.unavailable}]`;
+    }
+
+    const trimmed = typeof url === 'string' ? url.trim() : '';
+    if (!trimmed) {
+      return `[${labels.missingTarget}]`;
+    }
+
+    try {
+      const content = await options.gatewayCaps.webFetch(trimmed, prompt);
+      addEvidence(options.pushEvidence, {
+        source: 'web_fetch',
+        query: trimmed,
+        snippet: content,
+      });
+      return content;
+    } catch (err) {
+      return `[${labels.failurePrefix}: ${normalizeErrorMessage(err)}]`;
+    }
+  };
+
+  const searchWeb = async (
+    query: string,
+    maxUrls = 3,
+  ): Promise<Array<{ url: string; content: string }>> => {
+    const uniqueUrls = await planWebSearchUrls(query, maxUrls, options.llm_query_json);
+
+    const results: Array<{ url: string; content: string }> = [];
+    for (const url of uniqueUrls) {
+      const content = await fetchViaGateway(
+        url,
+        {
+          unavailable: 'Web browse unavailable: requires gateway web.fetch policy and audit path',
+          missingTarget: 'Web browse error: URL is required',
+          failurePrefix: 'Web browse error',
+        },
+        `Research query: ${query}`,
+      );
+      results.push({ url, content });
+    }
+    return results;
+  };
+
+  async function web(
+    action: 'fetch',
+    target: string,
+    options?: { prompt?: string },
+  ): Promise<string>;
+  async function web(
+    action: 'search',
+    target: string,
+    options?: { maxUrls?: number },
+  ): Promise<Array<{ url: string; content: string }>>;
+  async function web(
+    action: 'fetch' | 'search',
+    target: string,
+    options?: { prompt?: string; maxUrls?: number },
+  ): Promise<string | Array<{ url: string; content: string }>> {
+    switch (action) {
+      case 'fetch':
+        return await fetchViaGateway(
+          target,
+          {
+            unavailable: 'Web fetch unavailable: requires gateway web.fetch policy and audit path',
+            missingTarget: 'Web fetch error: URL is required',
+            failurePrefix: 'Web fetch error',
+          },
+          options?.prompt,
+        );
+      case 'search':
+        return await searchWeb(target, options?.maxUrls);
+      default:
+        // psfn-framework-9zgfd: "browse" duplicated "fetch" once the crawler
+        // lane was removed; it is retired, not aliased.
+        return String(action) === 'browse'
+          ? '[Web error: action "browse" was retired; use web("fetch", url)]'
+          : `[Web error: unsupported action "${String(action)}"]`;
+    }
+  }
+
+  return {
+    web,
+    web_fetch: async (url: string, prompt?: string): Promise<string> => fetchViaGateway(
+      url,
+      {
+        unavailable: 'Web fetch unavailable: requires gateway web.fetch policy and audit path',
+        missingTarget: 'Web fetch error: URL is required',
+        failurePrefix: 'Web fetch error',
+      },
+      prompt,
+    ),
+    web_research: async (query: string, maxUrls?: number): Promise<Array<{ url: string; content: string }>> => (
+      searchWeb(query, maxUrls)
+    ),
+  };
+}

@@ -1,0 +1,1848 @@
+import { FLEET_AUTH_LOCK_AUTHORITY_STATE_DDL_SQL } from './authority-state-lock-sql.js';
+import { FLEET_AUTH_LOCK_COMPANION_AUTHORITY_DDL_SQL } from './companion-authority-lock-sql.js';
+import { FLEET_AUTH_FLOOR_RESOURCE_TOMBSTONED_DDL_SQL } from './authority-floor-read-sql.js';
+import { FLEET_AUTH_CONTACT_AUTHORITY_DDL_SQL } from './contact-authority-sql.js';
+
+export interface FleetAuthMigration {
+  version: number;
+  name: string;
+  sql: string;
+}
+
+const DURABLE_AUTHORITY_SQL = `
+CREATE TABLE human_principals (
+  principal_id UUID PRIMARY KEY,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'active', 'suspended', 'revoked', 'quarantined')),
+  authn_version BIGINT NOT NULL DEFAULT 1 CHECK (authn_version >= 1),
+  authz_version BIGINT NOT NULL DEFAULT 1 CHECK (authz_version >= 1),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  restore_state TEXT NOT NULL DEFAULT 'live' CHECK (restore_state IN ('live', 'quarantined')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE authority_state (
+  singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  restore_checkpoint BIGINT NOT NULL CHECK (restore_checkpoint >= 0),
+  activation_generation BIGINT NOT NULL CHECK (activation_generation >= 1),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+INSERT INTO authority_state (
+  singleton, authority_generation, global_auth_epoch, restore_checkpoint, activation_generation
+) VALUES (TRUE, 1, 1, 0, 1)
+ON CONFLICT (singleton) DO NOTHING;
+
+CREATE TABLE provider_subjects (
+  provider TEXT NOT NULL CHECK (provider = 'discord'),
+  subject_id TEXT NOT NULL CHECK (subject_id ~ '^[1-9][0-9]{16,19}$'),
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'suspended', 'revoked', 'quarantined')),
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(metadata) = 'object'),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  restore_state TEXT NOT NULL DEFAULT 'live' CHECK (restore_state IN ('live', 'quarantined')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (provider, subject_id)
+);
+
+CREATE TABLE provider_subject_history (
+  event_id UUID PRIMARY KEY,
+  provider TEXT NOT NULL CHECK (provider = 'discord'),
+  subject_id TEXT NOT NULL CHECK (subject_id ~ '^[1-9][0-9]{16,19}$'),
+  principal_id UUID NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'suspended', 'revoked', 'quarantined')),
+  event_type TEXT NOT NULL CHECK (event_type IN ('created', 'linked', 'unlinked', 'replaced', 'recovered', 'restored')),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  payload JSONB NOT NULL DEFAULT '{}'::jsonb CHECK (jsonb_typeof(payload) = 'object'),
+  recorded_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE provider_subject_tombstones (
+  provider TEXT NOT NULL CHECK (provider = 'discord'),
+  subject_id TEXT NOT NULL CHECK (subject_id ~ '^[1-9][0-9]{16,19}$'),
+  prior_principal_id UUID NOT NULL,
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  revoked_at TIMESTAMPTZ NOT NULL,
+  reason_digest TEXT NOT NULL CHECK (reason_digest ~ '^[0-9a-f]{64}$'),
+  PRIMARY KEY (provider, subject_id)
+);
+
+CREATE TABLE principal_contact_bindings (
+  binding_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  companion_id UUID NOT NULL,
+  contact_id TEXT NOT NULL CHECK (length(contact_id) BETWEEN 1 AND 256),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'active', 'conflict', 'suspended', 'revoked', 'quarantined')),
+  verification_provenance JSONB NOT NULL CHECK (jsonb_typeof(verification_provenance) = 'object'),
+  version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  restore_state TEXT NOT NULL DEFAULT 'live' CHECK (restore_state IN ('live', 'quarantined')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  UNIQUE (principal_id, companion_id, contact_id)
+);
+
+CREATE TABLE principal_role_grants (
+  grant_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  companion_id UUID NOT NULL,
+  role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member', 'guest')),
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('pending', 'active', 'suspended', 'revoked', 'quarantined')),
+  version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  restore_state TEXT NOT NULL DEFAULT 'live' CHECK (restore_state IN ('live', 'quarantined')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE UNIQUE INDEX principal_role_one_live_base_role
+  ON principal_role_grants (principal_id, companion_id)
+  WHERE lifecycle IN ('active', 'pending');
+
+CREATE TABLE passkey_credentials (
+  credential_id_hash TEXT PRIMARY KEY CHECK (credential_id_hash ~ '^[0-9a-f]{64}$'),
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  expected_provider TEXT NOT NULL DEFAULT 'discord' CHECK (expected_provider = 'discord'),
+  expected_provider_subject_id TEXT NOT NULL CHECK (expected_provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  rp_id TEXT NOT NULL CHECK (length(rp_id) BETWEEN 1 AND 253),
+  public_key_projection TEXT NOT NULL CHECK (length(public_key_projection) > 0),
+  credential_generation BIGINT NOT NULL CHECK (credential_generation >= 1),
+  state TEXT NOT NULL CHECK (state IN ('pending', 'quarantined', 'suspended', 'revoked')),
+  sign_count BIGINT NOT NULL DEFAULT 0 CHECK (sign_count >= 0),
+  backup_eligible BOOLEAN NOT NULL DEFAULT FALSE,
+  backup_state BOOLEAN NOT NULL DEFAULT FALSE,
+  CHECK (NOT backup_state OR backup_eligible),
+  authority_floor_generation BIGINT NOT NULL CHECK (authority_floor_generation >= 1),
+  restore_state TEXT NOT NULL DEFAULT 'quarantined' CHECK (restore_state = 'quarantined'),
+  imported_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE authorization_audit_events (
+  event_id UUID PRIMARY KEY,
+  actor_context JSONB NOT NULL CHECK (jsonb_typeof(actor_context) = 'object'),
+  action TEXT NOT NULL CHECK (length(action) BETWEEN 1 AND 128),
+  resource TEXT NOT NULL CHECK (length(resource) BETWEEN 1 AND 1024),
+  decision TEXT NOT NULL CHECK (decision IN ('allow', 'deny')),
+  reason_code TEXT,
+  companion_id UUID,
+  principal_id UUID,
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  correlation_id TEXT,
+  occurred_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+`;
+
+const EPHEMERAL_AUTHORITY_SQL = `
+CREATE TABLE discord_evidence_snapshots (
+  evidence_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  provider TEXT NOT NULL DEFAULT 'discord' CHECK (provider = 'discord'),
+  provider_subject_id TEXT NOT NULL CHECK (provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  companion_id UUID NOT NULL,
+  guild_id TEXT NOT NULL CHECK (guild_id ~ '^[1-9][0-9]{16,19}$'),
+  channel_id TEXT CHECK (channel_id IS NULL OR channel_id ~ '^[1-9][0-9]{16,19}$'),
+  permission_inputs JSONB NOT NULL CHECK (jsonb_typeof(permission_inputs) = 'object'),
+  discord_permission_result BOOLEAN NOT NULL,
+  member_specific_deny_veto BOOLEAN NOT NULL,
+  psfn_evidence_result BOOLEAN NOT NULL,
+  input_digest TEXT NOT NULL CHECK (input_digest ~ '^[0-9a-f]{64}$'),
+  config_digest TEXT NOT NULL CHECK (config_digest ~ '^[0-9a-f]{64}$'),
+  provenance JSONB NOT NULL CHECK (jsonb_typeof(provenance) = 'object'),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  fetched_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL CHECK (expires_at > fetched_at)
+);
+
+CREATE TABLE oauth_transactions (
+  transaction_id UUID PRIMARY KEY,
+  state_digest TEXT NOT NULL UNIQUE CHECK (state_digest ~ '^[0-9a-f]{64}$'),
+  pkce_verifier_digest TEXT NOT NULL CHECK (pkce_verifier_digest ~ '^[0-9a-f]{64}$'),
+  callback_uri TEXT NOT NULL CHECK (callback_uri LIKE 'https://%'),
+  return_path TEXT NOT NULL CHECK (return_path LIKE '/%' AND return_path NOT LIKE '//%'),
+  kind TEXT NOT NULL DEFAULT 'login' CHECK (kind IN ('login', 'provider_link', 'provider_replace', 'first_owner', 'recovery')),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'consumed', 'expired', 'revoked')),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  CHECK (expires_at > created_at)
+);
+
+CREATE TABLE provider_token_custody (
+  custody_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  provider TEXT NOT NULL DEFAULT 'discord' CHECK (provider = 'discord'),
+  encrypted_token BYTEA NOT NULL CHECK (octet_length(encrypted_token) > 0),
+  key_version INTEGER NOT NULL CHECK (key_version >= 1),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE browser_sessions (
+  record_id UUID PRIMARY KEY,
+  token_digest TEXT NOT NULL UNIQUE CHECK (token_digest ~ '^[0-9a-f]{64}$'),
+  csrf_digest TEXT NOT NULL CHECK (csrf_digest ~ '^[0-9a-f]{64}$'),
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  audience TEXT NOT NULL CHECK (length(audience) BETWEEN 1 AND 256),
+  assurance TEXT NOT NULL CHECK (assurance IN ('oauth', 'webauthn_uv', 'break_glass')),
+  authn_version BIGINT NOT NULL CHECK (authn_version >= 1),
+  authz_version BIGINT NOT NULL CHECK (authz_version >= 1),
+  binding_version BIGINT NOT NULL DEFAULT 1 CHECK (binding_version >= 1),
+  policy_version BIGINT NOT NULL DEFAULT 1 CHECK (policy_version >= 1),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  idle_expires_at TIMESTAMPTZ NOT NULL,
+  absolute_expires_at TIMESTAMPTZ NOT NULL,
+  replaced_by UUID,
+  revoked_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  CHECK (absolute_expires_at > created_at),
+  CHECK (idle_expires_at <= absolute_expires_at)
+);
+
+CREATE TABLE step_up_challenges (
+  challenge_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  browser_session_id UUID NOT NULL REFERENCES browser_sessions(record_id),
+  challenge_digest TEXT NOT NULL UNIQUE CHECK (challenge_digest ~ '^[0-9a-f]{64}$'),
+  kind TEXT NOT NULL CHECK (kind IN ('webauthn_uv', 'discord_possession')),
+  action TEXT NOT NULL,
+  resource_digest TEXT NOT NULL CHECK (resource_digest ~ '^[0-9a-f]{64}$'),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'consumed', 'expired', 'revoked')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  CHECK (expires_at > created_at)
+);
+
+CREATE TABLE jit_authorization_grants (
+  grant_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  browser_session_id UUID NOT NULL REFERENCES browser_sessions(record_id),
+  companion_id UUID NOT NULL,
+  subject_scope JSONB NOT NULL CHECK (jsonb_typeof(subject_scope) = 'object'),
+  action TEXT NOT NULL,
+  resource_selector JSONB NOT NULL CHECK (jsonb_typeof(resource_selector) = 'object'),
+  purpose TEXT NOT NULL CHECK (length(purpose) BETWEEN 1 AND 512),
+  assurance TEXT NOT NULL CHECK (assurance IN ('webauthn_uv', 'discord_possession')),
+  memory_revision BIGINT NOT NULL CHECK (memory_revision >= 1),
+  classifier_evidence_digest TEXT NOT NULL CHECK (classifier_evidence_digest ~ '^[0-9a-f]{64}$'),
+  authz_version BIGINT NOT NULL CHECK (authz_version >= 1),
+  binding_version BIGINT NOT NULL CHECK (binding_version >= 1),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  revoked_at TIMESTAMPTZ,
+  CHECK (expires_at > issued_at)
+);
+
+CREATE TABLE trusted_host_ceremonies (
+  ceremony_id UUID PRIMARY KEY,
+  nonce_digest TEXT NOT NULL UNIQUE CHECK (nonce_digest ~ '^[0-9a-f]{64}$'),
+  kind TEXT NOT NULL CHECK (kind IN ('first_owner', 'account_reapproval', 'passkey_enrollment', 'passkey_recovery')),
+  expected_provider TEXT NOT NULL DEFAULT 'discord' CHECK (expected_provider = 'discord'),
+  expected_provider_subject_id TEXT NOT NULL CHECK (expected_provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  expected_companion_id UUID,
+  expected_contact_id TEXT,
+  exact_scope JSONB NOT NULL CHECK (jsonb_typeof(exact_scope) = 'object'),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'consumed', 'expired', 'revoked')),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  CHECK (expires_at > created_at)
+);
+`;
+
+const GUARDS_AND_INDEXES_SQL = `
+CREATE OR REPLACE FUNCTION reject_immutable_mutation()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION 'fleet_auth immutable relation is append-only' USING ERRCODE = '42501';
+END;
+$$;
+
+DROP TRIGGER IF EXISTS provider_subject_history_append_only ON provider_subject_history;
+CREATE TRIGGER provider_subject_history_append_only
+  BEFORE UPDATE OR DELETE ON provider_subject_history
+  FOR EACH ROW EXECUTE FUNCTION reject_immutable_mutation();
+
+DROP TRIGGER IF EXISTS provider_subject_tombstones_append_only ON provider_subject_tombstones;
+CREATE TRIGGER provider_subject_tombstones_append_only
+  BEFORE UPDATE OR DELETE ON provider_subject_tombstones
+  FOR EACH ROW EXECUTE FUNCTION reject_immutable_mutation();
+
+DROP TRIGGER IF EXISTS authorization_audit_events_append_only ON authorization_audit_events;
+CREATE TRIGGER authorization_audit_events_append_only
+  BEFORE UPDATE OR DELETE ON authorization_audit_events
+  FOR EACH ROW EXECUTE FUNCTION reject_immutable_mutation();
+
+CREATE INDEX provider_subjects_principal_idx ON provider_subjects (principal_id);
+CREATE INDEX contact_bindings_principal_companion_idx
+  ON principal_contact_bindings (principal_id, companion_id, state);
+CREATE INDEX role_grants_principal_companion_idx
+  ON principal_role_grants (principal_id, companion_id, lifecycle);
+CREATE INDEX evidence_lookup_idx
+  ON discord_evidence_snapshots (principal_id, companion_id, expires_at);
+CREATE INDEX browser_sessions_principal_idx
+  ON browser_sessions (principal_id, revoked_at, absolute_expires_at);
+CREATE INDEX jit_grants_session_idx
+  ON jit_authorization_grants (browser_session_id, revoked_at, expires_at);
+CREATE INDEX audit_occurred_idx ON authorization_audit_events (occurred_at, event_id);
+`;
+
+const LINEAGE_AND_IDENTITY_GUARDS_SQL = `
+ALTER TABLE authority_state
+  ADD COLUMN authority_lineage_id TEXT
+  CHECK (authority_lineage_id IS NULL OR authority_lineage_id ~ '^[0-9a-f]{64}$');
+
+CREATE TABLE provider_subject_registry (
+  provider TEXT NOT NULL CHECK (provider = 'discord'),
+  subject_id TEXT NOT NULL CHECK (subject_id ~ '^[1-9][0-9]{16,19}$'),
+  principal_id UUID NOT NULL,
+  tombstoned BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (provider, subject_id)
+);
+
+-- Freeze every source of durable identity evidence for the backfill window.
+-- provider_subject_history is append-only, but a concurrent INSERT during the
+-- upgrade could otherwise slip a new principal in between derivation and the
+-- trigger install, so it is locked alongside the live and tombstone tables.
+LOCK TABLE provider_subjects, provider_subject_tombstones, provider_subject_history
+  IN SHARE ROW EXCLUSIVE MODE;
+
+-- Derive one permanent provider/subject owner from ALL immutable identity
+-- evidence: current live rows, terminal tombstones, and the append-only
+-- history log. A subject linked to a principal only in history (for example
+-- one deleted before v4 without a tombstone) must still seed the registry, or
+-- it could be resurrected under a different principal after enforcement is
+-- installed. Any subject whose combined legacy evidence names more than one
+-- principal is ambiguous: fail the entire migration closed with an
+-- operator-actionable error instead of silently choosing an owner.
+DO $$
+DECLARE
+  ambiguous RECORD;
+BEGIN
+  SELECT provider, subject_id
+  INTO ambiguous
+  FROM (
+    SELECT provider, subject_id, principal_id FROM provider_subjects
+    UNION
+    SELECT provider, subject_id, prior_principal_id FROM provider_subject_tombstones
+    UNION
+    SELECT provider, subject_id, principal_id FROM provider_subject_history
+  ) AS identity_evidence
+  GROUP BY provider, subject_id
+  HAVING count(DISTINCT principal_id) > 1
+  ORDER BY provider, subject_id
+  LIMIT 1;
+  IF FOUND THEN
+    RAISE EXCEPTION
+      'provider subject %/% has conflicting legacy principal identity evidence; resolve ownership before upgrading',
+      ambiguous.provider, ambiguous.subject_id
+      USING ERRCODE = '23514';
+  END IF;
+END;
+$$;
+
+-- The ambiguity guard above guarantees exactly one distinct principal per
+-- subject, so the deduplicated principal aggregate has a single element that is
+-- the sole owner; bool_or(tombstoned) keeps any terminal tombstone permanent.
+INSERT INTO provider_subject_registry (provider, subject_id, principal_id, tombstoned)
+SELECT
+  provider,
+  subject_id,
+  (array_agg(DISTINCT principal_id))[1] AS principal_id,
+  bool_or(tombstoned) AS tombstoned
+FROM (
+  SELECT provider, subject_id, principal_id, FALSE AS tombstoned
+    FROM provider_subjects
+  UNION ALL
+  SELECT provider, subject_id, prior_principal_id AS principal_id, TRUE AS tombstoned
+    FROM provider_subject_tombstones
+  UNION ALL
+  SELECT provider, subject_id, principal_id, FALSE AS tombstoned
+    FROM provider_subject_history
+) AS identity_evidence
+GROUP BY provider, subject_id
+ON CONFLICT (provider, subject_id) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION enforce_provider_subject_registry()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, fleet_auth
+AS $$
+DECLARE
+  registered_principal UUID;
+  permanently_tombstoned BOOLEAN;
+BEGIN
+  INSERT INTO fleet_auth.provider_subject_registry
+    (provider, subject_id, principal_id, tombstoned)
+  VALUES (NEW.provider, NEW.subject_id, NEW.principal_id, FALSE)
+  ON CONFLICT (provider, subject_id) DO NOTHING;
+
+  SELECT principal_id, tombstoned
+  INTO registered_principal, permanently_tombstoned
+  FROM fleet_auth.provider_subject_registry
+  WHERE provider = NEW.provider AND subject_id = NEW.subject_id
+  FOR UPDATE;
+
+  IF registered_principal <> NEW.principal_id THEN
+    RAISE EXCEPTION 'provider subject is permanently bound to another principal'
+      USING ERRCODE = '23505';
+  END IF;
+  IF permanently_tombstoned AND NEW.state NOT IN ('revoked', 'quarantined') THEN
+    RAISE EXCEPTION 'provider subject is permanently tombstoned'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION enforce_provider_subject_tombstone_registry()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, fleet_auth
+AS $$
+DECLARE
+  registered_principal UUID;
+BEGIN
+  INSERT INTO fleet_auth.provider_subject_registry
+    (provider, subject_id, principal_id, tombstoned)
+  VALUES (NEW.provider, NEW.subject_id, NEW.prior_principal_id, TRUE)
+  ON CONFLICT (provider, subject_id) DO NOTHING;
+
+  SELECT principal_id
+  INTO registered_principal
+  FROM fleet_auth.provider_subject_registry
+  WHERE provider = NEW.provider AND subject_id = NEW.subject_id
+  FOR UPDATE;
+
+  IF registered_principal <> NEW.prior_principal_id THEN
+    RAISE EXCEPTION 'provider subject tombstone conflicts with its permanent principal binding'
+      USING ERRCODE = '23514';
+  END IF;
+
+  UPDATE fleet_auth.provider_subject_registry
+  SET tombstoned = TRUE, updated_at = clock_timestamp()
+  WHERE provider = NEW.provider AND subject_id = NEW.subject_id;
+
+  UPDATE fleet_auth.provider_subjects
+  SET state = 'revoked', updated_at = clock_timestamp()
+  WHERE provider = NEW.provider AND subject_id = NEW.subject_id
+    AND state <> 'revoked';
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION reject_untombstoned_provider_subject_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, fleet_auth
+AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM fleet_auth.provider_subject_registry
+    WHERE provider = OLD.provider
+      AND subject_id = OLD.subject_id
+      AND principal_id = OLD.principal_id
+      AND tombstoned = TRUE
+  ) THEN
+    RAISE EXCEPTION 'provider subject must be permanently tombstoned before deletion'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+CREATE TRIGGER provider_subject_registry_guard
+  BEFORE INSERT OR UPDATE OF provider, subject_id, principal_id, state
+  ON provider_subjects
+  FOR EACH ROW EXECUTE FUNCTION enforce_provider_subject_registry();
+
+CREATE TRIGGER provider_subject_delete_guard
+  BEFORE DELETE ON provider_subjects
+  FOR EACH ROW EXECUTE FUNCTION reject_untombstoned_provider_subject_delete();
+
+CREATE TRIGGER provider_subject_tombstone_registry_guard
+  BEFORE INSERT ON provider_subject_tombstones
+  FOR EACH ROW EXECUTE FUNCTION enforce_provider_subject_tombstone_registry();
+
+CREATE UNIQUE INDEX contact_binding_one_live_principal
+  ON principal_contact_bindings (companion_id, contact_id)
+  WHERE state IN ('active', 'pending');
+`;
+
+const RESTORED_HISTORY_IDENTITY_GUARD_SQL = `
+-- Immutable history is itself permanent provider identity evidence. Migration
+-- v4 backfilled pre-existing rows, but restore/import can append history after
+-- that one-time backfill. Register every new history row transactionally so a
+-- history-only A->subject binding can never later be recreated for B.
+--
+-- Freeze every identity source and the registry before closing the v4-to-v5
+-- trigger gap. SHARE ROW EXCLUSIVE blocks concurrent writes while allowing
+-- ordinary reads, so no restore/import row can slip between this backfill and
+-- trigger installation.
+LOCK TABLE provider_subjects, provider_subject_tombstones,
+  provider_subject_history, provider_subject_registry
+  IN SHARE ROW EXCLUSIVE MODE;
+
+-- A v4 database can contain history appended before v5 existed. Reject any
+-- subject whose history names multiple principals or conflicts with the
+-- permanent registry. The migration runner wraps this script and its ledger
+-- write in one transaction, so every conflict leaves both registry and schema
+-- version untouched.
+DO $$
+DECLARE
+  conflicting RECORD;
+BEGIN
+  SELECT provider, subject_id
+  INTO conflicting
+  FROM (
+    SELECT provider, subject_id, principal_id FROM provider_subject_history
+    UNION
+    SELECT provider, subject_id, principal_id FROM provider_subject_registry
+  ) AS identity_evidence
+  GROUP BY provider, subject_id
+  HAVING count(DISTINCT principal_id) > 1
+  ORDER BY provider, subject_id
+  LIMIT 1;
+  IF FOUND THEN
+    RAISE EXCEPTION
+      'provider subject history conflicts with its permanent principal binding for %/%',
+      conflicting.provider, conflicting.subject_id
+      USING ERRCODE = '23505';
+  END IF;
+END;
+$$;
+
+-- The ambiguity check guarantees one owner per historical subject. Seed every
+-- missing permanent binding before the trigger begins enforcing future rows;
+-- existing tombstone state and registry timestamps remain unchanged.
+INSERT INTO provider_subject_registry (provider, subject_id, principal_id, tombstoned)
+SELECT provider, subject_id, (array_agg(DISTINCT principal_id))[1], FALSE
+FROM provider_subject_history
+GROUP BY provider, subject_id
+ON CONFLICT (provider, subject_id) DO NOTHING;
+
+CREATE OR REPLACE FUNCTION enforce_provider_subject_history_registry()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, fleet_auth
+AS $$
+DECLARE
+  registered_principal UUID;
+BEGIN
+  INSERT INTO fleet_auth.provider_subject_registry
+    (provider, subject_id, principal_id, tombstoned)
+  VALUES (NEW.provider, NEW.subject_id, NEW.principal_id, FALSE)
+  ON CONFLICT (provider, subject_id) DO NOTHING;
+
+  SELECT principal_id
+  INTO registered_principal
+  FROM fleet_auth.provider_subject_registry
+  WHERE provider = NEW.provider AND subject_id = NEW.subject_id
+  FOR UPDATE;
+
+  IF registered_principal <> NEW.principal_id THEN
+    RAISE EXCEPTION 'provider subject history conflicts with its permanent principal binding'
+      USING ERRCODE = '23505';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS provider_subject_history_registry_guard ON provider_subject_history;
+CREATE TRIGGER provider_subject_history_registry_guard
+  AFTER INSERT ON provider_subject_history
+  FOR EACH ROW EXECUTE FUNCTION enforce_provider_subject_history_registry();
+
+`;
+
+const OAUTH_BROKER_SESSION_SQL = `
+ALTER TABLE oauth_transactions
+  ADD COLUMN pkce_verifier_ciphertext BYTEA,
+  ADD COLUMN completed_session_id UUID
+    REFERENCES browser_sessions(record_id);
+
+-- Transactions created before the broker could retain its PKCE verifier only
+-- contain a digest and can never complete a code exchange. Revoke them rather
+-- than attempting a compatibility fallback or accepting PKCE-less callbacks.
+UPDATE oauth_transactions
+SET status = 'revoked'
+WHERE pkce_verifier_ciphertext IS NULL
+  AND status = 'pending';
+
+ALTER TABLE browser_sessions
+  ADD CONSTRAINT browser_sessions_replacement_fk
+  FOREIGN KEY (replaced_by) REFERENCES browser_sessions(record_id);
+
+CREATE INDEX oauth_transactions_expiry_idx
+  ON oauth_transactions (status, expires_at);
+CREATE INDEX browser_sessions_token_lookup_idx
+  ON browser_sessions (token_digest, revoked_at);
+`;
+
+const OAUTH_INITIATING_BROWSER_SQL = `
+ALTER TABLE oauth_transactions
+  ADD COLUMN initiating_browser_digest TEXT
+    CHECK (initiating_browser_digest ~ '^[0-9a-f]{64}$');
+
+-- Transactions created before browser binding cannot safely complete. Preserve
+-- historical receipts but revoke every still-pending unbound transaction.
+UPDATE oauth_transactions
+SET status = 'revoked'
+WHERE initiating_browser_digest IS NULL
+  AND status = 'pending';
+
+ALTER TABLE oauth_transactions
+  ADD CONSTRAINT oauth_transactions_pending_browser_bound
+  CHECK (status <> 'pending' OR initiating_browser_digest IS NOT NULL);
+`;
+
+const HUB_DEVICE_ASSERTION_REPLAY_SQL = `
+CREATE TABLE hub_device_assertion_replays (
+  issuer TEXT NOT NULL CHECK (length(issuer) BETWEEN 1 AND 128),
+  jti UUID NOT NULL,
+  assertion_digest TEXT NOT NULL CHECK (assertion_digest ~ '^[0-9a-f]{64}$'),
+  device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 256),
+  enrollment_version BIGINT NOT NULL CHECK (enrollment_version >= 1),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (issuer, jti),
+  CHECK (expires_at > consumed_at)
+);
+
+CREATE INDEX hub_device_assertion_replays_expiry_idx
+  ON hub_device_assertion_replays (expires_at);
+`;
+
+const HUB_DEVICE_ASSERTION_REPLAY_AUDIT_SQL = `
+ALTER TABLE hub_device_assertion_replays
+  ADD COLUMN replay_count BIGINT NOT NULL DEFAULT 0 CHECK (replay_count >= 0),
+  ADD COLUMN last_replayed_at TIMESTAMPTZ,
+  ADD COLUMN mismatch_count BIGINT NOT NULL DEFAULT 0 CHECK (mismatch_count >= 0),
+  ADD COLUMN last_mismatch_digest TEXT CHECK (last_mismatch_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN last_mismatch_at TIMESTAMPTZ,
+  ADD CONSTRAINT hub_device_assertion_replay_audit_consistency
+    CHECK ((replay_count = 0) = (last_replayed_at IS NULL)),
+  ADD CONSTRAINT hub_device_assertion_mismatch_audit_consistency
+    CHECK ((mismatch_count = 0) = (last_mismatch_digest IS NULL AND last_mismatch_at IS NULL));
+`;
+
+const HUB_DEVICE_ASSERTION_DURABLE_DENIAL_AUDIT_SQL = `
+ALTER TABLE authorization_audit_events
+  ADD CONSTRAINT authorization_audit_hub_mutated_replay_shape CHECK (
+    (action <> 'hub_device_assertion.verify'
+      AND reason_code IS DISTINCT FROM 'mutated_replay')
+    OR (
+      action = 'hub_device_assertion.verify'
+      AND actor_context = '{"kind":"hub_device_assertion"}'::jsonb
+      AND resource = 'hub-device-assertion-replay'
+      AND decision = 'deny'
+      AND reason_code = 'mutated_replay'
+      AND companion_id IS NULL
+      AND principal_id IS NULL
+      AND correlation_id ~ '^[0-9a-f]{64}$'
+      AND decision_id IS NULL
+      AND ceremony_id IS NULL
+      AND reason_digest IS NULL
+      AND decision_context ?& ARRAY[
+        'schemaVersion',
+        'issuerDigest',
+        'keyIdDigest',
+        'audienceDigest',
+        'companionIdDigest',
+        'deviceIdDigest',
+        'sessionIdDigest',
+        'enrollmentVersionDigest',
+        'jtiDigest',
+        'acceptedAssertionDigest',
+        'mutatedAssertionDigest'
+      ]
+      AND decision_context - ARRAY[
+        'schemaVersion',
+        'issuerDigest',
+        'keyIdDigest',
+        'audienceDigest',
+        'companionIdDigest',
+        'deviceIdDigest',
+        'sessionIdDigest',
+        'enrollmentVersionDigest',
+        'jtiDigest',
+        'acceptedAssertionDigest',
+        'mutatedAssertionDigest'
+      ]::text[] = '{}'::jsonb
+      AND decision_context->'schemaVersion' = '1'::jsonb
+      AND jsonb_typeof(decision_context->'issuerDigest') = 'string'
+      AND jsonb_typeof(decision_context->'keyIdDigest') = 'string'
+      AND jsonb_typeof(decision_context->'audienceDigest') = 'string'
+      AND jsonb_typeof(decision_context->'companionIdDigest') = 'string'
+      AND jsonb_typeof(decision_context->'deviceIdDigest') = 'string'
+      AND jsonb_typeof(decision_context->'sessionIdDigest') = 'string'
+      AND jsonb_typeof(decision_context->'enrollmentVersionDigest') = 'string'
+      AND jsonb_typeof(decision_context->'jtiDigest') = 'string'
+      AND jsonb_typeof(decision_context->'acceptedAssertionDigest') = 'string'
+      AND jsonb_typeof(decision_context->'mutatedAssertionDigest') = 'string'
+      AND decision_context->>'issuerDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'keyIdDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'audienceDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'companionIdDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'deviceIdDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'sessionIdDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'enrollmentVersionDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'jtiDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'acceptedAssertionDigest' ~ '^[0-9a-f]{64}$'
+      AND decision_context->>'mutatedAssertionDigest' ~ '^[0-9a-f]{64}$'
+    )
+  );
+
+CREATE UNIQUE INDEX authorization_audit_hub_mutated_replay_unique
+  ON authorization_audit_events (correlation_id)
+  WHERE action = 'hub_device_assertion.verify'
+    AND reason_code = 'mutated_replay';
+`;
+
+const HUB_DEVICE_ASSERTION_REPLAY_PROCEDURE_BOUNDARY_SQL = `
+-- Replay fences are short-lived enforcement state. Drop any pre-boundary rows
+-- instead of guessing missing audit bindings during upgrade; signed assertions
+-- must be verified and consumed again against the new procedure-owned ledger.
+TRUNCATE TABLE hub_device_assertion_replays;
+
+ALTER TABLE hub_device_assertion_replays
+  ADD COLUMN key_id_digest TEXT NOT NULL CHECK (key_id_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN audience_digest TEXT NOT NULL CHECK (audience_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN companion_id_digest TEXT NOT NULL CHECK (companion_id_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN session_id_digest TEXT NOT NULL CHECK (session_id_digest ~ '^[0-9a-f]{64}$');
+
+-- v16 generated its dedup key from raw issuer/JTI values that are deliberately
+-- absent from the durable audit. Canonicalize that metadata once from the
+-- complete sanitized context so future restores can independently derive it.
+-- The table lock held by these DDL statements prevents an append gap while the
+-- immutable trigger is replaced inside the migration transaction.
+DROP TRIGGER authorization_audit_events_append_only ON authorization_audit_events;
+UPDATE authorization_audit_events
+SET correlation_id = encode(sha256(convert_to(jsonb_build_array(
+  decision_context->>'issuerDigest',
+  decision_context->>'keyIdDigest',
+  decision_context->>'audienceDigest',
+  decision_context->>'companionIdDigest',
+  decision_context->>'deviceIdDigest',
+  decision_context->>'sessionIdDigest',
+  decision_context->>'enrollmentVersionDigest',
+  decision_context->>'jtiDigest',
+  decision_context->>'acceptedAssertionDigest',
+  decision_context->>'mutatedAssertionDigest'
+)::text, 'UTF8')), 'hex')
+WHERE action = 'hub_device_assertion.verify'
+  AND reason_code = 'mutated_replay';
+CREATE TRIGGER authorization_audit_events_append_only
+  BEFORE UPDATE OR DELETE ON authorization_audit_events
+  FOR EACH ROW EXECUTE FUNCTION reject_immutable_mutation();
+
+ALTER TABLE authorization_audit_events
+  ADD CONSTRAINT authorization_audit_hub_mutated_replay_canonical CHECK (
+    (action <> 'hub_device_assertion.verify'
+      AND reason_code IS DISTINCT FROM 'mutated_replay')
+    OR (
+      action = 'hub_device_assertion.verify'
+      AND reason_code = 'mutated_replay'
+      AND correlation_id IS NOT NULL
+      AND correlation_id ~ '^[0-9a-f]{64}$'
+      AND correlation_id = encode(sha256(convert_to(jsonb_build_array(
+        decision_context->>'issuerDigest',
+        decision_context->>'keyIdDigest',
+        decision_context->>'audienceDigest',
+        decision_context->>'companionIdDigest',
+        decision_context->>'deviceIdDigest',
+        decision_context->>'sessionIdDigest',
+        decision_context->>'enrollmentVersionDigest',
+        decision_context->>'jtiDigest',
+        decision_context->>'acceptedAssertionDigest',
+        decision_context->>'mutatedAssertionDigest'
+      )::text, 'UTF8')), 'hex')
+    )
+  );
+`;
+
+const DISCORD_EVIDENCE_COMPLETENESS_SQL = `
+-- Pre-v10 evidence lacks the complete thread/config/reason contract and must
+-- never survive as positive authorization input after this migration.
+TRUNCATE TABLE discord_evidence_snapshots;
+
+ALTER TABLE discord_evidence_snapshots
+  ADD COLUMN thread_id TEXT
+    CHECK (thread_id IS NULL OR thread_id ~ '^[1-9][0-9]{16,19}$'),
+  ADD COLUMN decision_reason TEXT
+    CHECK (decision_reason IS NULL OR decision_reason IN (
+      'bot_absent',
+      'incomplete_observation',
+      'member_specific_deny',
+      'membership_removed',
+      'missing_private_thread_access',
+      'provider_unavailable',
+      'required_role_missing',
+      'stale_observation',
+      'view_channel_denied'
+    )),
+  ADD COLUMN mapping_config_version BIGINT NOT NULL DEFAULT 1
+    CHECK (mapping_config_version >= 1),
+  ADD CONSTRAINT discord_evidence_distinct_thread_parent
+    CHECK (thread_id IS NULL OR (channel_id IS NOT NULL AND thread_id <> channel_id)),
+  ADD CONSTRAINT discord_evidence_positive_consistency
+    CHECK (
+      NOT psfn_evidence_result
+      OR ((
+        discord_permission_result
+        AND NOT member_specific_deny_veto
+        AND decision_reason IS NULL
+      ) IS TRUE)
+    ),
+  ADD CONSTRAINT discord_evidence_positive_inputs
+    CHECK (
+      NOT psfn_evidence_result
+      OR ((
+        jsonb_typeof(permission_inputs -> 'oauthGuildMembership') = 'object'
+        AND jsonb_typeof(permission_inputs -> 'observation') = 'object'
+        AND jsonb_typeof(permission_inputs -> 'target') = 'object'
+        AND provenance ->> 'source' = 'discord_oauth_and_bot_observation'
+        AND provenance ->> 'provider' = 'discord'
+        AND provenance ->> 'providerSubjectId' = provider_subject_id
+        AND provenance ->> 'observationStatus' = 'observed'
+        AND length(provenance ->> 'observedAt') > 0
+        AND length(provenance ->> 'oauthObservedAt') > 0
+        AND length(provenance ->> 'observationId') > 0
+        AND length(provenance ->> 'botUserId') > 0
+      ) IS TRUE)
+    ),
+  ADD CONSTRAINT discord_evidence_denial_reason
+    CHECK (psfn_evidence_result OR decision_reason IS NOT NULL);
+
+CREATE INDEX evidence_exact_input_lookup_idx
+  ON discord_evidence_snapshots (
+    principal_id,
+    companion_id,
+    guild_id,
+    channel_id,
+    thread_id,
+    input_digest,
+    config_digest,
+    mapping_config_version,
+    expires_at
+  )
+  WHERE psfn_evidence_result = TRUE;
+`;
+
+const DISCORD_EVIDENCE_LIFECYCLE_FENCE_SQL = `
+CREATE TABLE discord_evidence_lifecycle_fences (
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  provider TEXT NOT NULL DEFAULT 'discord' CHECK (provider = 'discord'),
+  provider_subject_id TEXT NOT NULL CHECK (provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  lifecycle_id UUID NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('active', 'revoked')),
+  mutation_generation BIGINT NOT NULL CHECK (mutation_generation >= 0),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (principal_id, provider, provider_subject_id),
+  FOREIGN KEY (provider, provider_subject_id)
+    REFERENCES provider_subjects(provider, subject_id)
+);
+
+CREATE INDEX discord_evidence_lifecycle_active_idx
+  ON discord_evidence_lifecycle_fences (principal_id, provider_subject_id, lifecycle_id)
+  WHERE state = 'active';
+`;
+
+const ATOMIC_AUTHORITY_LIFECYCLE_SQL = `
+-- Central counters make every authorization input part of the session/JIT
+-- validity predicate. Existing ephemeral credentials predate exact provider
+-- provenance, so they are fenced instead of being guessed during migration.
+ALTER TABLE human_principals
+  ADD COLUMN binding_version BIGINT NOT NULL DEFAULT 1 CHECK (binding_version >= 1),
+  ADD COLUMN grant_version BIGINT NOT NULL DEFAULT 1 CHECK (grant_version >= 1),
+  ADD COLUMN policy_version BIGINT NOT NULL DEFAULT 1 CHECK (policy_version >= 1);
+
+ALTER TABLE oauth_transactions
+  ADD COLUMN verified_provider TEXT CHECK (verified_provider = 'discord'),
+  ADD COLUMN verified_provider_subject_id TEXT
+    CHECK (verified_provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  ADD CONSTRAINT oauth_transaction_verified_provider_pair
+    CHECK (
+      (verified_provider IS NULL AND verified_provider_subject_id IS NULL)
+      OR (verified_provider IS NOT NULL
+          AND verified_provider_subject_id IS NOT NULL
+          AND status = 'consumed'
+          AND consumed_at IS NOT NULL)
+    );
+
+UPDATE browser_sessions SET revoked_at = COALESCE(revoked_at, clock_timestamp());
+ALTER TABLE browser_sessions
+  ADD COLUMN provider TEXT CHECK (provider = 'discord'),
+  ADD COLUMN provider_subject_id TEXT
+    CHECK (provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  ADD COLUMN grant_version BIGINT NOT NULL DEFAULT 1 CHECK (grant_version >= 1),
+  ADD CONSTRAINT browser_session_exact_provider
+    CHECK (revoked_at IS NOT NULL OR (provider IS NOT NULL AND provider_subject_id IS NOT NULL)),
+  ADD CONSTRAINT browser_session_provider_subject_fk
+    FOREIGN KEY (provider, provider_subject_id)
+    REFERENCES provider_subjects(provider, subject_id);
+
+UPDATE provider_token_custody SET revoked_at = COALESCE(revoked_at, clock_timestamp());
+ALTER TABLE provider_token_custody
+  ADD COLUMN provider_subject_id TEXT
+    CHECK (provider_subject_id ~ '^[1-9][0-9]{16,19}$'),
+  ADD CONSTRAINT provider_custody_exact_subject
+    CHECK (revoked_at IS NOT NULL OR provider_subject_id IS NOT NULL),
+  ADD CONSTRAINT provider_custody_subject_fk
+    FOREIGN KEY (provider, provider_subject_id)
+    REFERENCES provider_subjects(provider, subject_id);
+
+UPDATE jit_authorization_grants SET revoked_at = COALESCE(revoked_at, clock_timestamp());
+ALTER TABLE jit_authorization_grants
+  ADD COLUMN grant_version BIGINT NOT NULL DEFAULT 1 CHECK (grant_version >= 1),
+  ADD COLUMN policy_version BIGINT NOT NULL DEFAULT 1 CHECK (policy_version >= 1);
+
+CREATE TABLE companion_authority_state (
+  companion_id UUID PRIMARY KEY,
+  lifecycle TEXT NOT NULL CHECK (lifecycle IN ('active', 'removed', 'quarantined')),
+  version BIGINT NOT NULL DEFAULT 1 CHECK (version >= 1),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  restore_state TEXT NOT NULL DEFAULT 'live' CHECK (restore_state IN ('live', 'quarantined')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+INSERT INTO companion_authority_state (companion_id, lifecycle, authority_generation)
+SELECT companion_id, 'active', max(authority_generation)
+FROM (
+  SELECT companion_id, authority_generation FROM principal_contact_bindings
+  UNION ALL
+  SELECT companion_id, authority_generation FROM principal_role_grants
+) AS existing_companions
+GROUP BY companion_id;
+
+CREATE TABLE principal_merge_aliases (
+  source_principal_id UUID PRIMARY KEY REFERENCES human_principals(principal_id),
+  canonical_principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  decision_id UUID NOT NULL UNIQUE,
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  reason_digest TEXT NOT NULL CHECK (reason_digest ~ '^[0-9a-f]{64}$'),
+  restore_state TEXT NOT NULL DEFAULT 'live' CHECK (restore_state IN ('live', 'quarantined')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  CHECK (source_principal_id <> canonical_principal_id)
+);
+
+CREATE TABLE lifecycle_decision_receipts (
+  receipt_id UUID PRIMARY KEY,
+  decision_id UUID NOT NULL,
+  ceremony_id UUID NOT NULL,
+  callback_transaction_id UUID,
+  action TEXT NOT NULL CHECK (length(action) BETWEEN 1 AND 128),
+  proof_digest TEXT CHECK (proof_digest ~ '^[0-9a-f]{64}$'),
+  created_at TIMESTAMPTZ NOT NULL,
+  UNIQUE (decision_id, callback_transaction_id),
+  UNIQUE (callback_transaction_id)
+);
+
+ALTER TABLE authorization_audit_events
+  ADD COLUMN decision_id UUID,
+  ADD COLUMN ceremony_id UUID,
+  ADD COLUMN reason_digest TEXT CHECK (reason_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN decision_context JSONB NOT NULL DEFAULT '{}'::jsonb
+    CHECK (jsonb_typeof(decision_context) = 'object');
+CREATE UNIQUE INDEX authorization_audit_lifecycle_decision_unique
+  ON authorization_audit_events (decision_id)
+  WHERE decision_id IS NOT NULL;
+
+CREATE TRIGGER principal_merge_aliases_append_only
+  BEFORE UPDATE OR DELETE ON principal_merge_aliases
+  FOR EACH ROW EXECUTE FUNCTION reject_immutable_mutation();
+CREATE INDEX principal_merge_aliases_canonical_idx
+  ON principal_merge_aliases (canonical_principal_id);
+CREATE INDEX lifecycle_decision_receipts_decision_idx
+  ON lifecycle_decision_receipts (decision_id);
+`;
+
+const LIFECYCLE_OAUTH_PURPOSE_SQL = `
+CREATE TABLE authority_floor_tombstone_projection (
+  kind TEXT NOT NULL CHECK (kind IN (
+    'provider_subject', 'contact_binding', 'role_grant', 'principal', 'companion'
+  )),
+  resource_hash TEXT NOT NULL CHECK (resource_hash ~ '^[0-9a-f]{64}$'),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  PRIMARY KEY (kind, resource_hash)
+);
+
+ALTER TABLE oauth_transactions
+  ADD COLUMN lifecycle_ceremony_id UUID,
+  ADD COLUMN lifecycle_action TEXT,
+  ADD COLUMN lifecycle_proof_role TEXT,
+  ADD COLUMN initiating_principal_id UUID REFERENCES human_principals(principal_id),
+  ADD COLUMN initiating_session_id UUID REFERENCES browser_sessions(record_id);
+
+-- Pending pre-v14 non-login transactions have no trustworthy lifecycle
+-- purpose. Revoke them instead of inferring a ceremony or proof role.
+UPDATE oauth_transactions
+SET status = 'revoked'
+WHERE status = 'pending'
+  AND kind <> 'login'
+  AND lifecycle_ceremony_id IS NULL;
+
+ALTER TABLE oauth_transactions
+  ADD CONSTRAINT oauth_transaction_lifecycle_purpose_complete CHECK (
+    (lifecycle_ceremony_id IS NULL
+      AND lifecycle_action IS NULL
+      AND lifecycle_proof_role IS NULL
+      AND initiating_principal_id IS NULL
+      AND initiating_session_id IS NULL)
+    OR
+    (lifecycle_ceremony_id IS NOT NULL
+      AND lifecycle_action IS NOT NULL
+      AND lifecycle_proof_role IS NOT NULL
+      AND initiating_principal_id IS NOT NULL
+      AND initiating_session_id IS NOT NULL)
+  ),
+  ADD CONSTRAINT oauth_transaction_lifecycle_purpose_exact CHECK (
+    lifecycle_action IS NULL OR (
+      (lifecycle_action IN ('binding.activate', 'provider.add')
+        AND lifecycle_proof_role = 'new'
+        AND kind = 'provider_link')
+      OR (lifecycle_action = 'provider.relink'
+        AND lifecycle_proof_role = 'new'
+        AND kind = 'recovery')
+      OR (lifecycle_action = 'provider.replace'
+        AND lifecycle_proof_role IN ('current', 'new')
+        AND kind = 'provider_replace')
+      OR (lifecycle_action = 'provider.unlink'
+        AND lifecycle_proof_role = 'current'
+        AND kind = 'recovery')
+      OR (lifecycle_action = 'principal.merge'
+        AND lifecycle_proof_role IN ('canonical', 'source')
+        AND kind = 'recovery')
+    )
+  );
+
+CREATE UNIQUE INDEX oauth_transaction_lifecycle_proof_unique
+  ON oauth_transactions (lifecycle_ceremony_id, lifecycle_proof_role)
+  WHERE lifecycle_ceremony_id IS NOT NULL;
+`;
+
+const COMPANION_AUTHORITY_LINEAGE_SQL = `
+ALTER TABLE companion_authority_state
+  ADD COLUMN authority_lineage_id TEXT CHECK (authority_lineage_id ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN lineage_generation BIGINT CHECK (lineage_generation >= 1),
+  ADD COLUMN readd_decision_id UUID UNIQUE,
+  ADD CONSTRAINT companion_authority_lineage_complete CHECK (
+    (authority_lineage_id IS NULL AND lineage_generation IS NULL AND readd_decision_id IS NULL)
+    OR (authority_lineage_id IS NOT NULL
+      AND lineage_generation IS NOT NULL
+      AND readd_decision_id IS NOT NULL)
+  );
+
+ALTER TABLE authority_floor_tombstone_projection
+  DROP CONSTRAINT authority_floor_tombstone_projection_kind_check,
+  ADD COLUMN companion_lineage_id TEXT CHECK (companion_lineage_id ~ '^[0-9a-f]{64}$'),
+  ADD CONSTRAINT authority_floor_tombstone_projection_kind_check CHECK (kind IN (
+    'provider_subject', 'contact_binding', 'role_grant', 'principal', 'companion',
+    'companion_lineage_floor'
+  )),
+  ADD CONSTRAINT authority_floor_companion_lineage_exact CHECK (
+    (kind = 'companion_lineage_floor' AND companion_lineage_id IS NOT NULL)
+    OR (kind <> 'companion_lineage_floor' AND companion_lineage_id IS NULL)
+  );
+
+ALTER TABLE trusted_host_ceremonies
+  DROP CONSTRAINT trusted_host_ceremonies_kind_check,
+  ALTER COLUMN expected_provider DROP NOT NULL,
+  ALTER COLUMN expected_provider_subject_id DROP NOT NULL,
+  ADD CONSTRAINT trusted_host_ceremonies_kind_check CHECK (kind IN (
+    'first_owner', 'account_reapproval', 'companion_reapproval',
+    'passkey_enrollment', 'passkey_recovery'
+  )),
+  ADD CONSTRAINT trusted_host_ceremony_provider_scope_exact CHECK (
+    (kind = 'companion_reapproval'
+      AND expected_provider IS NULL
+      AND expected_provider_subject_id IS NULL
+      AND expected_companion_id IS NOT NULL
+      AND expected_contact_id IS NULL)
+    OR (kind <> 'companion_reapproval'
+      AND expected_provider = 'discord'
+      AND expected_provider_subject_id IS NOT NULL)
+  );
+`;
+
+const COMPANION_RESTORE_PROJECTION_SQL = `
+ALTER TABLE authority_floor_tombstone_projection
+  ADD COLUMN companion_readd_decision_id UUID;
+`;
+
+const COMPANION_RESTORE_RECEIPTS_SQL = `
+CREATE TABLE companion_restore_import_receipts (
+  receipt_id UUID PRIMARY KEY,
+  restore_operation_id UUID NOT NULL,
+  restore_transaction_id BIGINT NOT NULL CHECK (restore_transaction_id >= 1),
+  manifest_digest TEXT NOT NULL CHECK (manifest_digest ~ '^[0-9a-f]{64}$'),
+  snapshot_digest TEXT NOT NULL CHECK (snapshot_digest ~ '^[0-9a-f]{64}$'),
+  companion_id UUID NOT NULL,
+  version BIGINT NOT NULL CHECK (version >= 1),
+  authority_lineage_id TEXT CHECK (
+    authority_lineage_id IS NULL OR authority_lineage_id ~ '^[0-9a-f]{64}$'
+  ),
+  lineage_generation BIGINT CHECK (lineage_generation IS NULL OR lineage_generation >= 1),
+  readd_decision_id UUID,
+  created_at TIMESTAMPTZ NOT NULL,
+  imported_at TIMESTAMPTZ NOT NULL,
+  global_authority_lineage_id TEXT NOT NULL CHECK (
+    global_authority_lineage_id ~ '^[0-9a-f]{64}$'
+  ),
+  authority_generation BIGINT NOT NULL CHECK (authority_generation >= 1),
+  restore_checkpoint BIGINT NOT NULL CHECK (restore_checkpoint >= 1),
+  issued_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  CONSTRAINT companion_restore_receipt_lineage_tuple_exact CHECK (
+    (authority_lineage_id IS NULL
+      AND lineage_generation IS NULL
+      AND readd_decision_id IS NULL)
+    OR (authority_lineage_id IS NOT NULL
+      AND lineage_generation IS NOT NULL
+      AND readd_decision_id IS NOT NULL)
+  ),
+  UNIQUE (restore_operation_id, companion_id)
+);
+`;
+
+const CONTACT_AUTHORITY_FLOOR_KIND_SQL = `
+ALTER TABLE authority_floor_tombstone_projection
+  DROP CONSTRAINT authority_floor_tombstone_projection_kind_check,
+  ADD CONSTRAINT authority_floor_tombstone_projection_kind_check CHECK (kind IN (
+    'provider_subject', 'contact_binding', 'role_grant', 'principal', 'companion',
+    'contact_authority_fence', 'companion_lineage_floor'
+  ));
+`;
+
+const HUB_DEVICE_HUMAN_ATTACHMENT_SQL = `
+CREATE TABLE hub_device_human_attachments (
+  attachment_id UUID PRIMARY KEY,
+  assertion_digest TEXT NOT NULL UNIQUE CHECK (assertion_digest ~ '^[0-9a-f]{64}$'),
+  assertion_jti UUID NOT NULL UNIQUE,
+  device_id TEXT NOT NULL CHECK (length(device_id) BETWEEN 1 AND 256),
+  enrollment_version BIGINT NOT NULL CHECK (enrollment_version >= 1),
+  place_id TEXT CHECK (place_id IS NULL OR length(place_id) BETWEEN 1 AND 256),
+  key_id TEXT NOT NULL CHECK (length(key_id) BETWEEN 1 AND 128),
+  companion_id UUID NOT NULL,
+  hub_session_id TEXT NOT NULL CHECK (length(hub_session_id) BETWEEN 1 AND 256),
+  connection_id TEXT NOT NULL CHECK (length(connection_id) BETWEEN 1 AND 256),
+  channel_id TEXT NOT NULL CHECK (channel_id ~ '^hub-device:[0-9a-f]{64}$'),
+  human_binding_digest TEXT CHECK (
+    human_binding_digest IS NULL OR human_binding_digest ~ '^[0-9a-f]{64}$'
+  ),
+  principal_id UUID,
+  session_record_id UUID,
+  provider_subject_id TEXT CHECK (
+    provider_subject_id IS NULL OR provider_subject_id ~ '^[1-9][0-9]{16,19}$'
+  ),
+  binding_id UUID,
+  contact_id TEXT CHECK (contact_id IS NULL OR length(contact_id) BETWEEN 1 AND 256),
+  binding_version BIGINT CHECK (binding_version IS NULL OR binding_version >= 1),
+  grant_id UUID,
+  role TEXT CHECK (role IS NULL OR role IN ('owner', 'admin', 'member', 'guest')),
+  grant_version BIGINT CHECK (grant_version IS NULL OR grant_version >= 1),
+  authority_generation BIGINT CHECK (authority_generation IS NULL OR authority_generation >= 1),
+  global_auth_epoch BIGINT CHECK (global_auth_epoch IS NULL OR global_auth_epoch >= 1),
+  device_state TEXT NOT NULL CHECK (device_state IN ('active', 'fenced')),
+  human_state TEXT NOT NULL CHECK (human_state IN ('attached', 'guest', 'detached')),
+  retry_count BIGINT NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+  last_retry_at TIMESTAMPTZ,
+  human_detached_at TIMESTAMPTZ,
+  fenced_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  CONSTRAINT hub_device_human_binding_exact CHECK (
+    (human_binding_digest IS NULL AND principal_id IS NULL AND session_record_id IS NULL
+      AND provider_subject_id IS NULL
+      AND binding_id IS NULL AND contact_id IS NULL AND binding_version IS NULL
+      AND grant_id IS NULL AND role IS NULL AND grant_version IS NULL
+      AND authority_generation IS NULL AND global_auth_epoch IS NULL)
+    OR
+    (human_binding_digest IS NOT NULL AND principal_id IS NOT NULL
+      AND session_record_id IS NOT NULL AND provider_subject_id IS NOT NULL
+      AND binding_id IS NOT NULL AND contact_id IS NOT NULL AND binding_version IS NOT NULL
+      AND grant_id IS NOT NULL AND role IS NOT NULL AND grant_version IS NOT NULL
+      AND authority_generation IS NOT NULL AND global_auth_epoch IS NOT NULL)
+  )
+);
+
+CREATE INDEX hub_device_human_attachments_device_session_idx
+  ON hub_device_human_attachments (companion_id, device_id, hub_session_id);
+CREATE INDEX hub_device_human_attachments_human_session_idx
+  ON hub_device_human_attachments (session_record_id)
+  WHERE session_record_id IS NOT NULL;
+`;
+
+const REQUEST_CAPABILITY_REPLAY_SQL = `
+CREATE TABLE request_capability_consumptions (
+  issuer TEXT NOT NULL CHECK (length(issuer) BETWEEN 1 AND 128),
+  jti TEXT NOT NULL CHECK (length(jti) BETWEEN 1 AND 256),
+  capability_digest TEXT NOT NULL CHECK (capability_digest ~ '^[0-9a-f]{64}$'),
+  target_digest TEXT NOT NULL CHECK (target_digest ~ '^[0-9a-f]{64}$'),
+  body_digest TEXT NOT NULL CHECK (body_digest ~ '^[0-9a-f]{64}$'),
+  audience_digest TEXT NOT NULL CHECK (audience_digest ~ '^[0-9a-f]{64}$'),
+  companion_digest TEXT NOT NULL CHECK (companion_digest ~ '^[0-9a-f]{64}$'),
+  action_digest TEXT NOT NULL CHECK (action_digest ~ '^[0-9a-f]{64}$'),
+  resource_digest TEXT NOT NULL CHECK (resource_digest ~ '^[0-9a-f]{64}$'),
+  parent_digest TEXT NOT NULL CHECK (parent_digest ~ '^[0-9a-f]{64}$'),
+  decision_digest TEXT NOT NULL CHECK (decision_digest ~ '^[0-9a-f]{64}$'),
+  authority_versions_digest TEXT NOT NULL CHECK (authority_versions_digest ~ '^[0-9a-f]{64}$'),
+  consume_result JSONB NOT NULL CHECK (jsonb_typeof(consume_result) = 'object'),
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+  replay_count BIGINT NOT NULL DEFAULT 0 CHECK (replay_count >= 0),
+  last_replayed_at TIMESTAMPTZ,
+  mismatch_count BIGINT NOT NULL DEFAULT 0 CHECK (mismatch_count >= 0),
+  last_mismatch_digest TEXT CHECK (
+    last_mismatch_digest IS NULL OR last_mismatch_digest ~ '^[0-9a-f]{64}$'
+  ),
+  last_mismatch_at TIMESTAMPTZ,
+  PRIMARY KEY (issuer, jti)
+);
+
+CREATE INDEX request_capability_consumptions_expiry_idx
+  ON request_capability_consumptions (expires_at);
+
+CREATE UNIQUE INDEX authorization_audit_request_capability_mutated_replay_unique
+  ON authorization_audit_events (correlation_id)
+  WHERE action = 'request_capability.consume'
+    AND reason_code = 'request_capability_mutated_replay';
+`;
+
+const PRIMARY_EMBODIMENT_AUTHORITY_SQL = `
+CREATE TABLE primary_embodiment_authority (
+  companion_id UUID PRIMARY KEY,
+  generation BIGINT NOT NULL CHECK (generation >= 1),
+  version BIGINT NOT NULL CHECK (version >= 1),
+  current_attachment_id UUID,
+  current_device_id TEXT CHECK (
+    current_device_id IS NULL OR length(current_device_id) BETWEEN 1 AND 256
+  ),
+  current_enrollment_version BIGINT CHECK (
+    current_enrollment_version IS NULL OR current_enrollment_version >= 1
+  ),
+  current_hub_session_id TEXT CHECK (
+    current_hub_session_id IS NULL OR length(current_hub_session_id) BETWEEN 1 AND 256
+  ),
+  last_decision_id UUID NOT NULL,
+  last_decision TEXT NOT NULL CHECK (last_decision IN ('handoff', 'invalidated')),
+  last_reason TEXT NOT NULL CHECK (last_reason IN (
+    'user_requested', 'device_replacement', 'recovery',
+    'device_revoked', 'enrollment_revoked'
+  )),
+  decided_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL,
+  CONSTRAINT primary_embodiment_current_tuple_exact CHECK (
+    (current_attachment_id IS NULL AND current_device_id IS NULL
+      AND current_enrollment_version IS NULL AND current_hub_session_id IS NULL
+      AND last_decision = 'invalidated')
+    OR
+    (current_attachment_id IS NOT NULL AND current_device_id IS NOT NULL
+      AND current_enrollment_version IS NOT NULL AND current_hub_session_id IS NOT NULL
+      AND last_decision = 'handoff')
+  )
+);
+
+CREATE TABLE primary_embodiment_handoff_decisions (
+  decision_id UUID PRIMARY KEY,
+  companion_id UUID NOT NULL,
+  expected_generation BIGINT NOT NULL CHECK (expected_generation >= 0),
+  target_attachment_id UUID NOT NULL,
+  target_device_digest TEXT NOT NULL CHECK (target_device_digest ~ '^[0-9a-f]{64}$'),
+  decision TEXT NOT NULL CHECK (decision IN ('allow', 'deny')),
+  reason_code TEXT NOT NULL CHECK (reason_code IN (
+    'handoff', 'decision_replay', 'decision_cross_companion', 'stale_generation',
+    'attachment_not_current', 'human_authority_required', 'already_primary'
+  )),
+  resulting_generation BIGINT NOT NULL CHECK (resulting_generation >= 0),
+  resulting_version BIGINT NOT NULL CHECK (resulting_version >= 0),
+  occurred_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX primary_embodiment_handoff_decisions_companion_idx
+  ON primary_embodiment_handoff_decisions (companion_id, occurred_at, decision_id);
+`;
+
+const JIT_STEP_UP_AUTHORITY_SQL = `
+ALTER TABLE step_up_challenges
+  DROP CONSTRAINT step_up_challenges_status_check,
+  ADD COLUMN protocol_version SMALLINT NOT NULL DEFAULT 0
+    CHECK (protocol_version IN (0, 1)),
+  ADD COLUMN request_nonce_digest TEXT
+    CHECK (request_nonce_digest IS NULL OR request_nonce_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN challenge_ciphertext BYTEA,
+  ADD COLUMN companion_id UUID,
+  ADD COLUMN target_digest TEXT
+    CHECK (target_digest IS NULL OR target_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN authorization_digest TEXT
+    CHECK (authorization_digest IS NULL OR authorization_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN assurance_requirement TEXT CHECK (
+    assurance_requirement IS NULL OR assurance_requirement IN (
+      'none', 'oauth', 'webauthn_uv', 'privacy_break_glass'
+    )
+  ),
+  ADD COLUMN subject_scope_digest TEXT
+    CHECK (subject_scope_digest IS NULL OR subject_scope_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN purpose_digest TEXT
+    CHECK (purpose_digest IS NULL OR purpose_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN memory_revision BIGINT
+    CHECK (memory_revision IS NULL OR memory_revision >= 1),
+  ADD COLUMN classifier_evidence_digest TEXT CHECK (
+    classifier_evidence_digest IS NULL OR classifier_evidence_digest ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN exact_origin TEXT,
+  ADD COLUMN credential_floor_generation BIGINT
+    CHECK (credential_floor_generation IS NULL OR credential_floor_generation >= 0),
+  ADD COLUMN attempt_count SMALLINT NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
+  ADD COLUMN cancelled_at TIMESTAMPTZ,
+  ADD CONSTRAINT step_up_challenges_status_check
+    CHECK (status IN ('pending', 'consumed', 'expired', 'revoked', 'cancelled', 'failed')),
+  ADD CONSTRAINT step_up_challenges_v1_exact CHECK (
+    (protocol_version = 0
+      AND request_nonce_digest IS NULL
+      AND challenge_ciphertext IS NULL
+      AND companion_id IS NULL
+      AND target_digest IS NULL
+      AND authorization_digest IS NULL
+      AND assurance_requirement IS NULL
+      AND subject_scope_digest IS NULL
+      AND purpose_digest IS NULL
+      AND memory_revision IS NULL
+      AND classifier_evidence_digest IS NULL
+      AND exact_origin IS NULL
+      AND credential_floor_generation IS NULL)
+    OR
+    (protocol_version = 1
+      AND request_nonce_digest IS NOT NULL
+      AND challenge_ciphertext IS NOT NULL
+      AND companion_id IS NOT NULL
+      AND target_digest IS NOT NULL
+      AND authorization_digest IS NOT NULL
+      AND assurance_requirement IS NOT NULL
+      AND subject_scope_digest IS NOT NULL
+      AND purpose_digest IS NOT NULL
+      AND memory_revision IS NOT NULL
+      AND classifier_evidence_digest IS NOT NULL
+      AND exact_origin IS NOT NULL
+      AND credential_floor_generation IS NOT NULL)
+  ),
+  ADD CONSTRAINT step_up_challenges_assurance_method CHECK (
+    protocol_version = 0
+    OR kind = 'webauthn_uv'
+    OR assurance_requirement IN ('none', 'oauth')
+  ),
+  ADD CONSTRAINT step_up_challenges_terminal_timestamps CHECK (
+    (status = 'consumed' AND consumed_at IS NOT NULL AND cancelled_at IS NULL)
+    OR (status = 'cancelled' AND consumed_at IS NULL AND cancelled_at IS NOT NULL)
+    OR (status NOT IN ('consumed', 'cancelled') AND consumed_at IS NULL AND cancelled_at IS NULL)
+  );
+
+CREATE INDEX step_up_challenges_v1_rate_limit_idx
+  ON step_up_challenges (browser_session_id, created_at)
+  WHERE protocol_version = 1 AND status = 'pending';
+
+ALTER TABLE jit_authorization_grants
+  ADD COLUMN protocol_version SMALLINT NOT NULL DEFAULT 0
+    CHECK (protocol_version IN (0, 1)),
+  ADD COLUMN challenge_id UUID UNIQUE REFERENCES step_up_challenges(challenge_id),
+  ADD COLUMN target_digest TEXT
+    CHECK (target_digest IS NULL OR target_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN authorization_digest TEXT
+    CHECK (authorization_digest IS NULL OR authorization_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN subject_scope_digest TEXT
+    CHECK (subject_scope_digest IS NULL OR subject_scope_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN purpose_digest TEXT
+    CHECK (purpose_digest IS NULL OR purpose_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN exact_origin TEXT,
+  ADD COLUMN credential_floor_generation BIGINT
+    CHECK (credential_floor_generation IS NULL OR credential_floor_generation >= 0),
+  ADD COLUMN consumed_at TIMESTAMPTZ,
+  ADD CONSTRAINT jit_authorization_grants_v1_exact CHECK (
+    (protocol_version = 0
+      AND challenge_id IS NULL
+      AND target_digest IS NULL
+      AND authorization_digest IS NULL
+      AND subject_scope_digest IS NULL
+      AND purpose_digest IS NULL
+      AND exact_origin IS NULL
+      AND credential_floor_generation IS NULL
+      AND consumed_at IS NULL)
+    OR
+    (protocol_version = 1
+      AND challenge_id IS NOT NULL
+      AND target_digest IS NOT NULL
+      AND authorization_digest IS NOT NULL
+      AND subject_scope_digest IS NOT NULL
+      AND purpose_digest IS NOT NULL
+      AND exact_origin IS NOT NULL
+      AND credential_floor_generation IS NOT NULL)
+  );
+
+CREATE INDEX jit_authorization_grants_v1_consume_idx
+  ON jit_authorization_grants (grant_id, browser_session_id, expires_at)
+  WHERE protocol_version = 1 AND revoked_at IS NULL AND consumed_at IS NULL;
+
+ALTER TABLE trusted_host_ceremonies
+  ADD COLUMN protocol_version SMALLINT NOT NULL DEFAULT 0
+    CHECK (protocol_version IN (0, 1)),
+  ADD COLUMN webauthn_challenge_digest TEXT CHECK (
+    webauthn_challenge_digest IS NULL OR webauthn_challenge_digest ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN webauthn_challenge_ciphertext BYTEA,
+  ADD COLUMN exact_origin TEXT,
+  ADD COLUMN rp_id TEXT,
+  ADD COLUMN credential_floor_generation BIGINT CHECK (
+    credential_floor_generation IS NULL OR credential_floor_generation >= 0
+  ),
+  ADD COLUMN prior_credential_id_hash TEXT CHECK (
+    prior_credential_id_hash IS NULL OR prior_credential_id_hash ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN confirmed_at TIMESTAMPTZ,
+  ADD COLUMN attempt_count SMALLINT NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 5),
+  ADD CONSTRAINT trusted_host_ceremonies_passkey_v1_exact CHECK (
+    (protocol_version = 0
+      AND webauthn_challenge_digest IS NULL
+      AND webauthn_challenge_ciphertext IS NULL
+      AND exact_origin IS NULL
+      AND rp_id IS NULL
+      AND credential_floor_generation IS NULL
+      AND prior_credential_id_hash IS NULL
+      AND confirmed_at IS NULL)
+    OR
+    (protocol_version = 1
+      AND kind IN ('first_owner', 'passkey_enrollment', 'passkey_recovery')
+      AND webauthn_challenge_digest IS NOT NULL
+      AND webauthn_challenge_ciphertext IS NOT NULL
+      AND exact_origin IS NOT NULL
+      AND rp_id IS NOT NULL
+      AND credential_floor_generation IS NOT NULL
+      AND confirmed_at IS NOT NULL
+      AND (
+        (kind = 'passkey_recovery' AND prior_credential_id_hash IS NOT NULL)
+        OR (kind <> 'passkey_recovery' AND prior_credential_id_hash IS NULL)
+      ))
+  );
+`;
+
+const ACCOUNT_REAPPROVAL_WEBAUTHN_SQL = `
+ALTER TABLE trusted_host_ceremonies
+  DROP CONSTRAINT trusted_host_ceremonies_passkey_v1_exact,
+  ADD COLUMN reapproval_verified_at TIMESTAMPTZ,
+  ADD COLUMN reapproval_actor_principal_id UUID,
+  ADD COLUMN reapproval_actor_session_id UUID,
+  ADD COLUMN reapproval_oauth_transaction_id UUID,
+  ADD COLUMN reapproval_oauth_proof_digest TEXT CHECK (
+    reapproval_oauth_proof_digest IS NULL
+    OR reapproval_oauth_proof_digest ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN reapproval_credential_id_hash TEXT CHECK (
+    reapproval_credential_id_hash IS NULL
+    OR reapproval_credential_id_hash ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN reapproval_credential_generation BIGINT CHECK (
+    reapproval_credential_generation IS NULL OR reapproval_credential_generation >= 1
+  ),
+  ADD COLUMN reapproval_credential_floor_generation BIGINT CHECK (
+    reapproval_credential_floor_generation IS NULL
+    OR reapproval_credential_floor_generation >= 1
+  ),
+  ADD CONSTRAINT trusted_host_ceremonies_passkey_v1_exact CHECK (
+    (protocol_version = 0
+      AND webauthn_challenge_digest IS NULL
+      AND webauthn_challenge_ciphertext IS NULL
+      AND exact_origin IS NULL
+      AND rp_id IS NULL
+      AND credential_floor_generation IS NULL
+      AND prior_credential_id_hash IS NULL
+      AND confirmed_at IS NULL
+      AND reapproval_verified_at IS NULL
+      AND reapproval_actor_principal_id IS NULL
+      AND reapproval_actor_session_id IS NULL
+      AND reapproval_oauth_transaction_id IS NULL
+      AND reapproval_oauth_proof_digest IS NULL
+      AND reapproval_credential_id_hash IS NULL
+      AND reapproval_credential_generation IS NULL
+      AND reapproval_credential_floor_generation IS NULL)
+    OR
+    (protocol_version = 1
+      AND kind IN (
+        'first_owner', 'account_reapproval', 'passkey_enrollment', 'passkey_recovery'
+      )
+      AND webauthn_challenge_digest IS NOT NULL
+      AND webauthn_challenge_ciphertext IS NOT NULL
+      AND exact_origin IS NOT NULL
+      AND rp_id IS NOT NULL
+      AND credential_floor_generation IS NOT NULL
+      AND confirmed_at IS NOT NULL
+      AND (
+        (kind = 'passkey_recovery' AND prior_credential_id_hash IS NOT NULL)
+        OR (kind <> 'passkey_recovery' AND prior_credential_id_hash IS NULL)
+      )
+      AND (
+        (kind <> 'account_reapproval'
+          AND reapproval_verified_at IS NULL
+          AND reapproval_actor_principal_id IS NULL
+          AND reapproval_actor_session_id IS NULL
+          AND reapproval_oauth_transaction_id IS NULL
+          AND reapproval_oauth_proof_digest IS NULL
+          AND reapproval_credential_id_hash IS NULL
+          AND reapproval_credential_generation IS NULL
+          AND reapproval_credential_floor_generation IS NULL)
+        OR
+        (kind = 'account_reapproval'
+          AND (
+            (reapproval_verified_at IS NULL
+              AND reapproval_actor_principal_id IS NULL
+              AND reapproval_actor_session_id IS NULL
+              AND reapproval_oauth_transaction_id IS NULL
+              AND reapproval_oauth_proof_digest IS NULL
+              AND reapproval_credential_id_hash IS NULL
+              AND reapproval_credential_generation IS NULL
+              AND reapproval_credential_floor_generation IS NULL)
+            OR
+            (reapproval_verified_at IS NOT NULL
+              AND reapproval_actor_principal_id IS NOT NULL
+              AND reapproval_actor_session_id IS NOT NULL
+              AND reapproval_oauth_transaction_id IS NOT NULL
+              AND reapproval_oauth_proof_digest IS NOT NULL
+              AND reapproval_credential_id_hash IS NOT NULL
+              AND reapproval_credential_generation IS NOT NULL
+              AND reapproval_credential_floor_generation IS NOT NULL)
+          ))
+      ))
+  );
+`;
+
+const TRUSTED_HOST_PROVIDER_RECOVERY_SQL = `
+ALTER TABLE oauth_transactions
+  DROP CONSTRAINT oauth_transaction_lifecycle_purpose_exact,
+  ADD CONSTRAINT oauth_transaction_lifecycle_purpose_exact CHECK (
+    lifecycle_action IS NULL OR (
+      (lifecycle_action IN ('binding.activate', 'provider.add')
+        AND lifecycle_proof_role = 'new'
+        AND kind = 'provider_link')
+      OR (lifecycle_action = 'provider.relink'
+        AND lifecycle_proof_role = 'new'
+        AND kind = 'recovery')
+      OR (lifecycle_action = 'provider.replace'
+        AND lifecycle_proof_role IN ('current', 'new')
+        AND kind = 'provider_replace')
+      OR (lifecycle_action = 'provider.recover'
+        AND lifecycle_proof_role = 'new'
+        AND kind = 'recovery')
+      OR (lifecycle_action = 'provider.unlink'
+        AND lifecycle_proof_role = 'current'
+        AND kind = 'recovery')
+      OR (lifecycle_action = 'principal.merge'
+        AND lifecycle_proof_role IN ('canonical', 'source')
+        AND kind = 'recovery')
+    )
+  );
+
+ALTER TABLE trusted_host_ceremonies
+  DROP CONSTRAINT trusted_host_ceremonies_kind_check,
+  DROP CONSTRAINT trusted_host_ceremonies_protocol_version_check,
+  DROP CONSTRAINT trusted_host_ceremonies_passkey_v1_exact,
+  ADD COLUMN recovery_receipt_digest TEXT CHECK (
+    recovery_receipt_digest IS NULL OR recovery_receipt_digest ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN recovery_credential_id_hash TEXT CHECK (
+    recovery_credential_id_hash IS NULL OR recovery_credential_id_hash ~ '^[0-9a-f]{64}$'
+  ),
+  ADD COLUMN recovery_credential_generation BIGINT CHECK (
+    recovery_credential_generation IS NULL OR recovery_credential_generation >= 1
+  ),
+  ADD CONSTRAINT trusted_host_ceremonies_kind_check CHECK (kind IN (
+    'first_owner', 'account_reapproval', 'companion_reapproval',
+    'passkey_enrollment', 'passkey_recovery', 'provider_recovery'
+  )),
+  ADD CONSTRAINT trusted_host_ceremonies_protocol_version_check CHECK (
+    protocol_version IN (0, 1, 2)
+  ),
+  ADD CONSTRAINT trusted_host_ceremonies_protocol_exact CHECK (
+    (protocol_version = 0
+      AND webauthn_challenge_digest IS NULL
+      AND webauthn_challenge_ciphertext IS NULL
+      AND exact_origin IS NULL
+      AND rp_id IS NULL
+      AND credential_floor_generation IS NULL
+      AND prior_credential_id_hash IS NULL
+      AND confirmed_at IS NULL
+      AND reapproval_verified_at IS NULL
+      AND reapproval_actor_principal_id IS NULL
+      AND reapproval_actor_session_id IS NULL
+      AND reapproval_oauth_transaction_id IS NULL
+      AND reapproval_oauth_proof_digest IS NULL
+      AND reapproval_credential_id_hash IS NULL
+      AND reapproval_credential_generation IS NULL
+      AND reapproval_credential_floor_generation IS NULL
+      AND recovery_receipt_digest IS NULL
+      AND recovery_credential_id_hash IS NULL
+      AND recovery_credential_generation IS NULL)
+    OR
+    (protocol_version = 1
+      AND kind IN (
+        'first_owner', 'account_reapproval', 'passkey_enrollment', 'passkey_recovery'
+      )
+      AND webauthn_challenge_digest IS NOT NULL
+      AND webauthn_challenge_ciphertext IS NOT NULL
+      AND exact_origin IS NOT NULL
+      AND rp_id IS NOT NULL
+      AND credential_floor_generation IS NOT NULL
+      AND confirmed_at IS NOT NULL
+      AND recovery_receipt_digest IS NULL
+      AND recovery_credential_id_hash IS NULL
+      AND recovery_credential_generation IS NULL
+      AND (
+        (kind = 'passkey_recovery' AND prior_credential_id_hash IS NOT NULL)
+        OR (kind <> 'passkey_recovery' AND prior_credential_id_hash IS NULL)
+      )
+      AND (
+        (kind <> 'account_reapproval'
+          AND reapproval_verified_at IS NULL
+          AND reapproval_actor_principal_id IS NULL
+          AND reapproval_actor_session_id IS NULL
+          AND reapproval_oauth_transaction_id IS NULL
+          AND reapproval_oauth_proof_digest IS NULL
+          AND reapproval_credential_id_hash IS NULL
+          AND reapproval_credential_generation IS NULL
+          AND reapproval_credential_floor_generation IS NULL)
+        OR
+        (kind = 'account_reapproval'
+          AND (
+            (reapproval_verified_at IS NULL
+              AND reapproval_actor_principal_id IS NULL
+              AND reapproval_actor_session_id IS NULL
+              AND reapproval_oauth_transaction_id IS NULL
+              AND reapproval_oauth_proof_digest IS NULL
+              AND reapproval_credential_id_hash IS NULL
+              AND reapproval_credential_generation IS NULL
+              AND reapproval_credential_floor_generation IS NULL)
+            OR
+            (reapproval_verified_at IS NOT NULL
+              AND reapproval_actor_principal_id IS NOT NULL
+              AND reapproval_actor_session_id IS NOT NULL
+              AND reapproval_oauth_transaction_id IS NOT NULL
+              AND reapproval_oauth_proof_digest IS NOT NULL
+              AND reapproval_credential_id_hash IS NOT NULL
+              AND reapproval_credential_generation IS NOT NULL
+              AND reapproval_credential_floor_generation IS NOT NULL)
+          ))
+      ))
+    OR
+    (protocol_version = 2
+      AND kind = 'provider_recovery'
+      AND expected_companion_id IS NOT NULL
+      AND expected_contact_id IS NULL
+      AND exact_origin IS NOT NULL
+      AND rp_id IS NOT NULL
+      AND credential_floor_generation IS NOT NULL
+      AND prior_credential_id_hash IS NOT NULL
+      AND confirmed_at IS NOT NULL
+      AND reapproval_verified_at IS NULL
+      AND reapproval_actor_principal_id IS NULL
+      AND reapproval_actor_session_id IS NULL
+      AND reapproval_oauth_transaction_id IS NULL
+      AND reapproval_oauth_proof_digest IS NULL
+      AND reapproval_credential_id_hash IS NULL
+      AND reapproval_credential_generation IS NULL
+      AND reapproval_credential_floor_generation IS NULL
+      AND ((webauthn_challenge_digest IS NULL AND webauthn_challenge_ciphertext IS NULL)
+        OR (webauthn_challenge_digest IS NOT NULL AND webauthn_challenge_ciphertext IS NOT NULL))
+      AND ((recovery_receipt_digest IS NULL
+          AND recovery_credential_id_hash IS NULL
+          AND recovery_credential_generation IS NULL)
+        OR (webauthn_challenge_digest IS NOT NULL
+          AND recovery_receipt_digest IS NOT NULL
+          AND recovery_credential_id_hash IS NOT NULL
+          AND recovery_credential_generation IS NOT NULL)))
+  );
+`;
+
+const HUB_REPLAY_KEYED_AUDIT_DIGEST_SQL = `
+-- psfn-framework-5wrp: audit/replay identifier digests move from unkeyed SHA-256
+-- to app-side keyed HMAC-SHA256 under the fleet-auth session pepper, closing a
+-- deanonymization oracle for privileged readers of authorization_audit_events.
+-- The consume procedure previously derived issuer/device/enrollment/jti digests
+-- from raw values in-SQL; those keyed digests are now computed app-side and
+-- stored on the ephemeral replay ledger so the mutated-replay audit context can
+-- be assembled without re-hashing a raw identifier in Postgres.
+--
+-- Replay fences are short-lived enforcement state (<=60s TTL) whose prior digest
+-- columns were SQL-derivable; drop them rather than backfilling unkeyed values.
+-- The procedure-owned ledger repopulates as signed assertions are re-verified.
+TRUNCATE TABLE hub_device_assertion_replays;
+
+ALTER TABLE hub_device_assertion_replays
+  ADD COLUMN issuer_digest TEXT NOT NULL CHECK (issuer_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN device_id_digest TEXT NOT NULL CHECK (device_id_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN enrollment_version_digest TEXT NOT NULL
+    CHECK (enrollment_version_digest ~ '^[0-9a-f]{64}$'),
+  ADD COLUMN jti_digest TEXT NOT NULL CHECK (jti_digest ~ '^[0-9a-f]{64}$');
+
+-- Correlation discontinuity note (no dual-read fallback, per the no-shims rule):
+-- pre-existing hub_device_assertion.verify/mutated_replay and lifecycle audit
+-- rows keep their prior unkeyed SHA-256 digests and correlation_ids. New keyed
+-- digests occupy a distinct versioned domain (v1), so an old value and a new
+-- value never collide under the correlation_id partial unique index, and the
+-- v17 canonical CHECK (correlation_id = sha256(digest-array)) still holds for
+-- both eras because the correlation stays a SHA-256 over already-digested fields.
+-- A logical mismatch that recurs after upgrade appends a fresh keyed deny audit
+-- row instead of deduplicating against a pre-upgrade row -- an accepted one-time
+-- discontinuity for append-only deny records, not a uniqueness regression.
+`;
+
+// Key-or-SSO ruling (psfn-framework-aol3m): the trusted-host reapproval
+// procedures had no runtime entrypoint left after the Discord-SSO-only doctrine
+// removed WebAuthn and the reapproval routes. They are dropped; reinstatement of
+// restored authority is the audited ADMIN_TOKEN operator's bounded procedures
+// (operator-account-authority-sql.ts), reasserted with the other procedures.
+const RETIRE_TRUSTED_HOST_REAPPROVAL_SQL = `
+DROP FUNCTION IF EXISTS fleet_auth.reapprove_account_authority(
+  uuid, uuid, text, text, uuid, text, uuid, uuid, uuid, timestamptz
+);
+DROP FUNCTION IF EXISTS fleet_auth.reapprove_companion_authority(
+  uuid, uuid, text, bigint, bigint, uuid, uuid, timestamptz
+);
+`;
+
+const DISCORD_SSO_ONLY_AUTHORITY_SQL = `
+-- Operator ruling D2 (2026-07-30): the passkey/WebAuthn/JIT step-up stack is
+-- removed. Discord SSO is the only authentication authority, and escalation is
+-- an audited, single-use SSO grant bound to one exact Garden route resource.
+--
+-- Every remaining SECURITY DEFINER procedure that referenced these tables is
+-- re-applied with a cleaned body by applyFleetAuthReapprovalBoundary inside the
+-- same migration transaction (schema.ts), so no CREATE OR REPLACE is repeated
+-- here and a fresh database and a migrated database end with identical bodies.
+-- The restore_quarantine_activation_guard trigger on passkey_credentials is
+-- removed together with its table and is no longer authored by that DDL.
+--
+-- jit_authorization_grants.challenge_id references step_up_challenges, so the
+-- grants table is dropped first; plain drops suffice and CASCADE is not used.
+DROP TABLE IF EXISTS jit_authorization_grants;
+DROP TABLE IF EXISTS step_up_challenges;
+DROP TABLE IF EXISTS passkey_credentials;
+
+-- The 'webauthn_uv' session assurance level is renamed to 'escalated': the
+-- elevated level survives, its second-factor derivation does not. Any session
+-- that reached it through a passkey assertion is revoked before the rename, so
+-- no pre-ruling elevation is carried into the SSO-only doctrine.
+UPDATE browser_sessions
+SET revoked_at = COALESCE(revoked_at, clock_timestamp())
+WHERE assurance = 'webauthn_uv';
+ALTER TABLE browser_sessions DROP CONSTRAINT browser_sessions_assurance_check;
+UPDATE browser_sessions SET assurance = 'escalated' WHERE assurance = 'webauthn_uv';
+ALTER TABLE browser_sessions
+  ADD CONSTRAINT browser_sessions_assurance_check
+  CHECK (assurance IN ('oauth', 'escalated', 'break_glass'));
+
+-- Single-use audited escalation grant. The grant authorizes one exact compiled
+-- Garden route resource for one companion under the issuing browser session,
+-- and is valid only while every authority counter it froze still matches.
+CREATE TABLE escalation_grants (
+  grant_id UUID PRIMARY KEY,
+  principal_id UUID NOT NULL REFERENCES human_principals(principal_id),
+  browser_session_id UUID NOT NULL REFERENCES browser_sessions(record_id),
+  companion_id UUID NOT NULL,
+  action TEXT NOT NULL CHECK (length(action) BETWEEN 1 AND 128),
+  route_id TEXT NOT NULL CHECK (length(route_id) BETWEEN 1 AND 512),
+  scope_digest TEXT NOT NULL CHECK (scope_digest ~ '^[0-9a-f]{64}$'),
+  reason_digest TEXT NOT NULL CHECK (reason_digest ~ '^[0-9a-f]{64}$'),
+  assurance_requirement TEXT NOT NULL
+    CHECK (assurance_requirement IN ('escalated', 'privacy_break_glass')),
+  exact_origin TEXT NOT NULL CHECK (exact_origin LIKE 'https://%'),
+  authz_version BIGINT NOT NULL CHECK (authz_version >= 1),
+  binding_version BIGINT NOT NULL CHECK (binding_version >= 1),
+  grant_version BIGINT NOT NULL CHECK (grant_version >= 1),
+  policy_version BIGINT NOT NULL CHECK (policy_version >= 1),
+  global_auth_epoch BIGINT NOT NULL CHECK (global_auth_epoch >= 1),
+  created_at TIMESTAMPTZ NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  consumed_at TIMESTAMPTZ,
+  revoked_at TIMESTAMPTZ,
+  CHECK (expires_at > created_at)
+);
+
+CREATE INDEX escalation_grants_session_idx
+  ON escalation_grants (browser_session_id, created_at);
+
+-- Orphan-marked rather than silently retained: every trusted-host ceremony
+-- minter was deleted with the passkey/WebAuthn stack, so this table can no
+-- longer be written by production code, but three live SECURITY DEFINER
+-- procedures still declare %ROWTYPE against it and would fail to compile if it
+-- were dropped here.
+COMMENT ON TABLE trusted_host_ceremonies IS
+  'Orphaned by D2 (Discord-SSO-only, 2026-07-30): no production writer remains; retained because live SECURITY DEFINER procedures declare %ROWTYPE against it. Remove with those procedures.';
+`;
+
+export const FLEET_AUTH_MIGRATIONS: readonly FleetAuthMigration[] = [
+  { version: 1, name: 'durable_authority', sql: DURABLE_AUTHORITY_SQL },
+  { version: 2, name: 'ephemeral_authority', sql: EPHEMERAL_AUTHORITY_SQL },
+  { version: 3, name: 'immutable_guards_and_indexes', sql: GUARDS_AND_INDEXES_SQL },
+  { version: 4, name: 'lineage_and_identity_guards', sql: LINEAGE_AND_IDENTITY_GUARDS_SQL },
+  { version: 5, name: 'restored_history_identity_guard', sql: RESTORED_HISTORY_IDENTITY_GUARD_SQL },
+  { version: 6, name: 'oauth_broker_sessions', sql: OAUTH_BROKER_SESSION_SQL },
+  { version: 7, name: 'oauth_initiating_browser_binding', sql: OAUTH_INITIATING_BROWSER_SQL },
+  { version: 8, name: 'hub_device_assertion_replay', sql: HUB_DEVICE_ASSERTION_REPLAY_SQL },
+  { version: 9, name: 'hub_device_assertion_replay_audit', sql: HUB_DEVICE_ASSERTION_REPLAY_AUDIT_SQL },
+  { version: 10, name: 'discord_evidence_completeness', sql: DISCORD_EVIDENCE_COMPLETENESS_SQL },
+  { version: 11, name: 'discord_evidence_lifecycle_fence', sql: DISCORD_EVIDENCE_LIFECYCLE_FENCE_SQL },
+  { version: 12, name: 'exclusive_broker_authority_lock', sql: FLEET_AUTH_LOCK_AUTHORITY_STATE_DDL_SQL },
+  { version: 13, name: 'atomic_authority_lifecycle', sql: ATOMIC_AUTHORITY_LIFECYCLE_SQL },
+  { version: 14, name: 'lifecycle_oauth_purpose', sql: LIFECYCLE_OAUTH_PURPOSE_SQL },
+  { version: 15, name: 'companion_authority_lineage', sql: COMPANION_AUTHORITY_LINEAGE_SQL },
+  { version: 16, name: 'hub_device_assertion_durable_denial_audit', sql: HUB_DEVICE_ASSERTION_DURABLE_DENIAL_AUDIT_SQL },
+  { version: 17, name: 'hub_device_assertion_replay_procedure_boundary', sql: HUB_DEVICE_ASSERTION_REPLAY_PROCEDURE_BOUNDARY_SQL },
+  { version: 18, name: 'companion_restore_projection', sql: COMPANION_RESTORE_PROJECTION_SQL },
+  { version: 19, name: 'companion_restore_receipts', sql: COMPANION_RESTORE_RECEIPTS_SQL },
+  {
+    version: 20,
+    name: 'broker_authorization_snapshot_locks',
+    sql: `${FLEET_AUTH_LOCK_COMPANION_AUTHORITY_DDL_SQL}\n${FLEET_AUTH_FLOOR_RESOURCE_TOMBSTONED_DDL_SQL}`,
+  },
+  {
+    version: 21,
+    name: 'contact_authority_lifecycle_fences',
+    sql: `${CONTACT_AUTHORITY_FLOOR_KIND_SQL}\n${FLEET_AUTH_CONTACT_AUTHORITY_DDL_SQL}`,
+  },
+  {
+    version: 22,
+    name: 'hub_replay_keyed_audit_digests',
+    sql: HUB_REPLAY_KEYED_AUDIT_DIGEST_SQL,
+  },
+  { version: 23, name: 'hub_device_human_attachment_ledger', sql: HUB_DEVICE_HUMAN_ATTACHMENT_SQL },
+  { version: 24, name: 'request_capability_replay_ledger', sql: REQUEST_CAPABILITY_REPLAY_SQL },
+  { version: 25, name: 'primary_embodiment_authority', sql: PRIMARY_EMBODIMENT_AUTHORITY_SQL },
+  { version: 26, name: 'jit_step_up_authority', sql: JIT_STEP_UP_AUTHORITY_SQL },
+  {
+    version: 27,
+    name: 'account_reapproval_webauthn_confirmation',
+    sql: ACCOUNT_REAPPROVAL_WEBAUTHN_SQL,
+  },
+  { version: 28, name: 'trusted_host_provider_recovery', sql: TRUSTED_HOST_PROVIDER_RECOVERY_SQL },
+  { version: 29, name: 'discord_sso_only_authority', sql: DISCORD_SSO_ONLY_AUTHORITY_SQL },
+  { version: 30, name: 'retire_trusted_host_reapproval', sql: RETIRE_TRUSTED_HOST_REAPPROVAL_SQL },
+] as const;

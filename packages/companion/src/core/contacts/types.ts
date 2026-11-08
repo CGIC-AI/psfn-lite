@@ -1,0 +1,413 @@
+import type { TrustLevel, SensitivityLevel } from '../../system/trust/types.js';
+import type { ChannelPrivacy } from '../../system/trust/context-envelope.js';
+
+export type RelationshipType = 'partner' | 'family' | 'friend' | 'acquaintance' | 'stranger' | 'ai_companion';
+
+/**
+ * Stable contact-identity namespace for an Eidoverse participant id.
+ *
+ * The `userId` stored beside this token is the participant/aid1 subject
+ * presented by the Hub. Linking it records identity continuity only: it does
+ * not create a contact, enroll a hub identity, grant trust, or represent the
+ * participant as cluster companion presence.
+ */
+export const EIDOVERSE_CONTACT_CHANNEL = 'eidoverse' as const;
+
+/** Open string domain: integrations may add contact namespaces without treating them as chat surfaces. */
+export type ContactChannel = string;
+// E3.2 demoted per-contact privacy to provenance evidence; E3.3 narrows the
+// value domain to ChannelPrivacy (stored legacy values decode at read time).
+export type ChannelPrivacyLevel = ChannelPrivacy;
+export type SocialGraphEntityKind = 'person';
+export type SocialGraphEntitySource = 'contact' | 'memory' | 'manual' | 'system';
+export type SocialRelationshipKind =
+  | 'partner'
+  | 'family'
+  | 'friend'
+  | 'acquaintance'
+  | 'colleague'
+  | 'parent'
+  | 'child'
+  | 'sibling'
+  | 'caregiver'
+  | 'household'
+  | 'manager'
+  | 'direct_report'
+  | 'other';
+
+export interface ContactChannelIdentity {
+  channel: ContactChannel;
+  userId: string;
+}
+
+/**
+ * Optional evidence describing where this exact channel identity first entered
+ * the contact biography. These fields are display/audit context only: trust,
+ * privacy classification, enrollment, and presence policy must ignore them.
+ */
+interface ContactIdentityIntroductionProvenance {
+  introducedAtPlaceId?: string;
+  introducedAtWorld?: string;
+  introducedVia?: ContactChannel;
+}
+
+export interface ContactChannelLink extends ContactChannelIdentity, ContactIdentityIntroductionProvenance {
+  /**
+   * @deprecated E3.2 (Context Envelope contract, docs/context-envelope.md):
+   * per-contact privacy labels are provenance EVIDENCE only. They must never
+   * feed channel classification or policy gating — channel privacy is owned
+   * by channels.json contextEnvelope labels, operator trust-policy overrides,
+   * and derived defaults. Rows are retained for history; removal of the
+   * column is a later cleanup bead.
+   */
+  privacyLevel: ChannelPrivacyLevel;
+  /**
+   * Channel bonding opt-in: when true, this channel
+   * identity participates in the contact's bonded set — bonded channels
+   * operate as one logical conversation at the lowest-common privacy of the
+   * set. Explicit operator configuration only (Garden contacts page); never
+   * inferred. Absent/false = unbonded (default).
+   */
+  bonded?: boolean;
+  firstSeen?: string;
+  lastSeen?: string;
+}
+
+export interface ContactConversationChannel {
+  channel: ContactChannel;
+  channelId: string;
+  firstSeen: string;
+  lastSeen: string;
+  /**
+   * @deprecated E3.2 (Context Envelope contract, docs/context-envelope.md):
+   * provenance evidence only — never a classification or gating input.
+   * Retained for history; column removal is a later cleanup bead.
+   */
+  privacyLevel?: ChannelPrivacyLevel;
+}
+
+export interface ContactIdentityLinkOptions extends ContactIdentityIntroductionProvenance {
+  /**
+   * @deprecated E3.2: recorded as provenance evidence on the contact row
+   * only; never consulted by channel classification (docs/context-envelope.md).
+   */
+  privacyLevel?: ChannelPrivacyLevel;
+}
+
+export type ContactIdentityLinkResult =
+  | 'linked'
+  | 'already_linked'
+  | 'contact_not_found'
+  | 'identity_conflict';
+
+export type ContactIdentityLinkVerificationState =
+  | 'pending'
+  | 'verified'
+  | 'failed'
+  | 'expired';
+
+export interface ContactIdentityLinkVerification {
+  id: string;
+  contactId: string;
+  sourceChannel: ContactChannel;
+  sourceUserId: string;
+  targetChannel: ContactChannel;
+  targetUserId: string;
+  nonce: string;
+  expiresAt: string;
+  signature: string;
+  status: ContactIdentityLinkVerificationState;
+  createdAt: string;
+  updatedAt: string;
+  verifiedAt?: string;
+  failureReason?: string;
+}
+
+export interface ContactIdentityLinkChallengeInput {
+  contactId: string;
+  sourceChannel: ContactChannel;
+  sourceUserId: string;
+  targetChannel: ContactChannel;
+  targetUserId: string;
+  ttlMs?: number;
+}
+
+export type ContactIdentityLinkChallengeResult =
+  | {
+    status: 'challenge_created' | 'pending_exists';
+    verification: ContactIdentityLinkVerification;
+  }
+  | { status: 'already_linked' }
+  | { status: 'contact_not_found' }
+  | { status: 'source_identity_not_linked' }
+  | { status: 'identity_conflict' };
+
+export interface ContactIdentityLinkVerificationInput {
+  contactId: string;
+  sourceChannel: ContactChannel;
+  sourceUserId: string;
+  targetChannel: ContactChannel;
+  targetUserId: string;
+  nonce: string;
+  expiresAt: string;
+  signature: string;
+  /**
+   * @deprecated E3.2: provenance evidence recorded on the resulting channel
+   * link only; never a classification or gating input (docs/context-envelope.md).
+   */
+  privacyLevel?: ChannelPrivacyLevel;
+}
+
+export type ContactIdentityLinkVerificationResult =
+  | { status: 'linked' | 'already_linked'; verification: ContactIdentityLinkVerification }
+  | { status: 'verification_not_found' }
+  | { status: 'verification_replayed'; verification: ContactIdentityLinkVerification }
+  | { status: 'verification_expired'; verification: ContactIdentityLinkVerification }
+  | { status: 'invalid_signature'; verification: ContactIdentityLinkVerification }
+  | { status: 'claim_mismatch'; verification: ContactIdentityLinkVerification }
+  | { status: 'source_identity_not_linked'; verification: ContactIdentityLinkVerification }
+  | { status: 'identity_conflict'; verification: ContactIdentityLinkVerification }
+  | { status: 'contact_not_found' };
+
+export const CONTACT_MUTATION_AUDIT_FIELDS = [
+  'trust_level',
+  'is_machine_intelligence',
+  'notes',
+  'display_name',
+  'nickname',
+  'timezone',
+  'relationship_type',
+  'gender',
+  'pronouns',
+  'age',
+  'channel_privacy',
+  'channel_bond',
+  'channel_link',
+  'conversation_channel',
+  'archived',
+  'merged',
+] as const;
+
+export type ContactMutationAuditField = typeof CONTACT_MUTATION_AUDIT_FIELDS[number];
+
+export interface ContactMutationAuditMetadata {
+  source: 'fleet_garden';
+  /** `admin_token` is the gateway's audited ADMIN_TOKEN operator door. */
+  provider: 'discord' | 'admin_token';
+  providerSubjectId: string;
+  principalId: string;
+  requestId: string;
+  decisionId: string;
+  authorizationEventId: string;
+  operatorGrantId: string;
+  sessionRecordId: string;
+  contactBindingId: string;
+}
+
+/**
+ * Operator/tool demographic write (bead fnyb). Only present keys are applied;
+ * a `null` clears the field, an absent key leaves it unchanged.
+ */
+export interface ContactDemographicsUpdate {
+  gender?: string | null;
+  pronouns?: string | null;
+  age?: number | null;
+}
+
+export interface ContactMutationAuditEntry {
+  id: number;
+  contactId: string;
+  actor: string;
+  field: ContactMutationAuditField;
+  oldValue: string | null;
+  newValue: string | null;
+  metadata?: ContactMutationAuditMetadata;
+  timestamp: string;
+}
+
+export interface ContactMutationAuditQuery {
+  contactId?: string;
+  actor?: string;
+  field?: ContactMutationAuditField;
+  limit?: number;
+}
+
+export const CHANNEL_PRIVACY_LEVELS: ChannelPrivacyLevel[] = [
+  'private',
+  'invite_only',
+  'public',
+];
+
+export const VALID_RELATIONSHIP_TYPES: RelationshipType[] = [
+  'partner', 'family', 'friend', 'acquaintance', 'stranger', 'ai_companion',
+];
+export const VALID_SOCIAL_GRAPH_ENTITY_KINDS: SocialGraphEntityKind[] = ['person'];
+export const VALID_SOCIAL_GRAPH_SOURCES: SocialGraphEntitySource[] = ['contact', 'memory', 'manual', 'system'];
+export const VALID_SOCIAL_RELATIONSHIP_KINDS: SocialRelationshipKind[] = [
+  'partner',
+  'family',
+  'friend',
+  'acquaintance',
+  'colleague',
+  'parent',
+  'child',
+  'sibling',
+  'caregiver',
+  'household',
+  'manager',
+  'direct_report',
+  'other',
+];
+
+export interface SocialGraphEntity {
+  id: string;
+  entityKind: SocialGraphEntityKind;
+  displayName: string;
+  contactId?: string;
+  sensitivity: SensitivityLevel;
+  provenanceRefs: string[];
+  confidence: number;
+  source: SocialGraphEntitySource;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SocialGraphEntityUpsertInput {
+  id?: string;
+  entityKind?: SocialGraphEntityKind;
+  displayName: string;
+  contactId?: string;
+  sensitivity?: SensitivityLevel;
+  provenanceRefs?: string[];
+  confidence?: number;
+  source?: SocialGraphEntitySource;
+}
+
+export interface SocialGraphQueryOptions {
+  viewerTrustLevel?: TrustLevel;
+  viewerChannelPrivacy?: ChannelPrivacyLevel;
+  limit?: number;
+}
+
+export interface SocialGraphEntityQuery extends SocialGraphQueryOptions {
+  contactId?: string;
+}
+
+export interface SocialRelationshipEdge {
+  id: string;
+  sourceEntityId: string;
+  targetEntityId: string;
+  relationshipType: SocialRelationshipKind;
+  directional: boolean;
+  sensitivity: SensitivityLevel;
+  provenanceRefs: string[];
+  evidenceMemoryIds: string[];
+  confidence: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SocialRelationshipEdgeUpsertInput {
+  sourceEntityId: string;
+  targetEntityId: string;
+  relationshipType: SocialRelationshipKind;
+  directional?: boolean;
+  sensitivity?: SensitivityLevel;
+  provenanceRefs?: string[];
+  evidenceMemoryIds?: string[];
+  confidence?: number;
+}
+
+export interface SocialRelationshipEdgeQuery extends SocialGraphQueryOptions {
+  contactId?: string;
+  entityId?: string;
+  relationshipType?: SocialRelationshipKind;
+  minConfidence?: number;
+}
+
+export interface Contact {
+  id: string;
+  discordUserId?: string;
+  nickname?: string;
+  channelIdentities?: ContactChannelIdentity[];
+  channels?: ContactChannelLink[];
+  conversationChannels?: ContactConversationChannel[];
+  displayName: string;
+  timezone?: string;
+  trustLevel: TrustLevel;
+  relationshipType: RelationshipType;
+  /**
+   * Demographic attributes (bead fnyb). Provenance is carried by the actor on
+   * the per-field contact_mutation_audit rows, mirroring is_machine_intelligence:
+   * an operator/tool actor is a deliberate specification, a `system:`-prefixed
+   * actor is an inference. Registered so a future inference write can honor an
+   * operator-specified value rather than clobber it.
+   */
+  gender?: string;
+  pronouns?: string;
+  age?: number;
+  emotionalBaseline?: Record<string, number>;  // e.g. { warmth: 0.7, formality: 0.3 }
+  /** True when this contact is another machine intelligence (peer companion/agent) — orthogonal to relationshipType. */
+  isMachineIntelligence?: boolean;
+  firstSeen: string;  // ISO timestamp
+  lastSeen: string;   // ISO timestamp
+  notes?: string;
+  /**
+   * Archive marker (bead psfn-framework-qgqw.1, adjudication R10.3): contacts
+   * are archived, never deleted. An absent value means the contact is live; an
+   * ISO timestamp means it was archived at that time. Archived contacts keep
+   * their row, memories, audit trail, and snapshotted privacy links as
+   * grayed-out history, but are excluded from live channel-identity resolution
+   * so a recreated/reused platform id resolves to a NEW person.
+   */
+  archivedAt?: string;
+}
+
+// ── Room roster (E4.1) ──
+// A "room" is a conversation channel keyed by channelId. Roster data is derived
+// ENTIRELY from existing contact_channel_activity rows (who has been seen in a
+// channel) joined to the owning contact row — no new modeling, no schema change.
+// This is DATA for operator/admin surfaces and future audience-scope consumers
+// (E3.3 audienceScope derivation, E4.4). It is NEVER loaded into prompt content.
+
+/** Default page size for a room roster query (operator constraint: bounded, ~50). */
+export const DEFAULT_ROOM_ROSTER_LIMIT = 50;
+/** Hard upper bound on a single room roster page. */
+export const MAX_ROOM_ROSTER_LIMIT = 200;
+/** Default cap on the known-rooms listing. */
+export const DEFAULT_KNOWN_ROOMS_LIMIT = 100;
+/** Hard upper bound on a known-rooms page. */
+export const MAX_KNOWN_ROOMS_LIMIT = 500;
+
+/** Summary of one known room (distinct channel + channelId) with membership stats. */
+export interface RoomSummary {
+  channel: ContactChannel;
+  channelId: string;
+  /** Count of distinct known contacts with activity in this room. */
+  memberCount: number;
+  /** Earliest first_seen across members (ISO timestamp). */
+  firstActivity: string;
+  /** Latest last_seen across members (ISO timestamp). */
+  lastActivity: string;
+}
+
+/** One known member of a room: channel-activity row joined to the owning contact. */
+export interface RoomRosterMember {
+  contactId: string;
+  displayName: string;
+  trustLevel: TrustLevel;
+  relationshipType: RelationshipType;
+  channel: ContactChannel;
+  channelId: string;
+  privacyLevel: ChannelPrivacyLevel | null;
+  firstSeen: string;  // ISO timestamp of first activity in this room
+  lastSeen: string;   // ISO timestamp of most recent activity in this room
+}
+
+/** Pagination / filter options for room queries. */
+export interface RoomQueryOptions {
+  /** Optional channel filter (channelId is the room key, but ids can be scoped per channel). */
+  channel?: ContactChannel;
+  limit?: number;
+  offset?: number;
+}

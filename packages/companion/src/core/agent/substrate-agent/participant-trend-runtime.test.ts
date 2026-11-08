@@ -1,0 +1,219 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EmotionSelfModelRuntime } from './emotion-self-model-runtime.js';
+import { EmotionState } from '../../emotion/state.js';
+import type { EmotionObserver } from '../../emotion/observer.js';
+import { createDmConversationScope, createGroupConversationScope } from '../../session/conversation-scope.js';
+import {
+  createDefaultEmotionScopingSettings,
+  type EmotionScopingSettings,
+} from '../../../system/config/emotion-scoping-config.js';
+import {
+  type ParticipantTrendStorePort,
+  type PersistedParticipantTrend,
+} from '../../emotion/participant-trend-persistence.js';
+import type { SessionManager } from '../../session/manager.js';
+import type { LLMProviderPort } from '../contracts.js';
+
+const NOW = 1_700_000_000_000;
+
+// Valence-based observer: CRUEL → negative, KIND → positive, else near-neutral.
+// Counts observe() calls so we can prove accumulation adds zero classifier work.
+function makeObserver(): { observer: EmotionObserver; observeCount: () => number } {
+  let count = 0;
+  const observer = {
+    observe: async (text: string) => {
+      count += 1;
+      if (text.includes('CRUEL')) {
+        return { observation: { vad: { valence: -0.8, arousal: 0.6, dominance: 0.5 }, discrete: { anger: 0.9 }, confidence: 1 } };
+      }
+      if (text.includes('KIND')) {
+        return { observation: { vad: { valence: 0.8, arousal: 0.4, dominance: 0.2 }, discrete: { love: 0.8 }, confidence: 1 } };
+      }
+      return { observation: { vad: { valence: 0, arousal: 0.02, dominance: 0 }, confidence: 1 } };
+    },
+  } as unknown as EmotionObserver;
+  return { observer, observeCount: () => count };
+}
+
+// LLM provider that fails loudly if the accumulation path ever calls it.
+const throwingLlm = {
+  complete: async () => { throw new Error('accumulation must not call the LLM'); },
+} as unknown as LLMProviderPort;
+
+const sessionManager = { getRecentMessages: () => [] } as unknown as SessionManager;
+
+class FakeTrendStore implements ParticipantTrendStorePort {
+  readonly rows = new Map<string, PersistedParticipantTrend>();
+  loadCalls = 0;
+  saveCalls = 0;
+  private key(roomKey: string, participantKey: string): string {
+    return `${roomKey}\x00${participantKey}`;
+  }
+  async loadRoom(roomKey: string): Promise<PersistedParticipantTrend[]> {
+    this.loadCalls += 1;
+    return [...this.rows.values()].filter((row) => row.roomKey === roomKey);
+  }
+  async saveTrend(record: PersistedParticipantTrend): Promise<void> {
+    this.saveCalls += 1;
+    this.rows.set(this.key(record.roomKey, record.participantKey), record);
+  }
+  async deleteTrends(roomKey: string, participantKeys: readonly string[]): Promise<void> {
+    for (const participantKey of participantKeys) {
+      this.rows.delete(this.key(roomKey, participantKey));
+    }
+  }
+}
+
+function makeRuntime(config: EmotionScopingSettings, store?: ParticipantTrendStorePort): EmotionSelfModelRuntime {
+  const { observer } = makeObserver();
+  return makeRuntimeWith(config, observer, store);
+}
+
+function makeRuntimeWith(
+  config: EmotionScopingSettings,
+  observer: EmotionObserver,
+  store?: ParticipantTrendStorePort,
+): EmotionSelfModelRuntime {
+  return new EmotionSelfModelRuntime({
+    sessionManager,
+    llmProvider: throwingLlm,
+    emotionRuntime: { state: new EmotionState(), observer, requireWiring: true },
+    emotionScopingConfig: config,
+    ...(store ? { participantTrendStore: store } : {}),
+    getActiveConcernProvider: () => null,
+    getPendingFollowUpProvider: () => null,
+    getContactStore: () => null,
+    getSelfModelRuntimeRequired: () => false,
+    logger: { debug: () => {} },
+  });
+}
+
+const room = createGroupConversationScope({
+  channelId: 'roomR',
+  recentSpeakers: [
+    { authorId: 'contactCruel', name: 'Cruel' },
+    { authorId: 'contactKind', name: 'Kind' },
+  ],
+});
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('per-participant trends in group rooms (E6.3 runtime)', () => {
+  it('moves opposite-valence participants independently; room aggregate unchanged with flag off', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+    const config = createDefaultEmotionScopingSettings();
+
+    // Two fresh runtimes over the IDENTICAL message sequence: one tracks
+    // participants (passes author keys), the control does not.
+    const tracked = makeRuntime(config, new FakeTrendStore());
+    const control = makeRuntime(config);
+    let trackedSnapshot = null;
+    let controlSnapshot = null;
+    for (let index = 0; index < 6; index += 1) {
+      await tracked.observeEmotionState('you are CRUEL', 'roomR', room, 'contactCruel');
+      trackedSnapshot = await tracked.observeEmotionState('that was so KIND', 'roomR', room, 'contactKind');
+      await control.observeEmotionState('you are CRUEL', 'roomR', room);
+      controlSnapshot = await control.observeEmotionState('that was so KIND', 'roomR', room);
+    }
+
+    // Per-participant trends move in independent directions.
+    const cruelTrend = tracked.getParticipantTrend('room:roomR', 'contactCruel');
+    const kindTrend = tracked.getParticipantTrend('room:roomR', 'contactKind');
+    expect(cruelTrend!.vad.valence).toBeLessThan(-0.3);
+    expect(kindTrend!.vad.valence).toBeGreaterThan(0.3);
+    expect(cruelTrend!.interactionCount).toBe(6);
+    expect(kindTrend!.interactionCount).toBe(6);
+
+    // Room aggregate (scoped room state) is byte-for-byte unchanged by tracking.
+    expect(trackedSnapshot!.vad.valence).toBeCloseTo(controlSnapshot!.vad.valence, 6);
+    expect(trackedSnapshot!.vad.arousal).toBeCloseTo(controlSnapshot!.vad.arousal, 6);
+    expect(trackedSnapshot!.mood.valence).toBeCloseTo(controlSnapshot!.mood.valence, 6);
+  });
+
+  it('leaves an idle participant untouched after sustained activity by others', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+    const runtime = makeRuntime(createDefaultEmotionScopingSettings(), new FakeTrendStore());
+
+    for (let index = 0; index < 10; index += 1) {
+      await runtime.observeEmotionState('you are CRUEL', 'roomR', room, 'contactCruel');
+      await runtime.observeEmotionState('that was so KIND', 'roomR', room, 'contactKind');
+    }
+
+    // The idle participant never authored a message: no trend, no movement.
+    expect(runtime.getParticipantTrend('room:roomR', 'contactIdle')).toBeNull();
+    expect(runtime.hasMeaningfulParticipantMovement('room:roomR', 'contactIdle')).toBe(false);
+  });
+
+  it('adds zero classifier/LLM calls in the accumulation path', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+    const { observer, observeCount } = makeObserver();
+    const runtime = makeRuntimeWith(createDefaultEmotionScopingSettings(), observer, new FakeTrendStore());
+
+    const messageCount = 8;
+    for (let index = 0; index < messageCount; index += 1) {
+      await runtime.observeEmotionState('you are CRUEL', 'roomR', room, 'contactCruel');
+    }
+    // Exactly one observe() per message; accumulation reuses that observation.
+    expect(observeCount()).toBe(messageCount);
+    // (throwingLlm proves complete() is never called in this path.)
+  });
+
+  it('persists trends and survives restart through the store', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+    const store = new FakeTrendStore();
+    const first = makeRuntime(createDefaultEmotionScopingSettings(), store);
+
+    for (let index = 0; index < 5; index += 1) {
+      await first.observeEmotionState('you are CRUEL', 'roomR', room, 'contactCruel');
+    }
+    const beforeRestart = first.getParticipantTrend('room:roomR', 'contactCruel');
+    expect(beforeRestart).not.toBeNull();
+    expect(store.rows.size).toBeGreaterThan(0);
+
+    // Fresh runtime, same store: a new group observation triggers a lazy load
+    // that rehydrates the persisted trend.
+    const restarted = makeRuntime(createDefaultEmotionScopingSettings(), store);
+    await restarted.observeEmotionState('that was so KIND', 'roomR', room, 'contactKind');
+    const afterRestart = restarted.getParticipantTrend('room:roomR', 'contactCruel');
+    expect(afterRestart).not.toBeNull();
+    expect(afterRestart!.interactionCount).toBe(beforeRestart!.interactionCount);
+    expect(afterRestart!.vad.valence).toBeCloseTo(beforeRestart!.vad.valence, 6);
+  });
+
+  it('flag on: group→DM carry-over weights by the contact\'s own trend, not the room aggregate', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(NOW);
+    const store = new FakeTrendStore();
+    const config = createDefaultEmotionScopingSettings();
+    config.participantTrends.emaAlpha = 0.6;
+    config.participantTrends.minInteractionsForMovement = 2;
+    config.participantTrends.carryOverUsesParticipantTrend = true;
+
+    const dmMember = createDmConversationScope({ channelId: 'chanM', contact: { contactId: 'contactKind' } });
+
+    // contactKind is warm in the room; a cruel person speaks LAST, so the room
+    // aggregate turns negative while contactKind's own trend stays positive.
+    const runtime = makeRuntime(config, store);
+    for (let index = 0; index < 4; index += 1) {
+      await runtime.observeEmotionState('that was so KIND', 'roomR', room, 'contactKind');
+    }
+    await runtime.observeEmotionState('you are CRUEL', 'roomR', room, 'contactCruel');
+    const memberDmOn = await runtime.observeEmotionState('hello', 'chanM', dmMember, 'contactKind');
+
+    // Flag off control: same sequence, carry-over sources the (negative) room
+    // aggregate instead of contactKind's positive trend.
+    const offConfig = createDefaultEmotionScopingSettings();
+    offConfig.participantTrends.emaAlpha = 0.6;
+    const off = makeRuntime(offConfig, new FakeTrendStore());
+    for (let index = 0; index < 4; index += 1) {
+      await off.observeEmotionState('that was so KIND', 'roomR', room, 'contactKind');
+    }
+    await off.observeEmotionState('you are CRUEL', 'roomR', room, 'contactCruel');
+    const memberDmOff = await off.observeEmotionState('hello', 'chanM', dmMember, 'contactKind');
+
+    expect(memberDmOn).not.toBeNull();
+    expect(memberDmOff).not.toBeNull();
+    // The contact's own warmth carries over when the flag is on; the room's
+    // late negativity carries over when it is off.
+    expect(memberDmOn!.vad.valence).toBeGreaterThan(memberDmOff!.vad.valence);
+  });
+});

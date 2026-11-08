@@ -1,0 +1,391 @@
+import {
+  isHighIntimacySensitivityLevel,
+  type TrustLevel,
+} from '../../../system/trust/types.js';
+import type { ChannelPrivacy } from '../../../system/trust/context-envelope.js';
+import {
+  evaluateMemoryPolicy,
+  type ChannelMeta,
+  type DisclosureBoundaryDirective,
+} from '../../../system/trust/policy.js';
+import type {
+  PurrMemory,
+  RetrievalAccessScope,
+} from '../types.js';
+import type { ConversationScope } from '../../../core/session/conversation-scope.js';
+import {
+  createEmptyMemoryWithheldSummary,
+  incrementMemoryWithheldRelevanceBand,
+  incrementMemoryWithheldReason,
+  resolveMemoryWithheldRelevanceBand,
+  type MemoryWithheldReasonTag,
+  type MemoryWithheldSummary,
+} from '../withheld-summary.js';
+import type { RetrievalAccessDecision } from './types.js';
+
+const WITHHOLD_BOUNDARY_TAGS = new Set([
+  'withhold',
+  'withheld',
+  'boundary_withhold',
+  'do_not_disclose',
+  'no_disclose',
+  'private_boundary',
+]);
+const CONSENT_REQUIRED_BOUNDARY_TAGS = new Set([
+  'consent_required',
+  'requires_consent',
+  'disclosure_requires_consent',
+  'gate_consent',
+]);
+const ROOM_CONTEXT_SCOPE_TAGS = new Set([
+  'group_memory',
+  'room_context',
+  'conversation',
+  'channel',
+]);
+
+export interface RetrievalRoomVisibilityContext {
+  /** The current room id; equals `conversationScope.channelId` when a scope is present. */
+  currentChannelId: string;
+  canonicalContactRoomIds?: ReadonlySet<string>;
+  /**
+   * The turn ConversationScope: the SOLE authority for the room kind
+   * (psfn-framework-bd9tx). Loose channel metadata never decides whether the
+   * current room is a DM. Absent, the room kind is unknown and every
+   * DM-only allowance fails closed.
+   */
+  conversationScope?: ConversationScope;
+}
+
+function isScopeDirectMessage(roomVisibility: RetrievalRoomVisibilityContext | undefined): boolean {
+  return roomVisibility?.conversationScope?.kind === 'dm';
+}
+
+interface RetrievalParticipantAccessContext {
+  accessScope?: RetrievalAccessScope;
+  trustLevel: TrustLevel;
+  channelPrivacy: ChannelPrivacy;
+  broadcast: boolean;
+  canonicalContactId?: string;
+  roomVisibility?: RetrievalRoomVisibilityContext;
+}
+
+function normalizeContactId(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function resolveMemorySubjectContactId(
+  memory: Pick<PurrMemory, 'contactId' | 'provenance'>,
+): string | undefined {
+  return normalizeContactId(memory.contactId)
+    ?? normalizeContactId(memory.provenance?.subjectContactId)
+    ?? normalizeContactId(memory.provenance?.routedContactId)
+    ?? normalizeContactId(memory.provenance?.sourceContactId)
+    ?? normalizeContactId(memory.provenance?.triggerContactId);
+}
+
+function hasOnlyCanonicalParticipantAttribution(
+  memory: Pick<PurrMemory, 'contactId' | 'provenance'>,
+  canonicalContactId: string,
+): boolean {
+  const participantContactIds = [
+    memory.contactId,
+    memory.provenance?.subjectContactId,
+    memory.provenance?.routedContactId,
+    memory.provenance?.sourceContactId,
+    memory.provenance?.triggerContactId,
+  ]
+    .map(normalizeContactId)
+    .filter((contactId): contactId is string => contactId !== undefined);
+  return participantContactIds.every(contactId => contactId === canonicalContactId);
+}
+
+function normalizeRoomId(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function hasRoomContextScopeTag(memory: Pick<PurrMemory, 'scopeTags'>): boolean {
+  for (const rawTag of memory.scopeTags ?? []) {
+    const normalized = rawTag.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_');
+    if (ROOM_CONTEXT_SCOPE_TAGS.has(normalized)) return true;
+  }
+  return false;
+}
+
+function isRecallableCompanionSelfExperience(
+  memory: Pick<PurrMemory, 'tags' | 'provenance'>,
+): boolean {
+  const tags = new Set(memory.tags.map(tag => tag.trim().toLowerCase()));
+  return memory.provenance?.actor === 'companion'
+    && tags.has('self_directed')
+    && tags.has('self_experience');
+}
+
+function resolveMemorySourceRoom(memory: Pick<PurrMemory, 'provenance' | 'scopeRef'>): {
+  roomId?: string;
+  inconsistent: boolean;
+} {
+  const scopedRoomId = memory.scopeRef?.kind === 'conversation'
+    ? normalizeRoomId(memory.scopeRef.id)
+    : undefined;
+  const provenanceRoomId = normalizeRoomId(memory.provenance?.channelId);
+  return {
+    roomId: scopedRoomId ?? provenanceRoomId,
+    inconsistent: scopedRoomId !== undefined
+      && provenanceRoomId !== undefined
+      && scopedRoomId !== provenanceRoomId,
+  };
+}
+
+function isPrimaryPrivateDmSubject(
+  memory: Pick<PurrMemory, 'sensitivity' | 'contactId' | 'tags' | 'provenance' | 'scopeRef' | 'scopeTags'>,
+  options: RetrievalParticipantAccessContext,
+): boolean {
+  const canonicalContactId = normalizeContactId(options.canonicalContactId);
+  const subjectContactId = resolveMemorySubjectContactId(memory);
+  if (!(options.trustLevel === 'primary'
+    && options.channelPrivacy === 'private'
+    && options.broadcast === false
+    && isScopeDirectMessage(options.roomVisibility)
+    && canonicalContactId !== undefined
+    && (subjectContactId === undefined || subjectContactId === canonicalContactId)
+    && hasOnlyCanonicalParticipantAttribution(memory, canonicalContactId))) {
+    return false;
+  }
+
+  const source = resolveMemorySourceRoom(memory);
+  if (source.inconsistent) return false;
+  if (subjectContactId === canonicalContactId) return true;
+  if (source.roomId && options.roomVisibility?.canonicalContactRoomIds?.has(source.roomId)) {
+    return true;
+  }
+
+  return memory.scopeRef?.kind !== 'conversation'
+    && !hasRoomContextScopeTag(memory)
+    && !isHighIntimacySensitivityLevel(memory.sensitivity)
+    && isRecallableCompanionSelfExperience(memory);
+}
+
+function violatesHighIntimacyContactScope(
+  memory: Pick<PurrMemory, 'sensitivity' | 'contactId' | 'tags' | 'provenance' | 'scopeRef' | 'scopeTags'>,
+  options: RetrievalParticipantAccessContext,
+): boolean {
+  if (!isHighIntimacySensitivityLevel(memory.sensitivity)) return false;
+  const canonicalContactId = normalizeContactId(options.canonicalContactId);
+  if (!canonicalContactId) return false;
+  if (isPrimaryPrivateDmSubject(memory, options)) return false;
+  return resolveMemorySubjectContactId(memory) !== canonicalContactId;
+}
+
+function requiresRoomProofWhenSourceMissing(
+  memory: Pick<PurrMemory, 'scopeRef' | 'scopeTags'>,
+): boolean {
+  return memory.scopeRef?.kind === 'conversation'
+    || hasRoomContextScopeTag(memory);
+}
+
+function evaluateRoomVisibilityDecision(
+  memory: Pick<PurrMemory, 'sensitivity' | 'contactId' | 'tags' | 'provenance' | 'scopeRef' | 'scopeTags'>,
+  options: RetrievalParticipantAccessContext,
+): RetrievalAccessDecision | undefined {
+  const roomVisibility = options.roomVisibility;
+  const currentRoomId = normalizeRoomId(roomVisibility?.currentChannelId);
+  if (!roomVisibility || !currentRoomId) return undefined;
+
+  const source = resolveMemorySourceRoom(memory);
+  if (source.inconsistent) {
+    return {
+      allowed: false,
+      rejectionKind: 'room_visibility',
+      withheldReason: 'room_visibility.blocked',
+    };
+  }
+  if (isPrimaryPrivateDmSubject(memory, options)) return undefined;
+  if (!source.roomId) {
+    if (requiresRoomProofWhenSourceMissing(memory)) {
+      return {
+        allowed: false,
+        rejectionKind: 'room_visibility',
+        withheldReason: 'room_visibility.blocked',
+      };
+    }
+    return undefined;
+  }
+  if (source.roomId === currentRoomId) return undefined;
+
+  if (isScopeDirectMessage(roomVisibility)) {
+    if (roomVisibility.canonicalContactRoomIds?.has(source.roomId)) {
+      return undefined;
+    }
+    return {
+      allowed: false,
+      rejectionKind: 'room_visibility',
+      withheldReason: 'room_visibility.blocked',
+    };
+  }
+
+  return {
+    allowed: false,
+    rejectionKind: 'room_visibility',
+    withheldReason: 'room_visibility.blocked',
+  };
+}
+
+export function evaluateRetrievalAccessDecision(
+  memory: Pick<PurrMemory, 'sensitivity' | 'contactId' | 'consentFlags' | 'tags' | 'provenance' | 'scopeRef' | 'scopeTags'>,
+  options: {
+    accessScope?: RetrievalAccessScope;
+    trustLevel: TrustLevel;
+    /** Context Envelope disclosure pair (E3.3 re-key). */
+    channelPrivacy: ChannelPrivacy;
+    broadcast: boolean;
+    channelMeta?: ChannelMeta;
+    canonicalContactId?: string;
+    operatorApproval?: boolean;
+    roomVisibility?: RetrievalRoomVisibilityContext;
+  },
+): RetrievalAccessDecision {
+  const companionSelfAccess = options.accessScope === 'companion_self_reflection'
+    || options.accessScope === 'companion_self_creation';
+  if (companionSelfAccess) return { allowed: true };
+
+  const roomDecision = evaluateRoomVisibilityDecision(memory, options);
+  if (roomDecision) return roomDecision;
+
+  if (violatesHighIntimacyContactScope(memory, options)) {
+    return {
+      allowed: false,
+      rejectionKind: 'contact_scope',
+      withheldReason: 'contact_scope.high_intimacy',
+    };
+  }
+
+  const policy = evaluateMemoryPolicy({
+    trustLevel: options.trustLevel,
+    channelPrivacy: options.channelPrivacy,
+    broadcast: options.broadcast,
+    memorySensitivity: memory.sensitivity,
+    consentFlags: memory.consentFlags,
+    disclosureBoundary: resolveDisclosureBoundaryDirective(memory, options.channelMeta),
+    operatorApproval: options.operatorApproval,
+  });
+  if (policy.decision === 'allow') {
+    return { allowed: true };
+  }
+
+  if (
+    policy.reasonTag === 'trust.ceiling_exceeded'
+    || policy.reasonTag === 'visibility.channel_restricted'
+    || policy.reasonTag === 'visibility.broadcast_restricted'
+  ) {
+    return {
+      allowed: false,
+      rejectionKind: 'sensitivity',
+      withheldReason: policy.reasonTag,
+    };
+  }
+
+  return {
+    allowed: false,
+    rejectionKind: 'policy',
+    withheldReason: policy.reasonTag as Exclude<
+      MemoryWithheldReasonTag,
+      'contact_scope.high_intimacy' | 'room_visibility.blocked'
+    >,
+  };
+}
+
+export function summarizeWithheldMemories<T extends Pick<PurrMemory, 'id' | 'sensitivity' | 'contactId' | 'consentFlags' | 'tags' | 'provenance' | 'scopeRef' | 'scopeTags'> & { similarity?: number }>(
+  memories: readonly T[],
+  options: {
+    accessScope?: RetrievalAccessScope;
+    trustLevel: TrustLevel;
+    /** Context Envelope disclosure pair (E3.3 re-key). */
+    channelPrivacy: ChannelPrivacy;
+    broadcast: boolean;
+    channelMeta?: ChannelMeta;
+    canonicalContactId?: string;
+    operatorApproval?: boolean;
+    roomVisibility?: RetrievalRoomVisibilityContext;
+  },
+): { summary?: MemoryWithheldSummary; withheldIds: string[] } {
+  const summary = createEmptyMemoryWithheldSummary();
+  const withheldIds = new Set<string>();
+  const seenIds = new Set<string>();
+
+  for (const memory of memories) {
+    if (seenIds.has(memory.id)) continue;
+    seenIds.add(memory.id);
+
+    const decision = evaluateRetrievalAccessDecision(memory, options);
+    if (!decision.allowed && decision.withheldReason) {
+      incrementMemoryWithheldReason(summary, decision.withheldReason);
+      incrementMemoryWithheldRelevanceBand(
+        summary,
+        resolveMemoryWithheldRelevanceBand(memory.similarity),
+      );
+      withheldIds.add(memory.id);
+    }
+  }
+
+  return {
+    ...(summary.totalCount > 0 ? { summary } : {}),
+    withheldIds: [...withheldIds],
+  };
+}
+
+export function mergeMemoryWithheldSummaries(
+  ...summaries: Array<MemoryWithheldSummary | undefined>
+): MemoryWithheldSummary | undefined {
+  let merged: MemoryWithheldSummary | undefined;
+  for (const summary of summaries) {
+    if (!summary || summary.totalCount <= 0) continue;
+    merged ??= { totalCount: 0, reasonCounts: {}, relevanceBands: {} };
+    merged.totalCount += summary.totalCount;
+    for (const [reason, count] of Object.entries(summary.reasonCounts)) {
+      if (!count || count <= 0) continue;
+      const reasonKey = reason as keyof MemoryWithheldSummary['reasonCounts'];
+      merged.reasonCounts[reasonKey] = (merged.reasonCounts[reasonKey] ?? 0) + count;
+    }
+    for (const [band, count] of Object.entries(summary.relevanceBands ?? {})) {
+      if (!count || count <= 0) continue;
+      const bandKey = band as keyof NonNullable<MemoryWithheldSummary['relevanceBands']>;
+      merged.relevanceBands ??= {};
+      merged.relevanceBands[bandKey] = (merged.relevanceBands[bandKey] ?? 0) + count;
+    }
+  }
+  return merged;
+}
+
+function normalizeBoundaryTag(value: string): string {
+  return value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_');
+}
+
+function hasBoundaryDirectiveTag(
+  tags: readonly string[],
+  candidates: ReadonlySet<string>,
+): boolean {
+  for (const rawTag of tags) {
+    const normalized = normalizeBoundaryTag(rawTag);
+    if (normalized.length === 0) continue;
+    if (candidates.has(normalized)) return true;
+  }
+  return false;
+}
+
+function resolveDisclosureBoundaryDirective(
+  memory: Pick<PurrMemory, 'tags'>,
+  channelMeta?: ChannelMeta,
+): DisclosureBoundaryDirective | undefined {
+  const withhold = hasBoundaryDirectiveTag(memory.tags, WITHHOLD_BOUNDARY_TAGS);
+  const consentRequired = hasBoundaryDirectiveTag(memory.tags, CONSENT_REQUIRED_BOUNDARY_TAGS);
+  if (!withhold && !consentRequired) return undefined;
+
+  return {
+    withhold,
+    consentRequired,
+    consentGranted: channelMeta?.disclosureConsentGranted === true,
+  };
+}

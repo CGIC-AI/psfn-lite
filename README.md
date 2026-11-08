@@ -28,6 +28,7 @@ and delivery; the core retains privacy, authorship, and continuity authority.
 - [Source provenance](docs/provenance.md)
 - [Continuity conformance](docs/conformance.md)
 - [Measured footprint](docs/footprint.md)
+- [Donor extraction record](docs/extraction.md)
 
 Work is tracked in Beads, not Markdown task lists. In this checkout run
 `bd prime` and `bd ready --json`. New clones require local Beads setup; Git
