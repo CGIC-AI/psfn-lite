@@ -2,21 +2,41 @@
  * A backup set as a directory of immutable files. Every write is atomic and
  * exclusive, so a set is never partially overwritten and a second backup into
  * the same directory is refused instead of mixing two sets.
+ *
+ * A set lives only directly under the layout's backup root, which
+ * `resolveStorageLayout` has already proven disjoint from history, workspace
+ * and credentials, so a full copy of private state can never land inside the
+ * agent workspace or beside canonical history.
  */
 import { createHash } from 'node:crypto';
-import { mkdir, readFile } from 'node:fs/promises';
-import { isAbsolute, join, normalize, sep } from 'node:path';
+import { mkdir, readFile, realpath } from 'node:fs/promises';
+import { dirname, isAbsolute, join, normalize, sep } from 'node:path';
 import { conflict, invalid, notFound, ok, unavailable, type BackupFile, type BackupStorePort, type Result } from '../core.ts';
 import { errorCode, errorMessage, writeNewFileAtomic } from './files.ts';
+import { isResolvedLayout, type StorageLayout } from './layout.ts';
 
 const CAPABILITY = 'backup_store';
+const SET_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-export async function openFileBackupStore(dir: string): Promise<Result<BackupStorePort>> {
-  try {
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-  } catch (error) {
-    return unavailable(CAPABILITY, `could not create backup directory: ${errorMessage(error)}`);
+export async function openFileBackupStore(layout: StorageLayout, setName: string): Promise<Result<BackupStorePort>> {
+  if (!isResolvedLayout(layout)) return invalid('the backup store needs a layout from resolveStorageLayout');
+  if (layout.backupRoot === null) return invalid('the storage layout has no backupRoot');
+  if (!SET_NAME.test(setName) || setName.includes('..')) {
+    return invalid('backup set name must be one path segment of letters, digits, ".", "_" or "-"');
   }
+  const root = layout.backupRoot;
+  const candidate = join(root, setName);
+  let dir: string;
+  try {
+    await mkdir(candidate, { mode: 0o700 }).catch((error: unknown) => {
+      if (errorCode(error) !== 'EEXIST') throw error;
+    });
+    dir = await realpath(candidate);
+  } catch (error) {
+    return unavailable(CAPABILITY, `could not create backup set directory: ${errorMessage(error)}`);
+  }
+  // A pre-existing symlink must not redirect the set out of the backup root.
+  if (dirname(dir) !== root) return invalid(`backup set ${setName} does not resolve directly under the backup root`);
 
   const resolve = (path: string): Result<string> => {
     const normal = normalize(path);

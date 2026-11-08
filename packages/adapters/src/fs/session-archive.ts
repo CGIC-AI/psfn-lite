@@ -12,7 +12,9 @@
  *   to verify marks the session damaged, and every operation on it returns
  *   `unavailable` rather than serving partial history.
  * - Single writer: the root holds an exclusive lock file for the life of the
- *   archive; a lock left by a dead process is taken over.
+ *   archive; a lock left by a dead process is taken over. A lock naming this
+ *   process's own pid that this process does not hold (a restarted container
+ *   where the app is pid 1 again, or pid reuse) is stale too.
  */
 import { mkdir, open, readFile, readdir, rm, truncate } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -293,8 +295,12 @@ async function syncFile(path: string): Promise<void> {
   }
 }
 
+/** Lock files this process currently holds, so a same-pid lock can be told apart from a stale one. */
+const heldLocks = new Set<string>();
+
 /** Takes the root's exclusive lock, replacing one left by a process that no longer exists. */
 async function acquireLock(lockPath: string): Promise<Result<void>> {
+  if (heldLocks.has(lockPath)) return conflict('already_exists', 'history is already open in this process');
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const handle = await open(lockPath, 'wx', 0o600);
@@ -304,12 +310,14 @@ async function acquireLock(lockPath: string): Promise<Result<void>> {
       } finally {
         await handle.close();
       }
+      heldLocks.add(lockPath);
       return ok(undefined);
     } catch (error) {
       if (errorCode(error) !== 'EEXIST') return unavailable(CAPABILITY, `could not lock history: ${errorMessage(error)}`);
     }
     const holder = Number.parseInt((await readFile(lockPath, 'utf8').catch(() => '')).trim(), 10);
-    if (Number.isInteger(holder) && holder > 0 && processAlive(holder)) {
+    // Our own pid is alive by definition; since this process does not hold the lock, it is stale.
+    if (Number.isInteger(holder) && holder > 0 && holder !== process.pid && processAlive(holder)) {
       return conflict('already_exists', `history is locked by running process ${String(holder)}`);
     }
     await rm(lockPath, { force: true });
@@ -327,6 +335,7 @@ function processAlive(pid: number): boolean {
 }
 
 async function releaseLock(lockPath: string): Promise<void> {
+  heldLocks.delete(lockPath);
   await rm(lockPath, { force: true });
 }
 

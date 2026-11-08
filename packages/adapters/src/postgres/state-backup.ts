@@ -6,7 +6,12 @@
  *
  * Restore requires an empty database migrated to exactly the same schema,
  * inserts every row in one transaction (identity columns included, then
- * sequences advanced past them), and is proven by recomputing the fingerprint.
+ * sequences advanced past them), and recomputes the fingerprint inside that
+ * transaction: a mismatch rolls back, leaving the target empty and retryable.
+ *
+ * Every export, fingerprint and import runs with the session TimeZone pinned
+ * to UTC, so timestamptz columns render identically whatever zone the source
+ * or target server, database or role is configured with.
  */
 import { createHash } from 'node:crypto';
 import type pg from 'pg';
@@ -48,6 +53,20 @@ async function tableRows(db: Queryable, table: TableSpec): Promise<string[]> {
   return found.rows.map((r) => r.row);
 }
 
+/** Pins how timestamptz renders for the rest of the current transaction. */
+async function renderInUtc(db: Queryable): Promise<void> {
+  await db.query("SET LOCAL TimeZone TO 'UTC'");
+}
+
+async function fingerprintOf(db: Queryable, applied: readonly AppliedMigration[]): Promise<string> {
+  const hash = createHash('sha256').update(schemaText(applied)).update('\n');
+  for (const table of BACKED_UP_TABLES) {
+    hash.update(`#${table.name}\n`);
+    for (const row of await tableRows(db, table)) hash.update(`${row}\n`);
+  }
+  return hash.digest('hex');
+}
+
 function schemaText(applied: readonly AppliedMigration[]): string {
   return JSON.stringify(applied.map((m) => ({ version: m.version, name: m.name, checksum: m.checksum })));
 }
@@ -57,6 +76,7 @@ export function createPostgresStateBackupComponent(pool: pg.Pool, name = 'state'
     transaction(
       pool,
       async (client) => {
+        await renderInUtc(client);
         const applied = await requireCurrentSchema(client);
         if (!applied.ok) return applied;
         return work(client, applied.value);
@@ -68,14 +88,7 @@ export function createPostgresStateBackupComponent(pool: pg.Pool, name = 'state'
     name,
 
     fingerprint: () =>
-      snapshot(async (client, applied) => {
-        const hash = createHash('sha256').update(schemaText(applied)).update('\n');
-        for (const table of BACKED_UP_TABLES) {
-          hash.update(`#${table.name}\n`);
-          for (const row of await tableRows(client, table)) hash.update(`${row}\n`);
-        }
-        return ok(hash.digest('hex'));
-      }),
+      snapshot(async (client, applied) => ok(await fingerprintOf(client, applied))),
 
     isEmpty: () =>
       snapshot(async (client) => {
@@ -101,7 +114,7 @@ export function createPostgresStateBackupComponent(pool: pg.Pool, name = 'state'
         return ok(files);
       }),
 
-    async importFrom(store, files) {
+    async importFrom(store, files, expectedFingerprint) {
       const prefix = `${name}/`;
       const byPath = new Map(files.map((f) => [f.path, f]));
       const expected = [SCHEMA_FILE, ...BACKED_UP_TABLES.map((t) => `${t.name}.jsonl`)].map((f) => `${prefix}${f}`);
@@ -119,6 +132,7 @@ export function createPostgresStateBackupComponent(pool: pg.Pool, name = 'state'
         tables.push({ spec, rows: parsed.value });
       }
       return transaction(pool, async (client) => {
+        await renderInUtc(client);
         const applied = await requireCurrentSchema(client);
         if (!applied.ok) return applied;
         if (Buffer.from(schemaBytes.value).toString('utf8').trim() !== schemaText(applied.value)) {
@@ -138,6 +152,10 @@ export function createPostgresStateBackupComponent(pool: pg.Pool, name = 'state'
               `SELECT setval(pg_get_serial_sequence('${spec.name}', '${spec.identity}'), (SELECT max(${spec.identity}) FROM ${spec.name}))`,
             );
           }
+        }
+        // Same client, same transaction: sees the uncommitted rows. A mismatch rolls everything back.
+        if ((await fingerprintOf(client, applied.value)) !== expectedFingerprint) {
+          return unavailable(`backup:${name}`, 'imported rows do not reproduce the backup fingerprint; nothing was committed');
         }
         return ok(undefined);
       });

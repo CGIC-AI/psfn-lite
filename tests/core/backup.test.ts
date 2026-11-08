@@ -101,6 +101,21 @@ describe('continuity backup use case', () => {
     const result = await backupOf([moving]).backup(store);
     expect(result.ok || result.error).toMatchObject({ kind: 'conflict' });
 
+    // A write landing in an earlier component after its export but before a later component's
+    // export (a turn in the ledger, missing from history) must not produce a set.
+    const history = new MemoryComponent('history', ['turn 1']);
+    const state = new MemoryComponent('state', ['turn 1']);
+    const exportState = state.exportTo.bind(state);
+    state.exportTo = async (target, prefix) => {
+      // History was already exported and re-fingerprinted under a per-component check.
+      history.rows.push('turn 2');
+      return exportState(target, prefix);
+    };
+    const skewed = new MemoryBackupStore();
+    const skew = await backupOf([history, state]).backup(skewed);
+    expect(skew.ok || skew.error).toMatchObject({ kind: 'conflict', reason: 'stale_revision' });
+    expect(skewed.files.has('manifest.json')).toBe(false);
+
     const sealed = new MemoryBackupStore();
     await backupOf([new MemoryComponent('history', ['a'])]).backup(sealed);
     sealed.files.set('manifest.json', new TextEncoder().encode('{"format":"psfn-lite-continuity-backup"}'));

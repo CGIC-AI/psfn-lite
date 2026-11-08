@@ -78,6 +78,12 @@ export class FakeTurnLedger implements TurnLedgerPort {
     return Promise.resolve(ok(match ?? null));
   }
 
+  lastSettled(sessionId: SessionId): Promise<Result<TurnRecord | null>> {
+    const { revision } = this.headOf(sessionId);
+    const match = [...this.turns.values()].find((t) => t.sessionId === sessionId && t.settlement?.revision === revision);
+    return Promise.resolve(ok(match ?? null));
+  }
+
   open(record: TurnRecord): Promise<Result<TurnRecord>> {
     const head = this.headOf(record.sessionId);
     if (head.openTurnId !== null || head.revision !== record.baseRevision) {

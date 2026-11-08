@@ -130,10 +130,12 @@ async function prepareTurn(
     if (record.requestFingerprint !== fingerprint) {
       return conflict('idempotency_mismatch', 'idempotency key was reused for a different request');
     }
-    if (!sameOwner(record.owner, input.owner)) return conflict('turn_ownership', 'turn is owned by another harness');
     // Re-appending repairs history a failed append left incomplete; identical entries are no-ops.
+    // The entries derive only from the ledger record, so any admitted caller may repair them,
+    // including a successor that is not the owner and is refused below.
     const archived = await deps.archive.append(turnEntries(record));
     if (!archived.ok) return archived;
+    if (!sameOwner(record.owner, input.owner)) return conflict('turn_ownership', 'turn is owned by another harness');
     if (record.settlement !== null) return ok({ kind: 'replayed', record });
     return ok({ kind: 'prepared', turn: { scope, record } });
   }
@@ -149,6 +151,11 @@ async function prepareTurn(
         'the owner settles it, or a successor recovers it after the lease',
     );
   }
+  // A crash between ledger settlement and the history append leaves the last
+  // settled turn's entries missing. Every new turn first restores them, so at
+  // most the latest settlement can ever lag history, and never past a new turn.
+  const repaired = await repairLastSettled(deps, input.sessionId);
+  if (!repaired.ok) return repaired;
   if (head.value.revision !== input.expectedRevision) {
     return fail({
       kind: 'conflict',
@@ -245,6 +252,13 @@ async function recoverTurn(
   });
   if (!settled.ok) return settled;
   return archiveSettled(deps, settled.value);
+}
+
+async function repairLastSettled(deps: TurnLifecycleDeps, sessionId: SessionId): Promise<Result<void>> {
+  const last = await deps.ledger.lastSettled(sessionId);
+  if (!last.ok) return last;
+  if (last.value === null) return ok(undefined);
+  return deps.archive.append(turnEntries(last.value));
 }
 
 async function archiveSettled(deps: TurnLifecycleDeps, record: TurnRecord): Promise<Result<TurnRecord>> {

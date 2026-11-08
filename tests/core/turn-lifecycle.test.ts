@@ -200,6 +200,35 @@ describe('turn lifecycle', () => {
     expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'hi']);
   });
 
+  it('lets a successor that does not own a settled turn still repair its missing history', async () => {
+    const { lifecycle, archive, admit } = setup();
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    archive.failNext = true;
+    await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'morning!', delivery: 'delivered' });
+    // The owner crashes here: the ledger holds the reply, history does not.
+    const replay = await lifecycle.prepareTurn(await admit('primary-dm-mcp'), input({ owner: OTHER_OWNER }));
+    expect(replay.ok || replay.error).toMatchObject({ kind: 'conflict', reason: 'turn_ownership' });
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'morning!']);
+  });
+
+  it('archives the last settled turn before opening the next one, and opens nothing if that fails', async () => {
+    const { lifecycle, archive, ledger, admit } = setup();
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    archive.failNext = true;
+    await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'morning!', delivery: 'delivered' });
+    const successor = await admit('primary-dm-mcp');
+    const next = input({ owner: OTHER_OWNER, idempotencyKey: id('key-2'), expectedRevision: 1, trigger: { kind: 'participant_message', text: 'still there?' } });
+
+    archive.failNext = true;
+    const refused = await lifecycle.prepareTurn(successor, next);
+    expect(refused.ok || refused.error).toMatchObject({ kind: 'unavailable', capability: 'session_archive' });
+    expect((await ledger.head(SESSION)).ok && ledger.turns.size).toBe(1);
+
+    const opened = await lifecycle.prepareTurn(successor, next);
+    expect(opened.ok && opened.value.kind).toBe('prepared');
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'morning!', 'still there?']);
+  });
+
   it('never archives a reply the ledger did not record when the ledger write fails', async () => {
     const { lifecycle, archive, ledger, admit } = setup();
     const turn = await prepared(lifecycle, await admit('primary-dm'));

@@ -89,6 +89,8 @@ export interface TurnLedgerPort {
   head(sessionId: SessionId): Promise<Result<SessionHead>>;
   get(turnId: TurnId): Promise<Result<TurnRecord>>;
   findByIdempotencyKey(sessionId: SessionId, key: IdempotencyKey): Promise<Result<TurnRecord | null>>;
+  /** The turn whose settlement produced the session's current revision, or null before the first settlement. */
+  lastSettled(sessionId: SessionId): Promise<Result<TurnRecord | null>>;
   open(record: TurnRecord): Promise<Result<TurnRecord>>;
   settle(input: {
     readonly turnId: TurnId;
