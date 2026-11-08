@@ -4,7 +4,8 @@
  * throwaway Postgres and temporary storage roots, with the Pi harness and
  * the Hermes protocol (lifecycle bridge + MCP) as the two surfaces, in both
  * orders where the scenario says so. The same scenario files run against the
- * real Hermes plugin in integrations/hermes/tests/test_conformance.py.
+ * real Hermes plugin in integrations/hermes/tests/test_conformance.py, except
+ * those it skips with a stated reason (delegated internal turns).
  */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

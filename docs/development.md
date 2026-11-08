@@ -98,6 +98,11 @@ uv pip compile --no-config "$HERMES_CLONE/pyproject.toml" /tmp/psfn-test-extra.i
   --extra mcp --python-version 3.13 --no-header --no-annotate -o requirements-test.txt
 ```
 
+`tests/test_conformance.py` runs the continuity conformance scenarios
+(`tests/conformance/scenarios`) on the real plugin, against the same
+conformance host process the TypeScript runner drives. It needs the same
+Docker, Node and `node_modules`. See [conformance](conformance.md).
+
 `tests/test_e2e_lite.py` starts `tests/hermes/fixtures/lite-host.ts` (the
 standalone runtime over a throwaway pgvector container, with the MCP
 transport and the lifecycle bridge on loopback), so it needs Docker, Node on

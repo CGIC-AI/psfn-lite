@@ -47,6 +47,11 @@ export class HostProcess {
     return this.log.stderr;
   }
 
+  /** The host process id (the runtime itself: node runs tsx's loader in-process). */
+  get pid(): number | undefined {
+    return this.child.pid;
+  }
+
   static async start(state: HostState): Promise<HostProcess> {
     // node with tsx's loader in one process (not the tsx CLI, which runs a child): SIGKILL then reaches the runtime itself.
     const child = spawn(process.execPath, ['--import', 'tsx', ENTRY], { cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env['PATH'] ?? '' } });
