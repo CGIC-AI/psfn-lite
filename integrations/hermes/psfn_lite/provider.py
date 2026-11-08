@@ -25,22 +25,6 @@ SYSTEM_PROMPT_BLOCK = (
 )
 
 
-def ownership_issues(config: dict) -> list:
-    """Hermes settings that would give the profile a second memory or a lossy compaction."""
-    memory = config.get("memory") if isinstance(config.get("memory"), dict) else {}
-    compression = config.get("compression") if isinstance(config.get("compression"), dict) else {}
-    issues = []
-    if memory.get("provider") != "psfn_lite":
-        issues.append("memory.provider must be psfn_lite")
-    if memory.get("memory_enabled", True) is not False:
-        issues.append("memory.memory_enabled must be false (Lite is the only memory)")
-    if memory.get("user_profile_enabled", True) is not False:
-        issues.append("memory.user_profile_enabled must be false (Lite is the only memory)")
-    if compression.get("checkpoint_required") is not True:
-        issues.append("compression.checkpoint_required must be true (compaction must not drop unproven turns)")
-    return issues
-
-
 class PsfnLiteProvider(MemoryProvider):
     pre_compress_checkpoint_api_version = PRE_COMPRESS_CHECKPOINT_API_VERSION
 
@@ -67,10 +51,8 @@ class PsfnLiteProvider(MemoryProvider):
         return ""
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        from hermes_cli.config import load_config
-
         runtime.add_warning_callback(kwargs.get("warning_callback"))
-        issues = ownership_issues(load_config() or {})
+        issues = runtime.profile_issues()
         if issues:
             raise ConfigError("psfn_lite refuses to start: " + "; ".join(issues))
         self._driver = runtime.driver(kwargs.get("hermes_home"))

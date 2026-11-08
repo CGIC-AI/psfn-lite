@@ -12,7 +12,7 @@ import os
 import threading
 
 from .bridge import BridgeClient
-from .config import Config, ConfigError
+from .config import Config, ConfigError, ownership_issues
 from .internal import INTERNAL_HOST_ENV, InternalTurnHost
 from .ledger import Ledger
 from .lifecycle import INTERNAL_JOB_ENV, Driver, host_instance
@@ -37,10 +37,17 @@ def notify(message: str) -> None:
 
 
 def add_warning_callback(callback) -> None:
+    """The latest agent's callback; the gateway builds an agent per message, so older ones are let go."""
     if callable(callback):
         with _lock:
-            if callback not in _warning_callbacks:
-                _warning_callbacks.append(callback)
+            _warning_callbacks[:] = [callback]
+
+
+def profile_issues() -> list:
+    """Why this profile must not drive Lite: a second memory or lossy compaction configured beside it."""
+    from hermes_cli.config import load_config
+
+    return ownership_issues(load_config() or {})
 
 
 def hermes_home() -> str:
@@ -70,6 +77,11 @@ def driver(home: str = None) -> Driver:
 def _hook(name: str):
     def call(**kwargs):
         try:
+            # The hooks are registered whether or not the provider started, so they refuse on their own
+            # when the profile would also keep Hermes's memory or compact without a checkpoint.
+            issues = profile_issues()
+            if issues:
+                raise ConfigError("psfn_lite refuses to drive Lite turns: " + "; ".join(issues))
             active = driver()
         except (ConfigError, ValueError, OSError) as error:
             logger.error("psfn_lite is not usable: %s", error)

@@ -216,6 +216,27 @@ def test_the_provider_refuses_to_start_beside_a_second_memory_or_lossy_compactio
         provider.initialize("sess-1", hermes_home=str(profile), platform="cli")
 
 
+@pytest.mark.parametrize("setting", [{"memory_enabled": True}, {"checkpoint_required": False}])
+def test_the_hooks_drive_no_lite_turn_while_the_profile_keeps_a_second_memory(profile, bridge, setting):
+    # Hermes only logs a provider that refuses to initialize, so the hooks refuse on their own.
+    write_profile(profile, bridge_url=bridge.url, **setting)
+    warnings = []
+    provider = load_provider()
+    with pytest.raises(ValueError):
+        provider.initialize("sess-1", hermes_home=str(profile), platform="cli", warning_callback=warnings.append)
+    [result] = fire("pre_llm_call", **turn())
+    fire("on_session_end", **end())
+    assert bridge.requests == []
+    assert "refuses to drive Lite turns" in result["context"]
+    assert any("refuses to drive Lite turns" in w for w in warnings)
+
+
+def test_a_subagent_is_recognised_by_its_platform_even_without_subagent_start(profile, bridge):
+    load_provider()
+    assert fire("pre_llm_call", **turn(session="child-x", turn_id="c-x", platform="subagent", parent="sess-1")) == []
+    assert bridge.requests == []
+
+
 def test_a_delegated_internal_turn_prepares_the_trigger_lite_fixed_and_says_it_is_internal(profile, bridge, monkeypatch):
     monkeypatch.setenv("PSFN_LITE_INTERNAL_JOB", "1")
     original = bridge.default
