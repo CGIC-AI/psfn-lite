@@ -4,6 +4,8 @@ import {
   normalizeContent,
   parseExtraction,
   sourceAccessFor,
+  subjectContacts,
+  subjectKey,
   type ExtractedMemory,
   type MemoryAttribution,
   type MemorySubject,
@@ -42,7 +44,8 @@ export interface MemoryExtraction {
  * extraction watermark. The model only proposes; the runtime binds each
  * memory's subject to the attributed speaker of the named source turn, marks
  * it participant-attributed or inferred, and records nothing about a contact
- * whose tracking consent is not granted. The watermark advances only after
+ * whose tracking consent is not granted, nor anything drawn from such a
+ * contact's own turn. The watermark advances only after
  * every write succeeded, and each write is keyed by its source turn and
  * content, so a retry neither duplicates memories nor changes their
  * provenance.
@@ -128,7 +131,10 @@ export function createMemoryExtraction(deps: {
       const withheld: { turnId: TurnId; reason: 'untracked_contact' }[] = [];
       const access = sourceAccessFor(viewerOf(scope), null);
       for (const { item, subject, attribution } of planned) {
-        const tracked = await consented(subject.kind === 'contacts' ? subject.contactIds : []);
+        // The source turn's speaker is checked whatever the subject: a group memory drawn from an untracked
+        // speaker's words would otherwise record them under a room subject.
+        const speaker = speakers.get(item.turnId);
+        const tracked = await consented([...new Set([...subjectContacts(subject), ...(speaker === undefined ? [] : [speaker])])]);
         if (!tracked.ok) return tracked;
         if (!tracked.value) {
           withheld.push({ turnId: item.turnId, reason: 'untracked_contact' });
@@ -151,7 +157,7 @@ export function createMemoryExtraction(deps: {
             sourceTurnIds: [item.turnId],
             sourceConversationAt: turnTimes.get(item.turnId) ?? null,
             via: 'extraction',
-            idempotencyKey: `mx:${digest({ sessionId: input.sessionId, turnId: item.turnId, kind: item.kind, content: normalizeContent(item.content) })}` as IdempotencyKey,
+            idempotencyKey: extractionKey(input.sessionId, item, subject, attribution),
           },
         });
         if (!result.ok) return result;
@@ -162,6 +168,26 @@ export function createMemoryExtraction(deps: {
       return advanced.ok ? report('extracted', last.seq, written, withheld) : advanced;
     },
   };
+}
+
+/**
+ * The write key of an extracted memory covers every field the writer's
+ * request digest covers. A rerun that re-emits an item unchanged replays its
+ * receipt; one that relabels it (another sensitivity or attribution) is a new
+ * write that deduplication and evolution resolve, never an
+ * `idempotency_mismatch` that would stall the session's watermark for good.
+ */
+function extractionKey(sessionId: SessionId, item: ExtractedMemory, subject: MemorySubject, attribution: MemoryAttribution): IdempotencyKey {
+  return `mx:${digest({
+    sessionId,
+    turnId: item.turnId,
+    kind: item.kind,
+    content: normalizeContent(item.content),
+    sensitivity: item.sensitivity,
+    subject: subjectKey(subject),
+    attribution,
+    occurredAt: null,
+  })}` as IdempotencyKey;
 }
 
 function label(archived: ArchivedEntry): ModelMessage {

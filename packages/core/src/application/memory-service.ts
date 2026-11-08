@@ -270,7 +270,7 @@ export function createMemoryService(deps: MemoryServiceDeps): MemoryService {
       if (!episodes.ok) return episodes;
       return ok({
         memories: memories.value.filter((r) => memoryReadable(access, r)).map((r) => renderMemory(access, r)),
-        episodes: episodes.value.filter((e) => episodeReadable(access, e)).map((e) => renderEpisode(e)),
+        episodes: episodes.value.filter((e) => episodeReadable(access, e)).map((e) => renderEpisode(access, e)),
       });
     },
 

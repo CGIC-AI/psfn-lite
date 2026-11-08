@@ -115,8 +115,9 @@ CREATE TABLE episodes (
 CREATE INDEX episodes_by_conversation ON episodes (source_conversation, occurred_from) WHERE lifecycle <> 'merged';
 CREATE INDEX episodes_by_time ON episodes (occurred_from, occurred_to);
 CREATE INDEX episodes_participants ON episodes USING gin (participants);
+-- Only the runtime summary is indexed: the companion's meaning is companion-private
 CREATE INDEX episodes_search ON episodes USING gin (
-  to_tsvector('simple'::regconfig, coalesce(record -> 'machineSignals' ->> 'summary', '') || ' ' || coalesce(record -> 'meaning' ->> 'text', ''))
+  to_tsvector('simple'::regconfig, coalesce(record -> 'machineSignals' ->> 'summary', ''))
 );
 
 -- Every version of the companion's meaning, kept when it is revised

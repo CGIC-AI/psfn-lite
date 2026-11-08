@@ -69,18 +69,33 @@ export interface EpisodeHit {
   readonly score: number;
 }
 
+/** One episode a merge absorbs, compare-and-set on the revision the plan read. */
+export interface EpisodeAbsorption {
+  readonly id: string;
+  readonly expectedRevision: number;
+}
+
 /**
  * Durable episodes. Filtered reads take a `SourceAccess` and apply it before
- * ranking and limits. `saveMachine` never writes meaning: the stored meaning
- * is kept whatever the record passed in says, so machine consolidation can
- * never overwrite first-person meaning. `setMeaning` is the sole meaning
- * writer, compare-and-set on the meaning revision, and keeps every version.
+ * ranking and limits. `saveMachine` and `merge` never write meaning: the
+ * stored meaning is kept whatever the record passed in says, and an episode
+ * that carries meaning may only be promoted, never merged, absorbed or
+ * re-summarized (`frozenEpisodeChange`). `setMeaning` is the sole meaning
+ * writer, compare-and-set on the meaning revision; it keeps every version and
+ * bumps the episode revision, so a machine change planned before the meaning
+ * was written fails its compare-and-set and is re-planned.
  */
 export interface EpisodeStorePort {
   get(id: string): Promise<Result<Episode>>;
   /** Creates the episode, or returns the existing one with `created: false` when the id is taken. */
   createIfAbsent(episode: Episode): Promise<Result<{ readonly episode: Episode; readonly created: boolean }>>;
   saveMachine(episode: Episode, expectedRevision: number): Promise<Result<Episode>>;
+  /**
+   * Saves a merge survivor and marks every absorbed episode merged into it,
+   * all or nothing, compare-and-set on every revision. Refused when any of
+   * them carries meaning.
+   */
+  merge(survivor: Episode, expectedSurvivorRevision: number, absorbed: readonly EpisodeAbsorption[], at: string): Promise<Result<Episode>>;
   setMeaning(episodeId: string, meaning: EpisodeMeaning, expectedMeaningRevision: number): Promise<Result<Episode>>;
   meaningHistory(episodeId: string): Promise<Result<readonly EpisodeMeaning[]>>;
   searchLexical(access: SourceAccess, query: string, limit: number): Promise<Result<readonly EpisodeHit[]>>;

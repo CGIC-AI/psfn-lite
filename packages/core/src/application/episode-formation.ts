@@ -62,7 +62,10 @@ export interface EpisodeFormation {
  * signals and no model call. Episode ids derive from the session and first
  * archive position and the watermark advances only after all are stored, so
  * a rerun returns the same episodes. Consolidation and arcs never write
- * meaning, and an episode the companion has given meaning is never merged.
+ * meaning, and an episode the companion has given meaning is never merged:
+ * each merge is one compare-and-set store call over every episode it
+ * touches, and writing meaning moves the episode revision, so a merge
+ * planned before the companion wrote fails and the next run freezes it.
  */
 export function createEpisodeFormation(deps: {
   readonly catalog: SessionCatalogPort;
@@ -183,15 +186,14 @@ export function createEpisodeFormation(deps: {
       const at = deps.clock.now().toISOString();
       const merged: { survivorId: string; absorbedIds: string[] }[] = [];
       for (const { survivor, absorbed } of plan.merges) {
-        const saved = await deps.episodes.saveMachine({ ...mergeEpisodes(survivor, absorbed, at), revision: survivor.revision + 1 }, survivor.revision);
+        // One all-or-nothing store call: a failure leaves no half-merged state for a retry to merge twice.
+        const saved = await deps.episodes.merge(
+          { ...mergeEpisodes(survivor, absorbed, at), revision: survivor.revision + 1 },
+          survivor.revision,
+          absorbed.map((e) => ({ id: e.id, expectedRevision: e.revision })),
+          at,
+        );
         if (!saved.ok) return saved;
-        for (const episode of absorbed) {
-          const gone = await deps.episodes.saveMachine(
-            { ...episode, lifecycle: 'merged', mergedInto: survivor.id, revision: episode.revision + 1, updatedAt: at },
-            episode.revision,
-          );
-          if (!gone.ok) return gone;
-        }
         merged.push({ survivorId: survivor.id, absorbedIds: absorbed.map((e) => e.id) });
       }
       for (const episode of plan.promote) {
