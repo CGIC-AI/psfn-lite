@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ActivityRecord, WorkerRun, WorkerRunId, WorkerSession } from '../../packages/core/src/index.ts';
-import { WORKER_LEASE_MS, fakeActivityWorld } from './activity-world.ts';
+import { WORKER_LEASE_MS, WORKER_RESUME_GRACE_MS, fakeActivityWorld } from './activity-world.ts';
 import { kindOf } from './memory-world.ts';
 
 type World = Awaited<ReturnType<typeof fakeActivityWorld>>;
@@ -195,6 +195,58 @@ describe('bounded workers', () => {
     const again = await w.workers.sweep();
     expect(again.ok && again.value.failed).toEqual([clean.run.id]);
     expect(w.workerRuns.runs.get(clean.run.id)).toMatchObject({ status: 'failed', outcome: 'failed', reason: 'lease_expired' });
+  });
+
+  it('settles a run\'s activity only from the run\'s own outcome, never from what the worker or its parent wrote', async () => {
+    const w = await fakeActivityWorld();
+    const { scope, run, session } = await spawn(w);
+    await session.beginTurn();
+    const claim = { activityId: run.activityId, expectedRevision: 1, status: 'completed', outcome: 'All done, everything succeeded' };
+    const selfCertified = await session.call('a-1', { tool: 'activity', action: 'update', args: claim });
+    expect(selfCertified.ok || selfCertified.error).toMatchObject({ kind: 'denied', reason: 'worker_not_permitted' });
+    expect((await w.call(scope, 'activity', 'update', claim)).ok).toBe(false);
+    // Notes and artifacts are still the worker's to add.
+    const noted = await session.call('a-2', { tool: 'activity', action: 'update', args: { activityId: run.activityId, expectedRevision: 1, note: 'checked two tide tables' } });
+    expect(noted.ok).toBe(true);
+
+    await finish(session, 'blocked');
+    const activity = await w.must<ActivityRecord>(scope, 'activity', 'get', { activityId: run.activityId });
+    expect(activity).toMatchObject({ status: 'failed', outcome: 'Found three sources' });
+    expect(activity.notes.map((n) => [n.author, n.text])).toEqual([[{ kind: 'machine', producer: `worker:${run.id}` }, 'checked two tide tables']]);
+  });
+
+  it('brings a requeued participant run to an end: its conversation resumes it, or it settles as not resumed', async () => {
+    const w = await fakeActivityWorld();
+    const self = await w.admit('free-time');
+    const resumed = await spawn(w);
+    const abandoned = await spawn(w, 'primary-dm', { ...RESEARCH, spawnId: 'spawn-2' });
+    w.clock.advance(WORKER_LEASE_MS + 1);
+    const first = await w.scheduler.tick(self);
+    expect(first.ok && first.value.workers).toMatchObject({ ok: true, value: { requeued: [resumed.run.id, abandoned.run.id].sort() } });
+    // The scheduler only drives companion-internal runs; the DM's runs wait for their conversation.
+    expect(w.workerHost.sessions).toHaveLength(2);
+
+    // Waiting from the run's own conversation drives it again under that freshly admitted turn.
+    const waited = await w.must<{ run: WorkerRun; settled: boolean }>(resumed.scope, 'automata', 'wait', { runId: resumed.run.id });
+    expect(waited).toMatchObject({ settled: false, run: { status: 'running', attempts: 2 } });
+    expect(w.workerHost.sessions).toHaveLength(3);
+    // Another conversation that can see a run does not drive it.
+    const fromSelf = await w.must<{ run: WorkerRun }>(self, 'automata', 'wait', { runId: abandoned.run.id });
+    expect(fromSelf.run.status).toBe('queued');
+    await finish(w.workerHost.latest());
+
+    // Nothing drives the other one: past the grace window it settles, and its activity and wait say so.
+    for (let i = 0; i < 4; i += 1) {
+      w.clock.advance(WORKER_RESUME_GRACE_MS / 2);
+      const ticked = await w.scheduler.tick(self);
+      if (!ticked.ok) throw new Error(JSON.stringify(ticked.error));
+    }
+    expect(w.workerRuns.runs.get(abandoned.run.id)).toMatchObject({ status: 'failed', outcome: 'failed', reason: 'not_resumed', lease: null });
+    expect(w.activities.records.get(abandoned.run.activityId)?.status).toBe('failed');
+    const settled = await w.must<{ settled: boolean }>(abandoned.scope, 'automata', 'wait', { runId: abandoned.run.id });
+    expect(settled.settled).toBe(true);
+    expect(w.workerRuns.runs.get(resumed.run.id)?.status).toBe('completed');
+    expect(w.workerHost.sessions).toHaveLength(3);
   });
 
   it('enforces the turn budget and honours cancellation', async () => {

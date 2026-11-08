@@ -1,4 +1,5 @@
 import type { ActivityLogPort, ActivityRecord, ActivityStatus, ArtifactRef } from '../activity/index.ts';
+import { workerActivityId } from '../automata/index.ts';
 import {
   canViewerRead,
   conflict,
@@ -7,6 +8,7 @@ import {
   isNonEmptyString,
   notFound,
   ok,
+  sameAudience,
   type ActivityId,
   type Audience,
   type Author,
@@ -54,6 +56,21 @@ export interface ActivityService {
 export function canSeeActivity(scope: TrustedTurnScope, record: ActivityRecord): boolean {
   if (scope.caller.kind === 'worker' && record.source.workerRunId === scope.caller.runId) return true;
   return canViewerRead(viewerOf(scope), record.visibility);
+}
+
+/**
+ * Who may write to an activity: only a scope in the conversation it happened
+ * in (the same audience), within what that scope can read. Reading another
+ * conversation's activity never lets a turn write into it, so nothing
+ * admitted elsewhere lands in a record this conversation reads back.
+ */
+export function canWriteActivity(scope: TrustedTurnScope, record: ActivityRecord): boolean {
+  return canSeeActivity(scope, record) && sameAudience(scope.audience, record.visibility);
+}
+
+/** Whether the record mirrors a worker run's lifecycle; its status and outcome are the runner's alone. */
+export function isWorkerLifecycleActivity(record: ActivityRecord): boolean {
+  return record.source.workerRunId !== null && record.id === workerActivityId(record.source.workerRunId);
 }
 
 /** A fresh in-progress activity record; ids derived by the caller keep retries idempotent. */
@@ -142,6 +159,11 @@ export function createActivityService(deps: {
     async update(scope, input) {
       const found = await readVisible(scope, input.id);
       if (!found.ok) return found;
+      if (!canWriteActivity(scope, found.value)) return notFound(`activity ${input.id}`);
+      // A worker (or its parent turn) may annotate a run's activity, but only the runner settles it, from the run's own outcome.
+      if (isWorkerLifecycleActivity(found.value) && (input.status !== undefined || input.outcome !== undefined)) {
+        return denied('worker_not_permitted', `activity ${input.id} is settled by its worker run's outcome`);
+      }
       const next = applyActivityUpdate(found.value, input, authorOf(scope), deps.clock.now().toISOString());
       return next.ok ? deps.log.update(next.value, input.expectedRevision) : next;
     },

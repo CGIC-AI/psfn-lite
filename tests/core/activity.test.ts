@@ -31,6 +31,24 @@ describe('activity records', () => {
     expect((await service.get(await admit('free-time'), started.value.id)).ok).toBe(true);
   });
 
+  it('writes only from the activity\'s own conversation, even where another can read it', async () => {
+    const { service, log, admit } = setup();
+    const friend = await admit('friend-dm');
+    const started = await service.start(friend, { purpose: 'plan a picnic', sessionId: null, turnId: null });
+    if (!started.ok) throw new Error('start');
+    // The primary conversation's admission covers the friend room's class, so it may read the record...
+    const primary = await admit('primary-dm');
+    expect((await service.get(primary, started.value.id)).ok).toBe(true);
+    // ...but nothing admitted there may be written into a record the friend conversation reads back.
+    const crossed = await service.update(primary, { id: started.value.id, expectedRevision: 1, note: 'primary secret: X', outcome: 'primary private detail', status: 'completed' });
+    expect(crossed.ok || crossed.error).toEqual({ kind: 'not_found', subject: `activity ${started.value.id}` });
+    const self = await service.update(await admit('free-time'), { id: started.value.id, expectedRevision: 1, note: 'x' });
+    expect(self.ok || self.error.kind).toBe('not_found');
+    expect(log.records.get(started.value.id)).toMatchObject({ status: 'in_progress', outcome: null, notes: [], revision: 1 });
+    const own = await service.update(friend, { id: started.value.id, expectedRevision: 1, note: 'bring a blanket' });
+    expect(own.ok && own.value.notes.map((n) => n.text)).toEqual(['bring a blanket']);
+  });
+
   it('attributes notes from the scope: worker notes are machine output, not companion reflection', async () => {
     const { service, admit } = setup();
     const parent = await admit('primary-dm');

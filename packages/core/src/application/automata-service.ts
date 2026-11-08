@@ -8,10 +8,10 @@ import {
   type WorkerRunPort,
   type WorkerRunStatus,
 } from '../automata/index.ts';
-import { denied, invalid, ok, type Clock, type Result, type WorkerRunId } from '../shared/index.ts';
+import { denied, invalid, ok, sameAudience, type Clock, type Result, type WorkerRunId } from '../shared/index.ts';
 import { collectPaged } from './paging.ts';
 import { authorOf, isTrustedTurnScope, viewerOf, type TrustedTurnScope } from './trusted-scope.ts';
-import type { WorkerRunner } from './worker-runner.ts';
+import { principalOf, samePrincipal, type WorkerRunner } from './worker-runner.ts';
 
 const GUIDANCE_MAX = 2_000;
 const GUIDANCE_ENTRIES_MAX = 50;
@@ -37,7 +37,11 @@ export interface AutomataService {
     input: { readonly spawnId: string; readonly label: string; readonly task: string; readonly grant: WorkerGrant },
   ): Promise<Result<{ readonly run: WorkerRun; readonly created: boolean }>>;
   message(scope: TrustedTurnScope, input: { readonly runId: WorkerRunId; readonly text: string }): Promise<Result<WorkerRun>>;
-  /** The run, and whether it has settled. It never blocks: a dispatcher call is request/response. */
+  /**
+   * The run, and whether it has settled. It never blocks: a dispatcher call is
+   * request/response. Waiting on a queued run from its own conversation (a
+   * run recovery returned to the queue) drives it again first.
+   */
   wait(scope: TrustedTurnScope, input: { readonly runId: WorkerRunId }): Promise<Result<{ readonly run: WorkerRun; readonly settled: boolean }>>;
   cancel(scope: TrustedTurnScope, input: { readonly runId: WorkerRunId }): Promise<Result<WorkerRun>>;
   status(
@@ -96,7 +100,12 @@ export function createAutomataService(deps: {
 
     async wait(scope, input) {
       const found = await deps.runner.visible(scope, input.runId);
-      return found.ok ? ok({ run: found.value, settled: isTerminalWorker(found.value.status) }) : found;
+      if (!found.ok) return found;
+      const run = found.value;
+      const own = scope.caller.kind !== 'worker' && sameAudience(scope.audience, run.source.audience) && samePrincipal(principalOf(scope), run.source.principal);
+      if (run.status !== 'queued' || !own) return ok({ run, settled: isTerminalWorker(run.status) });
+      const driven = await deps.runner.drive(scope, run.id);
+      return driven.ok ? ok({ run: driven.value, settled: isTerminalWorker(driven.value.status) }) : driven;
     },
 
     cancel: (scope, input) => deps.runner.cancel(scope, input.runId),

@@ -30,6 +30,8 @@ export type TemplateRunOutcome =
 export interface ScheduleRunReport {
   readonly prompts: readonly { readonly id: string; readonly state: ScheduledPrompt['state'] }[];
   readonly templates: readonly { readonly id: string; readonly state: TemplateRunOutcome['state'] }[];
+  /** Prompts and templates another scheduler pass holds or just moved; left to it, untouched. */
+  readonly contended: readonly string[];
 }
 
 export interface ScheduleService {
@@ -57,8 +59,11 @@ export interface ScheduleService {
 /**
  * Self-scheduled time (donor `src/core/scheduler/schedule-tool.ts`,
  * `scheduled-prompts.ts`, `reflection-policy.ts`). Times carry an explicit
- * IANA zone. Every run is fenced the same way: marked running before the
- * work, so a crash leaves it `interrupted` and it is never repeated. A
+ * IANA zone. Every run is fenced the same way: marked running, with its
+ * start time, before the work, so a crash leaves it `interrupted` and it is
+ * never repeated. A marker is read as a crash only once it is older than
+ * `inFlightMs`; a run another scheduler pass still has in flight is left
+ * alone, and a lost compare-and-set skips the item instead of repeating it. A
  * template is run inline only from the companion's own self turn and when no
  * other run of it is in flight; otherwise the run is deferred to the
  * scheduler.
@@ -70,6 +75,8 @@ export function createScheduleService(deps: {
   readonly model: ModelPort;
   readonly journal: JournalService;
   readonly clock: Clock;
+  /** How long a `running` marker may stand before it is read as left by a crash. */
+  readonly inFlightMs: number;
 }): ScheduleService {
   const nowIso = () => deps.clock.now().toISOString();
   const isSelf = (scope: TrustedTurnScope) => scope.audience.kind === 'self' && scope.caller.kind === 'companion_internal';
@@ -99,6 +106,9 @@ export function createScheduleService(deps: {
     const done = await putTemplate(running.value, { lastRun: { key, state: 'completed', reflectionId: recorded.value.id, at: nowIso(), detail: null } });
     return done.ok ? ok({ state: 'completed', template: done.value, reflectionId: recorded.value.id, replayed: false }) : done;
   };
+
+  /** Whether a marker set at `at` may still belong to a pass that is running now. */
+  const inFlight = (at: string | null) => at !== null && deps.clock.now().getTime() - Date.parse(at) < deps.inFlightMs;
 
   /** A run left `running` by a crash: recorded as interrupted, never resumed. */
   const closeStranded = async (template: ReflectionTemplate): Promise<Result<ReflectionTemplate>> => {
@@ -236,12 +246,24 @@ export function createScheduleService(deps: {
 
     async runDue(scope) {
       if (!isTrustedTurnScope(scope) || !isSelf(scope)) return denied('requires_self_audience', 'scheduled work runs in companion-internal turns');
-      const report = { prompts: [] as { id: string; state: ScheduledPrompt['state'] }[], templates: [] as { id: string; state: TemplateRunOutcome['state'] }[] };
+      const report = {
+        prompts: [] as { id: string; state: ScheduledPrompt['state'] }[],
+        templates: [] as { id: string; state: TemplateRunOutcome['state'] }[],
+        contended: [] as string[],
+      };
+      /** A lost compare-and-set means another pass moved the item: report it and leave it alone. */
+      const lostRace = (result: Result<unknown>, id: string): boolean => {
+        const lost = !result.ok && result.error.kind === 'conflict' && result.error.reason === 'stale_revision';
+        if (lost) report.contended.push(id);
+        return lost;
+      };
 
       const stranded = await deps.prompts.list({ states: ['running'], dueAtOrBefore: null, limit: DUE_BATCH, after: null });
       if (!stranded.ok) return stranded;
       for (const prompt of stranded.value) {
+        if (inFlight(prompt.firedAt)) continue;
         const closed = await deps.prompts.update({ ...prompt, state: 'interrupted', outcome: 'the run was cut off; not repeated', revision: prompt.revision + 1 }, prompt.revision);
+        if (lostRace(closed, prompt.id)) continue;
         if (!closed.ok) return closed;
         report.prompts.push({ id: prompt.id, state: 'interrupted' });
       }
@@ -249,11 +271,13 @@ export function createScheduleService(deps: {
       if (!due.ok) return due;
       for (const prompt of due.value) {
         const running = await deps.prompts.update({ ...prompt, state: 'running', firedAt: nowIso(), revision: prompt.revision + 1 }, prompt.revision);
+        if (lostRace(running, prompt.id)) continue;
         if (!running.ok) return running;
         const ran = await deps.turns.run({ scope, purpose: 'scheduled_prompt', prompt: `Scheduled for ${prompt.localTime} ${prompt.timeZone} (${prompt.name}): ${prompt.prompt}`, reference: { kind: 'scheduled_prompt', id: prompt.id } });
         const state = ran.ok && ran.value.status === 'completed' ? 'completed' : ran.ok && ran.value.status === 'interrupted' ? 'interrupted' : 'failed';
         const outcome = ran.ok ? `turn ${ran.value.status}` : `turn could not run: ${ran.error.kind}`;
         const settled = await deps.prompts.update({ ...running.value, state, outcome, revision: running.value.revision + 1 }, running.value.revision);
+        if (lostRace(settled, prompt.id)) continue;
         if (!settled.ok) return settled;
         report.prompts.push({ id: prompt.id, state });
       }
@@ -262,7 +286,10 @@ export function createScheduleService(deps: {
       if (!templates.ok) return templates;
       const nowMs = deps.clock.now().getTime();
       for (const listed of templates.value) {
+        // A run still inside its in-flight window belongs to another pass.
+        if (listed.lastRun?.state === 'running' && inFlight(listed.lastRun.at)) continue;
         const template = await closeStranded(listed);
+        if (lostRace(template, listed.id)) continue;
         if (!template.ok) return template;
         if (listed.lastRun?.state === 'running') report.templates.push({ id: listed.id, state: 'interrupted' });
         const t = template.value;
@@ -277,6 +304,7 @@ export function createScheduleService(deps: {
           nextRunAt = new Date(next.value).toISOString();
         }
         const ran = await runNow(scope, t, key, { nextRunAt });
+        if (lostRace(ran, t.id)) continue;
         if (!ran.ok) return ran;
         report.templates.push({ id: t.id, state: ran.value.state });
       }

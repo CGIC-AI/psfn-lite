@@ -68,6 +68,23 @@ describe('free time', () => {
     expect(blocks(w).filter((b) => b.state === 'deferred')).toHaveLength(1);
   });
 
+  it('invites once when two scheduler passes overlap', async () => {
+    const w = await fakeActivityWorld();
+    const self = await w.admit('free-time');
+    const [a, b] = await Promise.all([w.scheduler.tick(self), w.scheduler.tick(self)]);
+    if (!a.ok || !b.ok) throw new Error('tick');
+    expect(blocks(w)).toHaveLength(1);
+    expect(w.internalTurns.requests).toHaveLength(1);
+    const reports = [...a.value.freeTime, ...b.value.freeTime].flatMap((r) => (r.ok ? [r.value] : []));
+    expect(reports.filter((r) => r.kind === 'ran')).toHaveLength(1);
+    expect(reports.filter((r) => r.kind === 'skipped' && r.reason === 'invitation_open').length).toBeGreaterThan(0);
+    // The store refuses a second open block directly as well.
+    const open = blocks(w)[0] as FreeTimeBlock;
+    w.freeTimeBlocks.blocks.set(open.id, { ...open, state: 'invited' });
+    const second = await w.freeTimeBlocks.create({ ...open, id: 'free_time_block:other', state: 'invited' });
+    expect(second.ok || second.error).toMatchObject({ kind: 'conflict', reason: 'turn_already_open' });
+  });
+
   it('lets an unanswered invitation lapse without inventing a decision and without re-asking', async () => {
     const w = await fakeActivityWorld();
     const self = await w.admit('free-time');

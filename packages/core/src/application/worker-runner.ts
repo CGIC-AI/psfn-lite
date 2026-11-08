@@ -11,6 +11,7 @@ import {
   type WorkerRun,
   type WorkerRunPort,
   type WorkerTrigger,
+  workerActivityId,
 } from '../automata/index.ts';
 import {
   conflict,
@@ -20,7 +21,6 @@ import {
   notFound,
   ok,
   sameAudience,
-  type ActivityId,
   type Clock,
   type Result,
   type WorkerRunId,
@@ -55,19 +55,31 @@ export interface SweepReport {
   readonly blocked: readonly WorkerRunId[];
   readonly failed: readonly WorkerRunId[];
   readonly cancelled: readonly WorkerRunId[];
+  /** Queued runs nothing drove within the resume grace window, settled as failed (`not_resumed`). */
+  readonly notResumed: readonly WorkerRunId[];
+  /** Runs another pass moved first; left to it. */
+  readonly contended: readonly WorkerRunId[];
 }
 
 export interface WorkerRunner {
   spawn(parent: TrustedTurnScope, input: SpawnInput): Promise<Result<{ readonly run: WorkerRun; readonly created: boolean }>>;
   /** Claims a queued run and hands the attempt to the host, under a worker scope derived from this freshly admitted parent. */
   drive(parent: TrustedTurnScope, runId: WorkerRunId): Promise<Result<WorkerRun>>;
-  /** Drives every queued run of the parent's conversation spawned for the same principal (after a restart or recovery). */
+  /**
+   * Drives every queued run of the parent's conversation spawned for the same
+   * principal (after a restart or recovery). The scheduler tick calls it for
+   * companion-internal runs; the host calls it after admitting a participant
+   * turn, so that conversation's requeued work continues. A run another pass
+   * claimed first is skipped.
+   */
   resume(parent: TrustedTurnScope): Promise<Result<readonly WorkerRun[]>>;
   /**
    * Recovers attempts whose lease expired. A started effect without an outcome
    * becomes `outcome_unknown` and blocks its run; a run with no ambiguous
    * effect returns to the queue until `maxAttempts`, then fails as
-   * `lease_expired`. Nothing is re-executed here.
+   * `lease_expired`. A queued run that nothing drove within `resumeGraceMs`
+   * settles as failed (`not_resumed`), so no run waits forever for a
+   * conversation that never comes back. Nothing is re-executed here.
    */
   sweep(): Promise<Result<SweepReport>>;
   /**
@@ -91,6 +103,8 @@ export interface WorkerRunnerDeps {
   readonly owner: string;
   readonly leaseMs: number;
   readonly maxAttempts: number;
+  /** How long a queued run may wait for its conversation to drive it before it settles as `not_resumed`. */
+  readonly resumeGraceMs: number;
 }
 
 /**
@@ -104,6 +118,7 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
   const issues: string[] = [];
   if (!Number.isInteger(deps.leaseMs) || deps.leaseMs < 1) issues.push('leaseMs must be a positive integer');
   if (!Number.isInteger(deps.maxAttempts) || deps.maxAttempts < 1 || deps.maxAttempts > 10) issues.push('maxAttempts must be an integer from 1 to 10');
+  if (!Number.isInteger(deps.resumeGraceMs) || deps.resumeGraceMs < 1) issues.push('resumeGraceMs must be a positive integer');
   if (deps.owner.trim().length === 0) issues.push('owner must be non-empty');
   if (issues.length > 0) return invalid(...issues);
 
@@ -294,7 +309,7 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
       const turn = await deps.locate(parent);
       if (!turn.ok) return turn;
       const at = now();
-      const activityId = `activity:${hash}` as ActivityId;
+      const activityId = workerActivityId(runId);
       const activity = newActivity({
         id: activityId,
         purpose: `Worker: ${label}`,
@@ -355,6 +370,7 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
       // Oldest first, so work resumes in the order it was asked for.
       for (const run of queued.value.reverse()) {
         const result = await drive(parent, run.id);
+        if (lostRace(result)) continue;
         if (!result.ok) return result;
         driven.push(result.value);
       }
@@ -362,7 +378,21 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
     },
 
     async sweep() {
-      const report = { requeued: [] as WorkerRunId[], blocked: [] as WorkerRunId[], failed: [] as WorkerRunId[], cancelled: [] as WorkerRunId[] };
+      const report = {
+        requeued: [] as WorkerRunId[],
+        blocked: [] as WorkerRunId[],
+        failed: [] as WorkerRunId[],
+        cancelled: [] as WorkerRunId[],
+        notResumed: [] as WorkerRunId[],
+        contended: [] as WorkerRunId[],
+      };
+      /** Settles or requeues one run; a lost race leaves it to the pass that moved it. */
+      const record = (result: Result<WorkerRun>, run: WorkerRun, into: WorkerRunId[]): Result<void> => {
+        if (lostRace(result)) report.contended.push(run.id);
+        else if (!result.ok) return result;
+        else into.push(run.id);
+        return ok(undefined);
+      };
       const expired = await deps.runs.expired(now(), SWEEP_BATCH);
       if (!expired.ok) return expired;
       for (const run of expired.value) {
@@ -376,26 +406,35 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
           if (!marked.ok) return marked;
           unknown = true;
         }
-        if (unknown) {
-          const settled = await settle(run, { outcome: 'blocked', reason: 'effect_outcome_unknown', result: null });
-          if (!settled.ok) return settled;
-          report.blocked.push(run.id);
-        } else if (run.cancelRequested) {
-          const settled = await settle(run, { outcome: 'cancelled', reason: 'cancelled_lease_expired', result: null });
-          if (!settled.ok) return settled;
-          report.cancelled.push(run.id);
-        } else if (run.attempts >= run.maxAttempts) {
-          const settled = await settle(run, { outcome: 'failed', reason: 'lease_expired', result: null });
-          if (!settled.ok) return settled;
-          report.failed.push(run.id);
-        } else {
-          const requeued = await deps.runs.update(
-            { ...run, status: 'queued', lease: null, reason: 'lease_expired_requeued', updatedAt: now(), revision: run.revision + 1 },
-            run.revision,
-          );
-          if (!requeued.ok) return requeued;
-          report.requeued.push(run.id);
-        }
+        const outcome = unknown
+          ? record(await settle(run, { outcome: 'blocked', reason: 'effect_outcome_unknown', result: null }), run, report.blocked)
+          : run.cancelRequested
+            ? record(await settle(run, { outcome: 'cancelled', reason: 'cancelled_lease_expired', result: null }), run, report.cancelled)
+            : run.attempts >= run.maxAttempts
+              ? record(await settle(run, { outcome: 'failed', reason: 'lease_expired', result: null }), run, report.failed)
+              : record(
+                  await deps.runs.update(
+                    { ...run, status: 'queued', lease: null, reason: 'lease_expired_requeued', updatedAt: now(), revision: run.revision + 1 },
+                    run.revision,
+                  ),
+                  run,
+                  report.requeued,
+                );
+        if (!outcome.ok) return outcome;
+      }
+
+      // Queued work nothing drove: its conversation never resumed it within the grace window.
+      const cutoff = deps.clock.now().getTime() - deps.resumeGraceMs;
+      const abandoned = await collectPaged({
+        fetch: (after, pageSize) => deps.runs.list({ statuses: ['queued'], limit: pageSize, after }),
+        cursorOf: (r: WorkerRun) => ({ createdAt: r.createdAt, id: r.id }),
+        keep: (r) => Date.parse(r.updatedAt) <= cutoff,
+        limit: SWEEP_BATCH,
+      });
+      if (!abandoned.ok) return abandoned;
+      for (const run of abandoned.value) {
+        const outcome = record(await settle(run, { outcome: 'failed', reason: 'not_resumed', result: null }), run, report.notResumed);
+        if (!outcome.ok) return outcome;
       }
       return ok(report);
     },
@@ -422,7 +461,12 @@ export function principalOf(scope: TrustedTurnScope): WorkerPrincipal {
   return caller.kind === 'participant' ? { kind: 'participant', contactId: caller.contactId } : { kind: 'companion_internal' };
 }
 
-function samePrincipal(a: WorkerPrincipal, b: WorkerPrincipal): boolean {
+/** A compare-and-set lost to another pass, or a run another pass already holds. */
+function lostRace(result: Result<unknown>): boolean {
+  return !result.ok && result.error.kind === 'conflict' && (result.error.reason === 'stale_revision' || result.error.reason === 'turn_lease_active');
+}
+
+export function samePrincipal(a: WorkerPrincipal, b: WorkerPrincipal): boolean {
   if (a.kind === 'participant' && b.kind === 'participant') return a.contactId === b.contactId;
   return a.kind === b.kind;
 }

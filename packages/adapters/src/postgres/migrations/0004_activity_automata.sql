@@ -58,6 +58,8 @@ CREATE TABLE free_time_blocks (
   record       jsonb NOT NULL
 );
 CREATE INDEX free_time_blocks_by_lane ON free_time_blocks (lane, invited_at DESC, block_id DESC);
+-- At most one open block across every lane, so two scheduler passes can never both invite.
+CREATE UNIQUE INDEX free_time_blocks_one_open ON free_time_blocks ((true)) WHERE state IN ('invited', 'chosen', 'executing');
 
 CREATE TABLE scheduled_prompts (
   prompt_id  text PRIMARY KEY,

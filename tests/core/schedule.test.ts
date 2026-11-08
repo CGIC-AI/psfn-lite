@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CareReminder, ReflectionTemplate, ScheduledPrompt, TrustedTurnScope, WorkerRun } from '../../packages/core/src/index.ts';
-import { fakeActivityWorld } from './activity-world.ts';
+import { fakeActivityWorld, SCHEDULER_IN_FLIGHT_MS } from './activity-world.ts';
 import { kindOf } from './memory-world.ts';
 
 type World = Awaited<ReturnType<typeof fakeActivityWorld>>;
@@ -54,6 +54,10 @@ describe('self-scheduled prompts', () => {
     w.internalTurns.script = (request) => (request.purpose === 'scheduled_prompt' ? Promise.reject(new Error('crash')) : Promise.resolve({ ok: true, value: { status: 'completed', reply: null } }));
     await expect(w.schedule.runDue(self)).rejects.toThrow('crash');
     w.internalTurns.script = () => Promise.resolve({ ok: true, value: { status: 'completed', reply: null } });
+    // Inside its in-flight window the marker may still belong to a running pass, so it is left alone.
+    const early = await w.schedule.runDue(self);
+    expect(early.ok && early.value.prompts).toEqual([]);
+    w.clock.advance(SCHEDULER_IN_FLIGHT_MS);
     const recovered = await w.schedule.runDue(self);
     expect(recovered.ok && recovered.value.prompts.map((p) => p.state)).toEqual(['interrupted']);
     expect(w.internalTurns.requests.filter((r) => r.purpose === 'scheduled_prompt')).toHaveLength(2);
@@ -120,7 +124,11 @@ describe('reflection templates', () => {
     expect(w.reflectionTemplates.templates.get('evening')?.nextRunAt).toBe('2030-01-02T07:00:00.000Z');
 
     const current = w.reflectionTemplates.templates.get('evening') as ReflectionTemplate;
-    w.reflectionTemplates.templates.set('evening', { ...current, lastRun: { key: 'scheduled:x', state: 'running', reflectionId: null, at: current.updatedAt, detail: null } });
+    w.reflectionTemplates.templates.set('evening', { ...current, lastRun: { key: 'scheduled:x', state: 'running', reflectionId: null, at: w.clock.now().toISOString(), detail: null } });
+    const busy = await w.schedule.runDue(self);
+    expect(busy.ok && busy.value.templates).toEqual([]);
+    expect(w.reflectionTemplates.templates.get('evening')?.lastRun?.state).toBe('running');
+    w.clock.advance(SCHEDULER_IN_FLIGHT_MS);
     const closed = await w.schedule.runDue(self);
     expect(closed.ok && closed.value.templates).toEqual([{ id: 'evening', state: 'interrupted' }]);
     expect(w.reflectionTemplates.templates.get('evening')?.lastRun?.state).toBe('interrupted');
@@ -175,13 +183,79 @@ describe('care reminders', () => {
     expect(w.reminderDelivery.delivered).toHaveLength(3);
   });
 
+  it('records an ambiguous delivery as unknown and never sends it again; a daily one moves to its next day', async () => {
+    const w = await fakeActivityWorld();
+    const primary = await w.admit('primary-dm');
+    const self = await w.admit('free-time');
+    const once = await w.must<{ reminder: CareReminder }>(primary, 'concern', 'reminder_create', REMINDER);
+    const daily = await w.must<{ reminder: CareReminder }>(primary, 'concern', 'reminder_create', { ...REMINDER, kind: 'self_care', title: 'Water', content: 'Drink water', schedule: 'daily' });
+    w.clock.advance(12 * HOUR);
+    w.reminderDelivery.ambiguous = true;
+    const report = await tick(w, self);
+    expect(report.reminders.ok && [...report.reminders.value.unknown].sort()).toEqual([once.reminder.id, daily.reminder.id].sort());
+    w.reminderDelivery.ambiguous = false;
+    await tick(w, self);
+    await tick(w, self);
+    expect(w.reminderDelivery.calls).toHaveLength(2);
+    expect(w.careReminders.reminders.get(once.reminder.id)).toMatchObject({ state: 'delivery_unknown', deliveries: 0, unknownDeliveries: 1 });
+    expect(w.careReminders.reminders.get(daily.reminder.id)).toMatchObject({ state: 'pending', dueAt: '2030-01-02T12:00:00.000Z', unknownDeliveries: 1 });
+    w.clock.advance(24 * HOUR);
+    await tick(w, self);
+    expect(w.reminderDelivery.calls).toHaveLength(3);
+    expect(w.reminderDelivery.calls.filter((r) => r.id === daily.reminder.id)).toHaveLength(2);
+    expect(w.careReminders.reminders.get(daily.reminder.id)).toMatchObject({ state: 'pending', deliveries: 1, unknownDeliveries: 1, dueAt: '2030-01-03T12:00:00.000Z' });
+  });
+
+  it('leaves a delivery another pass has in flight alone, so it is neither marked unknown nor sent twice', async () => {
+    const w = await fakeActivityWorld();
+    const primary = await w.admit('primary-dm');
+    const self = await w.admit('free-time');
+    const { reminder } = await w.must<{ reminder: CareReminder }>(primary, 'concern', 'reminder_create', { ...REMINDER, schedule: 'daily' });
+    w.clock.advance(12 * HOUR);
+    let release = () => {};
+    w.reminderDelivery.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = w.scheduler.tick(self);
+    while (w.reminderDelivery.calls.length === 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    const overlapping = await tick(w, self);
+    expect(overlapping.reminders).toEqual({ ok: true, value: { delivered: [], failed: [], unknown: [], contended: [] } });
+    release();
+    w.reminderDelivery.hold = null;
+    const held = await first;
+    expect(held.ok && held.value.reminders).toMatchObject({ ok: true, value: { delivered: [reminder.id] } });
+    expect(w.careReminders.reminders.get(reminder.id)).toMatchObject({ state: 'pending', deliveries: 1, unknownDeliveries: 0 });
+    for (let day = 0; day < 3; day += 1) {
+      w.clock.advance(24 * HOUR);
+      await tick(w, self);
+    }
+    expect(w.reminderDelivery.calls).toHaveLength(4);
+  });
+
+  it('runs a due prompt once when two scheduler passes overlap', async () => {
+    const w = await fakeActivityWorld();
+    const self = await w.admit('free-time');
+    const { prompt } = await w.must<{ prompt: ScheduledPrompt }>(self, 'free_time', 'schedule_prompt', PROMPT);
+    w.clock.advance(14 * HOUR + 31 * 60_000);
+    const [a, b] = await Promise.all([w.schedule.runDue(self), w.schedule.runDue(self)]);
+    if (!a.ok || !b.ok) throw new Error('runDue');
+    expect([...a.value.prompts, ...b.value.prompts]).toEqual([{ id: prompt.id, state: 'completed' }]);
+    expect([...a.value.contended, ...b.value.contended]).toEqual([prompt.id]);
+    expect(w.internalTurns.requests.filter((r) => r.purpose === 'scheduled_prompt')).toHaveLength(1);
+  });
+
   it('never re-sends a delivery a crash left unconfirmed', async () => {
     const w = await fakeActivityWorld();
     const primary = await w.admit('primary-dm');
     const self = await w.admit('free-time');
     const { reminder } = await w.must<{ reminder: CareReminder }>(primary, 'concern', 'reminder_create', REMINDER);
-    w.careReminders.reminders.set(reminder.id, { ...reminder, state: 'delivering', revision: reminder.revision + 1 });
     w.clock.advance(12 * HOUR);
+    w.careReminders.reminders.set(reminder.id, { ...reminder, state: 'delivering', deliveryStartedAt: w.clock.now().toISOString(), revision: reminder.revision + 1 });
+    // A marker inside its in-flight window may be another pass delivering right now.
+    const early = await tick(w, self);
+    expect(early.reminders.ok && early.reminders.value.unknown).toEqual([]);
+    expect(w.careReminders.reminders.get(reminder.id)?.state).toBe('delivering');
+    w.clock.advance(SCHEDULER_IN_FLIGHT_MS);
     const report = await tick(w, self);
     expect(report.reminders.ok && report.reminders.value.unknown).toEqual([reminder.id]);
     expect(w.careReminders.reminders.get(reminder.id)?.state).toBe('delivery_unknown');

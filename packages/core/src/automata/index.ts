@@ -19,5 +19,5 @@ export {
   type WorkerSource,
   type WorkerTrigger,
 } from './types.ts';
-export { activityStatusForOutcome, canTransitionWorker, canViewWorkerRun, isTerminalWorker, statusForOutcome } from './rules.ts';
+export { activityStatusForOutcome, canTransitionWorker, canViewWorkerRun, isTerminalWorker, statusForOutcome, workerActivityId } from './rules.ts';
 export { automataTool } from './tool.ts';

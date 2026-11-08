@@ -18,10 +18,12 @@ const DELIVERY_BATCH = 50;
 
 export interface ReminderDeliveryReport {
   readonly delivered: readonly string[];
-  /** Delivery was refused or failed definitely; the reminder stays pending for the next tick. */
+  /** Delivery was refused definitely (nothing went out); the reminder stays pending for the next tick. */
   readonly failed: readonly { readonly id: string; readonly detail: string }[];
-  /** A delivery a crash left unconfirmed: recorded as unknown and not sent again. */
+  /** The delivery may have landed (an ambiguous host result, or a marker a crash left behind): recorded as unknown and not sent again. */
   readonly unknown: readonly string[];
+  /** Reminders another scheduler pass holds or just moved; left to it, untouched. */
+  readonly contended: readonly string[];
 }
 
 export interface CareReminderService {
@@ -40,19 +42,43 @@ export interface CareReminderService {
   deliverDue(scope: TrustedTurnScope): Promise<Result<ReminderDeliveryReport>>;
 }
 
+/** Host results that mean the message definitely did not go out. Anything else may have landed. */
+const DEFINITE_REFUSALS: ReadonlySet<string> = new Set(['denied', 'invalid', 'not_found']);
+
 /**
  * Care reminders: targeted like follow-ups (the current conversation or a
  * readable one), idempotent by target, text and due time, and delivered by
- * the scheduler through the host's channel delivery. A delivery is fenced: it
- * is marked before the host is asked, so a crash never sends it twice.
+ * the scheduler through the host's channel delivery. A delivery is fenced:
+ * it is marked, with its start time, before the host is asked. An ambiguous
+ * outcome is reconciled as unknown, never re-sent; a marker is read as a
+ * crash only once it is older than `inFlightMs`, so a delivery another
+ * scheduler pass still has in flight is left alone. A daily reminder whose
+ * occurrence is unknown moves on to the next day.
  */
 export function createCareReminderService(deps: {
   readonly reminders: CareReminderPort;
   readonly catalog: SessionCatalogPort;
   readonly delivery: ReminderDeliveryPort;
   readonly clock: Clock;
+  /** How long a `delivering` marker may stand before it is read as left by a crash. */
+  readonly inFlightMs: number;
 }): CareReminderService {
   const targetFor = conversationTarget(deps.catalog, 'a care reminder');
+  const nowMs = () => deps.clock.now().getTime();
+
+  /** The reminder after an occurrence whose outcome is unknown: a one-off ends there; a daily one moves to its next day. */
+  const afterUnknown = (reminder: CareReminder): CareReminder =>
+    reminder.schedule === 'daily'
+      ? { ...reminder, state: 'pending', dueAt: nextDaily(reminder.dueAt, nowMs()), deliveryStartedAt: null, unknownDeliveries: reminder.unknownDeliveries + 1 }
+      : { ...reminder, state: 'delivery_unknown', deliveryStartedAt: null, unknownDeliveries: reminder.unknownDeliveries + 1 };
+
+  /** Compare-and-set; a lost race is reported as contended (`null`), anything else fails the pass. */
+  const write = async (next: CareReminder, expectedRevision: number): Promise<Result<CareReminder | null>> => {
+    const written = await deps.reminders.update({ ...next, revision: expectedRevision + 1 }, expectedRevision);
+    if (written.ok) return written;
+    return written.error.kind === 'conflict' && written.error.reason === 'stale_revision' ? ok(null) : written;
+  };
+
   return {
     async create(scope, input) {
       if (!isTrustedTurnScope(scope)) return denied('unknown_authority', 'scope was not admitted by ingress');
@@ -78,6 +104,8 @@ export function createCareReminderService(deps: {
         createdAt: deps.clock.now().toISOString(),
         deliveries: 0,
         lastDeliveredAt: null,
+        deliveryStartedAt: null,
+        unknownDeliveries: 0,
         revision: 1,
       });
     },
@@ -87,30 +115,44 @@ export function createCareReminderService(deps: {
       if (scope.audience.kind !== 'self' || scope.caller.kind !== 'companion_internal') {
         return denied('requires_self_audience', 'reminders are delivered from companion-internal turns');
       }
-      const report = { delivered: [] as string[], failed: [] as { id: string; detail: string }[], unknown: [] as string[] };
+      const report = { delivered: [] as string[], failed: [] as { id: string; detail: string }[], unknown: [] as string[], contended: [] as string[] };
       const stranded = await deps.reminders.list({ states: ['delivering'], dueAtOrBefore: null, limit: DELIVERY_BATCH, after: null });
       if (!stranded.ok) return stranded;
       for (const reminder of stranded.value) {
-        const marked = await deps.reminders.update({ ...reminder, state: 'delivery_unknown', revision: reminder.revision + 1 }, reminder.revision);
+        const started = reminder.deliveryStartedAt === null ? Number.NEGATIVE_INFINITY : Date.parse(reminder.deliveryStartedAt);
+        // Still within its in-flight window: another pass may be delivering it right now.
+        if (nowMs() - started < deps.inFlightMs) continue;
+        const marked = await write(afterUnknown(reminder), reminder.revision);
         if (!marked.ok) return marked;
-        report.unknown.push(reminder.id);
+        (marked.value === null ? report.contended : report.unknown).push(reminder.id);
       }
       const due = await deps.reminders.list({ states: ['pending'], dueAtOrBefore: deps.clock.now().toISOString(), limit: DELIVERY_BATCH, after: null });
       if (!due.ok) return due;
       for (const reminder of due.value) {
-        const delivering = await deps.reminders.update({ ...reminder, state: 'delivering', revision: reminder.revision + 1 }, reminder.revision);
+        const delivering = await write({ ...reminder, state: 'delivering', deliveryStartedAt: deps.clock.now().toISOString() }, reminder.revision);
         if (!delivering.ok) return delivering;
-        const sent = await deps.delivery.deliver(delivering.value);
+        if (delivering.value === null) {
+          report.contended.push(reminder.id);
+          continue;
+        }
+        const marked = delivering.value;
+        const sent = await deps.delivery.deliver(marked);
         const at = deps.clock.now().toISOString();
+        const definite = !sent.ok && DEFINITE_REFUSALS.has(sent.error.kind);
         const next: CareReminder = sent.ok
           ? reminder.schedule === 'daily'
-            ? { ...delivering.value, state: 'pending', dueAt: nextDaily(reminder.dueAt, deps.clock.now().getTime()), deliveries: reminder.deliveries + 1, lastDeliveredAt: at }
-            : { ...delivering.value, state: 'delivered', deliveries: reminder.deliveries + 1, lastDeliveredAt: at }
-          : { ...delivering.value, state: 'pending' };
-        const settled = await deps.reminders.update({ ...next, revision: delivering.value.revision + 1 }, delivering.value.revision);
+            ? { ...marked, state: 'pending', dueAt: nextDaily(reminder.dueAt, nowMs()), deliveryStartedAt: null, deliveries: reminder.deliveries + 1, lastDeliveredAt: at }
+            : { ...marked, state: 'delivered', deliveryStartedAt: null, deliveries: reminder.deliveries + 1, lastDeliveredAt: at }
+          : definite
+            ? { ...marked, state: 'pending', deliveryStartedAt: null }
+            : afterUnknown(marked);
+        const settled = await write(next, marked.revision);
         if (!settled.ok) return settled;
-        if (sent.ok) report.delivered.push(reminder.id);
-        else report.failed.push({ id: reminder.id, detail: sent.error.kind === 'unavailable' ? sent.error.detail : sent.error.kind });
+        // Another pass read the marker as stranded and already recorded the occurrence as unknown.
+        if (settled.value === null) report.contended.push(reminder.id);
+        else if (sent.ok) report.delivered.push(reminder.id);
+        else if (definite) report.failed.push({ id: reminder.id, detail: sent.error.kind });
+        else report.unknown.push(reminder.id);
       }
       return ok(report);
     },
