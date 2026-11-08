@@ -35,4 +35,8 @@ describe('migration numbering', () => {
   it('ships this lane at 0003 next to the base schema', () => {
     expect(loadMigrations().map((m) => `${String(m.version)}_${m.name}`)).toContain('3_self_state');
   });
+
+  it('ships activity and automata at 0004', () => {
+    expect(loadMigrations().map((m) => `${String(m.version)}_${m.name}`)).toContain('4_activity_automata');
+  });
 });

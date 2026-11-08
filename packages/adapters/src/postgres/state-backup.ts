@@ -17,6 +17,7 @@ import { createHash } from 'node:crypto';
 import type pg from 'pg';
 import { conflict, invalid, isRecord, ok, unavailable, type BackupComponentPort, type BackupFile, type Result } from '../core.ts';
 import { transaction, type Queryable } from './database.ts';
+import { AUTOMATA_BACKED_UP_TABLES } from './automata-tables.ts';
 import { MEMORY_BACKED_UP_TABLES } from './memory-tables.ts';
 import { requireCurrentSchema, type AppliedMigration } from './migrations.ts';
 
@@ -53,6 +54,7 @@ export const BACKED_UP_TABLES: readonly TableSpec[] = Object.freeze([
   { name: 'concern_events', orderBy: 'concern_id, revision' },
   { name: 'follow_ups', orderBy: 'follow_up_id' },
   ...MEMORY_BACKED_UP_TABLES,
+  ...AUTOMATA_BACKED_UP_TABLES,
 ]);
 
 const SCHEMA_FILE = 'schema.json';

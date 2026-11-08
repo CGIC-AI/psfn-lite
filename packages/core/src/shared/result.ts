@@ -23,7 +23,9 @@ export type ConflictReason =
   | 'idempotency_mismatch'
   | 'entry_mismatch'
   | 'already_exists'
-  | 'identity_conflict';
+  | 'identity_conflict'
+  /** A side effect started but its outcome was never recorded; it is reconciled, never re-executed. */
+  | 'outcome_unknown';
 
 /** A caller lacks the authority for this operation. */
 export interface DeniedError {
