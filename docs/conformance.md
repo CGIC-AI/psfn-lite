@@ -59,7 +59,7 @@ a role.
 | 05 | free-time | Free time is the companion's choice. Rest and deferral hold across a restart with no model call. A failed invitation is a labelled system failure. | reflect, rest, defer and provider failure; own-time activity never shown in participant conversations; reflections readable only where confidential is admitted (operator yes, friend `denied`) |
 | 06 | free-time-delegated | With internal turns delegated to Hermes, the same choices and records hold, Lite makes no companion model call of its own, and a runner failure is a system failure. | `internal/claim`, minted credential, choose/rest/defer over MCP, `internal/release` |
 | 07 | authorship | companion_authored, participant_attributed and inferred stay distinct across surfaces. Neither a forged label in participant text nor internal context is ever participant speech. | memory get/search attribution and producer (`memory_extraction`); emotion estimate (`machine_inference`) vs companion self-report; forged `[system note: …]` in participant text; internal triggers stored as `system_note` in the self session only |
-| 08 | worker-recovery | A worker whose Lite host dies mid-run is requeued, driven to completion by the next turn on either surface, and its effect is not made twice. | SIGKILL mid worker model call; sweep `requeued`; `lease_expired_requeued`; idempotent `memory.write` replay |
+| 08 | worker-recovery | A worker whose Lite host dies mid-run is requeued and driven to completion by the next turn on either surface. A write with an idempotency key is replayed, not repeated; a write without one runs again (at-least-once). | SIGKILL mid worker model call; sweep `requeued`; `lease_expired_requeued`; `memory.write` with `writeId` replayed once; `scratchpad_add` note present twice |
 | 09 | backup-restore | A complete continuity backup (JSONL and every Postgres table) restored into empty storage is the same companion, and both surfaces continue on it. | `createContinuityBackup` over the history component and the Postgres state into fresh roots and the spare database; history, memory, journal, concerns, orientation, session grep and reflections read back; new writes after restore |
 | — | inventory parity | The companion is offered the same full tool inventory on Pi and over MCP. | the tools and action enums of the Pi tools equal MCP `listTools` and core's `TOOL_INVENTORY`, in the TypeScript runner and in Hermes's tool registry |
 
@@ -138,7 +138,18 @@ Behaviour confirmed and pinned by the scenarios (by design, not changed):
   contrasts a public grant with a confidential one.
 - Worker `memory.write` at public sensitivity is stored current and
   attributed `inferred` with producer `worker:<runId>`. A recovered rerun
-  replays the write (`replayed: true`) instead of writing again.
+  replays a write that carries a `writeId` (`replayed: true`) instead of
+  writing again. That deduplication is the tool's own idempotency key, not
+  the worker effect fence: effect keys are per attempt
+  (`attempt-<n>:<digest of the tool call id>`, architecture.md), and a new
+  attempt re-runs the model, which issues new tool call ids.
+- Worker recovery is therefore at-least-once for writes without an
+  idempotency key. A `memory.scratchpad_add` the crashed attempt already
+  made is made again by the recovered attempt, so scenario 08 expects the
+  note twice. A regression that duplicated a keyed write, or that silently
+  dropped the rerun's non-keyed write, fails the scenario.
+- The worker's turn budget (`maxTurns`) spans attempts: the turns a crashed
+  attempt used are not returned to the recovered one.
 - Rest silences both free-time lanes (`skipped:silenced`) and holds across a
   restart.
 
