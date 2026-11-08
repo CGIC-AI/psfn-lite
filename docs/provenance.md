@@ -57,3 +57,18 @@ Hermes integration reference: https://github.com/NousResearch/hermes-agent.
 No Hermes revision is selected or implementation copied yet. Pin the revision
 used for the compatibility proof and record the actual plugin/MCP capabilities
 tested before claiming support.
+
+Emotion, self-model, concerns and reflection continuity (psfn-lite-vvn.6).
+Written new for Lite from the donor's algorithms and tests at the donor
+revision above. No donor code was copied, and SubstrateAgent ownership was
+removed: core services take explicit ports, and the host calls `observeTurn`.
+
+| Lite path | Donor path | Retained behavior | Deliberate change |
+| --- | --- | --- | --- |
+| `packages/core/src/emotion/state.ts`, `policy.ts` | `src/core/emotion/state.ts`, `src/core/emotion/scoped-emotion.ts`, `src/core/emotion/telemetry-validation.ts` | Per-axis and per-label half-life decay, confidence-weighted impulses, mood and confidence EMAs, donor half-lives; scoped state per conversation | Pure functions over a snapshot; strict policy parsing; low-confidence telemetry is recorded but never applied; audio and satellite classifiers not ported |
+| `packages/core/src/emotion/appraisal-gate.ts`, `application/emotion-service.ts` | `src/core/emotion/appraisal.ts`, `src/core/emotion/narrative-appraisal-drift.ts`, `src/system/config/narrative-emotion-appraisal-config.ts`, `src/core/agent/substrate-agent/emotion-self-model-runtime.ts` | Drift-only gate at 0.35 with baseline seeding and untrusted skip; appraisal over the recent transcript | The pending appraisal is part of the compare-and-set state, settled only after a machine-authored entry is appended, so failures retry; observations are idempotent per turn; reads only from a trusted, fresh, same-scope estimate |
+| `packages/core/src/emotion/self-model.ts` | `src/core/self-model/state.ts` | Certainty, engagement, processing, trajectory and salient-term heuristics | Deterministic, computed from the turn and stored with the state; no free-text self-description |
+| `packages/core/src/intention/concerns.ts`, `application/concern-service.ts` | `src/core/intention/concerns.ts`, `src/core/intention/concern-visibility.ts`, `src/core/intention/concern-resolution-appraisal.ts`, `src/core/intention/concern-resolution-arc.ts`, `src/core/appraisal/concern-arc-prose.ts`, `src/core/intention/tools.ts` | Transition matrix with evidence-required reopen, duplicate detection by Dice similarity, relief delta, arc prose | Arc text is machine-authored, not first-person companion speech; relief applies once per resolution generation; evidence sensitivity must be admitted; the hidden-item count is not ported; every revision has an event |
+| `packages/core/src/intention/follow-ups.ts`, `application/follow-up-service.ts` | `src/core/intention/pending-follow-ups.ts` | Idempotent follow-ups by target, content and due time | Targets resolve through the session catalog and are gated by `canViewerRead`; activation is compare-and-set |
+| `packages/core/src/application/self-state-context.ts` | `src/core/scheduler/reflection-template-runtime/prompt-formatting.ts` | Inner-state, concern and reflection sections in internal context | Typed origins keep inferred state, authored reflection and signals apart; each item is admission-gated; reflections are read through a narrow port without journals |
+| `packages/adapters/src/postgres/self-state-stores.ts`, `migrations/0003_self_state.sql` | none (the donor kept this state in agent memory and files) | Durable emotion, concern and follow-up state | JSONB records with compare-and-set; observation and state written in one transaction; included in the state backup |

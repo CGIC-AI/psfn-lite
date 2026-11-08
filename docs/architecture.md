@@ -143,6 +143,50 @@ adapter.
   only if the version and checksum have not moved. Values append revisions.
   The North Star holds at most three active items, and every item version is
   kept.
+- **Self-state** (`createEmotionService`, `createConcernService`,
+  `createFollowUpService`, `createSelfStateContext`, `createSelfStateHandlers`).
+  Emotion state is kept per conversation scope (`direct:<contact>`,
+  `room:<channel>` or `self`). The host calls `observeTurn` after each settled
+  turn.
+  - Affect: one estimator call per turn. A reading below `trustedConfidence`
+    is recorded as untrusted telemetry and changes nothing. A trusted reading
+    advances the donor dynamics: per-axis half-life decay, a
+    confidence-weighted impulse, then the mood and confidence EMAs.
+  - Meaningful-change gate: the first trusted reading seeds the baseline.
+    Drift below `appraisalThreshold` (0.35 on any axis) skips the appraisal
+    model entirely. Drift at or above it records a pending appraisal in the
+    same compare-and-set write as the state. That appraisal is settled only
+    after a machine-authored entry is appended, so a crash or model failure
+    retries it on the next observation of that turn.
+  - Idempotency: each observation is keyed by turn id. Replaying a turn makes
+    no estimator call.
+  - Self-model: certainty, engagement, processing, trajectory and salient
+    terms are derived deterministically from the turn, the affect and the
+    open concerns.
+  - Reads: `emotion.read` returns the estimate only when it is trusted and
+    fresh (`freshForMs`) in the caller's own scope. The estimate is labelled
+    `machine_inference`. Companion-authored self-reports are a separate,
+    append-only record with optional `supersedes`, and appraisal summaries
+    are never presented as the companion's words. Appraisals, concerns,
+    follow-ups and reflections are filtered by `canViewerRead` on their
+    source audience. Concerns and their evidence are also filtered by
+    admitted sensitivity, and hidden items are neither counted nor hinted at.
+  - Concerns: they follow the donor transition matrix. Reopening requires
+    new evidence. Evidence refs merge and are never dropped, and every
+    revision is kept as an event. Resolving a concern records the resolution
+    VAD and the relief delta, plus a machine-authored arc, and applies relief
+    once per resolution generation. A reopen clears the current resolution,
+    but its event remains.
+  - Follow-ups: they are idempotent on target, content and due time, may be
+    targeted only at a conversation the viewer can read, and activate by
+    compare-and-set.
+  - Context: `createSelfStateContext` renders all of this as internal context
+    (machine inference, authored reflection, internal signal or system note),
+    never as participant speech. Each item is gated by the admission of the
+    tool action that would read it. Authored reflections enter through the
+    narrow `AuthoredReflectionPort`; the journal store that implements it
+    belongs to the journals lane.
+  - Gaps: `concern.reminder_create` has no handler and stays `unavailable`.
 
 Failure semantics are types (`shared/result.ts`): every operation returns a
 `Result` whose failures are `denied`, `not_found` (also used for items the
@@ -245,6 +289,20 @@ never references the adapters.
     after the first committed leaves the first restored.
   - A component that changes during the backup fails it, and the writers must
     be quiesced before retrying.
+- **Self-state stores** (`createPostgresSelfStateStores`, migration
+  `0003_self_state.sql`).
+  - Tables: `emotion_states` (compare-and-set on the scope key, committed in
+    one transaction with its `emotion_observations` row, so a turn is applied
+    at most once), `emotion_appraisals` and `emotion_self_reports`
+    (append-only, with identity ordering), and `concerns` with
+    `concern_events`. Each concern revision and its event are written
+    together. Follow-ups live in `follow_ups`.
+  - Backup: all seven tables are appended to the state backup component.
+  - Migration numbering: the loader requires unique, increasing versions from
+    0001 rather than contiguous ones, because parallel lanes reserve numbers.
+    Applied migrations are still verified in order. A database migrated past
+    a gap stops startup if the missing number later appears, so the gap has
+    to close before any database outside tests is migrated.
 
 Integration tests (`*.integration.test.ts`, part of `npx vitest run`) run
 against a throwaway pgvector container. The container uses a pinned image
