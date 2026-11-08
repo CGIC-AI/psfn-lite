@@ -13,7 +13,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:ci-rules": "node --test scripts/ci/*.test.mjs scripts/checks/*.test.mjs"
+    "test:ci-rules": "node --test scripts/ci/*.test.mjs scripts/checks/*.test.mjs",
+    "standalone": "tsx apps/standalone/src/main.ts"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.3.0",
@@ -28,6 +29,8 @@
     "vitest": "4.1.12"
   },
   "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
     "@modelcontextprotocol/server": "2.3.0",
     "pg": "8.20.0"
   }
