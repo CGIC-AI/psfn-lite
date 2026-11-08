@@ -1,8 +1,9 @@
 /**
- * A synthetic companion world wired from the real core services over
- * in-memory fakes: ingress resolves callers through the real contact
- * authority, and the dispatcher carries the real continuity handlers.
- * Every identity here is invented.
+ * A synthetic companion world wired from the real core services. Ingress
+ * resolves callers through the real contact authority, and the dispatcher
+ * carries the real continuity handlers. `wireWorld` takes any port
+ * implementations, so the same world runs over in-memory fakes here and over
+ * the real storage adapters in integration tests. Every identity is invented.
  */
 import {
   BASELINE_DISCLOSURE_POLICY,
@@ -18,12 +19,28 @@ import {
   createTrustedIngress,
   createTurnLifecycle,
   createValuesService,
+  type ApprovalPort,
+  type ContactAdministration,
   type ContactId,
+  type ContactStorePort,
+  type ContinuityPort,
+  type CoreBlockPort,
+  type FocusPort,
   type HostAttestation,
+  type IdSource,
+  type ModelPort,
+  type NorthStarPort,
+  type PersonaPort,
+  type PromptLayerPort,
   type RegisterContactInput,
+  type SessionArchivePort,
+  type SessionCatalogPort,
   type ToolDispatcher,
+  type TranscriptProjectionPort,
   type TrustedTurnScope,
+  type TurnLedgerPort,
   type TurnLifecycle,
+  type ValuesJournalPort,
 } from '../../packages/core/src/index.ts';
 import {
   FakeApprovals,
@@ -43,6 +60,26 @@ import { COMPANION, FakeArchive, FakeAuthenticator, FakeTurnLedger, FixedClock, 
 
 export const OPERATOR = 'operator:test';
 
+export interface WorldPorts {
+  readonly clock: FixedClock;
+  readonly ids: IdSource;
+  readonly authenticator: FakeAuthenticator;
+  readonly contactStore: ContactStorePort;
+  readonly approvals: ApprovalPort;
+  readonly model: ModelPort;
+  readonly catalog: SessionCatalogPort;
+  readonly archive: SessionArchivePort;
+  readonly ledger: TurnLedgerPort;
+  readonly projection: TranscriptProjectionPort;
+  readonly continuity: ContinuityPort;
+  readonly focus: FocusPort;
+  readonly layers: PromptLayerPort;
+  readonly persona: PersonaPort;
+  readonly blocks: CoreBlockPort;
+  readonly valuesJournal: ValuesJournalPort;
+  readonly northStar: NorthStarPort;
+}
+
 function direct(externalId: string, channel: string, turnKind: 'foreground' | 'background' = 'foreground'): HostAttestation {
   return {
     surface: PI,
@@ -52,24 +89,23 @@ function direct(externalId: string, channel: string, turnKind: 'foreground' | 'b
   };
 }
 
-export async function continuityWorld() {
-  const clock = new FixedClock();
-  const ids = new SequentialIds();
-  const contactStore = new FakeContactStore();
-  const approvals = new FakeApprovals();
-  const model = new FakeModel();
-  const catalog = new FakeSessionCatalog();
-  const archive = new FakeArchive();
-  const ledger = new FakeTurnLedger();
-  const projection = new FakeProjection();
-  const layers = new FakeLayers();
-  const persona = new FakePersona();
-  const blocks = new FakeCoreBlocks();
-  const valuesJournal = new FakeValues();
-  const northStar = new FakeNorthStar();
-  const authenticator = new FakeAuthenticator();
+/** Host tokens for the standard cast: their DMs, a background DM and companion free time. */
+export function standardTokens(authenticator: FakeAuthenticator): void {
+  authenticator.tokens.set('primary-dm', direct('primary-handle', 'dm-primary'));
+  authenticator.tokens.set('friend-dm', direct('friend-handle', 'dm-friend'));
+  authenticator.tokens.set('friend-dm-background', direct('friend-handle', 'dm-friend', 'background'));
+  authenticator.tokens.set('acq-dm', direct('acq-handle', 'dm-acq'));
+  authenticator.tokens.set('stranger-dm', direct('stranger-handle', 'dm-stranger'));
+  authenticator.tokens.set('free-time', {
+    surface: PI,
+    principal: { kind: 'companion_internal', purpose: 'free_time' },
+    room: { kind: 'self' },
+    turnKind: 'background',
+  });
+}
 
-  const admin = createContactAdministration({ store: contactStore, clock, ids });
+/** Registers the standard cast: primary Robin, trusted friend Sam, acquaintance Lee and stranger Ash. */
+export async function registerPeople(admin: ContactAdministration) {
   const register = async (input: Partial<RegisterContactInput> & { readonly externalId: string }): Promise<ContactId> => {
     const created = await admin.register(OPERATOR, {
       displayName: input.displayName ?? input.externalId,
@@ -82,27 +118,22 @@ export async function continuityWorld() {
     if (!created.ok) throw new Error(`register ${input.externalId}: ${JSON.stringify(created.error)}`);
     return created.value.contactId;
   };
-  const primary = await register({ externalId: 'primary-handle', displayName: 'Robin', trust: 'primary', relationship: 'partner' });
-  const friend = await register({ externalId: 'friend-handle', displayName: 'Sam', trust: 'trusted', relationship: 'friend' });
-  const acquaintance = await register({ externalId: 'acq-handle', displayName: 'Lee', trust: 'regular' });
-  const stranger = await register({ externalId: 'stranger-handle', displayName: 'Ash', trust: 'public', relationship: 'stranger' });
+  return {
+    primary: await register({ externalId: 'primary-handle', displayName: 'Robin', trust: 'primary', relationship: 'partner' }),
+    friend: await register({ externalId: 'friend-handle', displayName: 'Sam', trust: 'trusted', relationship: 'friend' }),
+    acquaintance: await register({ externalId: 'acq-handle', displayName: 'Lee', trust: 'regular' }),
+    stranger: await register({ externalId: 'stranger-handle', displayName: 'Ash', trust: 'public', relationship: 'stranger' }),
+  };
+}
 
-  authenticator.tokens.set('primary-dm', direct('primary-handle', 'dm-primary'));
-  authenticator.tokens.set('friend-dm', direct('friend-handle', 'dm-friend'));
-  authenticator.tokens.set('friend-dm-background', direct('friend-handle', 'dm-friend', 'background'));
-  authenticator.tokens.set('acq-dm', direct('acq-handle', 'dm-acq'));
-  authenticator.tokens.set('stranger-dm', direct('stranger-handle', 'dm-stranger'));
-  authenticator.tokens.set('free-time', {
-    surface: PI,
-    principal: { kind: 'companion_internal', purpose: 'free_time' },
-    room: { kind: 'self' },
-    turnKind: 'background',
-  });
-
+/** Wires the real core services over the given ports. Registers nobody. */
+export function wireWorld(ports: WorldPorts) {
+  const { clock, ids } = ports;
+  const admin = createContactAdministration({ store: ports.contactStore, clock, ids });
   const ingressResult = createTrustedIngress({
     companionId: COMPANION,
-    authenticator,
-    contacts: createContactAuthority(contactStore),
+    authenticator: ports.authenticator,
+    contacts: createContactAuthority(ports.contactStore),
     policy: BASELINE_DISCLOSURE_POLICY,
   });
   if (!ingressResult.ok) throw new Error('ingress');
@@ -113,11 +144,20 @@ export async function continuityWorld() {
     return scope.value;
   };
 
-  const sessions = createSessionService({ catalog, archive, projection, continuity: new FakeContinuity(), focus: new FakeFocus(), model, clock, ids });
-  const contacts = createContactService({ store: contactStore, approvals, clock, ids });
-  const orientation = createOrientationService({ blocks, layers, persona, approvals, clock });
-  const values = createValuesService({ values: valuesJournal, northStar, clock, ids });
-  const identityAdmin = createIdentityAdministration({ layers, persona, clock });
+  const sessions = createSessionService({
+    catalog: ports.catalog,
+    archive: ports.archive,
+    projection: ports.projection,
+    continuity: ports.continuity,
+    focus: ports.focus,
+    model: ports.model,
+    clock,
+    ids,
+  });
+  const contacts = createContactService({ store: ports.contactStore, approvals: ports.approvals, clock, ids });
+  const orientation = createOrientationService({ blocks: ports.blocks, layers: ports.layers, persona: ports.persona, approvals: ports.approvals, clock });
+  const values = createValuesService({ values: ports.valuesJournal, northStar: ports.northStar, clock, ids });
+  const identityAdmin = createIdentityAdministration({ layers: ports.layers, persona: ports.persona, clock });
   const dispatcherResult = createToolDispatcher({
     inventory: TOOL_INVENTORY,
     handlers: createContinuityHandlers({ sessions, contacts, orientation, values }),
@@ -126,7 +166,7 @@ export async function continuityWorld() {
   const dispatcher: ToolDispatcher = dispatcherResult.value;
 
   const lifecycle = (): TurnLifecycle => {
-    const created = createTurnLifecycle({ ledger, archive, sessions: catalog, clock, ids, turnLeaseMs: 60_000 });
+    const created = createTurnLifecycle({ ledger: ports.ledger, archive: ports.archive, sessions: ports.catalog, clock, ids, turnLeaseMs: 60_000 });
     if (!created.ok) throw new Error('lifecycle');
     return created.value;
   };
@@ -135,7 +175,7 @@ export async function continuityWorld() {
   const converse = async (scope: TrustedTurnScope, text: string, reply: string, key: string) => {
     const session = await sessions.current(scope);
     if (!session.ok) throw new Error(JSON.stringify(session.error));
-    const head = await ledger.head(session.value.sessionId);
+    const head = await ports.ledger.head(session.value.sessionId);
     if (!head.ok) throw new Error('head');
     const life = lifecycle();
     const owner = { surface: PI, instance: 'pi-1' };
@@ -155,33 +195,31 @@ export async function continuityWorld() {
   const call = (scope: TrustedTurnScope, tool: string, action: string, args: Record<string, unknown> = {}) =>
     dispatcher.dispatch(scope, { tool, action, args });
 
-  return {
-    clock,
-    ids,
-    contactStore,
-    approvals,
-    model,
-    catalog,
-    archive,
-    projection,
-    layers,
-    persona,
-    blocks,
-    valuesJournal,
-    northStar,
-    authenticator,
-    ingress,
-    admit,
-    admin,
-    identityAdmin,
-    sessions,
-    contacts,
-    orientation,
-    values,
-    dispatcher,
-    lifecycle,
-    converse,
-    call,
-    people: { primary, friend, acquaintance, stranger },
+  return { ingress, admit, admin, identityAdmin, sessions, contacts, orientation, values, dispatcher, lifecycle, converse, call };
+}
+
+export async function continuityWorld() {
+  const ports = {
+    clock: new FixedClock(),
+    ids: new SequentialIds(),
+    authenticator: new FakeAuthenticator(),
+    contactStore: new FakeContactStore(),
+    approvals: new FakeApprovals(),
+    model: new FakeModel(),
+    catalog: new FakeSessionCatalog(),
+    archive: new FakeArchive(),
+    ledger: new FakeTurnLedger(),
+    projection: new FakeProjection(),
+    continuity: new FakeContinuity(),
+    focus: new FakeFocus(),
+    layers: new FakeLayers(),
+    persona: new FakePersona(),
+    blocks: new FakeCoreBlocks(),
+    valuesJournal: new FakeValues(),
+    northStar: new FakeNorthStar(),
   };
+  standardTokens(ports.authenticator);
+  const world = wireWorld(ports);
+  const people = await registerPeople(world.admin);
+  return { ...ports, ...world, people };
 }
