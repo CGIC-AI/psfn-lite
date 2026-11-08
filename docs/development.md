@@ -54,6 +54,29 @@ state ownership, harness handover and module isolation. Exercise real entrypoint
 and adapters where appropriate; no production in-memory fallback disguised as
 durability. Scope expensive validation to actual risk and changed behavior.
 
+## Validation commands
+
+```bash
+mise exec node@24.22.1 npm@11.17.0 -- npx tsc --noEmit -p tsconfig.json
+mise exec node@24.22.1 npm@11.17.0 -- npx tsc --noEmit -p packages/companion/tsconfig.json
+mise exec node@24.22.1 npm@11.17.0 -- npx eslint .
+mise exec node@24.22.1 npm@11.17.0 -- npx vitest run
+```
+
+`packages/companion` is the extracted donor core (see [extraction](extraction.md)).
+It keeps the donor's compiler options in its own `tsconfig.json`, so the root
+typecheck and eslint exclude it and the second command typechecks it. `npx vitest
+run` runs two projects: `lite` and `companion` (the extracted donor tests, with the
+donor's test settings). To check the companion tests against the donor baseline:
+
+```bash
+mise exec node@24.22.1 npm@11.17.0 -- npx vitest run --project companion --reporter=json --outputFile=/tmp/companion-report.json
+mise exec node@24.22.1 -- node packages/companion/extraction/compare-baseline.mjs /tmp/companion-report.json
+```
+
+The donor Postgres-harness tests need Docker. Each run gets its own harness
+profile and temp directory, and removes exactly its own containers.
+
 Adapter integration tests (`*.integration.test.ts`) run inside `npx vitest run`
 against a throwaway pinned pgvector container, so Docker is required. Without it
 they fail. `LITE_SKIP_DOCKER_TESTS=1` skips them explicitly and prints that it did.

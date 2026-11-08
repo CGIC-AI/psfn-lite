@@ -1,0 +1,1925 @@
+import { captureViewerCeilingFromRequest, type ViewerCeiling } from '../../core/session/viewer-ceiling.js';
+// ── ShardManager ──
+// Manages bounded subagent launches plus shard routing/state for parallel task execution.
+// Bounded launches share parent's heavy resources (LLM, DB, memory) but get isolated channelIds.
+
+import { randomUUID } from 'node:crypto';
+import type { AgentTool } from '../../boundary/pi-agent/index.js';
+import type { CapabilityTier, ShardToolsetConfig, SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
+import type { SubstrateMessage } from '../../shared/contracts/runtime.js';
+import type { IntakeEnvelopeSnapshot } from '../../shared/contracts/intake-envelope.js';
+import { cloneIntakeSnapshots } from '../../core/cogsec/intake/derived-content.js';
+import { resolvePresenceSubjectId } from '../../core/agent/presence-metadata.js';
+import type { EventBus } from '../../shared/event-bus.js';
+import type { LLMProviderPort, MemoryProvider } from '../../core/agent/contracts.js';
+import type { EmbeddingProviderPort } from '../../shared/contracts/embedding-provider.js';
+import {
+  createActiveEmanationSatellitePresencePort,
+  type SatellitePresencePort,
+  type SatelliteDelegationRoutingHint,
+} from '../../core/agent/satellite-adapter-port.js';
+import type { ToolWiringValidationMode } from '../../core/agent/tool-wiring-validator.js';
+import { normalizeCapabilityTier } from '../../system/capabilities/tiers.js';
+import type { DerivedShardCapabilityGrant } from '../../system/capabilities/shard-derivation.js';
+import type {
+  AuthenticatedShardWorkloadHandle,
+  ShardWorkloadLifecyclePort,
+} from '../../system/capabilities/shard-approval-grant-contracts.js';
+import type { SessionStore } from '../../persistence/sessions/store.js';
+import type { SessionManager } from '../../core/session/manager.js';
+import type { ShardExecutionPort } from './port.js';
+import type {
+  ShardAuditTrail,
+} from './types.js';
+import { chargeSurface, getRunChargeContext, runWithChargeContext } from '../../shared/telemetry/run-charge.js';
+import {
+  ShardExecutionError,
+  type ActiveShard,
+  type SatelliteDelegationRequest,
+  type ShardConfigurationMutationResult,
+  type ShardConfigurationSnapshot,
+  type ShardConfig,
+  type ShardLifecycleState,
+  type ShardResult,
+  type ShardRuntimeRecord,
+} from './types.js';
+export {
+  ShardExecutionError,
+} from './types.js';
+export type {
+  ActiveShard,
+  SatelliteDelegationRequest,
+  ShardAuditTrail,
+} from './types.js';
+import { buildShardLineageEnvelope, deriveShardCompanionId } from './result-lineage.js';
+import { getRequestContext } from '../../primitives/llm/request-context.js';
+import { hydrateToolForCaller } from '../../core/agent/tool-surface/hydration.js';
+import { AGENT_LOOP_MAX_ASSISTANT_STEPS_PER_RUN } from '../../core/agent/turn-limits.js';
+import {
+  createArtifactReturnPort,
+  type ArtifactReturnBatch,
+  type ArtifactReturnPort,
+} from './artifact-return-port.js';
+import { toErrorMessage } from '../../shared/utils/errors.js';
+import {
+  buildCompletionHandoffDedupeKey,
+  buildFailedCompletionHandoffDelivery,
+  emitCompletionHandoff,
+  safeEmitCompletionHandoffError,
+  summarizeCompletionText,
+  type CompletionHandoffInput,
+  type CompletionHandoffRef,
+} from '../../core/agent/completion-handoff.js';
+import type {
+  CompletionNoticeBuffer,
+  CompletionNoticeDeliveryPort,
+} from '../../core/agent/completion-notices.js';
+import type {
+  ShardFoldReviewController,
+  ShardFoldReviewRecord,
+  ShardFoldReviewResolveParams,
+} from './fold-review.js';
+import {
+  resolveCoreCompanionIdFromConfig,
+  resolveCompanionNameFromConfig,
+} from '../../core/identity/companion-runtime.js';
+import {
+  ShardContextPackHelper,
+} from './context-pack.js';
+import { ShardToolSyncHelper } from './tool-sync.js';
+import type { CompressionGuidelineEvolutionPort } from '../../core/session/compression-guideline-evolution.js';
+import { createComponentLogger } from '../../shared/logger.js';
+import type { CompanionId } from '../../shared/routing/companion-id.js';
+import { CompanionVisibleOperationalError } from '../../core/tools/results.js';
+import {
+  runGovernedAutomataClass,
+  type AutomataClassLifecycleRuntime,
+} from '../automata/bus/class-lifecycle.js';
+import type { ProductionAutomataClassId } from '../automata/registry-contract.js';
+import { LiveShardDirectory } from './directory.js';
+import { createShardAgentRuntime } from './agent-runtime.js';
+import type { PolicyGovernedShardParentIcpDeliveryPort } from '../../shared/contracts/shard-parent-icp.js';
+import { LiveShardParentIcpRuntime } from './parent-icp-runtime.js';
+import {
+  createShardParentIcpTool,
+  SHARD_PARENT_ICP_TOOL_NAME,
+} from './parent-icp-tool.js';
+import type {
+  PostgresShardSchemaBinding,
+  PostgresShardSchemaLifecycle,
+} from '../../persistence/postgres/shard-schema-lifecycle.js';
+import {
+  cloneShardCapabilityGrantEvidence,
+  resolveShardLaunchCapabilityGrant,
+  toShardCapabilityGrantEvidence,
+  type ParentCapabilityGrantSnapshotProvider,
+} from './launch-capabilities.js';
+import type { ChargePolicyConfig } from '../../shared/contracts/charge-policy.js';
+import {
+  createShardConfigurationControl,
+  ShardConfigurationRegistry,
+} from './configuration-snapshot.js';
+import {
+  createGovernedShardTool,
+  GOVERNED_SHARD_TOOL_POLICIES,
+} from './tool-governance.js';
+
+const log = createComponentLogger('ShardManager');
+type ShardExecutionResult = Omit<ShardResult, 'completionHandoff'>;
+const DEFAULT_MAX_CONCURRENT = 5;
+const DEFAULT_MAX_TURNS = 1;
+const DEFAULT_SHARD_HEARTBEAT_STALE_AFTER_MS = 60_000;
+const DEFAULT_SHARD_HEARTBEAT_DISCONNECT_MULTIPLIER = 3;
+const DEFAULT_SHARD_CAPABILITIES = ['general'] as const;
+const SHARD_TOOLSET_ALL = '*';
+const BLOCKED_SHARD_TOOL_NAMES = new Set([
+  'subagent',
+  'spawn_subagent',
+  'load_tools',
+  // notify is the operator emergency button (contact the operator when a
+  // normal channel is down), never a companion outbound surface. A shard —
+  // even on a human-driven chat turn — must not hold external notify egress.
+  // The external.* capability mask (SHARD_CAPABILITY_DENIAL_MASK) is the
+  // defense-in-depth backstop; this name-block keeps the tool off the surface.
+  'notify',
+  'memory_write',
+  'memory_import_batch',
+  'memory_patch',
+  'memory_redact',
+  'memory_delete',
+  'undo_memory_delete',
+  'scratchpad_read',
+  'scratchpad_write',
+  // gjkh: canonical identity/purpose/trust surfaces are blocked at injection,
+  // mirroring the subagent seam's BLOCKED_SUBAGENT_TOOL_NAMES. Core stays
+  // authoritative for identity, values, and trust truth (charter 6.13), and a
+  // shard folds proposed changes back through origin-side review rather than
+  // mutating live state. The pre-existing contact_* split aliases already
+  // blocked even the reads, so the multiplexed `contact` tool
+  // (set_trust/set_relationship/link_identity/block = trust truth) joins them
+  // — otherwise an autonomous-tier ('*') shard would reach it live through the
+  // shard wrapper, which only stages memory mutations. `orient` is the sole
+  // exception: it keeps task-scoped reads under GOVERNED_SHARD_TOOL_POLICIES
+  // (mutations denied), matching p0le's disposition for orient.
+  'identity',
+  'north_star',
+  'contact',
+  'contact_list',
+  'contact_lookup',
+  'contact_note',
+  'contact_set_trust',
+  'contact_link_identity',
+  'contact_set_channel_privacy',
+  'contact_set_machine_intelligence',
+  SHARD_PARENT_ICP_TOOL_NAME,
+]);
+const APPRENTICE_SHARD_TOOL_EXTRAS = [
+] as const;
+export const DEFAULT_SHARD_TOOLSET = [
+  'memory',
+  // gjkh: `contact` was removed from the default toolset when it joined
+  // BLOCKED_SHARD_TOOL_NAMES (trust truth is core-authoritative, charter 6.13);
+  // naming a blocked tool in a toolset can never inject it, so keep the default
+  // honest rather than carrying a dead entry.
+  //
+  // as1wr: `repo_status`/`repo_diff` were retired hidden aliases (collapsed into
+  // the multiplexed `repo` tool's `inspect` action); a toolset naming them
+  // resolves to nothing, so they under-provisioned no capability and were dead
+  // entries. Dropped to keep the default honest and reference only live tool
+  // names. Re-granting repo inspection to shards is a separate capability
+  // decision — the live surface is the whole `repo` tool (inspect + patch +
+  // commit + branch + publish), which must be weighed against shard isolation,
+  // not restored implicitly by re-adding a dead alias.
+] as const;
+
+const DEFAULT_SHARD_TOOLSETS_BY_TIER: Readonly<Record<CapabilityTier, readonly string[]>> = {
+  nursery: DEFAULT_SHARD_TOOLSET,
+  apprentice: [...DEFAULT_SHARD_TOOLSET, ...APPRENTICE_SHARD_TOOL_EXTRAS],
+  autonomous: [SHARD_TOOLSET_ALL],
+  custom: [SHARD_TOOLSET_ALL],
+};
+
+function normalizeShardMaxTurns(value: unknown): number {
+  if (!Number.isFinite(value)) return DEFAULT_MAX_TURNS;
+  return Math.max(1, Math.min(AGENT_LOOP_MAX_ASSISTANT_STEPS_PER_RUN, Math.trunc(value as number)));
+}
+
+const SHARD_STATE_TRANSITIONS: Readonly<Record<ShardLifecycleState, readonly ShardLifecycleState[]>> = {
+  registering: ['ready', 'degraded', 'offline'],
+  ready: ['degraded', 'offline'],
+  degraded: ['ready', 'offline'],
+  offline: [],
+};
+
+export interface ShardToolCatalog {
+  core: readonly AgentTool<any>[];
+  extended: readonly AgentTool<any>[];
+}
+
+// ShardAuditTrail is canonically owned by ./types.ts and re-exported above.
+// Manager consumers retain their existing public import path without a second declaration.
+export interface ShardManagerDeps {
+  eventBus: EventBus;
+  llmProvider: LLMProviderPort;
+  sessionStore: SessionStore;
+  /** Buffer for compact companion-facing completion notices (never session-persisted). */
+  completionNotices?: CompletionNoticeBuffer | null;
+  /** Canonical parent-orchestration result delivery; production uses this instead of direct buffering. */
+  completionNoticeDelivery?: CompletionNoticeDeliveryPort | null;
+  sessionManager?: SessionManager | null;
+  embeddingService: EmbeddingProviderPort | null;
+  memoryProvider: MemoryProvider | null;
+  config: SubstrateConfig;
+  parentSystemPrompt: string;
+  maxConcurrent?: number;
+  heartbeatStaleAfterMs?: number;
+  heartbeatDisconnectAfterMs?: number;
+  shardToolsets?: ShardToolsetConfig;
+  toolCatalogProvider?: () => ShardToolCatalog;
+  auditTrail?: ShardAuditTrail;
+  runtimeMode?: ToolWiringValidationMode;
+  shardSessionMemorySyncAuditPath?: string;
+  artifactReturnPort?: ArtifactReturnPort;
+  satellitePresencePort?: SatellitePresencePort;
+  foldReviewController?: ShardFoldReviewController | null;
+  compressionGuidelineEvolution?: CompressionGuidelineEvolutionPort | null;
+  shardPostgresLifecycle?: PostgresShardSchemaLifecycle | null;
+  /**
+   * Optional canonical ordinary-ICP ingress. No local or raw transport
+   * fallback is permitted when inner-addressed shard-parent delivery is used.
+   */
+  shardParentIcpDelivery?: PolicyGovernedShardParentIcpDeliveryPort | null;
+  /**
+   * One authoritative capability owner read per launch. Callers must wire
+   * CapabilityRuntime.snapshotOwnerGrant directly; sequenced tier/token
+   * getters are not an atomic snapshot.
+   */
+  snapshotParentCapabilityGrant: ParentCapabilityGrantSnapshotProvider;
+  /**
+   * 2h6q.3: authenticated shard-workload registry. Each launch registers one
+   * workload generation (frozen derived access included) before execution and
+   * ends it on release, so a gateway sharing this registry can authenticate
+   * shard-originated exceptional-action requests. Absent ⇒ shards run without
+   * workload registration and every shard temporary-grant path stays
+   * unavailable (fail closed at the gateway).
+   */
+  workloadRegistry?: ShardWorkloadLifecyclePort;
+  /** Exact async-local parent turn envelopes captured at shard launch. */
+  activeTurnIntakeEnvelopesProvider?: () => readonly IntakeEnvelopeSnapshot[];
+  /** Governed Automata Bus lifecycle. Absent where no durable Automata runtime is composed. */
+  automataClassLifecycle?: AutomataClassLifecycleRuntime | null;
+}
+
+const SHARD_AUTOMATON_CLASS: ProductionAutomataClassId = 'shard.long_horizon';
+/**
+ * Automata Bus run id for one GOVERNED ATTEMPT at a shard (8n40k). The shard id
+ * alone is stable for the shard's whole life, so a second governed attempt
+ * under it would re-enter a terminal run and fail closed forever. Binding the
+ * attempt into the run id opens a fresh run instead, which is exactly what the
+ * class-lifecycle contract asks a re-attempting class to do. `workerId` and
+ * `taskId` stay the bare shard id so lineage still points at one shard.
+ */
+function buildShardAutomataRunId(shardId: string, attempt: number): string {
+  return attempt > 1 ? `${shardId}#attempt-${attempt}` : shardId;
+}
+const SHARD_TASK_LABEL = 'Long-horizon shard';
+const SHARD_TASK_SUMMARY = 'Execute one long-horizon shard workload to a terminal outcome.';
+
+export class ShardManager implements ShardExecutionPort {
+  private deps: ShardManagerDeps;
+  private auditTrail: ShardAuditTrail | null;
+  private artifactReturnPort: ArtifactReturnPort;
+  private satellitePresencePort: SatellitePresencePort;
+  private contextPackHelper: ShardContextPackHelper;
+  private toolSyncHelper: ShardToolSyncHelper;
+  private activeCount = 0;
+  private maxConcurrent: number;
+  private heartbeatStaleAfterMs: number;
+  private heartbeatDisconnectAfterMs: number;
+  private activeShards = new Map<string, ActiveShard>();
+  private workloadHandles = new Map<string, AuthenticatedShardWorkloadHandle>();
+  /**
+   * Governed Automata attempts per live shard id (8n40k). Entries live exactly
+   * as long as the shard does; see `buildShardAutomataRunId`.
+   */
+  private governedShardAttempts = new Map<string, number>();
+  readonly shardDirectory: LiveShardDirectory;
+  readonly shardParentIcp: LiveShardParentIcpRuntime;
+  private activeShardChannels = new Map<string, Set<string>>();
+  private configurationRegistry: ShardConfigurationRegistry;
+  private foldReviewController: ShardFoldReviewController | null;
+
+  constructor(deps: ShardManagerDeps) {
+    this.deps = deps;
+    if (deps.config.multiCompanion === true && !deps.shardPostgresLifecycle) {
+      throw new Error('Multi-companion shard execution requires a Postgres shard schema lifecycle');
+    }
+    // Owner-file settings (zet.7): explicit deps override wins (tests/embedding),
+    // then the operator's settings.json value, then the compiled default.
+    this.maxConcurrent = deps.maxConcurrent ?? deps.config.shardMaxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+    this.heartbeatStaleAfterMs = normalizeHeartbeatStaleAfterMs(
+      deps.heartbeatStaleAfterMs ?? deps.config.shardHeartbeatStaleAfterMs,
+      DEFAULT_SHARD_HEARTBEAT_STALE_AFTER_MS,
+    );
+    this.heartbeatDisconnectAfterMs = normalizeHeartbeatDisconnectAfterMs(
+      deps.heartbeatDisconnectAfterMs ?? deps.config.shardHeartbeatDisconnectAfterMs,
+      this.heartbeatStaleAfterMs,
+      this.heartbeatStaleAfterMs * DEFAULT_SHARD_HEARTBEAT_DISCONNECT_MULTIPLIER,
+    );
+    this.auditTrail = deps.auditTrail ?? null;
+    this.configurationRegistry = new ShardConfigurationRegistry({
+      liveParentConfig: () => this.deps.config,
+      auditTrail: this.auditTrail,
+    });
+    this.artifactReturnPort = deps.artifactReturnPort ?? createArtifactReturnPort();
+    this.satellitePresencePort = deps.satellitePresencePort ?? createActiveEmanationSatellitePresencePort();
+    this.contextPackHelper = new ShardContextPackHelper({
+      config: deps.config,
+      parentSystemPrompt: deps.parentSystemPrompt,
+      sessionStore: deps.sessionStore,
+      sessionManager: deps.sessionManager,
+      memoryProvider: deps.memoryProvider,
+      auditTrail: this.auditTrail,
+      shardSessionMemorySyncAuditPath: deps.shardSessionMemorySyncAuditPath,
+      resolveCapabilityTier: () => this.resolveCapabilityTier(),
+    });
+    this.foldReviewController = deps.foldReviewController ?? null;
+    this.toolSyncHelper = new ShardToolSyncHelper({
+      auditTrail: this.auditTrail,
+      foldReviewController: this.foldReviewController,
+      contextPackHelper: this.contextPackHelper,
+    });
+    this.shardDirectory = new LiveShardDirectory({
+      parentCompanionId: () => resolveCoreCompanionIdFromConfig(deps.config),
+      refreshDeployments: () => this.refreshShardHealth(),
+      deployments: () => [...this.activeShards.values()].map(shard => ({
+        id: shard.id,
+        name: shard.name,
+        task: shard.task,
+        startedAt: shard.startedAt,
+        state: shard.state,
+        health: shard.health === 'healthy'
+          ? 'healthy' as const
+          : shard.health === 'stale'
+            ? 'degraded' as const
+            : 'offline' as const,
+      })),
+      intakeScreening: deps.sessionManager?.intakeScreening ?? null,
+    });
+    this.shardParentIcp = new LiveShardParentIcpRuntime(
+      this.shardDirectory,
+      deps.shardParentIcpDelivery ?? null,
+    );
+    this.installAuditHooks();
+  }
+
+  /** Resolved concurrency cap on active shards (owner-file backed, zet.7). */
+  get maxConcurrentShards(): number {
+    return this.maxConcurrent;
+  }
+
+  /** Resolved heartbeat stale threshold in ms (owner-file backed, zet.7). */
+  get heartbeatStaleThresholdMs(): number {
+    return this.heartbeatStaleAfterMs;
+  }
+
+  /** Resolved heartbeat disconnect threshold in ms (owner-file backed, zet.7). */
+  get heartbeatDisconnectThresholdMs(): number {
+    return this.heartbeatDisconnectAfterMs;
+  }
+
+  async spawn(shardConfig: ShardConfig): Promise<ShardResult> {
+    const activeChargeContext = getRunChargeContext();
+    const chargePolicy = cloneShardChargePolicy(
+      this.deps.config.chargePolicy ?? activeChargeContext?.chargePolicy,
+    );
+    if (!activeChargeContext && chargePolicy) {
+      return runWithChargeContext({
+        chargePolicy,
+        eventBus: this.deps.eventBus,
+        lane: 'interactive',
+        correlation: getRequestContext(),
+      }, async () => this.spawn(shardConfig));
+    }
+
+    // A shard reads as no more than the conversation that spawned it
+    // (psfn-framework-mzytp); a spawn without an admitted viewer is refused.
+    const viewerCeiling = captureViewerCeilingFromRequest('Shard spawn');
+    this.refreshShardHealth();
+    const shardId = `shard-${randomUUID()}`;
+    const channelId = `shard:${shardId}`;
+    const coreCompanionId = resolveCoreCompanionIdFromConfig(this.deps.config);
+    const coreCompanionName = resolveCompanionNameFromConfig(this.deps.config);
+    const capabilityGrant = resolveShardLaunchCapabilityGrant(
+      coreCompanionId,
+      this.deps.snapshotParentCapabilityGrant,
+    );
+    const shardCompanionId = deriveShardCompanionId(coreCompanionId, shardId);
+    const shardPostgres = this.resolveShardPostgresBinding(coreCompanionId, shardId);
+    const shardRuntimeConfig: SubstrateConfig = {
+      ...this.deps.config,
+      companionId: shardCompanionId,
+      ...(shardPostgres ? { postgresSchema: shardPostgres.schema } : {}),
+    };
+    const contextPack = shardConfig.contextPack
+      ? this.contextPackHelper.withCompanionNameForContextPack(shardConfig.contextPack, coreCompanionName)
+      : await this.contextPackHelper.buildContextPack(
+        shardId,
+        channelId,
+        shardConfig,
+        coreCompanionName,
+        viewerCeiling,
+      );
+    const preparedConfig = contextPack
+      ? { ...shardConfig, contextPack }
+      : shardConfig;
+    const baseMessage: SubstrateMessage = {
+      id: shardId,
+      channelId,
+      channelType: 'api',
+      authorId: coreCompanionId,
+      authorName: coreCompanionName,
+      content: shardConfig.task,
+      timestamp: new Date(),
+    };
+    const lineage = buildShardLineageEnvelope({
+      kind: 'spawn',
+      coreCompanionId,
+      shardId,
+      shardChannelId: channelId,
+      sourceMessage: baseMessage,
+      ingestedIntakeEnvelopes: this.deps.activeTurnIntakeEnvelopesProvider?.(),
+      ...(shardConfig.sourceContext ? { sourceContext: shardConfig.sourceContext } : {}),
+    });
+    const execute = () => shardPostgres
+      ? this.executeShard(
+        shardId,
+        channelId,
+        preparedConfig,
+        baseMessage,
+        lineage,
+        shardRuntimeConfig,
+        capabilityGrant,
+        chargePolicy,
+        viewerCeiling,
+        shardPostgres,
+      )
+      : this.executeShard(
+        shardId,
+        channelId,
+        preparedConfig,
+        baseMessage,
+        lineage,
+        shardRuntimeConfig,
+        capabilityGrant,
+        chargePolicy,
+        viewerCeiling,
+      );
+    const charged = (): Promise<ShardResult> => (chargePolicy
+      ? runWithChargeContext({
+        chargePolicy,
+        eventBus: this.deps.eventBus,
+        lane: 'shard',
+        runId: shardId,
+        correlation: getRequestContext(),
+      }, execute)
+      : execute());
+    return await this.runGovernedShard({
+      shardId,
+      channelId,
+      name: shardConfig.name,
+      execute: charged,
+    });
+  }
+
+  /**
+   * Open, brief, and settle one long-horizon shard run inside the governed
+   * Automata Bus lifecycle.
+   *
+   * Shard execution itself is untouched: the shard agent keeps its own prompt
+   * stack, tools, and turn budget, and this class stays single-pass on the Bus —
+   * its deterministic terminal handoff carries the run's accounting and its
+   * governed artifact references, never shard output or transcript text.
+   */
+  private async runGovernedShard(input: {
+    shardId: string;
+    channelId: string;
+    name: string;
+    execute: () => Promise<ShardResult>;
+  }): Promise<ShardResult> {
+    const attempt = (this.governedShardAttempts.get(input.shardId) ?? 0) + 1;
+    this.governedShardAttempts.set(input.shardId, attempt);
+    const governed = await runGovernedAutomataClass({
+      runtime: this.deps.automataClassLifecycle,
+      spec: {
+        automatonClass: SHARD_AUTOMATON_CLASS,
+        runId: buildShardAutomataRunId(input.shardId, attempt),
+        workerId: input.shardId,
+        taskId: input.shardId,
+        taskLabel: SHARD_TASK_LABEL,
+        taskSummary: SHARD_TASK_SUMMARY,
+        sessionIds: [input.channelId],
+      },
+      briefingQuery: input.name,
+      work: async () => {
+        const result = await input.execute();
+        // Counts only. The shard's own artifact-return batch already owns
+        // returned-artifact custody, so this handoff reports how many artifacts
+        // came back rather than asserting a second durable custody claim over
+        // references the automata artifact store never took custody of.
+        return {
+          value: result,
+          resultKind: result.outcome === 'completed' ? 'final' : 'partial',
+          summary: `Shard ${result.outcome}: turns=${result.turns} `
+            + `lifecycleState=${result.lifecycleState} health=${result.health} `
+            + `returnedArtifacts=${result.artifactReturn?.artifacts.length ?? 0}`,
+        };
+      },
+    });
+    if (governed.status === 'replayed') {
+      throw new Error(
+        `Shard "${input.shardId}" re-entered an already terminal Automata run `
+        + `(attempt ${attempt})`,
+      );
+    }
+    return governed.value;
+  }
+
+  async delegateSatelliteSession(request: SatelliteDelegationRequest): Promise<ShardResult> {
+    const activeChargeContext = getRunChargeContext();
+    const chargePolicy = cloneShardChargePolicy(
+      this.deps.config.chargePolicy ?? activeChargeContext?.chargePolicy,
+    );
+    if (!activeChargeContext && chargePolicy) {
+      return runWithChargeContext({
+        chargePolicy,
+        eventBus: this.deps.eventBus,
+        lane: 'interactive',
+        correlation: getRequestContext(),
+      }, async () => this.delegateSatelliteSession(request));
+    }
+
+    this.refreshShardHealth();
+    const content = request.message.content.trim();
+    if (!content) {
+      throw new Error('Satellite shard delegation requires non-empty message content.');
+    }
+
+    const routing = request.routing ?? request.message.routing?.wyoming;
+    const shardId = `wyoming-shard-${randomUUID()}`;
+    const coreCompanionId = resolveCoreCompanionIdFromConfig(this.deps.config);
+    const capabilityGrant = resolveShardLaunchCapabilityGrant(
+      coreCompanionId,
+      this.deps.snapshotParentCapabilityGrant,
+    );
+    const shardCompanionId = deriveShardCompanionId(coreCompanionId, shardId);
+    const shardPostgres = this.resolveShardPostgresBinding(coreCompanionId, shardId);
+    const shardRuntimeConfig: SubstrateConfig = {
+      ...this.deps.config,
+      companionId: shardCompanionId,
+      ...(shardPostgres ? { postgresSchema: shardPostgres.schema } : {}),
+    };
+    const presenceSubjectId = resolvePresenceSubjectId(routing?.presence) ?? routing?.satelliteId?.trim();
+    const routeCapabilities = this.resolveWyomingRouteCapabilities(routing, presenceSubjectId);
+    const shardName = request.shardName?.trim()
+      || this.resolveWyomingShardName(routing, presenceSubjectId);
+    const embodimentContext = this.satellitePresencePort.resolveCanonicalEmbodiment(routing?.presence);
+    const shardConfig: ShardConfig = {
+      name: shardName,
+      task: request.message.content,
+      maxTurns: 1,
+      capabilities: routeCapabilities,
+      requiredCapabilities: routeCapabilities,
+      sourceContext: {
+        channelId: request.message.channelId,
+        ...(routing?.sessionId ? { logicalSessionId: routing.sessionId } : {}),
+        requestId: request.message.id,
+        ...(routing?.turnId ? { turnId: routing.turnId } : {}),
+        ...(embodimentContext ? { embodimentContext } : {}),
+      },
+    };
+    this.auditTrail?.append('satellite.shard.delegate.start', {
+      shardId,
+      channelId: request.message.channelId,
+      messageId: request.message.id,
+      connectionId: routing?.connectionId,
+      sessionId: routing?.sessionId,
+      turnId: routing?.turnId,
+      siteId: routing?.siteId,
+      satelliteId: routing?.satelliteId,
+      presence: routing?.presence,
+      capabilityGrant: toShardCapabilityGrantEvidence(capabilityGrant),
+    });
+    const lineage = buildShardLineageEnvelope({
+      kind: 'wyoming',
+      coreCompanionId,
+      shardId,
+      shardChannelId: request.message.channelId,
+      sourceMessage: request.message,
+      ...(routing ? { satelliteRouting: routing } : {}),
+    });
+    const execute = () => shardPostgres
+      ? this.executeShard(
+        shardId,
+        request.message.channelId,
+        shardConfig,
+        request.message,
+        lineage,
+        shardRuntimeConfig,
+        capabilityGrant,
+        chargePolicy,
+        null,
+        shardPostgres,
+      )
+      : this.executeShard(
+        shardId,
+        request.message.channelId,
+        shardConfig,
+        request.message,
+        lineage,
+        shardRuntimeConfig,
+        capabilityGrant,
+        chargePolicy,
+        null,
+      );
+
+    try {
+      const result = await this.runGovernedShard({
+        shardId,
+        channelId: request.message.channelId,
+        name: shardConfig.name,
+        execute: () => (chargePolicy
+          ? runWithChargeContext({
+            chargePolicy,
+            eventBus: this.deps.eventBus,
+            lane: 'shard',
+            runId: shardId,
+            correlation: getRequestContext(),
+          }, execute)
+          : execute()),
+      });
+      this.auditTrail?.append('satellite.shard.delegate.end', {
+        shardId,
+        status: 'completed',
+        durationMs: result.durationMs,
+        channelId: request.message.channelId,
+        messageId: request.message.id,
+        connectionId: routing?.connectionId,
+        sessionId: routing?.sessionId,
+        turnId: routing?.turnId,
+        capabilityGrant: toShardCapabilityGrantEvidence(capabilityGrant),
+      });
+      return result;
+    } catch (error) {
+      const message = toErrorMessage(error);
+      this.auditTrail?.append('satellite.shard.delegate.end', {
+        shardId,
+        status: 'failed',
+        error: message,
+        channelId: request.message.channelId,
+        messageId: request.message.id,
+        connectionId: routing?.connectionId,
+        sessionId: routing?.sessionId,
+        turnId: routing?.turnId,
+        capabilityGrant: toShardCapabilityGrantEvidence(capabilityGrant),
+      });
+      throw error;
+    }
+  }
+
+  private async executeShard(
+    shardId: string,
+    channelId: string,
+    shardConfig: ShardConfig,
+    baseMessage: SubstrateMessage,
+    lineage: ShardResult['lineage'],
+    runtimeConfig: SubstrateConfig,
+    capabilityGrant: DerivedShardCapabilityGrant,
+    shardChargePolicy: ChargePolicyConfig | null,
+    /**
+     * The spawning conversation's viewer ceiling (psfn-framework-mzytp). Null
+     * only for a satellite delegation, where the shard turn is the inbound
+     * satellite message itself and resolves that speaker's own viewer.
+     */
+    viewerCeiling: ViewerCeiling | null,
+    shardPostgres?: PostgresShardSchemaBinding,
+  ): Promise<ShardResult> {
+    this.refreshShardHealth();
+    if (this.activeCount >= this.maxConcurrent) {
+      await this.emitShardBlockedHandoff({
+        shardId,
+        channelId,
+        shardConfig,
+        lineage,
+        reason: 'concurrency_limit',
+        error: `Shard limit reached (${this.maxConcurrent} concurrent). Wait for active shards to complete.`,
+      });
+      throw new CompanionVisibleOperationalError({
+        companionMessage:
+          `Shard limit reached (${this.maxConcurrent} concurrent). Wait for active shards to complete.`,
+        errorClass: 'unavailable',
+        retryHint: 'retry_after_delay',
+      });
+    }
+
+    const startTime = Date.now();
+    const maxTurns = normalizeShardMaxTurns(shardConfig.maxTurns);
+    const capabilities = this.resolveAdvertisedCapabilities(shardConfig.capabilities);
+    const requiredCapabilities = this.resolveRequiredCapabilities(shardConfig.requiredCapabilities);
+    const missingCapabilities = requiredCapabilities.filter(capability => !capabilities.includes(capability));
+    if (missingCapabilities.length > 0) {
+      await this.emitShardBlockedHandoff({
+        shardId,
+        channelId,
+        shardConfig,
+        lineage,
+        reason: 'missing_capabilities',
+        error: `Shard routing denied: "${shardConfig.name}" is missing required capability tokens `
+        + `(${missingCapabilities.join(', ')}).`,
+      });
+      throw new CompanionVisibleOperationalError({
+        companionMessage:
+          `Shard routing denied: "${shardConfig.name}" is missing required capability tokens `
+          + `(${missingCapabilities.join(', ')}).`,
+        errorClass: 'policy_blocked',
+        retryHint: 'try_alternative_input',
+      });
+    }
+    const heartbeatStaleAfterMs = this.resolveHeartbeatStaleAfterMs(shardConfig.heartbeatStaleAfterMs);
+    const heartbeatDisconnectAfterMs = this.resolveHeartbeatDisconnectAfterMs(
+      shardConfig.heartbeatDisconnectAfterMs,
+      heartbeatStaleAfterMs,
+    );
+    const capabilityGrantEvidence = toShardCapabilityGrantEvidence(capabilityGrant);
+    const configurationControl = createShardConfigurationControl({
+      shardId,
+      parentCompanionId: lineage.companionProvenance.parentCompanionId,
+      lifecycleState: 'registering',
+      health: 'healthy',
+      capturedAt: startTime,
+      maxTurns,
+      capabilityGrant: capabilityGrantEvidence,
+      lineage,
+      config: this.deps.config,
+      parentSystemPrompt: this.deps.parentSystemPrompt,
+    });
+    chargeSurface('shardLaunch', {
+      details: {
+        shardId,
+        name: shardConfig.name,
+        maxTurns,
+        channelId,
+      },
+    });
+
+    this.configurationRegistry.register(configurationControl, shardChargePolicy);
+    this.activeCount++;
+    this.activeShards.set(shardId, {
+      id: shardId,
+      name: shardConfig.name,
+      task: shardConfig.task,
+      startedAt: startTime,
+      channelId,
+      state: 'registering',
+      stateReason: 'spawn_requested',
+      health: 'healthy',
+      lastTransitionAt: startTime,
+      lastHeartbeatAt: startTime,
+      heartbeatStaleAfterMs,
+      heartbeatDisconnectAfterMs,
+      capabilities,
+      requiredCapabilities,
+      capabilityGrant: capabilityGrantEvidence,
+      lineage,
+    });
+    this.registerActiveShardChannel(channelId, shardId);
+    this.auditTrail?.append('shard.lifecycle.transition', {
+      shardId,
+      from: 'none',
+      to: 'registering',
+      reason: 'spawn_requested',
+      health: 'healthy',
+      channelId,
+    });
+    this.auditTrail?.append('shard.spawn.start', {
+      shardId,
+      name: shardConfig.name,
+      maxTurns,
+      channelId,
+      capabilities,
+      requiredCapabilities,
+      capabilityGrant: capabilityGrantEvidence,
+    });
+    let shardPostgresPrepared = false;
+    let executionFailure: Error | undefined;
+    let totalInput = 0;
+    let totalOutput = 0;
+    let lastModel = '';
+    let lastContent = '';
+    let turns = 0;
+    let artifactReturn: ArtifactReturnBatch | null = null;
+    try {
+      await this.emitShardLifecycleProgressHandoff({
+        shardId,
+        shardConfig,
+        lineage,
+        status: 'started',
+        completedTurns: 0,
+        maxTurns,
+      });
+      // 2h6q.3: register the authenticated workload generation (with its
+      // frozen derived access) before any execution, inside the try so a
+      // registration failure releases the shard instead of leaking it. The
+      // task channel and the direct human-chat lane both address this
+      // workload at the gateway.
+      if (this.deps.workloadRegistry) {
+        const workloadHandle = await this.deps.workloadRegistry.registerWorkload({
+          parentCompanionId: lineage.companionProvenance.parentCompanionId,
+          shardId,
+          shardLabel: shardConfig.name,
+          channelIds: [channelId, `${channelId}:human`],
+          capabilityGrant,
+        });
+        this.workloadHandles.set(shardId, workloadHandle);
+      }
+      if (shardPostgres) {
+        const lifecycle = this.deps.shardPostgresLifecycle;
+        if (!lifecycle) {
+          throw new Error('Multi-companion shard execution requires a Postgres shard schema lifecycle');
+        }
+        await lifecycle.prepare(shardPostgres);
+        shardPostgresPrepared = true;
+        this.auditTrail?.append('shard.postgres.prepared', {
+          shardId,
+          postgresSchema: shardPostgres.schema,
+          postgresRole: shardPostgres.role,
+        });
+      }
+      const shardMemoryReviewContext: Pick<ShardRuntimeRecord, 'channelId' | 'task' | 'lineage'> = {
+        channelId,
+        task: shardConfig.task,
+        lineage,
+      };
+      const systemPrompt = this.contextPackHelper.resolveSystemPrompt(shardConfig);
+      // Shards don't recurse or self-escalate: we inject a tier-limited subset only.
+      const injectedTools = this.resolveInjectedTools(shardId, shardMemoryReviewContext);
+      const { agentLoop, sessionManager } = createShardAgentRuntime({
+        eventBus: this.deps.eventBus,
+        llmProvider: this.deps.llmProvider,
+        sessionStore: this.deps.sessionStore,
+        runtimeConfig,
+        systemPrompt,
+        runtimeMode: this.deps.runtimeMode,
+        capabilityAccess: capabilityGrant.access,
+        memoryProvider: this.deps.memoryProvider,
+        exposeMemory: !shardConfig.contextPack,
+        tools: injectedTools,
+        viewerCeiling,
+        // hrmrq.54: resolved at spawn time — composition assigns the parent
+        // SessionManager's screening service after construction.
+        intakeScreening: this.deps.sessionManager?.intakeScreening ?? null,
+      });
+      const chatChannelId = `${channelId}:human`;
+      const chatTools = this.resolveInjectedTools(shardId, {
+        channelId: chatChannelId,
+        task: shardConfig.task,
+        lineage,
+      });
+      const { agentLoop: chatAgentLoop } = createShardAgentRuntime({
+        eventBus: this.deps.eventBus,
+        llmProvider: this.deps.llmProvider,
+        sessionStore: this.deps.sessionStore,
+        runtimeConfig,
+        systemPrompt: `${systemPrompt}\n\nYou are responding in a direct human-to-shard thread. Stay within this shard's assigned remit and do not impersonate the parent companion.`,
+        runtimeMode: this.deps.runtimeMode,
+        capabilityAccess: capabilityGrant.access,
+        memoryProvider: this.deps.memoryProvider,
+        exposeMemory: !shardConfig.contextPack,
+        tools: chatTools,
+        viewerCeiling,
+        // hrmrq.54: the human-to-shard chat runtime screens tool results too.
+        intakeScreening: this.deps.sessionManager?.intakeScreening ?? null,
+      });
+      this.shardDirectory.register(shardId, {
+        agentLoop: chatAgentLoop,
+        channelId: chatChannelId,
+      });
+      this.auditTrail?.append('shard.tools.injected', {
+        shardId,
+        tier: capabilityGrant.access.getTier(),
+        grantedTokens: [...capabilityGrant.tokens],
+        tools: injectedTools.map(tool => tool.name),
+        capabilityGrant: capabilityGrantEvidence,
+      });
+      this.transitionShardState(shardId, 'ready', 'agent_initialized');
+      this.touchShardHeartbeat(shardId);
+      // No memoryExtractor — shards don't run L1 extraction/archive jobs.
+
+      // Execute with a bounded turn loop.
+      for (
+        let turn = 0;
+        turn < this.configurationRegistry.effectiveWorkerBudget(shardId).maxTurns;
+        turn++
+      ) {
+        this.refreshShardHealth();
+        this.assertShardRoutable(shardId, requiredCapabilities);
+        this.touchShardHeartbeat(shardId);
+        const effectiveConfiguration = this.configurationRegistry.effectiveValues(shardId);
+        const turnMessage: SubstrateMessage = {
+          ...baseMessage,
+          ...(turn > 0 ? {
+            id: `${shardId}-turn-${turn}`,
+            content: lastContent,
+          } : {}),
+          routing: {
+            ...baseMessage.routing,
+            modelOverride: {
+              provider: effectiveConfiguration.model.provider,
+              model: effectiveConfiguration.model.model,
+              maxTokens: effectiveConfiguration.workerBudget.maxOutputTokens,
+              ...(effectiveConfiguration.model.contextWindow !== undefined
+                ? { contextWindow: effectiveConfiguration.model.contextWindow }
+                : {}),
+              purpose: 'chat',
+            },
+          },
+        };
+
+        const response = await agentLoop.handleMessage(turnMessage);
+        try {
+          await this.deps.compressionGuidelineEvolution?.captureAndReview({
+            sessionManager,
+            message: turnMessage,
+            response,
+          });
+        } catch (error) {
+          log.error('Shard compression-guideline evolution failed', {
+            shardId,
+            channelId,
+            sourceMessageId: turnMessage.id,
+            error: toErrorMessage(error),
+          });
+          this.auditTrail?.append('shard.compression_guideline.review_failed', {
+            shardId,
+            channelId,
+            sourceMessageId: turnMessage.id,
+            error: toErrorMessage(error),
+          });
+        }
+        const shardArtifactReturn = this.artifactReturnPort.collectArtifactReturn({
+          lineage,
+          turnIndex: turn + 1,
+          turnMessageId: turnMessage.id,
+          attachments: response.attachments,
+        });
+        if (shardArtifactReturn) {
+          const shardArtifacts = shardArtifactReturn.artifacts;
+          artifactReturn = artifactReturn
+            ? {
+              mergePolicy: artifactReturn.mergePolicy,
+              artifacts: [...artifactReturn.artifacts, ...shardArtifacts],
+            }
+            : {
+              mergePolicy: shardArtifactReturn.mergePolicy,
+              artifacts: [...shardArtifacts],
+            };
+          this.auditTrail?.append('shard.artifact.return', {
+            shardId,
+            turnIndex: turn + 1,
+            artifactIds: shardArtifacts.map(artifact => artifact.artifactId),
+            mergePolicy: shardArtifactReturn.mergePolicy,
+          });
+          if (this.foldReviewController) {
+            await this.foldReviewController.recordArtifactReturn({
+              shardId,
+              channelId,
+              task: shardConfig.task,
+              lineage,
+              timestamp: Date.now(),
+              artifactReturn: shardArtifactReturn,
+            });
+          }
+        }
+
+        totalInput += response.metadata.inputTokens;
+        totalOutput += response.metadata.outputTokens;
+        lastModel = response.metadata.model;
+        lastContent = response.content;
+        turns++;
+        this.touchShardHeartbeat(shardId);
+        await this.emitShardLifecycleProgressHandoff({
+          shardId,
+          shardConfig,
+          lineage,
+          status: 'progress',
+          completedTurns: turns,
+          maxTurns,
+        });
+
+        // Shards are ephemeral and intentionally do not own a durable post-turn
+        // worker. For a bounded multi-turn shard, the manager therefore owns
+        // compaction between turns so the next turn sees a committed summary
+        // and compression-guideline review retains the exact shard trajectory.
+        const recordedTurn = response.metadata.turnId
+          ? sessionManager.findRecordedTurn(channelId, response.metadata.turnId)
+          : null;
+        const autoCompactionEligible = recordedTurn?.observability
+          ?.snapshot?.sessionContext?.autoCompactionEligible === true;
+        const effectiveMaxTurns = this.configurationRegistry
+          .effectiveWorkerBudgetIfAvailable(shardId)?.maxTurns ?? turn + 1;
+        if (turn + 1 < effectiveMaxTurns && autoCompactionEligible) {
+          await sessionManager.scheduleAutoCompactionBetweenTurns({
+            channelId,
+            systemPrompt,
+            memoriesBlock: '',
+            llmProvider: this.deps.llmProvider,
+            throwOnFailure: true,
+          });
+        }
+
+        // For a one-turn shard, we break after the first turn.
+        // Multi-turn shards continue only if the response suggests more work.
+        if (turn === 0 && effectiveMaxTurns === 1) break;
+      }
+
+      this.transitionShardState(shardId, 'offline', 'completed');
+      const finishedShard = this.activeShards.get(shardId);
+      const result: ShardExecutionResult = {
+        shardId,
+        name: shardConfig.name,
+        content: lastContent,
+        model: lastModel,
+        inputTokens: totalInput,
+        outputTokens: totalOutput,
+        durationMs: Date.now() - startTime,
+        turns,
+        outcome: 'completed',
+        lifecycleState: finishedShard?.state ?? 'offline',
+        health: finishedShard?.health ?? 'healthy',
+        stateReason: finishedShard?.stateReason ?? 'completed',
+        ...(finishedShard?.failureReason ? { failureReason: finishedShard.failureReason } : {}),
+        capabilities: [...capabilities],
+        requiredCapabilities: [...requiredCapabilities],
+        capabilityGrant: capabilityGrantEvidence,
+        lineage,
+        ...(artifactReturn ? { artifactReturn } : {}),
+      };
+      this.auditTrail?.append('shard.spawn.end', {
+        shardId,
+        status: 'completed',
+        durationMs: result.durationMs,
+        turns: result.turns,
+        lifecycleState: result.lifecycleState,
+        health: result.health,
+        capabilityGrant: capabilityGrantEvidence,
+      });
+      let completionHandoff: ShardResult['completionHandoff'] = { status: 'delivered' };
+      try {
+        await this.emitShardCompletionHandoff({
+          shardConfig,
+          channelId,
+          result,
+        });
+      } catch (handoffError) {
+        completionHandoff = buildFailedCompletionHandoffDelivery(handoffError);
+        log.error('Completed shard lifecycle handoff failed without changing the shard result', {
+          shardId,
+          error: completionHandoff.error,
+        });
+      }
+      return {
+        ...result,
+        completionHandoff,
+      };
+    } catch (error) {
+      const msg = toErrorMessage(error);
+      this.transitionShardState(shardId, 'degraded', 'execution_failed', msg);
+      this.transitionShardState(shardId, 'offline', 'execution_failed', msg);
+      this.auditTrail?.append('shard.spawn.end', {
+        shardId,
+        status: 'failed',
+        durationMs: Date.now() - startTime,
+        error: msg,
+        capabilityGrant: capabilityGrantEvidence,
+      });
+      let completionHandoff: ShardResult['completionHandoff'] = { status: 'delivered' };
+      try {
+        await this.emitShardFailureHandoff({
+          shardId,
+          channelId,
+          shardConfig,
+          lineage,
+          error: msg,
+        });
+      } catch (handoffError) {
+        completionHandoff = buildFailedCompletionHandoffDelivery(handoffError);
+        log.error('Failed shard lifecycle handoff could not be recorded', {
+          shardId,
+          error: completionHandoff.error,
+        });
+      }
+      const failedShard = this.activeShards.get(shardId);
+      const result: ShardResult = {
+        shardId,
+        name: shardConfig.name,
+        content: lastContent,
+        model: lastModel,
+        inputTokens: totalInput,
+        outputTokens: totalOutput,
+        durationMs: Date.now() - startTime,
+        turns,
+        outcome: 'failed',
+        completionHandoff,
+        lifecycleState: failedShard?.state ?? 'offline',
+        health: failedShard?.health ?? 'failed',
+        stateReason: failedShard?.stateReason ?? 'execution_failed',
+        failureReason: msg,
+        capabilities: [...capabilities],
+        requiredCapabilities: [...requiredCapabilities],
+        capabilityGrant: capabilityGrantEvidence,
+        lineage,
+        ...(artifactReturn ? { artifactReturn } : {}),
+      };
+      executionFailure = new ShardExecutionError(
+        `Shard "${shardConfig.name}" failed (execution_failed): ${msg}`,
+        result,
+        { cause: error },
+      );
+      throw executionFailure;
+    } finally {
+      const cleanupErrors: unknown[] = [];
+      try {
+        await this.releaseActiveShard(shardId, channelId);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+      if (shardPostgres && shardPostgresPrepared) {
+        const lifecycle = this.deps.shardPostgresLifecycle;
+        if (!lifecycle) {
+          cleanupErrors.push(
+            new Error('Multi-companion shard cleanup lost its Postgres schema lifecycle'),
+          );
+        } else {
+          try {
+            const evidence = await lifecycle.cleanup(shardPostgres);
+            this.auditTrail?.append('shard.postgres.cleaned', {
+              shardId,
+              postgresSchema: shardPostgres.schema,
+              droppedObjectCount: evidence.droppedObjectCount,
+            });
+          } catch (cleanupError) {
+            cleanupErrors.push(cleanupError);
+          }
+        }
+      }
+      if (cleanupErrors.length === 1 && !executionFailure) {
+        throw cleanupErrors[0];
+      }
+      if (cleanupErrors.length > 0 && executionFailure) {
+        // The execution failure already carries the truthful worker outcome and
+        // the terminal lifecycle-delivery status. Surfacing it inside an
+        // AggregateError would force callers to excavate `.errors[0]` to recover
+        // that structure, so the structured error stays the thrown value and
+        // the cleanup failures stay visible on it as suppressed context.
+        // `.suppressed` is custom secondary-failure context on this error; it
+        // keeps cleanup failures visible without replacing the primary throw.
+        const carrier = executionFailure as Error & { suppressed?: unknown[] };
+        carrier.suppressed = [...(carrier.suppressed ?? []), ...cleanupErrors];
+        log.error('Shard cleanup failed after terminal execution; preserving structured result', {
+          shardId,
+          cleanupErrorCount: cleanupErrors.length,
+        });
+        throw executionFailure;
+      }
+      if (cleanupErrors.length > 0) {
+        throw new AggregateError(
+          cleanupErrors,
+          `Shard "${shardConfig.name}" cleanup failed`,
+        );
+      }
+    }
+  }
+
+  private resolveShardPostgresBinding(
+    parentCompanionId: CompanionId,
+    shardId: string,
+  ): PostgresShardSchemaBinding | null {
+    if (this.deps.config.multiCompanion !== true) return null;
+    const parentSchema = this.deps.config.postgresSchema?.trim();
+    if (!parentSchema) {
+      throw new Error('Multi-companion shard execution requires the parent Postgres schema');
+    }
+    const lifecycle = this.deps.shardPostgresLifecycle;
+    if (!lifecycle) {
+      throw new Error('Multi-companion shard execution requires a Postgres shard schema lifecycle');
+    }
+    return lifecycle.derive(parentCompanionId, parentSchema, shardId);
+  }
+
+  getActiveCount(): number {
+    this.refreshShardHealth();
+    return this.activeCount;
+  }
+
+  getActiveShards(): ActiveShard[] {
+    this.refreshShardHealth();
+    return [...this.activeShards.values()].map(shard => ({
+      ...shard,
+      capabilities: [...shard.capabilities],
+      requiredCapabilities: [...shard.requiredCapabilities],
+      capabilityGrant: cloneShardCapabilityGrantEvidence(shard.capabilityGrant),
+      lineage: cloneShardLineage(shard.lineage),
+    }));
+  }
+
+  getShardConfigurationSnapshot(
+    parentCompanionId: string,
+    shardId: string,
+  ): ShardConfigurationSnapshot | null {
+    this.refreshShardHealth();
+    return this.configurationRegistry.getSnapshot(parentCompanionId, shardId);
+  }
+
+  updateShardConfigurationOverrides(input: {
+    parentCompanionId: string;
+    shardId: string;
+    actor: string;
+    override: unknown;
+  }): ShardConfigurationMutationResult {
+    this.refreshShardHealth();
+    return this.configurationRegistry.update(input);
+  }
+
+  private async emitShardBlockedHandoff(input: {
+    shardId: string;
+    channelId: string;
+    shardConfig: ShardConfig;
+    lineage: ShardResult['lineage'];
+    reason: string;
+    error: string;
+  }): Promise<void> {
+    await this.emitShardHandoff({
+      source: 'shard',
+      taskId: input.shardId,
+      taskLabel: input.shardConfig.name,
+      shardId: input.shardId,
+      status: 'blocked',
+      resultSummary: `Shard "${input.shardConfig.name}" did not start.`,
+      outputRefs: [
+        { kind: 'session', ref: input.channelId, label: 'shard transcript' },
+        { kind: 'lineage', ref: input.lineage.shardId, label: input.lineage.kind },
+      ],
+      validationPerformed: ['shard_spawn_policy', input.reason],
+      blocker: {
+        reason: input.reason,
+        error: input.error,
+      },
+      partialResult: false,
+      recommendedNextAction: 'Revise the shard request, wait for active shards to clear, or choose a narrower task before any partner notification.',
+      origin: this.originFromShardConfig(input.shardConfig),
+      ingestedIntakeEnvelopes: input.lineage.ingestedIntakeEnvelopes,
+      dedupeKey: buildCompletionHandoffDedupeKey([
+        'shard',
+        input.shardId,
+        'blocked',
+        input.reason,
+        input.shardConfig.sourceContext?.requestId,
+        input.shardConfig.sourceContext?.turnId,
+      ]),
+    }, input.shardConfig.sourceContext?.channelId);
+  }
+
+  private async emitShardCompletionHandoff(input: {
+    shardConfig: ShardConfig;
+    channelId: string;
+    result: ShardExecutionResult;
+  }): Promise<void> {
+    const artifactRefs = this.buildArtifactRefs(input.result);
+    await this.emitShardHandoff({
+      source: 'shard',
+      taskId: input.result.shardId,
+      taskLabel: input.result.name,
+      shardId: input.result.shardId,
+      status: 'completed',
+      resultSummary: summarizeCompletionText(input.result.content),
+      artifactRefs,
+      outputRefs: [
+        { kind: 'session', ref: input.channelId, label: 'shard transcript' },
+        { kind: 'lineage', ref: input.result.lineage.shardId, label: input.result.lineage.kind },
+        ...(artifactRefs.length > 0
+          ? [{ kind: 'fold_review', ref: input.result.shardId, label: 'artifact review required' }]
+          : []),
+      ],
+      validationPerformed: [
+        'shard_lifecycle_terminal',
+        `state_reason:${input.result.stateReason}`,
+        `health:${input.result.health}`,
+        ...(input.result.artifactReturn ? ['artifact_return_review_required'] : []),
+      ],
+      partialResult: false,
+      recommendedNextAction: input.result.artifactReturn
+        ? 'Review returned artifacts through fold review, then decide whether to continue or write a companion-authored response.'
+        : 'Review the shard handoff and decide whether to continue, delegate follow-up work, or write a companion-authored response.',
+      origin: this.originFromShardConfig(input.shardConfig),
+      ingestedIntakeEnvelopes: input.result.lineage.ingestedIntakeEnvelopes,
+      dedupeKey: buildCompletionHandoffDedupeKey([
+        'shard',
+        input.result.shardId,
+        'completed',
+        input.result.stateReason,
+        input.shardConfig.sourceContext?.requestId,
+        input.shardConfig.sourceContext?.turnId,
+      ]),
+    }, input.shardConfig.sourceContext?.channelId);
+  }
+
+  private async emitShardFailureHandoff(input: {
+    shardId: string;
+    channelId: string;
+    shardConfig: ShardConfig;
+    lineage: ShardResult['lineage'];
+    error: string;
+  }): Promise<void> {
+    await this.emitShardHandoff({
+      source: 'shard',
+      taskId: input.shardId,
+      taskLabel: input.shardConfig.name,
+      shardId: input.shardId,
+      status: 'failed',
+      resultSummary: `Shard "${input.shardConfig.name}" failed before producing a final handoff.`,
+      outputRefs: [
+        { kind: 'session', ref: input.channelId, label: 'shard transcript' },
+        { kind: 'lineage', ref: input.lineage.shardId, label: input.lineage.kind },
+      ],
+      validationPerformed: ['shard_lifecycle_terminal', 'execution_failed'],
+      blocker: {
+        reason: 'execution_failed',
+        error: input.error,
+      },
+      partialResult: false,
+      recommendedNextAction: 'Inspect the shard transcript/error, then decide whether to retry with narrower scope or communicate a companion-authored status.',
+      origin: this.originFromShardConfig(input.shardConfig),
+      dedupeKey: buildCompletionHandoffDedupeKey([
+        'shard',
+        input.shardId,
+        'failed',
+        input.error,
+        input.shardConfig.sourceContext?.requestId,
+        input.shardConfig.sourceContext?.turnId,
+      ]),
+    }, input.shardConfig.sourceContext?.channelId);
+  }
+
+  private async emitShardLifecycleProgressHandoff(input: {
+    shardId: string;
+    shardConfig: ShardConfig;
+    lineage: ShardResult['lineage'];
+    status: 'started' | 'progress';
+    completedTurns: number;
+    maxTurns: number;
+  }): Promise<void> {
+    await this.emitShardHandoff({
+      source: 'shard',
+      taskId: input.shardId,
+      taskLabel: input.shardConfig.name,
+      shardId: input.shardId,
+      status: input.status,
+      resultSummary: input.status === 'started'
+        ? `Shard "${input.shardConfig.name}" started.`
+        : `Shard "${input.shardConfig.name}" completed ${input.completedTurns} of ${input.maxTurns} bounded turns.`,
+      outputRefs: [
+        { kind: 'lineage', ref: input.lineage.shardId, label: input.lineage.kind },
+      ],
+      validationPerformed: [
+        'shard_lifecycle_nonterminal',
+        ...(input.status === 'progress' ? [`completed_turns:${input.completedTurns}`] : []),
+      ],
+      partialResult: input.status === 'progress',
+      recommendedNextAction: 'Keep the task visible without interrupting the foreground conversation.',
+      origin: this.originFromShardConfig(input.shardConfig),
+      dedupeKey: buildCompletionHandoffDedupeKey([
+        'shard',
+        input.shardId,
+        input.status,
+        String(input.completedTurns),
+        input.shardConfig.sourceContext?.requestId,
+        input.shardConfig.sourceContext?.turnId,
+      ]),
+    }, input.shardConfig.sourceContext?.channelId, false);
+  }
+
+  private async emitShardHandoff(
+    handoff: CompletionHandoffInput,
+    targetChannelId: string | undefined,
+    bufferNotice = true,
+  ): Promise<void> {
+    const intakeScreening = this.deps.sessionManager?.intakeScreening ?? null;
+    const intakeSinkGate = this.deps.sessionManager?.intakeSinkGate ?? null;
+    try {
+      await emitCompletionHandoff({
+        eventBus: this.deps.eventBus,
+        handoff,
+        ...(targetChannelId?.trim() ? { targetChannelId } : {}),
+        ...(bufferNotice && this.deps.completionNotices
+          ? { notices: this.deps.completionNotices }
+          : {}),
+        ...(bufferNotice && this.deps.completionNoticeDelivery
+          ? { noticeDelivery: this.deps.completionNoticeDelivery }
+          : {}),
+        intakeScreening,
+        intakeSinkGate,
+      });
+    } catch (error) {
+      this.auditTrail?.append('shard.completion_handoff.failed', {
+        shardId: handoff.shardId,
+        targetChannelId,
+        error: safeEmitCompletionHandoffError(error),
+      });
+      throw error;
+    }
+  }
+
+  private buildArtifactRefs(result: Pick<ShardResult, 'artifactReturn'>): CompletionHandoffRef[] {
+    return (result.artifactReturn?.artifacts ?? []).map(artifact => ({
+      kind: artifact.kind,
+      ref: artifact.artifactId,
+      label: artifact.name,
+      policy: artifact.mergePolicy,
+    }));
+  }
+
+  private originFromShardConfig(shardConfig: ShardConfig): CompletionHandoffInput['origin'] {
+    const source = shardConfig.sourceContext;
+    if (!source) {
+      return {};
+    }
+    return {
+      sourceChannelId: source.channelId,
+      ...(source.logicalSessionId ? { logicalSessionId: source.logicalSessionId } : {}),
+      ...(source.requestId ? { requestId: source.requestId, sourceMessageId: source.requestId } : {}),
+      ...(source.turnId ? { turnId: source.turnId, originatingTaskId: source.turnId } : {}),
+    };
+  }
+
+  async listFoldReviews(): Promise<ShardFoldReviewRecord[]> {
+    return await this.requireFoldReviewController().listFoldReviews();
+  }
+
+  async getFoldReview(shardId: string): Promise<ShardFoldReviewRecord | null> {
+    return await this.requireFoldReviewController().getFoldReview(shardId);
+  }
+
+  async resolveFoldReview(params: ShardFoldReviewResolveParams): Promise<ShardFoldReviewRecord | null> {
+    const controller = this.requireFoldReviewController();
+    const review = await controller.resolveFoldReview(params);
+    if (review?.reviewState === 'approved') {
+      const sourceContext = review.lineage.sourceContext;
+      await this.emitShardHandoff({
+        source: 'shard',
+        taskId: review.shardId,
+        taskLabel: review.task,
+        shardId: review.shardId,
+        status: 'folded_back',
+        resultSummary: 'Approved shard outputs were folded back through operator review.',
+        outputRefs: [
+          { kind: 'fold_review', ref: review.validationPath, label: 'approved' },
+        ],
+        validationPerformed: ['shard_fold_review', 'operator_approved'],
+        partialResult: false,
+        recommendedNextAction: 'Review the approved folded-back outputs and continue in the companion’s own voice.',
+        origin: {
+          ...(sourceContext?.channelId
+            ? { sourceChannelId: sourceContext.channelId }
+            : {}),
+          ...(sourceContext?.logicalSessionId
+            ? { logicalSessionId: sourceContext.logicalSessionId }
+            : {}),
+          ...(sourceContext?.requestId
+            ? {
+                requestId: sourceContext.requestId,
+                sourceMessageId: sourceContext.requestId,
+              }
+            : {}),
+          ...(sourceContext?.turnId
+            ? {
+                turnId: sourceContext.turnId,
+                originatingTaskId: sourceContext.turnId,
+              }
+            : {}),
+        },
+        ingestedIntakeEnvelopes: review.lineage.ingestedIntakeEnvelopes,
+        dedupeKey: buildCompletionHandoffDedupeKey([
+          'shard',
+          review.shardId,
+          'folded_back',
+        ]),
+      }, sourceContext?.channelId);
+    }
+    return review;
+  }
+
+  private resolveHeartbeatStaleAfterMs(value: number | undefined): number {
+    return normalizeHeartbeatStaleAfterMs(value, this.heartbeatStaleAfterMs);
+  }
+
+  private resolveHeartbeatDisconnectAfterMs(value: number | undefined, staleAfterMs: number): number {
+    return normalizeHeartbeatDisconnectAfterMs(value, staleAfterMs, this.heartbeatDisconnectAfterMs);
+  }
+
+  private requireFoldReviewController(): ShardFoldReviewController {
+    if (!this.foldReviewController) {
+      throw new Error('Shard fold review controller unavailable.');
+    }
+    return this.foldReviewController;
+  }
+
+  private resolveAdvertisedCapabilities(tokens: readonly string[] | undefined): string[] {
+    return normalizeCapabilityTokens(tokens, DEFAULT_SHARD_CAPABILITIES);
+  }
+
+  private resolveRequiredCapabilities(tokens: readonly string[] | undefined): string[] {
+    return normalizeCapabilityTokens(tokens);
+  }
+
+  private touchShardHeartbeat(shardId: string): void {
+    const shard = this.activeShards.get(shardId);
+    if (!shard) return;
+    shard.lastHeartbeatAt = Date.now();
+    if (shard.state === 'degraded' && shard.stateReason === 'heartbeat_stale') {
+      this.transitionShardState(shardId, 'ready', 'heartbeat_recovered');
+    }
+  }
+
+  private refreshShardHealth(now = Date.now()): void {
+    const activeShards = [...this.activeShards.values()];
+    for (const shard of activeShards) {
+      const inHeartbeatManagedState = shard.state === 'registering'
+        || shard.state === 'ready'
+        || (shard.state === 'degraded' && shard.stateReason === 'heartbeat_stale');
+      if (!inHeartbeatManagedState) {
+        continue;
+      }
+
+      const staleForMs = now - shard.lastHeartbeatAt;
+      if (staleForMs <= shard.heartbeatStaleAfterMs) {
+        continue;
+      }
+
+      const staleReason = `No heartbeat observed for ${staleForMs}ms (limit ${shard.heartbeatStaleAfterMs}ms).`;
+      this.transitionShardState(shard.id, 'degraded', 'heartbeat_stale', staleReason);
+      if (staleForMs <= shard.heartbeatDisconnectAfterMs) {
+        continue;
+      }
+
+      const timeoutReason =
+        `Heartbeat stale for ${staleForMs}ms exceeded recovery window `
+        + `(${shard.heartbeatDisconnectAfterMs}ms).`;
+      this.transitionShardState(shard.id, 'offline', 'heartbeat_timeout', timeoutReason);
+      void this.releaseActiveShard(shard.id, shard.channelId).catch((error: unknown) => {
+        log.error('Failed to release heartbeat-evicted shard workload', {
+          shardId: shard.id,
+          error: toErrorMessage(error),
+        });
+      });
+      this.auditTrail?.append('shard.health.evict', {
+        shardId: shard.id,
+        state: 'offline',
+        reason: 'heartbeat_timeout',
+        staleForMs,
+        heartbeatStaleAfterMs: shard.heartbeatStaleAfterMs,
+        heartbeatDisconnectAfterMs: shard.heartbeatDisconnectAfterMs,
+      });
+    }
+  }
+
+  private assertShardRoutable(shardId: string, requiredCapabilities: readonly string[]): void {
+    const shard = this.activeShards.get(shardId);
+    if (!shard) {
+      throw new CompanionVisibleOperationalError({
+        companionMessage: 'Shard routing denied: the requested shard is offline.',
+        errorClass: 'unavailable',
+        retryHint: 'retry_after_delay',
+      });
+    }
+    if (shard.state !== 'ready' || shard.health !== 'healthy') {
+      const detail = shard.failureReason
+        ? `${shard.stateReason}; ${shard.failureReason}`
+        : shard.stateReason;
+      throw new CompanionVisibleOperationalError({
+        companionMessage:
+          `Shard routing denied: "${shard.name}" is ${shard.state}/${shard.health}.`,
+        errorClass: 'unavailable',
+        retryHint: 'retry_after_delay',
+        operatorDiagnostic:
+          `Shard routing denied: "${shard.name}" is ${shard.state}/${shard.health} (${detail}).`,
+      });
+    }
+
+    const missing = requiredCapabilities.filter(capability => !shard.capabilities.includes(capability));
+    if (missing.length > 0) {
+      throw new CompanionVisibleOperationalError({
+        companionMessage:
+          `Shard routing denied: "${shard.name}" is missing required capability tokens `
+          + `(${missing.join(', ')}).`,
+        errorClass: 'policy_blocked',
+        retryHint: 'try_alternative_input',
+      });
+    }
+  }
+
+  private async releaseActiveShard(shardId: string, channelId: string): Promise<void> {
+    // 2h6q.3: end the authenticated workload generation first so no grant can
+    // be prepared or consumed against a shard that is being released.
+    const workloadHandle = this.workloadHandles.get(shardId);
+    let workloadReleaseError: unknown;
+    if (workloadHandle) {
+      try {
+        await this.deps.workloadRegistry?.endWorkload(workloadHandle);
+        this.workloadHandles.delete(shardId);
+      } catch (error) {
+        workloadReleaseError = error;
+      }
+    }
+    const deleted = this.activeShards.delete(shardId);
+    // The shard id is retired here, so its governed-attempt counter goes with
+    // it — nothing can re-attempt a shard that no longer exists.
+    this.governedShardAttempts.delete(shardId);
+    this.shardDirectory.release(shardId);
+    this.configurationRegistry.release(shardId);
+    this.unregisterActiveShardChannel(channelId, shardId);
+    if (!deleted) {
+      if (workloadReleaseError) throw workloadReleaseError;
+      return;
+    }
+    this.activeCount = Math.max(0, this.activeCount - 1);
+    if (workloadReleaseError) throw workloadReleaseError;
+  }
+
+  private transitionShardState(
+    shardId: string,
+    nextState: ShardLifecycleState,
+    reason: string,
+    failureReason?: string,
+  ): void {
+    const shard = this.activeShards.get(shardId);
+    if (!shard) {
+      return;
+    }
+
+    const now = Date.now();
+    const currentState = shard.state;
+    const currentFailureReason = shard.failureReason;
+    if (
+      currentState === nextState
+      && shard.stateReason === reason
+      && currentFailureReason === failureReason
+    ) {
+      return;
+    }
+    if (currentState !== nextState) {
+      const allowedTransitions = SHARD_STATE_TRANSITIONS[currentState];
+      if (!allowedTransitions.includes(nextState)) {
+        throw new Error(
+          `Invalid shard lifecycle transition for ${shardId}: ${currentState} -> ${nextState}.`,
+        );
+      }
+      shard.state = nextState;
+      shard.lastTransitionAt = now;
+    }
+    shard.stateReason = reason;
+
+    if (nextState === 'ready') {
+      shard.health = 'healthy';
+      delete shard.failureReason;
+    } else if (nextState === 'degraded') {
+      shard.health = reason === 'heartbeat_stale' ? 'stale' : 'failed';
+      if (failureReason) {
+        shard.failureReason = failureReason;
+      }
+    } else if (nextState === 'offline' && failureReason) {
+      shard.failureReason = failureReason;
+    }
+
+    this.auditTrail?.append('shard.lifecycle.transition', {
+      shardId,
+      from: currentState,
+      to: nextState,
+      reason,
+      health: shard.health,
+      ...(failureReason ? { failureReason } : {}),
+    });
+    this.configurationRegistry.syncLifecycle(shardId, shard.state, shard.health);
+  }
+
+  private installAuditHooks(): void {
+    this.deps.eventBus.on('agent.tool.start', (event) => {
+      const shardId = this.resolveShardId(event.channelId);
+      if (!shardId) return;
+      this.touchShardHeartbeat(shardId);
+      this.auditTrail?.append('shard.tool.start', {
+        shardId,
+        channelId: event.channelId,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+      });
+    });
+
+    this.deps.eventBus.on('agent.tool.end', (event) => {
+      const shardId = this.resolveShardId(event.channelId);
+      if (!shardId) return;
+      this.touchShardHeartbeat(shardId);
+      this.auditTrail?.append('shard.tool.end', {
+        shardId,
+        channelId: event.channelId,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        isError: event.isError,
+      });
+    });
+  }
+
+  private resolveInjectedTools(
+    shardId: string,
+    memoryReviewContext: Pick<ShardRuntimeRecord, 'channelId' | 'task' | 'lineage'>,
+  ): AgentTool<any>[] {
+    const catalog = this.deps.toolCatalogProvider?.();
+
+    const availableByName = new Map<string, AgentTool<any>>();
+    const available = catalog ? [...catalog.core, ...catalog.extended] : [];
+    for (const tool of available) {
+      if (BLOCKED_SHARD_TOOL_NAMES.has(tool.name)) continue;
+      if (!availableByName.has(tool.name)) {
+        availableByName.set(tool.name, tool);
+      }
+    }
+
+    const toolNames = this.resolveToolNamesForTier(this.resolveCapabilityTier());
+    const includeAll = toolNames.includes(SHARD_TOOLSET_ALL);
+    const selected = includeAll
+      ? [...availableByName.values()]
+      : toolNames
+        .map(name => availableByName.get(name))
+        .filter((tool): tool is AgentTool<any> => tool !== undefined);
+
+    return [
+      createShardParentIcpTool(shardId, this.shardParentIcp),
+      ...selected.map(tool => {
+        const hydrated = hydrateToolForCaller(tool, { kind: 'shard', shardId });
+        const wrapped = this.toolSyncHelper.wrapShardTool(hydrated, shardId, memoryReviewContext);
+        // gjkh: canonical multiplexed surfaces (orient) reach a shard loop only
+        // behind a read-pass / mutation-deny wrapper, reusing p0le's orient
+        // classification. identity/north_star/contact never get this far — they
+        // are blocked at injection (BLOCKED_SHARD_TOOL_NAMES).
+        const governancePolicy = GOVERNED_SHARD_TOOL_POLICIES.get(tool.name);
+        if (governancePolicy) {
+          return createGovernedShardTool(wrapped, governancePolicy, {
+            shardId,
+            auditTrail: this.auditTrail,
+          });
+        }
+        return wrapped;
+      }),
+    ];
+  }
+
+  private resolveToolNamesForTier(tier: CapabilityTier): string[] {
+    const configured = this.deps.shardToolsets ?? this.deps.config.shardToolsets;
+    const nursery = normalizeToolNames(
+      configured?.nursery,
+      DEFAULT_SHARD_TOOLSETS_BY_TIER.nursery,
+    );
+
+    if (tier === 'nursery') return nursery;
+
+    if (tier === 'apprentice') {
+      const apprentice = normalizeToolNames(configured?.apprentice);
+      if (apprentice.length > 0) return apprentice;
+      return [...nursery, ...APPRENTICE_SHARD_TOOL_EXTRAS.filter(name => !nursery.includes(name))];
+    }
+
+    const tierConfig = normalizeToolNames(configured?.[tier] ?? configured?.autonomous);
+    if (tierConfig.length > 0) return tierConfig;
+    return [...DEFAULT_SHARD_TOOLSETS_BY_TIER[tier]];
+  }
+
+  private resolveCapabilityTier(): CapabilityTier {
+    return normalizeCapabilityTier(this.deps.config.capabilityTier);
+  }
+
+  private resolveWyomingShardName(
+    routing: SatelliteDelegationRoutingHint | undefined,
+    presenceSubjectId: string | undefined,
+  ): string {
+    const siteId = routing?.siteId?.trim() || 'unknown-site';
+    const subjectId = presenceSubjectId || routing?.satelliteId?.trim() || 'unknown-satellite';
+    return `wyoming:${siteId}:${subjectId}`;
+  }
+
+  private resolveWyomingRouteCapabilities(
+    routing: SatelliteDelegationRoutingHint | undefined,
+    presenceSubjectId: string | undefined,
+  ): string[] {
+    const siteId = routing?.siteId?.trim() || 'unknown-site';
+    const subjectId = presenceSubjectId || routing?.satelliteId?.trim() || 'unknown-satellite';
+    return normalizeCapabilityTokens([
+      'wyoming',
+      `wyoming:${siteId}`,
+      `wyoming:${siteId}:${subjectId}`,
+    ]);
+  }
+
+  private registerActiveShardChannel(channelId: string, shardId: string): void {
+    const active = this.activeShardChannels.get(channelId) ?? new Set<string>();
+    active.add(shardId);
+    this.activeShardChannels.set(channelId, active);
+  }
+
+  private unregisterActiveShardChannel(channelId: string, shardId: string): void {
+    const active = this.activeShardChannels.get(channelId);
+    if (!active) return;
+    active.delete(shardId);
+    if (active.size === 0) {
+      this.activeShardChannels.delete(channelId);
+    }
+  }
+
+  private resolveShardId(channelId: string): string | null {
+    if (channelId.startsWith('shard:')) {
+      const shardId = channelId.slice('shard:'.length).trim();
+      return shardId.length > 0 ? shardId : null;
+    }
+
+    const activeShards = this.activeShardChannels.get(channelId);
+    if (!activeShards || activeShards.size === 0) {
+      return null;
+    }
+    return activeShards.values().next().value ?? null;
+  }
+}
+
+function normalizeToolNames(
+  configured: readonly string[] | undefined,
+  fallback: readonly string[] = [],
+): string[] {
+  const source = configured && configured.length > 0 ? configured : fallback;
+  return [...new Set(
+    source
+      .map(item => item.trim())
+      .filter(Boolean),
+  )];
+}
+
+function normalizeCapabilityTokens(
+  configured: readonly string[] | undefined,
+  fallback: readonly string[] = [],
+): string[] {
+  const source = configured && configured.length > 0 ? configured : fallback;
+  return [...new Set(
+    source
+      .map(item => item.trim())
+      .filter(Boolean),
+  )];
+}
+
+function normalizeHeartbeatStaleAfterMs(value: number | undefined, fallback: number): number {
+  if (!Number.isFinite(value) || value === undefined) {
+    return fallback;
+  }
+  const normalized = Math.floor(value);
+  return normalized > 0 ? normalized : fallback;
+}
+
+function normalizeHeartbeatDisconnectAfterMs(
+  value: number | undefined,
+  staleAfterMs: number,
+  fallback: number,
+): number {
+  const normalized = normalizeHeartbeatStaleAfterMs(value, fallback);
+  if (normalized <= staleAfterMs) {
+    return staleAfterMs + 1;
+  }
+  return normalized;
+}
+
+function cloneShardChargePolicy(
+  chargePolicy: ChargePolicyConfig | undefined,
+): ChargePolicyConfig | null {
+  if (!chargePolicy) return null;
+  return {
+    ...chargePolicy,
+    runChargeQuotaByLane: { ...chargePolicy.runChargeQuotaByLane },
+  };
+}
+
+function cloneShardLineage(lineage: ShardResult['lineage']): ShardResult['lineage'] {
+  return {
+    ...lineage,
+    companionProvenance: { ...lineage.companionProvenance },
+    sourceMessage: { ...lineage.sourceMessage },
+    ...(lineage.sourceContext ? { sourceContext: { ...lineage.sourceContext } } : {}),
+    ...(lineage.satelliteRouting ? { satelliteRouting: { ...lineage.satelliteRouting } } : {}),
+    ...(lineage.ingestedIntakeEnvelopes
+      ? { ingestedIntakeEnvelopes: cloneIntakeSnapshots(lineage.ingestedIntakeEnvelopes) }
+      : {}),
+  };
+}

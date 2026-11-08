@@ -1,0 +1,1819 @@
+import type { Pool, PoolClient, QueryResultRow } from 'pg';
+
+import {
+  IcpAutonomyInvalidationConflictError,
+  IcpDyadLifecycleConflictError,
+  IcpOutstandingInvitationConflictError,
+  IcpPermitRevocationConflictError,
+  type IcpAutonomyInvalidationFence,
+  type IcpLifecycleAdmissionResult,
+  type IcpPermitConsumptionInput,
+  type IcpPermitConsumptionResult,
+  type IcpSharedAutonomyStorePort,
+  type IcpConversationTransitionInput,
+  type IcpDyadTransitionInput,
+} from '../../core/icp/autonomy-store-ports.js';
+import {
+  ICP_AUTONOMY_REASON_CODES,
+  assertIcpConversationActivityTransition,
+  assertIcpConversationStatusTransition,
+  icpDyadStatusReasonCode,
+  parseIcpAvailabilityLease,
+  parseIcpConversationEpisode,
+  parseIcpDyad,
+  resolveIcpDyadStatus,
+  parseIcpInitiationPermit,
+  ICP_DYAD_DELIVERY_OUTCOMES,
+  type IcpAutonomyReasonCode,
+  type IcpAvailabilityLease,
+  type IcpAvailabilitySource,
+  type IcpConversationEpisode,
+  type IcpDyad,
+  type IcpDyadDelivery,
+  type IcpDyadDeliveryOutcome,
+  type IcpDyadParticipantState,
+  type IcpInitiationPermit,
+} from '../../shared/contracts/icp-autonomy.js';
+import { parseCompanionChannelId } from '../../shared/contracts/companion-channels.js';
+import { isRecord } from '../../shared/utils/types.js';
+import {
+  createPostgresPool,
+  executeQuery,
+  queryOne,
+  queryRows,
+  withPostgresClient,
+} from '../postgres.js';
+import { SHARED_SCHEMA_NAME } from './migrations.js';
+import {
+  requirePositiveSafeInteger as requirePositiveInteger,
+  requireSafeInteger as safeInteger,
+  requireUuid,
+} from './row-guards.js';
+
+interface AvailabilityRow extends QueryResultRow {
+  companion_id: string;
+  state: string;
+  issued_at_ms: string | number;
+  expires_at_ms: string | number;
+  source: string;
+  revision: string | number;
+}
+
+interface ConversationRow extends QueryResultRow {
+  conversation_id: string;
+  channel_id: string;
+  participant_companion_ids: unknown;
+  root_initiation_id: string;
+  initiated_by_companion_id: string;
+  initiation_source: string;
+  provenance_ref: string;
+  opened_at_ms: string | number;
+  last_activity_at_ms: string | number;
+  status: string;
+  close_reason_code: string | null;
+  revision: string | number;
+}
+
+interface DyadRow extends QueryResultRow {
+  dyad_id: string;
+  channel_id: string;
+  first_companion_id: string;
+  second_companion_id: string;
+  status: string;
+  first_relationship_state: string;
+  second_relationship_state: string;
+  first_blocked: boolean;
+  second_blocked: boolean;
+  first_state_updated_at_ms: string | number;
+  second_state_updated_at_ms: string | number;
+  lifecycle_revision: string | number;
+  created_at_ms: string | number;
+  closed_at_ms: string | number | null;
+  close_reason_code: string | null;
+  provenance_conversation_ids: unknown;
+  revision: string | number;
+}
+
+interface PermitRow extends QueryResultRow {
+  permit_id: string;
+  candidate_id: string;
+  conversation_id: string;
+  sender_companion_id: string;
+  recipient_companion_id: string;
+  channel_id: string;
+  provenance_ref: string;
+  issued_at_ms: string | number;
+  expires_at_ms: string | number;
+  status: string;
+  consumed_at_ms: string | number | null;
+  revoked_at_ms: string | number | null;
+  reason_code: string | null;
+  revision: string | number;
+}
+
+interface DyadDeliveryRow extends QueryResultRow {
+  delivery_id: string;
+  dyad_id: string;
+  conversation_id: string;
+  sender_companion_id: string;
+  recipient_companion_id: string;
+  outcome: string;
+  created_at_ms: string | number;
+  updated_at_ms: string | number;
+  attempt: string | number;
+  gateway_message_id: string | null;
+  reason_code: string | null;
+  dyad_lifecycle_revision: string | number;
+  revision: string | number;
+}
+
+interface InvalidationFenceRow extends QueryResultRow {
+  companion_id: string;
+  generation: string | number;
+  invalidated_at_ms: string | number | null;
+  last_reason_code: string | null;
+  /** psfn-framework-h248l.9: the durable, non-expiring lifecycle admission bit. */
+  lifecycle_fenced: boolean;
+}
+
+interface EpisodeDyadRow extends QueryResultRow {
+  dyad_id: string | null;
+}
+
+const AVAILABILITY_COLUMNS =
+  'companion_id, state, issued_at_ms, expires_at_ms, source, revision';
+const CONVERSATION_COLUMNS = `
+  conversation_id, channel_id, participant_companion_ids, root_initiation_id,
+  initiated_by_companion_id, initiation_source, provenance_ref, opened_at_ms,
+  last_activity_at_ms, status, close_reason_code, revision
+`;
+const DYAD_COLUMNS = `
+  dyad_id, channel_id, first_companion_id, second_companion_id, status,
+  first_relationship_state, second_relationship_state, first_blocked, second_blocked,
+  first_state_updated_at_ms, second_state_updated_at_ms, lifecycle_revision,
+  created_at_ms, closed_at_ms, close_reason_code, provenance_conversation_ids, revision
+`;
+const PERMIT_COLUMNS = `
+  permit_id, candidate_id, conversation_id, sender_companion_id,
+  recipient_companion_id, channel_id, provenance_ref, issued_at_ms,
+  expires_at_ms, status, consumed_at_ms, revoked_at_ms, reason_code, revision
+`;
+const INVALIDATION_FENCE_COLUMNS = `
+  companion_id, generation, invalidated_at_ms, last_reason_code, lifecycle_fenced
+`;
+const DYAD_DELIVERY_COLUMNS = `
+  delivery_id, dyad_id, conversation_id, sender_companion_id,
+  recipient_companion_id, outcome, created_at_ms, updated_at_ms, attempt,
+  gateway_message_id, reason_code, dyad_lifecycle_revision, revision
+`;
+
+function availabilitySourcePrioritySql(expression: string, unknownPriority: 0 | 4): string {
+  return `CASE ${expression}
+    WHEN 'runtime' THEN 1
+    WHEN 'companion' THEN 2
+    WHEN 'operator' THEN 3
+    ELSE ${unknownPriority}
+  END`;
+}
+
+const REQUESTED_AVAILABILITY_SOURCE_PRIORITY = availabilitySourcePrioritySql('$5::text', 0);
+const CURRENT_AVAILABILITY_SOURCE_PRIORITY = availabilitySourcePrioritySql('source', 4);
+const EXCLUDED_AVAILABILITY_SOURCE_PRIORITY = availabilitySourcePrioritySql('EXCLUDED.source', 0);
+const CONFLICT_AVAILABILITY_SOURCE_PRIORITY = availabilitySourcePrioritySql(
+  'icp_availability_leases.source',
+  4,
+);
+const CLEAR_REQUEST_SOURCE_PRIORITY = availabilitySourcePrioritySql('$3::text', 0);
+const PUBLISH_AVAILABILITY_SQL = `
+  INSERT INTO icp_availability_leases (
+    companion_id, state, issued_at_ms, expires_at_ms, source, revision
+  )
+  SELECT $1::uuid, $2::text, $3::bigint, $4::bigint, $5::text, $6::bigint
+  WHERE $6::bigint = 1 OR EXISTS (
+    SELECT 1 FROM icp_availability_leases
+    WHERE companion_id = $1
+      AND (
+        (
+          revision + 1 = $6
+          AND (
+            expires_at_ms <= $3
+            OR ${REQUESTED_AVAILABILITY_SOURCE_PRIORITY}
+              >= ${CURRENT_AVAILABILITY_SOURCE_PRIORITY}
+          )
+        )
+        OR (
+          revision = $6
+          AND ${REQUESTED_AVAILABILITY_SOURCE_PRIORITY}
+            > ${CURRENT_AVAILABILITY_SOURCE_PRIORITY}
+        )
+      )
+  )
+  ON CONFLICT (companion_id) DO UPDATE SET
+    state = EXCLUDED.state,
+    issued_at_ms = EXCLUDED.issued_at_ms,
+    expires_at_ms = EXCLUDED.expires_at_ms,
+    source = EXCLUDED.source,
+    revision = CASE
+      WHEN icp_availability_leases.revision = EXCLUDED.revision
+        THEN icp_availability_leases.revision + 1
+      ELSE EXCLUDED.revision
+    END
+  WHERE (
+      icp_availability_leases.revision + 1 = EXCLUDED.revision
+      AND (
+        icp_availability_leases.expires_at_ms <= EXCLUDED.issued_at_ms
+        OR ${EXCLUDED_AVAILABILITY_SOURCE_PRIORITY}
+          >= ${CONFLICT_AVAILABILITY_SOURCE_PRIORITY}
+      )
+    )
+    OR (
+      icp_availability_leases.revision = EXCLUDED.revision
+      AND ${EXCLUDED_AVAILABILITY_SOURCE_PRIORITY}
+        > ${CONFLICT_AVAILABILITY_SOURCE_PRIORITY}
+    )
+  RETURNING ${AVAILABILITY_COLUMNS}
+`;
+const CLEAR_AVAILABILITY_SQL = `
+  DELETE FROM icp_availability_leases
+  WHERE companion_id = $1 AND revision = $2
+    AND (
+      expires_at_ms <= $4
+      OR ${CLEAR_REQUEST_SOURCE_PRIORITY} >= ${CURRENT_AVAILABILITY_SOURCE_PRIORITY}
+    )
+`;
+
+function requireTimestamp(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new Error(`${field} must be a non-negative safe integer timestamp`);
+  return value;
+}
+
+function requireReasonCode(value: IcpAutonomyReasonCode, field: string): IcpAutonomyReasonCode {
+  if (!ICP_AUTONOMY_REASON_CODES.includes(value)) throw new Error(`${field} is not a known ICP reason code`);
+  return value;
+}
+
+function normalizeKnownCompanionIds(values: readonly string[]): ReadonlySet<string> {
+  if (!Array.isArray(values)) {
+    throw new Error('ICP shared autonomy store requires knownCompanionIds');
+  }
+  const known = new Set(values.map((value, index) => requireUuid(value, `knownCompanionIds[${index}]`)));
+  if (known.size < 2) {
+    throw new Error('ICP shared autonomy store requires at least two known companion IDs');
+  }
+  if (known.size !== values.length) {
+    throw new Error('ICP shared autonomy store knownCompanionIds must not contain duplicates');
+  }
+  return known;
+}
+
+function mapAvailability(row: AvailabilityRow): IcpAvailabilityLease {
+  return parseIcpAvailabilityLease({
+    companionId: row.companion_id,
+    state: row.state,
+    issuedAtMs: safeInteger(row.issued_at_ms, 'availability.issuedAtMs'),
+    expiresAtMs: safeInteger(row.expires_at_ms, 'availability.expiresAtMs'),
+    source: row.source,
+    revision: safeInteger(row.revision, 'availability.revision'),
+  });
+}
+
+function mapConversation(
+  row: ConversationRow,
+  knownCompanionIds: ReadonlySet<string>,
+): IcpConversationEpisode {
+  return parseIcpConversationEpisode({
+    conversationId: row.conversation_id,
+    channelId: row.channel_id,
+    participantCompanionIds: row.participant_companion_ids,
+    rootInitiationId: row.root_initiation_id,
+    initiatedByCompanionId: row.initiated_by_companion_id,
+    initiationSource: row.initiation_source,
+    provenanceRef: row.provenance_ref,
+    openedAtMs: safeInteger(row.opened_at_ms, 'episode.openedAtMs'),
+    lastActivityAtMs: safeInteger(row.last_activity_at_ms, 'episode.lastActivityAtMs'),
+    status: row.status,
+    ...(row.close_reason_code !== null ? { closeReasonCode: row.close_reason_code } : {}),
+    revision: safeInteger(row.revision, 'episode.revision'),
+  }, { knownCompanionIds });
+}
+
+function mapDyad(row: DyadRow, knownCompanionIds: ReadonlySet<string>): IcpDyad {
+  const participantStates: [IcpDyadParticipantState, IcpDyadParticipantState] = [
+    {
+      companionId: row.first_companion_id,
+      relationshipState: row.first_relationship_state as IcpDyadParticipantState['relationshipState'],
+      blocked: row.first_blocked,
+      updatedAtMs: safeInteger(row.first_state_updated_at_ms, 'dyad.firstStateUpdatedAtMs'),
+    },
+    {
+      companionId: row.second_companion_id,
+      relationshipState: row.second_relationship_state as IcpDyadParticipantState['relationshipState'],
+      blocked: row.second_blocked,
+      updatedAtMs: safeInteger(row.second_state_updated_at_ms, 'dyad.secondStateUpdatedAtMs'),
+    },
+  ];
+  return parseIcpDyad({
+    dyadId: row.dyad_id,
+    channelId: row.channel_id,
+    participantCompanionIds: [row.first_companion_id, row.second_companion_id],
+    status: row.status,
+    participantStates,
+    createdAtMs: safeInteger(row.created_at_ms, 'dyad.createdAtMs'),
+    provenanceConversationIds: row.provenance_conversation_ids,
+    lifecycleRevision: safeInteger(row.lifecycle_revision, 'dyad.lifecycleRevision'),
+    revision: safeInteger(row.revision, 'dyad.revision'),
+  }, { knownCompanionIds });
+}
+
+function requireDyadDeliveryOutcome(value: unknown, field: string): IcpDyadDeliveryOutcome {
+  if (typeof value !== 'string'
+    || !ICP_DYAD_DELIVERY_OUTCOMES.includes(value as IcpDyadDeliveryOutcome)) {
+    throw new Error(`${field} is invalid`);
+  }
+  return value as IcpDyadDeliveryOutcome;
+}
+
+function mapDyadDelivery(row: DyadDeliveryRow): IcpDyadDelivery {
+  const outcome = requireDyadDeliveryOutcome(row.outcome, 'dyadDelivery.outcome');
+  const gatewayMessageId = row.gateway_message_id?.trim() || undefined;
+  if ((outcome === 'delivered' || outcome === 'duplicate') !== (gatewayMessageId !== undefined)) {
+    throw new Error('ICP dyad delivery gateway receipt does not match its outcome');
+  }
+  return {
+    deliveryId: requireUuid(row.delivery_id, 'dyadDelivery.deliveryId'),
+    dyadId: requireUuid(row.dyad_id, 'dyadDelivery.dyadId'),
+    conversationId: requireUuid(row.conversation_id, 'dyadDelivery.conversationId'),
+    senderCompanionId: requireUuid(row.sender_companion_id, 'dyadDelivery.senderCompanionId'),
+    recipientCompanionId: requireUuid(row.recipient_companion_id, 'dyadDelivery.recipientCompanionId'),
+    outcome,
+    createdAtMs: safeInteger(row.created_at_ms, 'dyadDelivery.createdAtMs'),
+    updatedAtMs: safeInteger(row.updated_at_ms, 'dyadDelivery.updatedAtMs'),
+    attempt: safeInteger(row.attempt, 'dyadDelivery.attempt'),
+    ...(gatewayMessageId ? { gatewayMessageId } : {}),
+    ...(row.reason_code !== null
+      ? { reasonCode: requireReasonCode(
+          row.reason_code as IcpAutonomyReasonCode,
+          'dyadDelivery.reasonCode',
+        ) }
+      : {}),
+    dyadLifecycleRevision: safeInteger(
+      row.dyad_lifecycle_revision,
+      'dyadDelivery.dyadLifecycleRevision',
+    ),
+    revision: safeInteger(row.revision, 'dyadDelivery.revision'),
+  };
+}
+
+async function ensureCanonicalDyadWithClient(
+  client: PoolClient,
+  episode: IcpConversationEpisode,
+  knownCompanionIds: ReadonlySet<string>,
+): Promise<IcpDyad> {
+  const parsedChannel = parseCompanionChannelId(episode.channelId);
+  if (parsedChannel?.kind !== 'dm' || episode.participantCompanionIds.length !== 2) {
+    throw new Error('ICP dyads require a canonical two-companion DM episode');
+  }
+  const [firstCompanionId, secondCompanionId] = episode.participantCompanionIds;
+  const result = await client.query<DyadRow>(`
+    INSERT INTO icp_dyads (
+      dyad_id, channel_id, first_companion_id, second_companion_id, status,
+      first_relationship_state, second_relationship_state, first_blocked, second_blocked,
+      first_state_updated_at_ms, second_state_updated_at_ms, lifecycle_revision,
+      created_at_ms, closed_at_ms, close_reason_code, provenance_conversation_ids, revision
+    ) VALUES (
+      $1, $2, $3, $4, 'open', 'open', 'open', FALSE, FALSE,
+      $5, $5, 1, $5, NULL, NULL, ARRAY[$1::uuid], 1
+    )
+    ON CONFLICT (first_companion_id, second_companion_id) DO UPDATE SET
+      provenance_conversation_ids = CASE
+        WHEN $1::uuid = ANY(icp_dyads.provenance_conversation_ids)
+          THEN icp_dyads.provenance_conversation_ids
+        ELSE ARRAY(
+          SELECT value
+          FROM unnest(icp_dyads.provenance_conversation_ids || $1::uuid) AS value
+          ORDER BY value
+        )
+      END,
+      revision = CASE
+        WHEN $1::uuid = ANY(icp_dyads.provenance_conversation_ids)
+          THEN icp_dyads.revision
+        ELSE icp_dyads.revision + 1
+      END
+    WHERE icp_dyads.channel_id = EXCLUDED.channel_id
+    RETURNING ${DYAD_COLUMNS}
+  `, [
+    episode.conversationId,
+    episode.channelId,
+    firstCompanionId,
+    secondCompanionId,
+    episode.openedAtMs,
+  ]);
+  const row = result.rows.at(0);
+  if (!row) throw new Error('ICP dyad pair/channel ownership is ambiguous');
+  const dyad = mapDyad(row, knownCompanionIds);
+  return dyad;
+}
+
+function episodeUsesDurableDyad(episode: IcpConversationEpisode): boolean {
+  return episode.initiationSource !== 'operator_test'
+    && parseCompanionChannelId(episode.channelId)?.kind === 'dm'
+    && episode.participantCompanionIds.length === 2;
+}
+
+async function resolveEpisodeDyadIdWithClient(
+  client: PoolClient,
+  episode: IcpConversationEpisode,
+  knownCompanionIds: ReadonlySet<string>,
+): Promise<string | null> {
+  if (!episodeUsesDurableDyad(episode)) return null;
+  return (await ensureCanonicalDyadWithClient(client, episode, knownCompanionIds)).dyadId;
+}
+
+function mapPermit(row: PermitRow): IcpInitiationPermit {
+  return parseIcpInitiationPermit({
+    permitId: row.permit_id,
+    candidateId: row.candidate_id,
+    conversationId: row.conversation_id,
+    senderCompanionId: row.sender_companion_id,
+    recipientCompanionId: row.recipient_companion_id,
+    channelId: row.channel_id,
+    provenanceRef: row.provenance_ref,
+    issuedAtMs: safeInteger(row.issued_at_ms, 'permit.issuedAtMs'),
+    expiresAtMs: safeInteger(row.expires_at_ms, 'permit.expiresAtMs'),
+    status: row.status,
+    ...(row.consumed_at_ms !== null
+      ? { consumedAtMs: safeInteger(row.consumed_at_ms, 'permit.consumedAtMs') }
+      : {}),
+    ...(row.revoked_at_ms !== null
+      ? { revokedAtMs: safeInteger(row.revoked_at_ms, 'permit.revokedAtMs') }
+      : {}),
+    ...(row.reason_code !== null ? { reasonCode: row.reason_code } : {}),
+    revision: safeInteger(row.revision, 'permit.revision'),
+  });
+}
+
+function validateConsumptionBinding(input: IcpPermitConsumptionInput): void {
+  requireUuid(input.permitId, 'permitId');
+  requireUuid(input.conversationId, 'conversationId');
+  requireUuid(input.senderCompanionId, 'senderCompanionId');
+  requireUuid(input.recipientCompanionId, 'recipientCompanionId');
+  requireTimestamp(input.consumedAtMs, 'consumedAtMs');
+  const parsed = parseCompanionChannelId(input.channelId);
+  if (!parsed) throw new Error('channelId must be a canonical companion channel');
+  if (input.senderCompanionId === input.recipientCompanionId) {
+    throw new Error('permit consumption requires distinct companions');
+  }
+  if (parsed.kind === 'dm') {
+    const pair = [input.senderCompanionId, input.recipientCompanionId].sort();
+    if (parsed.participants[0] !== pair[0] || parsed.participants[1] !== pair[1]) {
+      throw new Error('permit consumption binding does not match the DM channel');
+    }
+  }
+}
+
+function permitMatches(permit: IcpInitiationPermit, input: IcpPermitConsumptionInput): boolean {
+  return permit.conversationId === input.conversationId
+    && permit.senderCompanionId === input.senderCompanionId
+    && permit.recipientCompanionId === input.recipientCompanionId
+    && permit.channelId === input.channelId;
+}
+
+function normalizeFence(
+  input: unknown,
+  firstCompanionId: string,
+  secondCompanionId: string,
+): IcpAutonomyInvalidationFence {
+  const pair = [
+    requireUuid(firstCompanionId, 'firstCompanionId'),
+    requireUuid(secondCompanionId, 'secondCompanionId'),
+  ].sort();
+  if (pair[0] === pair[1]) throw new Error('Invalidation fence requires distinct companions');
+  if (!isRecord(input) || !Array.isArray(input.companions) || input.companions.length !== 2) {
+    throw new Error('expectedInvalidationFence must contain exactly two companions');
+  }
+  const entries = input.companions.map((entry, index) => {
+    if (!isRecord(entry)) {
+      throw new Error(`expectedInvalidationFence.companions[${index}] must be an object`);
+    }
+    return {
+      companionId: requireUuid(entry.companionId, `expectedInvalidationFence.companions[${index}].companionId`),
+      generation: requireNonNegativeInteger(
+        entry.generation,
+        `expectedInvalidationFence.companions[${index}].generation`,
+      ),
+    };
+  }).sort((left, right) => left.companionId.localeCompare(right.companionId));
+  if (entries[0]?.companionId !== pair[0] || entries[1]?.companionId !== pair[1]) {
+    throw new Error('expectedInvalidationFence does not match permit participants');
+  }
+  const dyadLifecycle = input.dyadLifecycle;
+  if (dyadLifecycle !== undefined && !isRecord(dyadLifecycle)) {
+    throw new Error('expectedInvalidationFence.dyadLifecycle must be an object');
+  }
+  if (dyadLifecycle !== undefined && typeof dyadLifecycle.revision !== 'number') {
+    throw new Error('expectedInvalidationFence.dyadLifecycle.revision must be a number');
+  }
+  const normalizedDyadLifecycle = dyadLifecycle === undefined ? undefined : {
+    dyadId: requireUuid(dyadLifecycle.dyadId, 'expectedInvalidationFence.dyadLifecycle.dyadId'),
+    revision: requirePositiveInteger(
+      dyadLifecycle.revision as number,
+      'expectedInvalidationFence.dyadLifecycle.revision',
+    ),
+  };
+  return {
+    companions: [entries[0]!, entries[1]!],
+    ...(normalizedDyadLifecycle === undefined ? {} : { dyadLifecycle: normalizedDyadLifecycle }),
+  };
+}
+
+function requireNonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function transitionParticipantState(
+  current: IcpDyadParticipantState,
+  action: IcpDyadTransitionInput['action'],
+  transitionedAtMs: number,
+): IcpDyadParticipantState {
+  switch (action) {
+    case 'pause':
+      if (current.relationshipState !== 'open') {
+        throw new IcpDyadLifecycleConflictError(
+          current.relationshipState === 'closed' ? 'dyad_closed' : 'dyad_paused',
+        );
+      }
+      return { ...current, relationshipState: 'paused', updatedAtMs: transitionedAtMs };
+    case 'resume':
+      if (current.relationshipState !== 'paused') {
+        throw new IcpDyadLifecycleConflictError(
+          current.relationshipState === 'closed' ? 'dyad_closed' : 'dyad_stale_revision',
+        );
+      }
+      return { ...current, relationshipState: 'open', updatedAtMs: transitionedAtMs };
+    case 'close':
+      if (current.relationshipState === 'closed') {
+        throw new IcpDyadLifecycleConflictError('dyad_closed');
+      }
+      return { ...current, relationshipState: 'closed', updatedAtMs: transitionedAtMs };
+    case 'block':
+      if (current.blocked) throw new IcpDyadLifecycleConflictError('dyad_blocked');
+      return { ...current, blocked: true, updatedAtMs: transitionedAtMs };
+    case 'unblock':
+      if (!current.blocked) throw new IcpDyadLifecycleConflictError('dyad_stale_revision');
+      return { ...current, blocked: false, updatedAtMs: transitionedAtMs };
+  }
+}
+
+function mapFenceRows(rows: readonly InvalidationFenceRow[]): IcpAutonomyInvalidationFence {
+  if (rows.length !== 2) throw new Error('ICP invalidation fence is missing a companion row');
+  const entries = rows.map(row => ({
+    companionId: requireUuid(row.companion_id, 'invalidationFence.companionId'),
+    generation: safeInteger(row.generation, 'invalidationFence.generation'),
+  })).sort((left, right) => left.companionId.localeCompare(right.companionId));
+  return { companions: [entries[0]!, entries[1]!] };
+}
+
+function fenceConflictReason(
+  expected: IcpAutonomyInvalidationFence,
+  actualRows: readonly InvalidationFenceRow[],
+): IcpAutonomyReasonCode | null {
+  const actual = new Map(actualRows.map(row => [
+    row.companion_id,
+    {
+      generation: safeInteger(row.generation, 'invalidationFence.generation'),
+      reasonCode: row.last_reason_code,
+    },
+  ]));
+  for (const entry of expected.companions) {
+    const current = actual.get(entry.companionId);
+    if (!current) throw new Error(`ICP invalidation fence missing companion ${entry.companionId}`);
+    if (current.generation === entry.generation) continue;
+    if (!current.reasonCode || !ICP_AUTONOMY_REASON_CODES.includes(current.reasonCode as IcpAutonomyReasonCode)) {
+      throw new Error(`ICP invalidation fence has invalid reason for ${entry.companionId}`);
+    }
+    return current.reasonCode as IcpAutonomyReasonCode;
+  }
+  return null;
+}
+
+async function lockInvalidationFence(
+  client: PoolClient,
+  expectedInput: IcpAutonomyInvalidationFence,
+  firstCompanionId: string,
+  secondCompanionId: string,
+  enforceDyadLifecycle: boolean,
+): Promise<IcpAutonomyReasonCode | null> {
+  const expected = normalizeFence(expectedInput, firstCompanionId, secondCompanionId);
+  const ids = expected.companions.map(entry => entry.companionId);
+  const result = await client.query<InvalidationFenceRow>(`
+    SELECT ${INVALIDATION_FENCE_COLUMNS}
+    FROM icp_autonomy_invalidation_fences
+    WHERE companion_id = ANY($1::uuid[])
+    ORDER BY companion_id
+    FOR UPDATE
+  `, [ids]);
+  if (result.rows.length !== 2) throw new Error('ICP invalidation fence is missing a companion row');
+  // psfn-framework-h248l.9: the non-expiring lifecycle admission bit is read
+  // under the SAME row lock as the generation, and BEFORE the generation
+  // comparison. Generation freshness proves only that a view is current; it
+  // proves nothing about membership, so a caller that captured the fence a
+  // microsecond ago is still refused while a participant is lifecycle-fenced.
+  if (result.rows.some(row => row.lifecycle_fenced === true)) {
+    return 'unknown_participant';
+  }
+  const companionReason = fenceConflictReason(expected, result.rows);
+  if (companionReason || !enforceDyadLifecycle) return companionReason;
+  const pair = [firstCompanionId, secondCompanionId].sort();
+  const dyadResult = await client.query<Pick<DyadRow, 'dyad_id' | 'lifecycle_revision'>>(`
+    SELECT dyad_id, lifecycle_revision
+    FROM icp_dyads
+    WHERE first_companion_id = $1 AND second_companion_id = $2
+    FOR UPDATE
+  `, pair);
+  const current = dyadResult.rows.at(0);
+  const expectedDyad = expected.dyadLifecycle;
+  if (!current && !expectedDyad) return null;
+  if (!current || !expectedDyad || current.dyad_id !== expectedDyad.dyadId
+    || safeInteger(current.lifecycle_revision, 'dyadLifecycle.revision') !== expectedDyad.revision) {
+    return 'dyad_stale_revision';
+  }
+  return null;
+}
+
+async function invalidateCompanionWithClient(
+  client: PoolClient,
+  companionId: string,
+  revokedAtMs: number,
+  reasonCode: IcpAutonomyReasonCode,
+): Promise<IcpInitiationPermit[]> {
+  const fenceResult = await client.query<InvalidationFenceRow>(`
+    UPDATE icp_autonomy_invalidation_fences
+    SET generation = generation + 1,
+        invalidated_at_ms = $2,
+        last_reason_code = $3
+    WHERE companion_id = $1
+    RETURNING ${INVALIDATION_FENCE_COLUMNS}
+  `, [companionId, revokedAtMs, reasonCode]);
+  if (!fenceResult.rows.at(0)) {
+    throw new Error(`ICP invalidation fence missing companion ${companionId}`);
+  }
+  const permitResult = await client.query<PermitRow>(`
+    UPDATE icp_initiation_permits
+    SET status = 'revoked', revoked_at_ms = GREATEST($2, issued_at_ms),
+        reason_code = $3, revision = revision + 1
+    WHERE status = 'issued'
+      AND (sender_companion_id = $1 OR recipient_companion_id = $1)
+    RETURNING ${PERMIT_COLUMNS}
+  `, [companionId, revokedAtMs, reasonCode]);
+  return permitResult.rows.map(mapPermit);
+}
+
+/**
+ * The lifecycle admission transition, linearized on the companion's existing
+ * fence row lock (psfn-framework-h248l.9).
+ *
+ * Insert-if-missing mirrors the fleet sweep below: a companion that never held
+ * a row can still be fenced ("denied before first admission"), and the
+ * reconciler never has to care whether the row exists.
+ *
+ * Idempotent by construction: when the bit already holds the requested value
+ * this returns without advancing the generation or touching a permit, so
+ * "advance exactly once" means once per real transition, not once per call.
+ */
+async function setLifecycleAdmissionWithClient(
+  client: PoolClient,
+  companionId: string,
+  lifecycleFenced: boolean,
+  nowMs: number,
+  reasonCode: IcpAutonomyReasonCode,
+): Promise<{ transitioned: boolean; revokedPermits: IcpInitiationPermit[] }> {
+  await client.query(`
+    INSERT INTO icp_autonomy_invalidation_fences (companion_id, generation)
+    VALUES ($1, 0)
+    ON CONFLICT (companion_id) DO NOTHING
+  `, [companionId]);
+  const locked = await client.query<InvalidationFenceRow>(`
+    SELECT ${INVALIDATION_FENCE_COLUMNS}
+    FROM icp_autonomy_invalidation_fences
+    WHERE companion_id = $1
+    FOR UPDATE
+  `, [companionId]);
+  const current = locked.rows.at(0);
+  if (!current) throw new Error(`ICP invalidation fence missing companion ${companionId}`);
+  if ((current.lifecycle_fenced === true) === lifecycleFenced) {
+    return { transitioned: false, revokedPermits: [] };
+  }
+  // Same transaction, same lock: the generation advance, the durable evidence,
+  // the revocation of every outstanding permit, and the bit itself either all
+  // land or none do. The generation moves FIRST so the row never transiently
+  // violates the fenced-implies-evidence CHECK (it is not deferrable).
+  const revokedPermits = await invalidateCompanionWithClient(
+    client,
+    companionId,
+    nowMs,
+    reasonCode,
+  );
+  await client.query(`
+    UPDATE icp_autonomy_invalidation_fences
+    SET lifecycle_fenced = $2
+    WHERE companion_id = $1
+  `, [companionId, lifecycleFenced]);
+  return { transitioned: true, revokedPermits };
+}
+
+async function revokePairPermitsWithClient(
+  client: PoolClient,
+  dyadId: string,
+  revokedAtMs: number,
+  reasonCode: IcpAutonomyReasonCode,
+): Promise<IcpInitiationPermit[]> {
+  const permitResult = await client.query<PermitRow>(`
+    UPDATE icp_initiation_permits AS permit
+    SET status = 'revoked', revoked_at_ms = GREATEST($2, issued_at_ms),
+        reason_code = $3, revision = permit.revision + 1
+    FROM icp_conversation_episodes AS episode
+    WHERE permit.status = 'issued'
+      AND permit.conversation_id = episode.conversation_id
+      AND episode.dyad_id = $1
+    RETURNING permit.*
+  `, [dyadId, revokedAtMs, reasonCode]);
+  return permitResult.rows.map(mapPermit);
+}
+
+export class PostgresIcpSharedAutonomyStore implements IcpSharedAutonomyStorePort {
+  private constructor(
+    private readonly pool: Pool,
+    private readonly knownCompanionIds: ReadonlySet<string>,
+  ) {}
+
+  static async connect(
+    databaseUrl: string,
+    options: { knownCompanionIds: readonly string[] },
+  ): Promise<PostgresIcpSharedAutonomyStore> {
+    const knownCompanionIds = normalizeKnownCompanionIds(options.knownCompanionIds);
+    const pool = createPostgresPool(databaseUrl, {
+      applicationName: 'psfn-icp-autonomy-shared',
+      allowExitOnIdle: true,
+      schema: SHARED_SCHEMA_NAME,
+    });
+    try {
+      const store = new PostgresIcpSharedAutonomyStore(pool, knownCompanionIds);
+      await executeQuery(pool, `
+        INSERT INTO icp_autonomy_invalidation_fences (companion_id, generation)
+        SELECT companion_id, 0
+        FROM unnest($1::uuid[]) AS companion_id
+        ON CONFLICT (companion_id) DO NOTHING
+      `, [[...knownCompanionIds]]);
+      await store.revokeOutstandingPermitsOutsideFleet(
+        [...knownCompanionIds],
+        Date.now(),
+      );
+      return store;
+    } catch (error) {
+      await pool.end().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async publishAvailability(leaseInput: IcpAvailabilityLease): Promise<IcpAvailabilityLease> {
+    const lease = parseIcpAvailabilityLease(leaseInput);
+    const row = await queryOne<AvailabilityRow>(this.pool, PUBLISH_AVAILABILITY_SQL, [
+      lease.companionId,
+      lease.state,
+      lease.issuedAtMs,
+      lease.expiresAtMs,
+      lease.source,
+      lease.revision,
+    ]);
+    if (!row) throw new Error(`ICP availability revision conflict for ${lease.companionId}`);
+    return mapAvailability(row);
+  }
+
+  async publishAvailabilityAndInvalidate(
+    leaseInput: IcpAvailabilityLease,
+    reasonCodeInput: IcpAutonomyReasonCode,
+  ): Promise<{ lease: IcpAvailabilityLease; revokedPermits: IcpInitiationPermit[] }> {
+    const lease = parseIcpAvailabilityLease(leaseInput);
+    const reasonCode = requireReasonCode(reasonCodeInput, 'reasonCode');
+    return await withPostgresClient(this.pool, async client => {
+      const revokedPermits = await invalidateCompanionWithClient(
+        client,
+        lease.companionId,
+        lease.issuedAtMs,
+        reasonCode,
+      );
+      const result = await client.query<AvailabilityRow>(PUBLISH_AVAILABILITY_SQL, [
+        lease.companionId,
+        lease.state,
+        lease.issuedAtMs,
+        lease.expiresAtMs,
+        lease.source,
+        lease.revision,
+      ]);
+      const row = result.rows.at(0);
+      if (!row) throw new Error(`ICP availability revision conflict for ${lease.companionId}`);
+      return { lease: mapAvailability(row), revokedPermits };
+    });
+  }
+
+  async getAvailability(companionId: string): Promise<IcpAvailabilityLease | null> {
+    const normalizedId = requireUuid(companionId, 'companionId');
+    const row = await queryOne<AvailabilityRow>(this.pool, `
+      SELECT ${AVAILABILITY_COLUMNS}
+      FROM icp_availability_leases
+      WHERE companion_id = $1
+    `, [normalizedId]);
+    return row ? mapAvailability(row) : null;
+  }
+
+  async clearAvailability(
+    companionId: string,
+    expectedRevision: number,
+    request: { source: IcpAvailabilitySource; nowMs: number },
+  ): Promise<boolean> {
+    const result = await executeQuery(this.pool, CLEAR_AVAILABILITY_SQL, [
+      requireUuid(companionId, 'companionId'),
+      requirePositiveInteger(expectedRevision, 'expectedRevision'),
+      request.source,
+      requireTimestamp(request.nowMs, 'nowMs'),
+    ]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  async clearAvailabilityAndInvalidate(
+    companionId: string,
+    expectedRevision: number,
+    request: { source: IcpAvailabilitySource; nowMs: number },
+    reasonCodeInput: IcpAutonomyReasonCode,
+  ): Promise<{ cleared: boolean; revokedPermits: IcpInitiationPermit[] }> {
+    const normalizedCompanionId = requireUuid(companionId, 'companionId');
+    const normalizedExpectedRevision = requirePositiveInteger(expectedRevision, 'expectedRevision');
+    const normalizedNowMs = requireTimestamp(request.nowMs, 'nowMs');
+    const reasonCode = requireReasonCode(reasonCodeInput, 'reasonCode');
+    return await withPostgresClient(this.pool, async client => {
+      const fenceResult = await client.query<InvalidationFenceRow>(`
+        SELECT ${INVALIDATION_FENCE_COLUMNS}
+        FROM icp_autonomy_invalidation_fences
+        WHERE companion_id = $1
+        FOR UPDATE
+      `, [normalizedCompanionId]);
+      if (!fenceResult.rows.at(0)) {
+        throw new Error(`ICP invalidation fence missing companion ${normalizedCompanionId}`);
+      }
+      const clearResult = await client.query(CLEAR_AVAILABILITY_SQL, [
+        normalizedCompanionId,
+        normalizedExpectedRevision,
+        request.source,
+        normalizedNowMs,
+      ]);
+      if ((clearResult.rowCount ?? 0) === 0) return { cleared: false, revokedPermits: [] };
+      const revokedPermits = await invalidateCompanionWithClient(
+        client,
+        normalizedCompanionId,
+        normalizedNowMs,
+        reasonCode,
+      );
+      return { cleared: true, revokedPermits };
+    });
+  }
+
+  async createEpisode(episodeInput: IcpConversationEpisode): Promise<IcpConversationEpisode> {
+    const episode = parseIcpConversationEpisode(episodeInput, {
+      knownCompanionIds: this.knownCompanionIds,
+    });
+    if (episode.status !== 'invited' || episode.revision !== 1) {
+      throw new Error('A new ICP conversation episode must start invited at revision 1');
+    }
+    return await withPostgresClient(this.pool, async client => {
+      const dyadId = await resolveEpisodeDyadIdWithClient(
+        client,
+        episode,
+        this.knownCompanionIds,
+      );
+      const result = await client.query<ConversationRow>(`
+        INSERT INTO icp_conversation_episodes (
+          conversation_id, dyad_id, channel_id, participant_companion_ids, root_initiation_id,
+          initiated_by_companion_id, initiation_source, provenance_ref, opened_at_ms,
+          last_activity_at_ms, status, close_reason_code, revision
+        ) VALUES ($1, $13, $2, $3::uuid[], $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING ${CONVERSATION_COLUMNS}
+      `, [
+        episode.conversationId,
+        episode.channelId,
+        episode.participantCompanionIds,
+        episode.rootInitiationId,
+        episode.initiatedByCompanionId,
+        episode.initiationSource,
+        episode.provenanceRef,
+        episode.openedAtMs,
+        episode.lastActivityAtMs,
+        episode.status,
+        episode.closeReasonCode ?? null,
+        episode.revision,
+        dyadId,
+      ]);
+      const row = result.rows.at(0);
+      if (!row) throw new Error(`Failed to create ICP conversation ${episode.conversationId}`);
+      return mapConversation(row, this.knownCompanionIds);
+    });
+  }
+
+  async getDyad(dyadId: string): Promise<IcpDyad | null> {
+    const row = await queryOne<DyadRow>(this.pool, `
+      SELECT ${DYAD_COLUMNS}
+      FROM icp_dyads
+      WHERE dyad_id = $1
+    `, [requireUuid(dyadId, 'dyadId')]);
+    return row ? mapDyad(row, this.knownCompanionIds) : null;
+  }
+
+  async getDyadBetween(firstCompanionId: string, secondCompanionId: string): Promise<IcpDyad | null> {
+    const pair = [
+      requireUuid(firstCompanionId, 'firstCompanionId'),
+      requireUuid(secondCompanionId, 'secondCompanionId'),
+    ].sort();
+    if (pair[0] === pair[1]) throw new Error('ICP dyad lookup requires distinct companions');
+    const row = await queryOne<DyadRow>(this.pool, `
+      SELECT ${DYAD_COLUMNS}
+      FROM icp_dyads
+      WHERE first_companion_id = $1 AND second_companion_id = $2
+    `, pair);
+    return row ? mapDyad(row, this.knownCompanionIds) : null;
+  }
+
+  async listDyadsForCompanion(companionId: string): Promise<IcpDyad[]> {
+    const ownerId = requireUuid(companionId, 'companionId');
+    if (!this.knownCompanionIds.has(ownerId)) throw new Error('Unknown ICP dyad owner');
+    const rows = await queryRows<DyadRow>(this.pool, `
+      SELECT ${DYAD_COLUMNS}
+      FROM icp_dyads
+      WHERE first_companion_id = $1 OR second_companion_id = $1
+      ORDER BY created_at_ms, dyad_id
+    `, [ownerId]);
+    return rows.map(row => mapDyad(row, this.knownCompanionIds));
+  }
+
+  async createDyadContinuation(input: {
+    dyadId: string;
+    expectedLifecycleRevision: number;
+    episode: IcpConversationEpisode;
+    delivery: IcpDyadDelivery;
+  }): Promise<{ dyad: IcpDyad; episode: IcpConversationEpisode; delivery: IcpDyadDelivery }> {
+    const dyadId = requireUuid(input.dyadId, 'dyadId');
+    const episode = parseIcpConversationEpisode(input.episode, {
+      knownCompanionIds: this.knownCompanionIds,
+    });
+    const delivery = input.delivery;
+    requireUuid(delivery.deliveryId, 'delivery.deliveryId');
+    if (delivery.dyadId !== dyadId || delivery.conversationId !== episode.conversationId
+      || delivery.outcome !== 'queued' || delivery.attempt !== 0 || delivery.revision !== 1
+      || delivery.createdAtMs !== delivery.updatedAtMs
+      || delivery.gatewayMessageId !== undefined || delivery.reasonCode !== undefined
+      || delivery.dyadLifecycleRevision !== input.expectedLifecycleRevision) {
+      throw new Error('New ICP dyad delivery must be a revision-1 queued continuation');
+    }
+    requireUuid(delivery.senderCompanionId, 'delivery.senderCompanionId');
+    requireUuid(delivery.recipientCompanionId, 'delivery.recipientCompanionId');
+    if (episode.status !== 'invited' || episode.revision !== 1
+      || episode.initiatedByCompanionId !== delivery.senderCompanionId
+      || episode.participantCompanionIds.length !== 2
+      || !episode.participantCompanionIds.includes(delivery.senderCompanionId)
+      || !episode.participantCompanionIds.includes(delivery.recipientCompanionId)) {
+      throw new Error('ICP dyad continuation episode/delivery binding is invalid');
+    }
+    return await withPostgresClient(this.pool, async client => {
+      const dyadRow = (await client.query<DyadRow>(`
+        SELECT ${DYAD_COLUMNS}
+        FROM icp_dyads
+        WHERE dyad_id = $1
+        FOR UPDATE
+      `, [dyadId])).rows.at(0);
+      if (!dyadRow) throw new Error('ICP dyad continuation requires an owned open dyad');
+      let dyad = mapDyad(dyadRow, this.knownCompanionIds);
+      if (dyad.status !== 'open'
+        || dyad.lifecycleRevision
+          !== requirePositiveInteger(input.expectedLifecycleRevision, 'expectedLifecycleRevision')
+        || dyad.channelId !== episode.channelId
+        || !dyad.participantCompanionIds.includes(delivery.senderCompanionId)
+        || !dyad.participantCompanionIds.includes(delivery.recipientCompanionId)) {
+        throw new Error('ICP dyad continuation requires an owned open dyad');
+      }
+      const insertedEpisode = (await client.query<ConversationRow>(`
+        INSERT INTO icp_conversation_episodes (
+          conversation_id, dyad_id, channel_id, participant_companion_ids, root_initiation_id,
+          initiated_by_companion_id, initiation_source, provenance_ref, opened_at_ms,
+          last_activity_at_ms, status, close_reason_code, revision
+        ) VALUES ($1, $13, $2, $3::uuid[], $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (conversation_id) DO NOTHING
+        RETURNING ${CONVERSATION_COLUMNS}
+      `, [
+        episode.conversationId, episode.channelId, episode.participantCompanionIds,
+        episode.rootInitiationId, episode.initiatedByCompanionId, episode.initiationSource,
+        episode.provenanceRef, episode.openedAtMs, episode.lastActivityAtMs, episode.status,
+        episode.closeReasonCode ?? null, episode.revision, dyadId,
+      ])).rows.at(0);
+      const persistedEpisode = insertedEpisode
+        ? mapConversation(insertedEpisode, this.knownCompanionIds)
+        : mapConversation((await client.query<ConversationRow>(`
+            SELECT ${CONVERSATION_COLUMNS} FROM icp_conversation_episodes
+            WHERE conversation_id = $1 AND dyad_id = $2
+          `, [episode.conversationId, dyadId])).rows.at(0)
+            ?? (() => { throw new Error('ICP dyad continuation episode collision'); })(),
+          this.knownCompanionIds);
+      if (JSON.stringify(persistedEpisode) !== JSON.stringify(episode)) {
+        throw new Error('ICP dyad continuation episode collision');
+      }
+      const insertedDelivery = (await client.query<DyadDeliveryRow>(`
+        INSERT INTO icp_dyad_deliveries (
+          delivery_id, dyad_id, conversation_id, sender_companion_id,
+          recipient_companion_id, outcome, created_at_ms, updated_at_ms, attempt,
+          gateway_message_id, reason_code, dyad_lifecycle_revision, revision
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, $10, $11)
+        ON CONFLICT (delivery_id) DO NOTHING
+        RETURNING ${DYAD_DELIVERY_COLUMNS}
+      `, [
+        delivery.deliveryId, dyadId, episode.conversationId, delivery.senderCompanionId,
+        delivery.recipientCompanionId, delivery.outcome, delivery.createdAtMs,
+        delivery.updatedAtMs, delivery.attempt, delivery.dyadLifecycleRevision, delivery.revision,
+      ])).rows.at(0);
+      const persistedDelivery = insertedDelivery
+        ? mapDyadDelivery(insertedDelivery)
+        : mapDyadDelivery((await client.query<DyadDeliveryRow>(`
+            SELECT ${DYAD_DELIVERY_COLUMNS} FROM icp_dyad_deliveries WHERE delivery_id = $1
+          `, [delivery.deliveryId])).rows.at(0)
+            ?? (() => { throw new Error('ICP dyad delivery collision'); })());
+      if (JSON.stringify(persistedDelivery) !== JSON.stringify(delivery)) {
+        throw new Error('ICP dyad delivery collision');
+      }
+      if (!dyad.provenanceConversationIds.includes(episode.conversationId)) {
+        const updated = (await client.query<DyadRow>(`
+          UPDATE icp_dyads
+          SET provenance_conversation_ids = ARRAY(
+                SELECT value FROM unnest(provenance_conversation_ids || $2::uuid) AS value ORDER BY value
+              ),
+              revision = revision + 1
+          WHERE dyad_id = $1
+          RETURNING ${DYAD_COLUMNS}
+        `, [dyadId, episode.conversationId])).rows.at(0);
+        if (!updated) throw new Error('ICP dyad disappeared during continuation creation');
+        dyad = mapDyad(updated, this.knownCompanionIds);
+      }
+      return { dyad, episode: persistedEpisode, delivery: persistedDelivery };
+    });
+  }
+
+  async getDyadDelivery(deliveryId: string): Promise<IcpDyadDelivery | null> {
+    const row = await queryOne<DyadDeliveryRow>(this.pool, `
+      SELECT ${DYAD_DELIVERY_COLUMNS} FROM icp_dyad_deliveries WHERE delivery_id = $1
+    `, [requireUuid(deliveryId, 'deliveryId')]);
+    return row ? mapDyadDelivery(row) : null;
+  }
+
+  async getLatestDyadDelivery(dyadId: string): Promise<IcpDyadDelivery | null> {
+    const row = await queryOne<DyadDeliveryRow>(this.pool, `
+      SELECT ${DYAD_DELIVERY_COLUMNS}
+      FROM icp_dyad_deliveries
+      WHERE dyad_id = $1
+      ORDER BY updated_at_ms DESC, delivery_id DESC
+      LIMIT 1
+    `, [requireUuid(dyadId, 'dyadId')]);
+    return row ? mapDyadDelivery(row) : null;
+  }
+
+  async transitionDyadDelivery(input: {
+    deliveryId: string;
+    expectedOutcomes: readonly IcpDyadDeliveryOutcome[];
+    outcome: IcpDyadDeliveryOutcome;
+    updatedAtMs: number;
+    attempt: number;
+    gatewayMessageId?: string;
+    reasonCode?: IcpAutonomyReasonCode;
+  }): Promise<IcpDyadDelivery> {
+    const expected = [...new Set(input.expectedOutcomes.map(outcome => (
+      requireDyadDeliveryOutcome(outcome, 'expectedOutcome')
+    )))];
+    if (expected.length === 0) throw new Error('ICP dyad delivery transition requires expected outcomes');
+    const outcome = requireDyadDeliveryOutcome(input.outcome, 'outcome');
+    const gatewayMessageId = input.gatewayMessageId?.trim() || undefined;
+    if ((outcome === 'delivered' || outcome === 'duplicate') !== (gatewayMessageId !== undefined)) {
+      throw new Error('ICP dyad delivery receipt does not match its outcome');
+    }
+    const row = await queryOne<DyadDeliveryRow>(this.pool, `
+      UPDATE icp_dyad_deliveries
+      SET outcome = $3, updated_at_ms = $4, attempt = $5,
+          gateway_message_id = $6, reason_code = $7, revision = revision + 1
+      WHERE delivery_id = $1 AND outcome = ANY($2::text[])
+        AND updated_at_ms <= $4 AND attempt <= $5
+      RETURNING ${DYAD_DELIVERY_COLUMNS}
+    `, [
+      requireUuid(input.deliveryId, 'deliveryId'), expected, outcome,
+      requireTimestamp(input.updatedAtMs, 'updatedAtMs'),
+      requireNonNegativeInteger(input.attempt, 'attempt'), gatewayMessageId ?? null,
+      input.reasonCode === undefined ? null : requireReasonCode(input.reasonCode, 'reasonCode'),
+    ]);
+    if (!row) throw new Error('ICP dyad delivery transition conflict');
+    return mapDyadDelivery(row);
+  }
+
+  async transitionDyad(input: IcpDyadTransitionInput) {
+    const dyadId = requireUuid(input.dyadId, 'dyadId');
+    const actorCompanionId = requireUuid(input.actorCompanionId, 'actorCompanionId');
+    const expectedRevision = requirePositiveInteger(input.expectedRevision, 'expectedRevision');
+    const transitionedAtMs = requireTimestamp(input.transitionedAtMs, 'transitionedAtMs');
+    return await withPostgresClient(this.pool, async client => {
+      const currentRow = (await client.query<DyadRow>(`
+        SELECT ${DYAD_COLUMNS} FROM icp_dyads WHERE dyad_id = $1 FOR UPDATE
+      `, [dyadId])).rows.at(0);
+      if (!currentRow) throw new IcpDyadLifecycleConflictError('dyad_not_found');
+      const current = mapDyad(currentRow, this.knownCompanionIds);
+      if (current.lifecycleRevision !== expectedRevision) {
+        throw new IcpDyadLifecycleConflictError('dyad_stale_revision');
+      }
+      const actorIndex = current.participantStates.findIndex(
+        state => state.companionId === actorCompanionId,
+      );
+      if (actorIndex < 0) throw new IcpDyadLifecycleConflictError('dyad_not_found');
+      const participantStates = [...current.participantStates] as [
+        IcpDyadParticipantState,
+        IcpDyadParticipantState,
+      ];
+      participantStates[actorIndex] = transitionParticipantState(
+        participantStates[actorIndex]!,
+        input.action,
+        transitionedAtMs,
+      );
+      const status = resolveIcpDyadStatus(participantStates);
+      const updatedRow = (await client.query<DyadRow>(`
+        UPDATE icp_dyads SET
+          status = $3,
+          first_relationship_state = $4,
+          second_relationship_state = $5,
+          first_blocked = $6,
+          second_blocked = $7,
+          first_state_updated_at_ms = $8,
+          second_state_updated_at_ms = $9,
+          lifecycle_revision = lifecycle_revision + 1,
+          revision = revision + 1
+        WHERE dyad_id = $1 AND lifecycle_revision = $2
+        RETURNING ${DYAD_COLUMNS}
+      `, [
+        dyadId, expectedRevision, status,
+        participantStates[0].relationshipState, participantStates[1].relationshipState,
+        participantStates[0].blocked, participantStates[1].blocked,
+        participantStates[0].updatedAtMs, participantStates[1].updatedAtMs,
+      ])).rows.at(0);
+      if (!updatedRow) throw new IcpDyadLifecycleConflictError('dyad_stale_revision');
+      const dyad = mapDyad(updatedRow, this.knownCompanionIds);
+      const reasonCode = icpDyadStatusReasonCode(status);
+      const revokedPermits = await revokePairPermitsWithClient(
+        client,
+        dyadId,
+        transitionedAtMs,
+        reasonCode,
+      );
+      const fenced = await client.query<DyadDeliveryRow>(`
+        UPDATE icp_dyad_deliveries
+        SET outcome = 'suppressed', updated_at_ms = GREATEST(updated_at_ms, $3),
+            reason_code = $4, gateway_message_id = NULL, revision = revision + 1
+        WHERE dyad_id = $1 AND dyad_lifecycle_revision < $2
+          AND outcome IN ('queued', 'delayed', 'retrying', 'failed')
+        RETURNING ${DYAD_DELIVERY_COLUMNS}
+      `, [dyadId, dyad.lifecycleRevision, transitionedAtMs, reasonCode]);
+      return {
+        dyad,
+        revokedPermits,
+        fencedDeliveries: fenced.rows.map(mapDyadDelivery),
+      };
+    });
+  }
+
+  async getEpisode(conversationId: string): Promise<IcpConversationEpisode | null> {
+    const row = await queryOne<ConversationRow>(this.pool, `
+      SELECT ${CONVERSATION_COLUMNS}
+      FROM icp_conversation_episodes
+      WHERE conversation_id = $1
+    `, [requireUuid(conversationId, 'conversationId')]);
+    return row ? mapConversation(row, this.knownCompanionIds) : null;
+  }
+
+  async transitionEpisode(input: IcpConversationTransitionInput): Promise<IcpConversationEpisode> {
+    assertIcpConversationStatusTransition(input.expectedStatus, input.status);
+    assertIcpConversationActivityTransition(
+      input.expectedLastActivityAtMs,
+      input.lastActivityAtMs,
+    );
+    const reasonCode = input.closeReasonCode === undefined
+      ? null
+      : requireReasonCode(input.closeReasonCode, 'closeReasonCode');
+    const row = await queryOne<ConversationRow>(this.pool, `
+      UPDATE icp_conversation_episodes
+      SET status = $5,
+          last_activity_at_ms = $6,
+          close_reason_code = $7,
+          revision = revision + 1
+      WHERE conversation_id = $1 AND status = $2 AND revision = $3
+        AND last_activity_at_ms = $4
+        AND $6 >= last_activity_at_ms
+      RETURNING ${CONVERSATION_COLUMNS}
+    `, [
+      requireUuid(input.conversationId, 'conversationId'),
+      input.expectedStatus,
+      requirePositiveInteger(input.expectedRevision, 'expectedRevision'),
+      requireTimestamp(input.expectedLastActivityAtMs, 'expectedLastActivityAtMs'),
+      input.status,
+      requireTimestamp(input.lastActivityAtMs, 'lastActivityAtMs'),
+      reasonCode,
+    ]);
+    if (!row) throw new Error(`ICP conversation transition conflict for ${input.conversationId}`);
+    return mapConversation(row, this.knownCompanionIds);
+  }
+
+  async reclassifyEndedEpisodeCloseReason(input: {
+    conversationId: string;
+    expectedRevision: number;
+    fromReasonCode: IcpAutonomyReasonCode;
+    toReasonCode: IcpAutonomyReasonCode;
+  }): Promise<IcpConversationEpisode> {
+    const row = await queryOne<ConversationRow>(this.pool, `
+      UPDATE icp_conversation_episodes
+      SET close_reason_code = $4, revision = revision + 1
+      WHERE conversation_id = $1 AND status = 'ended' AND revision = $2
+        AND close_reason_code = $3
+      RETURNING ${CONVERSATION_COLUMNS}
+    `, [
+      requireUuid(input.conversationId, 'conversationId'),
+      requirePositiveInteger(input.expectedRevision, 'expectedRevision'),
+      requireReasonCode(input.fromReasonCode, 'fromReasonCode'),
+      requireReasonCode(input.toReasonCode, 'toReasonCode'),
+    ]);
+    if (!row) throw new Error(`ICP conversation close-reason reclassification conflict for ${input.conversationId}`);
+    return mapConversation(row, this.knownCompanionIds);
+  }
+
+  async captureInvalidationFence(
+    firstCompanionId: string,
+    secondCompanionId: string,
+  ): Promise<IcpAutonomyInvalidationFence> {
+    const first = requireUuid(firstCompanionId, 'firstCompanionId');
+    const second = requireUuid(secondCompanionId, 'secondCompanionId');
+    if (first === second) throw new Error('Invalidation fence requires distinct companions');
+    const rows = await queryRows<InvalidationFenceRow>(this.pool, `
+      SELECT ${INVALIDATION_FENCE_COLUMNS}
+      FROM icp_autonomy_invalidation_fences
+      WHERE companion_id = ANY($1::uuid[])
+      ORDER BY companion_id
+    `, [[first, second]]);
+    const fence = mapFenceRows(rows);
+    const pair = [first, second].sort();
+    const dyad = await queryOne<Pick<DyadRow, 'dyad_id' | 'lifecycle_revision'>>(this.pool, `
+      SELECT dyad_id, lifecycle_revision
+      FROM icp_dyads
+      WHERE first_companion_id = $1 AND second_companion_id = $2
+    `, pair);
+    return {
+      ...fence,
+      ...(dyad ? {
+        dyadLifecycle: {
+          dyadId: requireUuid(dyad.dyad_id, 'dyadLifecycle.dyadId'),
+          revision: safeInteger(dyad.lifecycle_revision, 'dyadLifecycle.revision'),
+        },
+      } : {}),
+    };
+  }
+
+  async issuePermit(input: {
+    permit: IcpInitiationPermit;
+    expectedInvalidationFence: IcpAutonomyInvalidationFence;
+  }): Promise<IcpInitiationPermit> {
+    const permit = parseIcpInitiationPermit(input.permit);
+    if (permit.status !== 'issued' || permit.revision !== 1) {
+      throw new Error('A new ICP initiation permit must start issued at revision 1');
+    }
+    return await withPostgresClient(this.pool, async client => {
+      const episodeBinding = (await client.query<EpisodeDyadRow>(`
+        SELECT dyad_id FROM icp_conversation_episodes WHERE conversation_id = $1
+      `, [permit.conversationId])).rows.at(0);
+      const invalidationReason = await lockInvalidationFence(
+        client,
+        input.expectedInvalidationFence,
+        permit.senderCompanionId,
+        permit.recipientCompanionId,
+        episodeBinding?.dyad_id !== null && episodeBinding?.dyad_id !== undefined,
+      );
+      if (invalidationReason) throw new IcpAutonomyInvalidationConflictError(invalidationReason);
+      // Lazy expiry and issuance share the same pair fence lock. The partial
+      // unique index then makes opposite-direction invitations race-safe.
+      await client.query(`
+        UPDATE icp_initiation_permits
+        SET status = 'expired', reason_code = 'permit_expired', revision = revision + 1
+        WHERE status = 'issued' AND expires_at_ms <= $3
+          AND LEAST(sender_companion_id, recipient_companion_id) = LEAST($1::uuid, $2::uuid)
+          AND GREATEST(sender_companion_id, recipient_companion_id) = GREATEST($1::uuid, $2::uuid)
+      `, [permit.senderCompanionId, permit.recipientCompanionId, permit.issuedAtMs]);
+      const result = await client.query<PermitRow>(`
+        INSERT INTO icp_initiation_permits (
+          permit_id, candidate_id, conversation_id, sender_companion_id,
+          recipient_companion_id, channel_id, provenance_ref, issued_at_ms,
+          expires_at_ms, status, consumed_at_ms, revoked_at_ms, reason_code, revision
+        )
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11
+        FROM icp_conversation_episodes
+        WHERE conversation_id = $3
+          AND channel_id = $6
+          AND participant_companion_ids @> ARRAY[$4::uuid, $5::uuid]
+          AND status = 'invited'
+        ON CONFLICT DO NOTHING
+        RETURNING ${PERMIT_COLUMNS}
+      `, [
+        permit.permitId,
+        permit.candidateId,
+        permit.conversationId,
+        permit.senderCompanionId,
+        permit.recipientCompanionId,
+        permit.channelId,
+        permit.provenanceRef,
+        permit.issuedAtMs,
+        permit.expiresAtMs,
+        permit.status,
+        permit.revision,
+      ]);
+      const row = result.rows.at(0);
+      if (!row) {
+        const sameCandidate = await client.query<PermitRow>(`
+          SELECT ${PERMIT_COLUMNS}
+          FROM icp_initiation_permits
+          WHERE candidate_id = $1
+          LIMIT 1
+        `, [permit.candidateId]);
+        if (sameCandidate.rows.at(0)) throw new IcpOutstandingInvitationConflictError();
+        const outstanding = await client.query<PermitRow>(`
+          SELECT ${PERMIT_COLUMNS}
+          FROM icp_initiation_permits
+          WHERE status = 'issued' AND issued_at_ms <= $3 AND expires_at_ms > $3
+            AND LEAST(sender_companion_id, recipient_companion_id) = LEAST($1::uuid, $2::uuid)
+            AND GREATEST(sender_companion_id, recipient_companion_id) = GREATEST($1::uuid, $2::uuid)
+          LIMIT 1
+        `, [permit.senderCompanionId, permit.recipientCompanionId, permit.issuedAtMs]);
+        if (outstanding.rows.at(0)) throw new IcpOutstandingInvitationConflictError();
+        throw new Error('ICP permit conversation/channel/participant/candidate binding mismatch');
+      }
+      return mapPermit(row);
+    });
+  }
+
+  async createEpisodeAndIssuePermit(input: {
+    episode: IcpConversationEpisode;
+    permit: IcpInitiationPermit;
+    expectedInvalidationFence: IcpAutonomyInvalidationFence;
+  }): Promise<{ dyad: IcpDyad | null; episode: IcpConversationEpisode; permit: IcpInitiationPermit }> {
+    const episode = parseIcpConversationEpisode(input.episode, {
+      knownCompanionIds: this.knownCompanionIds,
+    });
+    const permit = parseIcpInitiationPermit(input.permit);
+    if (episode.status !== 'invited' || episode.revision !== 1) {
+      throw new Error('A new ICP conversation episode must start invited at revision 1');
+    }
+    if (permit.status !== 'issued' || permit.revision !== 1) {
+      throw new Error('A new ICP initiation permit must start issued at revision 1');
+    }
+    if (permit.conversationId !== episode.conversationId
+      || permit.channelId !== episode.channelId
+      || permit.senderCompanionId !== episode.initiatedByCompanionId
+      || !episode.participantCompanionIds.includes(permit.senderCompanionId)
+      || !episode.participantCompanionIds.includes(permit.recipientCompanionId)
+      || permit.provenanceRef !== episode.provenanceRef
+      || permit.issuedAtMs !== episode.openedAtMs) {
+      throw new Error('ICP atomic episode/permit binding mismatch');
+    }
+
+    return await withPostgresClient(this.pool, async client => {
+      const invalidationReason = await lockInvalidationFence(
+        client,
+        input.expectedInvalidationFence,
+        permit.senderCompanionId,
+        permit.recipientCompanionId,
+        episodeUsesDurableDyad(episode),
+      );
+      if (invalidationReason) throw new IcpAutonomyInvalidationConflictError(invalidationReason);
+      await client.query(`
+        UPDATE icp_initiation_permits
+        SET status = 'expired', reason_code = 'permit_expired', revision = revision + 1
+        WHERE status = 'issued' AND expires_at_ms <= $3
+          AND LEAST(sender_companion_id, recipient_companion_id) = LEAST($1::uuid, $2::uuid)
+          AND GREATEST(sender_companion_id, recipient_companion_id) = GREATEST($1::uuid, $2::uuid)
+      `, [permit.senderCompanionId, permit.recipientCompanionId, permit.issuedAtMs]);
+
+      const dyadId = await resolveEpisodeDyadIdWithClient(
+        client,
+        episode,
+        this.knownCompanionIds,
+      );
+      const dyad = dyadId === null
+        ? null
+        : mapDyad(
+          (await client.query<DyadRow>(`
+            SELECT ${DYAD_COLUMNS}
+            FROM icp_dyads
+            WHERE dyad_id = $1
+          `, [dyadId])).rows.at(0) ?? (() => { throw new Error('ICP dyad disappeared after insert'); })(),
+          this.knownCompanionIds,
+        );
+
+      const episodeResult = await client.query<ConversationRow>(`
+        INSERT INTO icp_conversation_episodes (
+          conversation_id, dyad_id, channel_id, participant_companion_ids, root_initiation_id,
+          initiated_by_companion_id, initiation_source, provenance_ref, opened_at_ms,
+          last_activity_at_ms, status, close_reason_code, revision
+        ) VALUES ($1, $13, $2, $3::uuid[], $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING ${CONVERSATION_COLUMNS}
+      `, [
+        episode.conversationId,
+        episode.channelId,
+        episode.participantCompanionIds,
+        episode.rootInitiationId,
+        episode.initiatedByCompanionId,
+        episode.initiationSource,
+        episode.provenanceRef,
+        episode.openedAtMs,
+        episode.lastActivityAtMs,
+        episode.status,
+        episode.closeReasonCode ?? null,
+        episode.revision,
+        dyadId,
+      ]);
+
+      const permitResult = await client.query<PermitRow>(`
+        INSERT INTO icp_initiation_permits (
+          permit_id, candidate_id, conversation_id, sender_companion_id,
+          recipient_companion_id, channel_id, provenance_ref, issued_at_ms,
+          expires_at_ms, status, consumed_at_ms, revoked_at_ms, reason_code, revision
+        )
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11
+        FROM icp_conversation_episodes
+        WHERE conversation_id = $3
+          AND channel_id = $6
+          AND participant_companion_ids @> ARRAY[$4::uuid, $5::uuid]
+          AND status = 'invited'
+        ON CONFLICT DO NOTHING
+        RETURNING ${PERMIT_COLUMNS}
+      `, [
+        permit.permitId,
+        permit.candidateId,
+        permit.conversationId,
+        permit.senderCompanionId,
+        permit.recipientCompanionId,
+        permit.channelId,
+        permit.provenanceRef,
+        permit.issuedAtMs,
+        permit.expiresAtMs,
+        permit.status,
+        permit.revision,
+      ]);
+      const permitRow = permitResult.rows.at(0);
+      if (!permitRow) {
+        const sameCandidateResult = await client.query<PermitRow>(`
+          SELECT ${PERMIT_COLUMNS}
+          FROM icp_initiation_permits
+          WHERE candidate_id = $1
+          LIMIT 1
+        `, [permit.candidateId]);
+        if (sameCandidateResult.rows.at(0)) {
+          throw new IcpOutstandingInvitationConflictError();
+        }
+        const outstandingResult = await client.query<PermitRow>(`
+          SELECT ${PERMIT_COLUMNS}
+          FROM icp_initiation_permits
+          WHERE status = 'issued' AND issued_at_ms <= $3 AND expires_at_ms > $3
+            AND LEAST(sender_companion_id, recipient_companion_id) = LEAST($1::uuid, $2::uuid)
+            AND GREATEST(sender_companion_id, recipient_companion_id) = GREATEST($1::uuid, $2::uuid)
+          LIMIT 1
+        `, [permit.senderCompanionId, permit.recipientCompanionId, permit.issuedAtMs]);
+        if (outstandingResult.rows.at(0)) {
+          throw new IcpOutstandingInvitationConflictError();
+        }
+        throw new Error('ICP permit conversation/channel/participant/candidate binding mismatch');
+      }
+      const episodeRow = episodeResult.rows.at(0);
+      if (!episodeRow) throw new Error('Failed to create ICP conversation episode atomically');
+      return {
+        dyad,
+        episode: mapConversation(episodeRow, this.knownCompanionIds),
+        permit: mapPermit(permitRow),
+      };
+    });
+  }
+
+  async getPermit(permitId: string): Promise<IcpInitiationPermit | null> {
+    const row = await queryOne<PermitRow>(this.pool, `
+      SELECT ${PERMIT_COLUMNS}
+      FROM icp_initiation_permits
+      WHERE permit_id = $1
+    `, [requireUuid(permitId, 'permitId')]);
+    return row ? mapPermit(row) : null;
+  }
+
+  async getPermitByCandidate(candidateId: string): Promise<IcpInitiationPermit | null> {
+    const row = await queryOne<PermitRow>(this.pool, `
+      SELECT ${PERMIT_COLUMNS}
+      FROM icp_initiation_permits
+      WHERE candidate_id = $1
+    `, [requireUuid(candidateId, 'candidateId')]);
+    return row ? mapPermit(row) : null;
+  }
+
+  async consumePermit(input: IcpPermitConsumptionInput): Promise<IcpPermitConsumptionResult> {
+    validateConsumptionBinding(input);
+    return await withPostgresClient(this.pool, async client => {
+      const episodeBinding = (await client.query<EpisodeDyadRow>(`
+        SELECT dyad_id FROM icp_conversation_episodes WHERE conversation_id = $1
+      `, [input.conversationId])).rows.at(0);
+      const invalidationReason = await lockInvalidationFence(
+        client,
+        input.expectedInvalidationFence,
+        input.senderCompanionId,
+        input.recipientCompanionId,
+        episodeBinding?.dyad_id !== null && episodeBinding?.dyad_id !== undefined,
+      );
+      if (!invalidationReason) {
+        const result = await client.query<PermitRow>(`
+          UPDATE icp_initiation_permits
+          SET status = 'consumed', consumed_at_ms = $6, revision = revision + 1
+          WHERE permit_id = $1 AND status = 'issued'
+            AND conversation_id = $2
+            AND sender_companion_id = $3
+            AND recipient_companion_id = $4
+            AND channel_id = $5
+            AND issued_at_ms <= $6
+            AND expires_at_ms > $6
+          RETURNING ${PERMIT_COLUMNS}
+        `, [
+          input.permitId,
+          input.conversationId,
+          input.senderCompanionId,
+          input.recipientCompanionId,
+          input.channelId,
+          input.consumedAtMs,
+        ]);
+        const consumedRow = result.rows.at(0);
+        if (consumedRow) {
+          const dyadRow = (await client.query<DyadRow>(`
+            SELECT ${DYAD_COLUMNS}
+            FROM icp_dyads
+            WHERE dyad_id = (
+              SELECT dyad_id FROM icp_conversation_episodes WHERE conversation_id = $1
+            )
+            FOR UPDATE
+          `, [input.conversationId])).rows.at(0);
+          if (dyadRow) {
+            const dyad = mapDyad(dyadRow, this.knownCompanionIds);
+            if (dyad.status === 'blocked') {
+              throw new IcpAutonomyInvalidationConflictError('dyad_blocked');
+            }
+            if (dyad.status !== 'open') {
+              const reopened = await client.query<DyadRow>(`
+                UPDATE icp_dyads SET
+                  status = 'open',
+                  first_relationship_state = 'open',
+                  second_relationship_state = 'open',
+                  first_state_updated_at_ms = $2,
+                  second_state_updated_at_ms = $2,
+                  lifecycle_revision = lifecycle_revision + 1,
+                  revision = revision + 1
+                WHERE dyad_id = $1 AND lifecycle_revision = $3
+                  AND NOT first_blocked AND NOT second_blocked
+                RETURNING ${DYAD_COLUMNS}
+              `, [dyad.dyadId, input.consumedAtMs, dyad.lifecycleRevision]);
+              if (!reopened.rows.at(0)) {
+                throw new IcpAutonomyInvalidationConflictError('dyad_stale_revision');
+              }
+            }
+          }
+          return { outcome: 'consumed', permit: mapPermit(consumedRow) };
+        }
+      }
+
+      const existingResult = await client.query<PermitRow>(`
+        SELECT ${PERMIT_COLUMNS}
+        FROM icp_initiation_permits
+        WHERE permit_id = $1
+      `, [input.permitId]);
+      const existingRow = existingResult.rows.at(0);
+      if (!existingRow) return { outcome: 'not_found', permit: null };
+      let existing = mapPermit(existingRow);
+      if (!permitMatches(existing, input)) {
+        return { outcome: 'mismatch', permit: existing, reasonCode: 'permit_mismatch' };
+      }
+      if (existing.status === 'revoked') {
+        return { outcome: 'revoked', permit: existing, reasonCode: 'permit_revoked' };
+      }
+      if (existing.status === 'consumed') {
+        if (invalidationReason && invalidationReason !== 'dyad_stale_revision') {
+          throw new IcpAutonomyInvalidationConflictError(invalidationReason);
+        }
+        return { outcome: 'replayed', permit: existing, reasonCode: 'permit_replayed' };
+      }
+      if (invalidationReason) {
+        throw new IcpAutonomyInvalidationConflictError(invalidationReason);
+      }
+      if (existing.status === 'expired' || existing.expiresAtMs <= input.consumedAtMs) {
+        if (existing.status === 'issued') {
+          const expiredResult = await client.query<PermitRow>(`
+            UPDATE icp_initiation_permits
+            SET status = 'expired', reason_code = 'permit_expired', revision = revision + 1
+            WHERE permit_id = $1 AND status = 'issued' AND revision = $2 AND expires_at_ms <= $3
+            RETURNING ${PERMIT_COLUMNS}
+          `, [existing.permitId, existing.revision, input.consumedAtMs]);
+          const expiredRow = expiredResult.rows.at(0);
+          if (expiredRow) existing = mapPermit(expiredRow);
+        }
+        return { outcome: 'expired', permit: existing, reasonCode: 'permit_expired' };
+      }
+      return { outcome: 'mismatch', permit: existing, reasonCode: 'permit_mismatch' };
+    });
+  }
+
+  async revokePermit(
+    permitId: string,
+    expectedRevision: number,
+    revokedAtMs: number,
+    reasonCodeInput: IcpAutonomyReasonCode,
+  ): Promise<IcpInitiationPermit> {
+    const reasonCode = requireReasonCode(reasonCodeInput, 'reasonCode');
+    const row = await queryOne<PermitRow>(this.pool, `
+      UPDATE icp_initiation_permits
+      SET status = 'revoked', revoked_at_ms = $3, reason_code = $4, revision = revision + 1
+      WHERE permit_id = $1 AND revision = $2 AND status = 'issued'
+        AND issued_at_ms <= $3
+      RETURNING ${PERMIT_COLUMNS}
+    `, [
+      requireUuid(permitId, 'permitId'),
+      requirePositiveInteger(expectedRevision, 'expectedRevision'),
+      requireTimestamp(revokedAtMs, 'revokedAtMs'),
+      reasonCode,
+    ]);
+    if (!row) throw new IcpPermitRevocationConflictError();
+    return mapPermit(row);
+  }
+
+  async findOutstandingPermitBetween(
+    firstCompanionId: string,
+    secondCompanionId: string,
+    nowMs: number,
+  ): Promise<IcpInitiationPermit | null> {
+    const first = requireUuid(firstCompanionId, 'firstCompanionId');
+    const second = requireUuid(secondCompanionId, 'secondCompanionId');
+    if (first === second) throw new Error('Outstanding permit lookup requires distinct companions');
+    const now = requireTimestamp(nowMs, 'nowMs');
+    await executeQuery(this.pool, `
+      UPDATE icp_initiation_permits
+      SET status = 'expired', reason_code = 'permit_expired', revision = revision + 1
+      WHERE status = 'issued' AND expires_at_ms <= $3
+        AND LEAST(sender_companion_id, recipient_companion_id) = LEAST($1::uuid, $2::uuid)
+        AND GREATEST(sender_companion_id, recipient_companion_id) = GREATEST($1::uuid, $2::uuid)
+    `, [first, second, now]);
+    const row = await queryOne<PermitRow>(this.pool, `
+      SELECT ${PERMIT_COLUMNS}
+      FROM icp_initiation_permits
+      WHERE status = 'issued' AND issued_at_ms <= $3 AND expires_at_ms > $3
+        AND LEAST(sender_companion_id, recipient_companion_id) = LEAST($1::uuid, $2::uuid)
+        AND GREATEST(sender_companion_id, recipient_companion_id) = GREATEST($1::uuid, $2::uuid)
+      LIMIT 1
+    `, [first, second, now]);
+    return row ? mapPermit(row) : null;
+  }
+
+  async revokeOutstandingPermitsForCompanion(
+    companionId: string,
+    revokedAtMs: number,
+    reasonCodeInput: IcpAutonomyReasonCode,
+  ): Promise<IcpInitiationPermit[]> {
+    const reasonCode = requireReasonCode(reasonCodeInput, 'reasonCode');
+    const normalizedCompanionId = requireUuid(companionId, 'companionId');
+    const normalizedRevokedAtMs = requireTimestamp(revokedAtMs, 'revokedAtMs');
+    return await withPostgresClient(this.pool, async client =>
+      await invalidateCompanionWithClient(
+        client,
+        normalizedCompanionId,
+        normalizedRevokedAtMs,
+        reasonCode,
+      ));
+  }
+
+  async revokeOutstandingPermitsOutsideFleet(
+    knownCompanionIdsInput: readonly string[],
+    revokedAtMs: number,
+  ): Promise<IcpInitiationPermit[]> {
+    const knownCompanionIds = normalizeKnownCompanionIds(knownCompanionIdsInput);
+    const normalizedRevokedAtMs = requireTimestamp(revokedAtMs, 'revokedAtMs');
+    return await withPostgresClient(this.pool, async client => {
+      const outsideResult = await client.query<{ companion_id: string }>(`
+        SELECT DISTINCT companion_id
+        FROM (
+          SELECT companion_id
+          FROM icp_autonomy_invalidation_fences
+          WHERE companion_id <> ALL($1::uuid[])
+          UNION
+          SELECT sender_companion_id AS companion_id
+          FROM icp_initiation_permits
+          WHERE status = 'issued' AND sender_companion_id <> ALL($1::uuid[])
+          UNION
+          SELECT recipient_companion_id AS companion_id
+          FROM icp_initiation_permits
+          WHERE status = 'issued' AND recipient_companion_id <> ALL($1::uuid[])
+        ) AS outside_fleet
+        ORDER BY companion_id
+      `, [[...knownCompanionIds]]);
+      const outsideIds = outsideResult.rows.map(row => requireUuid(row.companion_id, 'outsideFleetCompanionId'));
+      // psfn-framework-h248l.9: this connect-time sweep is the only durable
+      // "companion left the fleet" event the runtime has, and it is exactly the
+      // post-crash reconciliation the lifecycle fence exists for. Each departed
+      // companion is fenced through the idempotent transition (sorted, so the
+      // per-row lock order matches the batched lock this replaces), which also
+      // stops the old sweep from advancing the generation on EVERY restart.
+      //
+      // A companion still in the manifest is never touched here: readmission is
+      // explicit (clearLifecycleAdmission) and never a side effect of booting.
+      for (const outsideId of [...outsideIds].sort()) {
+        await setLifecycleAdmissionWithClient(
+          client,
+          outsideId,
+          true,
+          normalizedRevokedAtMs,
+          'unknown_participant',
+        );
+      }
+      const permitResult = await client.query<PermitRow>(`
+        UPDATE icp_initiation_permits
+        SET status = 'revoked', revoked_at_ms = GREATEST($2, issued_at_ms),
+            reason_code = 'unknown_participant', revision = revision + 1
+        WHERE status = 'issued'
+          AND NOT (
+            sender_companion_id = ANY($1::uuid[])
+            AND recipient_companion_id = ANY($1::uuid[])
+          )
+        RETURNING ${PERMIT_COLUMNS}
+      `, [[...knownCompanionIds], normalizedRevokedAtMs]);
+      return permitResult.rows.map(mapPermit);
+    });
+  }
+
+  async fenceLifecycleAdmission(
+    companionId: string,
+    nowMs: number,
+  ): Promise<IcpLifecycleAdmissionResult> {
+    return await this.setLifecycleAdmission(companionId, nowMs, true, 'unknown_participant');
+  }
+
+  async clearLifecycleAdmission(
+    companionId: string,
+    nowMs: number,
+  ): Promise<IcpLifecycleAdmissionResult> {
+    // Readmission is an explicit lifecycle act, and it advances the generation
+    // like any other: a view captured while the companion was fenced must not
+    // survive the clear.
+    return await this.setLifecycleAdmission(companionId, nowMs, false, 'lifecycle_readmitted');
+  }
+
+  async isLifecycleAdmissionFenced(companionId: string): Promise<boolean> {
+    const row = await queryOne<Pick<InvalidationFenceRow, 'lifecycle_fenced'>>(this.pool, `
+      SELECT lifecycle_fenced
+      FROM icp_autonomy_invalidation_fences
+      WHERE companion_id = $1
+    `, [requireUuid(companionId, 'companionId')]);
+    return row?.lifecycle_fenced === true;
+  }
+
+  private async setLifecycleAdmission(
+    companionId: string,
+    nowMs: number,
+    lifecycleFenced: boolean,
+    reasonCode: IcpAutonomyReasonCode,
+  ): Promise<IcpLifecycleAdmissionResult> {
+    const normalizedCompanionId = requireUuid(companionId, 'companionId');
+    const normalizedNowMs = requireTimestamp(nowMs, 'nowMs');
+    // Deliberately NOT gated on knownCompanionIds: the companion this fence
+    // exists to deny is, by definition, the one leaving the fleet.
+    return await withPostgresClient(this.pool, async client => {
+      const outcome = await setLifecycleAdmissionWithClient(
+        client,
+        normalizedCompanionId,
+        lifecycleFenced,
+        normalizedNowMs,
+        reasonCode,
+      );
+      return {
+        companionId: normalizedCompanionId,
+        lifecycleFenced,
+        transitioned: outcome.transitioned,
+        revokedPermits: outcome.revokedPermits,
+      };
+    });
+  }
+
+  async close(): Promise<void> {
+    await this.pool.end();
+  }
+}

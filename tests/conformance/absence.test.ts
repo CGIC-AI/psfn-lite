@@ -7,6 +7,13 @@
  * fleet, Gateway, SubstrateAgent, Discord, Redis); and no governed tool for
  * one. Identifiers are split into words, so `LoopUsage` is not "opus" and a
  * comment that cites a donor path for provenance is not an import.
+ *
+ * Operator rulings for the donor extraction (docs/extraction.md) amend this:
+ * the companion's local classifier and logger packages are core and allowed;
+ * the packages only the temporarily vendored donor scaffolding needs are
+ * allowed until that scaffolding is cut; and the extracted donor tree
+ * (packages/companion) keeps donor names verbatim, so the name rule covers
+ * Lite's own code.
  */
 import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, sep } from 'node:path';
@@ -74,6 +81,36 @@ export function excludedPackage(specifier: string): boolean {
   return EXCLUDED_PACKAGES.some((p) => p.test(name) || p.test(specifier));
 }
 
+/**
+ * Packages the operator ruled core for the extracted companion
+ * (packages/companion): the local emotion/embedding classifier
+ * (`@huggingface/transformers` and the ONNX runtime it loads) and the donor
+ * logger. They are allowed everywhere.
+ */
+const CORE_PACKAGES: readonly RegExp[] = [/^@huggingface\//, /^onnxruntime-/, /^winston$/];
+
+/**
+ * Packages only the donor scaffolding vendored temporarily into
+ * packages/companion needs (packages/companion/extraction/vendored-files.txt).
+ * Allowed in the manifest, the lockfile and packages/companion imports until
+ * the seams are cut; they must be gone when the vendored scaffolding is.
+ */
+const TEMPORARY_VENDORED_PACKAGES: readonly RegExp[] = [/^discord\.js$/, /^@discordjs\/(builders|collection|formatters|rest|util|ws)$/, /^discord-api-types$/, /^@redis\/client$/, /^pdfjs-dist$/];
+
+const COMPANION = 'packages/companion/';
+
+function packageName(specifier: string): string {
+  return specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : (specifier.split('/')[0] ?? specifier);
+}
+
+/** Excluded and not allowed: core packages always pass; vendored-scaffolding packages pass where `vendored` holds. */
+export function bannedPackage(specifier: string, vendored: boolean): boolean {
+  if (!excludedPackage(specifier)) return false;
+  const name = packageName(specifier);
+  if (CORE_PACKAGES.some((p) => p.test(name))) return false;
+  return !(vendored && TEMPORARY_VENDORED_PACKAGES.some((p) => p.test(name)));
+}
+
 /** A specifier that reaches the donor runtime: its package name or a path into its checkout. */
 export function donorSpecifier(specifier: string): boolean {
   return /(^|[/\\])psfn-framework([/\\]|$)/.test(specifier);
@@ -139,8 +176,13 @@ const SOURCE_ROOTS = ['packages', 'apps', 'integrations', 'tests', 'scripts'];
 const sources = SOURCE_ROOTS.flatMap((root) => walk(join(REPO, root), skipped));
 const codeFiles = sources.filter((f) => /\.(ts|mts|cts|js|mjs|cjs)$/.test(f));
 const pythonFiles = sources.filter((f) => f.endsWith('.py'));
-/** Product code: what Lite ships. Tests are checked for imports, not for the words their fixtures and assertions use. */
-const productFiles = sources.filter((f) => /^(packages|apps|integrations\/hermes\/psfn_lite)\//.test(f));
+/**
+ * Product code: what Lite ships. Tests are checked for imports, not for the words their fixtures and assertions use.
+ * The extracted donor tree keeps donor names verbatim (the donor is the spec, so `SubstrateAgent` and the like stay),
+ * so the name and path rule covers Lite's own packages; scaffolding absence in packages/companion is tracked by
+ * packages/companion/extraction/vendored-files.txt.
+ */
+const productFiles = sources.filter((f) => /^(packages|apps|integrations\/hermes\/psfn_lite)\//.test(f) && !f.startsWith(COMPANION));
 
 describe('the checker itself', () => {
   it('flags each kind of excluded reference and passes look-alikes', () => {
@@ -149,6 +191,12 @@ describe('the checker itself', () => {
     expect(excludedPackage('@redis/client')).toBe(true);
     expect(excludedPackage('@huggingface/transformers/dist/x.js')).toBe(true);
     expect(excludedPackage('pg')).toBe(false);
+    expect(bannedPackage('@huggingface/transformers', false)).toBe(false);
+    expect(bannedPackage('winston', false)).toBe(false);
+    expect(bannedPackage('discord.js', false)).toBe(true);
+    expect(bannedPackage('discord.js', true)).toBe(false);
+    expect(bannedPackage('@discordjs/voice', true)).toBe(true);
+    expect(bannedPackage('@character-foundry/character-foundry', true)).toBe(true);
     expect(donorSpecifier('../../psfn-framework/src/core/agent.ts')).toBe(true);
     expect(donorSpecifier('psfn-framework')).toBe(true);
     expect(excludedName('SubstrateAgent')).toBe('substrate');
@@ -173,7 +221,7 @@ describe('excluded subsystems are absent from Lite', () => {
     const declared = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'bundleDependencies']
       .flatMap((k) => Object.keys((manifest[k] as Record<string, string> | undefined) ?? {}));
     expect(declared.length).toBeGreaterThan(0);
-    expect(declared.filter(excludedPackage)).toEqual([]);
+    expect(declared.filter((d) => bannedPackage(d, true))).toEqual([]);
   });
 
   it('the lockfile resolves none of them anywhere in the tree, and node_modules holds none', () => {
@@ -182,11 +230,11 @@ describe('excluded subsystems are absent from Lite', () => {
       .filter((k) => k.includes('node_modules/'))
       .map((k) => k.slice(k.lastIndexOf('node_modules/') + 'node_modules/'.length));
     expect(resolved.length).toBeGreaterThan(0);
-    expect(resolved.filter(excludedPackage)).toEqual([]);
+    expect(resolved.filter((r) => bannedPackage(r, true))).toEqual([]);
     const top = readdirSync(join(REPO, 'node_modules')).flatMap((name) =>
       name.startsWith('@') ? readdirSync(join(REPO, 'node_modules', name)).map((n) => `${name}/${n}`) : [name],
     );
-    expect(top.filter(excludedPackage)).toEqual([]);
+    expect(top.filter((t) => bannedPackage(t, true))).toEqual([]);
   });
 
   it('the Hermes integration declares none of their Python packages', () => {
@@ -198,7 +246,7 @@ describe('excluded subsystems are absent from Lite', () => {
     expect(codeFiles.length).toBeGreaterThan(50);
     const hits = codeFiles.flatMap((file) =>
       collectSpecifiers(file, readFileSync(join(REPO, file), 'utf8'))
-        .specifiers.filter((s) => excludedPackage(s) || donorSpecifier(s))
+        .specifiers.filter((s) => bannedPackage(s, file.startsWith(COMPANION)) || donorSpecifier(s))
         .map((s) => `${file}: ${s}`),
     );
     expect(hits).toEqual([]);
@@ -212,7 +260,7 @@ describe('excluded subsystems are absent from Lite', () => {
 
   it('no product file, directory or declared name is one of the excluded subsystems', () => {
     expect(productFiles.length).toBeGreaterThan(50);
-    const paths = sources.filter((f) => f !== SELF).flatMap((f) => f.split('/').map((segment) => [f, segment, excludedName(segment)] as const)).filter(([, , w]) => w !== null);
+    const paths = sources.filter((f) => f !== SELF && !f.startsWith(COMPANION)).flatMap((f) => f.split('/').map((segment) => [f, segment, excludedName(segment)] as const)).filter(([, , w]) => w !== null);
     expect(paths.map(([f, segment, w]) => `${f}: ${segment} (${String(w)})`)).toEqual([]);
     const names = productFiles.flatMap((file) => {
       const text = readFileSync(join(REPO, file), 'utf8');

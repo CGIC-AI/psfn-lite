@@ -1,0 +1,715 @@
+import { createComponentLogger } from '../../../shared/logger.js';
+import type { EventBus } from '../../../shared/event-bus.js';
+import type { ContextCoherenceEvent } from '../../../shared/contracts/context-coherence.js';
+import type { TurnID } from '../../../shared/contracts/runtime.js';
+import type { ObserverEvalSidecarLeverSettings } from '../../../shared/contracts/runtime.js';
+import { createDefaultObserverEvalSidecarSettings } from '../../../system/config/runtime-config-contracts.js';
+import { createDefaultEmoSimProactivitySettings } from '../../../system/config/runtime-config-contracts.js';
+import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
+import type { TenantPoolScope } from '../../../persistence/postgres/tenant-pool-scope.js';
+import {
+  createEmoSimProactivityPort,
+  type EmoSimProactivityImpulse,
+  type EmoSimProactivityPort,
+  type EmoSimProactivityStateStorePort,
+} from '../../emotion/emosim-proactivity-port.js';
+import { createObserverEmotionCrosswalk } from './crosswalk.js';
+import {
+  runEmoSimProjectedStimulus,
+  EMOSIM_INTEGRATION_SURFACE,
+  type EmoSimAdapterOutput,
+  type EmoSimRunner,
+  type EmoSimSubject,
+} from './emosim-adapter.js';
+import { createEmoSimServerRunner } from './emosim-server-adapter.js';
+import { createEmoSimLiveStateSampler } from './proactivity-sampling.js';
+import {
+  createEmptyObserverLeverTrackerState,
+  normalizeObserverLeverTrackerState,
+  OBSERVER_EVAL_LEVER_NAMES,
+  ObserverLeverTracker,
+  type ObserverLeverEvaluation,
+  type ObserverLeverSnapshotInput,
+} from './levers.js';
+import {
+  createObserverEvalComparisonMetrics,
+  createPostgresObserverEvalSidecarStore,
+  type ObserverEvalSidecarErrorState,
+  type ObserverEvalSidecarLeverPersistencePort,
+  type ObserverEvalSidecarLeverStateEntry,
+  type ObserverEvalSidecarObservationInput,
+  type ObserverEvalSidecarPersistencePort,
+  type ObserverEvalSidecarRetentionMetadata,
+} from './persistence.js';
+import { projectObserverEvalToEmoSim } from './projection.js';
+import type {
+  ObserverEvalInput,
+  ObserverEvalInputPayload,
+  ObserverEvalSidecarConfig,
+  ObserverEvalSidecarPort,
+  ObserverEvalSidecarRuntime,
+} from './types.js';
+
+const OBSERVER_EVAL_RUN_PREFIX = 'observer-eval-sidecar';
+const DAY_MS = 86_400_000;
+const OBSERVER_EVAL_LEVER_MIN_RETENTION_DAYS = 90;
+
+export function createObserverEvalSidecarRuntimeFromConfig(
+  config: Pick<
+    SubstrateConfig,
+    'observerEvalSidecar' | 'emosimProactivity' | 'persistenceBackend' | 'companionId'
+  >,
+  dependencies: {
+    postgresDatabaseUrl?: string;
+    eventBus?: EventBus;
+    tenant?: TenantPoolScope;
+    emitProactivityImpulse?: (impulse: EmoSimProactivityImpulse) => Promise<void>;
+    proactivityStateStore?: EmoSimProactivityStateStorePort;
+  },
+): ObserverEvalSidecarRuntime {
+  const settings = structuredClone(
+    config.observerEvalSidecar ?? createDefaultObserverEvalSidecarSettings(),
+  );
+  const proactivitySettings = structuredClone(
+    config.emosimProactivity ?? createDefaultEmoSimProactivitySettings(),
+  );
+  const persistence = createObserverEvalSidecarPersistence(
+    config,
+    settings,
+    dependencies.postgresDatabaseUrl,
+    dependencies.tenant,
+  );
+
+  return {
+    config: settings,
+    ...createObserverEvalSidecarPort(
+      settings,
+      persistence,
+      dependencies.eventBus,
+      config.companionId,
+      dependencies.emitProactivityImpulse,
+      proactivitySettings,
+      dependencies.proactivityStateStore,
+    ),
+  };
+}
+
+function createObserverEvalSidecarPort(
+  settings: ObserverEvalSidecarConfig,
+  persistence: ObserverEvalSidecarPersistencePort | null,
+  eventBus: EventBus | undefined,
+  companionIdInput: string | undefined,
+  emitProactivityImpulse: ((impulse: EmoSimProactivityImpulse) => Promise<void>) | undefined,
+  proactivitySettings: ReturnType<typeof createDefaultEmoSimProactivitySettings>,
+  proactivityStateStore: EmoSimProactivityStateStorePort | undefined,
+): Pick<ObserverEvalSidecarRuntime, 'observer' | 'proactivitySampling'> {
+  if (settings.enabled !== true || settings.adapter?.kind !== 'emosim_server') {
+    return { observer: null };
+  }
+  const serverUrl = settings.adapter.serverUrl?.trim();
+  const sessionLabel = settings.adapter.sessionLabel?.trim();
+  const agentName = settings.adapter.agentName?.trim();
+  const personality = settings.adapter.personality;
+  if (!serverUrl || !sessionLabel || !agentName || !personality) {
+    // Startup config validation (validateObserverEvalSidecarStartupConfig and
+    // the settings normalizer) already fails closed on these; reaching this
+    // point means the sidecar was constructed without validated settings.
+    throw new Error(
+      'observerEvalSidecar.adapter requires serverUrl, sessionLabel, agentName, and personality for kind=emosim_server',
+    );
+  }
+  if (settings.levers?.enabled === true && !eventBus) {
+    throw new Error('observerEvalSidecar.levers requires the context-coherence event bus');
+  }
+  const companionId = companionIdInput?.trim();
+  const proactivityEnabled = proactivitySettings.mode !== 'off';
+  if (proactivityEnabled && !companionId) {
+    throw new Error('EmoSim Proactivity Port requires an explicit companionId');
+  }
+  if (proactivityEnabled && (!emitProactivityImpulse || !proactivityStateStore)) {
+    throw new Error(
+      'EmoSim Proactivity Port requires its production impulse sink and companion-local state store',
+    );
+  }
+
+  const proactivityPort = proactivityEnabled
+    && companionId
+    && emitProactivityImpulse
+    && proactivityStateStore
+    ? createEmoSimProactivityPort({
+        enabled: true,
+        companionId,
+        thresholdProfile: proactivitySettings.thresholdProfile,
+        stateStore: proactivityStateStore,
+        emitImpulse: emitProactivityImpulse,
+      })
+    : null;
+
+  // Shared across turn projection and scheduled reads: one exact session and
+  // one serialized production threshold cursor for both observation sources.
+  const runner = createEmoSimServerRunner({
+    serverUrl,
+    sessionLabel,
+    agentName,
+    personality,
+    ...(settings.adapter.timeoutMs !== undefined ? { timeoutMs: settings.adapter.timeoutMs } : {}),
+  });
+  const observer = new EmoSimObserverEvalSidecar({
+    config: settings,
+    persistence,
+    ...(eventBus
+      ? { emitContextCoherence: event => eventBus.emit('context.coherence.detected', event) }
+      : {}),
+    ...(proactivityPort ? { proactivityPort, companionId: companionId! } : {}),
+    // One runner per sidecar: it caches the contract check and the persistent
+    // session bootstrap across observations.
+    runner,
+    subject: {
+      name: agentName,
+      uid: settings.sidecarId ?? OBSERVER_EVAL_RUN_PREFIX,
+      personality: structuredClone(personality),
+    },
+  });
+  return {
+    observer,
+    ...(proactivityPort && companionId ? {
+      proactivitySampling: {
+        intervalMs: proactivitySettings.thresholdProfile.samplingIntervalMs,
+        sample: createEmoSimLiveStateSampler({
+          companionId,
+          readCurrentState: () => runner.readCurrentState(),
+          port: proactivityPort,
+        }),
+      },
+    } : {}),
+  };
+}
+
+function createObserverEvalSidecarPersistence(
+  config: Pick<SubstrateConfig, 'persistenceBackend'>,
+  settings: ObserverEvalSidecarConfig,
+  postgresDatabaseUrlInput: string | undefined,
+  tenant: TenantPoolScope | undefined,
+): ObserverEvalSidecarPersistencePort | null {
+  if (settings.persistence?.enabled !== true) {
+    return null;
+  }
+  if (config.persistenceBackend !== 'postgres') {
+    throw new Error(
+      'observerEvalSidecar.persistence requires persistenceBackend=postgres',
+    );
+  }
+  const postgresDatabaseUrl = postgresDatabaseUrlInput?.trim();
+  if (!postgresDatabaseUrl) {
+    throw new Error(
+      'observerEvalSidecar.persistence requires an explicit PostgreSQL database URL',
+    );
+  }
+  // Per-companion store: pin the tenant search_path/role so a multi-companion
+  // follower's sidecar write pool operates inside its own companion schema
+  // instead of defaulting to the primary tenant's `public` (psfn-framework-3ack).
+  // This is the memoized first creation in the agent process, so it decides the
+  // scope the advisory read path later reuses.
+  // The store registers its migration with the process readiness coordinator.
+  // Optional failure is retained for health reporting and every store call
+  // still fails closed through the same observed readiness handle.
+  return createPostgresObserverEvalSidecarStore(postgresDatabaseUrl, {}, tenant);
+}
+
+interface EmoSimObserverEvalSidecarOptions {
+  config: ObserverEvalSidecarConfig;
+  persistence: ObserverEvalSidecarPersistencePort | null;
+  runner: EmoSimRunner;
+  /** The companion's own emo_sim subject; recorded on every projected input. */
+  subject: EmoSimSubject;
+  emitContextCoherence?: (event: ContextCoherenceEvent) => Promise<void>;
+  /** Production port is a sibling sink of the live EmoSim result, never an eval-row reader. */
+  proactivityPort?: EmoSimProactivityPort;
+  companionId?: string;
+}
+
+class EmoSimObserverEvalSidecar implements ObserverEvalSidecarPort {
+  private readonly runId: string;
+  private readonly startedAtMs: number;
+  private runRecorded = false;
+  private readonly leverStage: ObserverEvalLeverStage | null;
+
+  constructor(private readonly options: EmoSimObserverEvalSidecarOptions) {
+    this.startedAtMs = Date.now();
+    this.runId = [
+      OBSERVER_EVAL_RUN_PREFIX,
+      normalizeIdPart(options.config.sidecarId ?? 'sidecar'),
+      String(process.pid),
+      String(this.startedAtMs),
+    ].join('-');
+    this.leverStage = createObserverEvalLeverStage({
+      settings: options.config.levers,
+      persistence: options.persistence,
+      sidecarId: options.config.sidecarId ?? OBSERVER_EVAL_RUN_PREFIX,
+      retentionDays: options.config.persistence?.retentionDays ?? 14,
+      ...(options.emitContextCoherence
+        ? { emitContextCoherence: options.emitContextCoherence }
+        : {}),
+    });
+  }
+
+  async observeTurn(input: ObserverEvalInput): Promise<void> {
+    const rawInput = input as ObserverEvalInputPayload;
+    const projection = projectObserverEvalToEmoSim(rawInput, {
+      runId: this.runId,
+      includeWorldState: this.options.config.adapter?.includeWorldState ?? false,
+      subject: this.options.subject,
+    });
+    const socialContactKey = rawInput.metadata.socialContactKey;
+    const emosim = projection.ok
+      ? await runEmoSimProjectedStimulus(projection.adapterInput, {
+        runner: this.options.runner,
+        ...(socialContactKey !== undefined ? { context: { socialContactKey } } : {}),
+      })
+      : undefined;
+    const crosswalk = projection.ok && emosim?.ok
+      ? createObserverEmotionCrosswalk({
+        psfn: rawInput.emotion.snapshot,
+        emosim: emosim.output,
+      })
+      : undefined;
+    const error = buildObservationError(projection, emosim);
+    const leverSnapshot = toObserverLeverSnapshot(emosim?.ok ? emosim.output : undefined);
+
+    if (this.options.proactivityPort && this.options.companionId) {
+      try {
+        await this.options.proactivityPort.observe({
+          companionId: this.options.companionId,
+          observedAtMs: Date.now(),
+          source: {
+            model: 'emo_sim',
+            version: EMOSIM_INTEGRATION_SURFACE,
+            availability: emosim?.ok ? 'available' : 'unavailable',
+            confidence: projection.confidence,
+          },
+          lineage: {
+            schemaVersion: 1,
+            inputId: [
+              this.runId,
+              normalizeIdPart(String(rawInput.turn.turnId)),
+              String(rawInput.provenance.capturedAt),
+            ].join(':'),
+            projectionVersion: projection.projectionVersion,
+            privacyClass: projection.privacy.privacyClass,
+            rawContentRedacted: true,
+          },
+          snapshot: leverSnapshot,
+        });
+      } catch (proactivityError) {
+        // Required response loss leaves the production cursor unchanged, so
+        // the same first-crossing dedupe key is retried on the next live result.
+        createComponentLogger('EmoSimProactivityPort').error(
+          'EmoSim proactivity impulse handoff failed; crossing remains retryable',
+          {
+            companionId: this.options.companionId,
+            error: proactivityError instanceof Error
+              ? proactivityError.message
+              : String(proactivityError),
+          },
+        );
+      }
+    }
+
+    let observationId: string | null = null;
+    if (this.options.persistence) {
+      observationId = await this.recordObservation({
+        rawInput,
+        projection,
+        emosim,
+        crosswalk,
+        error,
+      });
+    }
+
+    if (observationId && this.leverStage) {
+      // Lever evaluation runs strictly AFTER the observation is persisted and
+      // feeds on the same observation payload. Lever failure must not fail
+      // the observation: it is logged through the sidecar's error channel and
+      // recorded on the persisted lever state -- never silently swallowed and
+      // never propagated into the observation path.
+      await this.leverStage.evaluateObservation({
+        runId: this.runId,
+        observationId,
+        snapshot: leverSnapshot,
+        observedAtMs: Date.now(),
+        coherenceContext: {
+          channelId: rawInput.turn.channelId,
+          turnId: rawInput.turn.turnId,
+          requestId: rawInput.turn.requestId,
+          sessionContext: rawInput.coherenceContext,
+        },
+      });
+    }
+
+    if (error && shouldPropagateObserverEvalObservationError(error, Boolean(this.options.persistence))) {
+      throw new Error(error.message);
+    }
+  }
+
+  private async recordObservation(input: {
+    rawInput: ObserverEvalInputPayload;
+    projection: ReturnType<typeof projectObserverEvalToEmoSim>;
+    emosim: Awaited<ReturnType<typeof runEmoSimProjectedStimulus>> | undefined;
+    crosswalk: ReturnType<typeof createObserverEmotionCrosswalk> | undefined;
+    error: ObserverEvalSidecarErrorState | undefined;
+  }): Promise<string | null> {
+    const persistence = this.options.persistence;
+    if (!persistence) {
+      return null;
+    }
+
+    await this.ensureRunRecorded(persistence);
+    const observedAtMs = Date.now();
+    const observation: ObserverEvalSidecarObservationInput = {
+      observationId: [
+        this.runId,
+        normalizeIdPart(String(input.rawInput.turn.turnId)),
+        String(observedAtMs),
+      ].join(':'),
+      runId: this.runId,
+      sanitizedInput: input.projection.sanitizedInput,
+      observedAtMs,
+      projection: input.projection,
+      ...(input.emosim ? { emosim: input.emosim } : {}),
+      ...(input.crosswalk ? { crosswalk: input.crosswalk } : {}),
+      comparisonMetrics: createObserverEvalComparisonMetrics(input.crosswalk, {
+        sidecarId: this.options.config.sidecarId ?? null,
+        adapterKind: this.options.config.adapter?.kind ?? null,
+      }),
+      ...(input.error ? { error: input.error } : {}),
+      retention: this.makeRetention(observedAtMs),
+    };
+    await persistence.recordObservation(observation);
+    await persistence.pruneExpiredRetention(observedAtMs);
+    return observation.observationId;
+  }
+
+  private async ensureRunRecorded(persistence: ObserverEvalSidecarPersistencePort): Promise<void> {
+    if (this.runRecorded) {
+      return;
+    }
+    await persistence.upsertRun({
+      runId: this.runId,
+      sidecarId: this.options.config.sidecarId ?? OBSERVER_EVAL_RUN_PREFIX,
+      deployment: toObserverEvalPersistenceDeployment(this.options.config.deploymentTarget),
+      status: 'running',
+      startedAtMs: this.startedAtMs,
+      retention: this.makeRetention(this.startedAtMs),
+      metadata: {
+        mode: this.options.config.mode ?? 'observe_only',
+        adapterKind: this.options.config.adapter?.kind ?? 'unknown',
+      },
+    });
+    this.runRecorded = true;
+  }
+
+  private makeRetention(capturedAtMs: number) {
+    const retentionDays = this.options.config.persistence?.retentionDays ?? 14;
+    return {
+      retentionClass: 'standard' as const,
+      policyId: `${OBSERVER_EVAL_RUN_PREFIX}-runtime`,
+      capturedAtMs,
+      retainUntilMs: capturedAtMs + (retentionDays * DAY_MS),
+      reason: 'Observer eval sidecar runtime telemetry retention',
+    };
+  }
+}
+
+function buildObservationError(
+  projection: ReturnType<typeof projectObserverEvalToEmoSim>,
+  emosim: Awaited<ReturnType<typeof runEmoSimProjectedStimulus>> | undefined,
+): ObserverEvalSidecarErrorState | undefined {
+  if (!projection.ok) {
+    return {
+      message: projection.error.message,
+      code: projection.error.reason,
+      recoverable: projection.error.recoverable,
+      redacted: true,
+      redactionReason: 'observer_eval_projection_error',
+      ...(projection.error.details ? { details: projection.error.details } : {}),
+    };
+  }
+  if (emosim && !emosim.ok) {
+    return {
+      message: emosim.error.message,
+      code: emosim.error.reason,
+      recoverable: emosim.error.recoverable,
+      redacted: true,
+      redactionReason: 'observer_eval_emosim_error',
+      ...(emosim.error.details ? { details: emosim.error.details } : {}),
+    };
+  }
+  return undefined;
+}
+
+export function shouldPropagateObserverEvalObservationError(
+  error: ObserverEvalSidecarErrorState | undefined,
+  persistenceAvailable: boolean,
+): boolean {
+  if (!error) {
+    return false;
+  }
+  if (!persistenceAvailable) {
+    return true;
+  }
+  return error.recoverable !== true;
+}
+
+function normalizeIdPart(value: string): string {
+  const normalized = value.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return normalized.length > 0 ? normalized : 'unknown';
+}
+
+export function toObserverLeverSnapshot(
+  output: EmoSimAdapterOutput | undefined,
+): ObserverLeverSnapshotInput | null {
+  const snapshot = output?.snapshots.afterTick;
+  if (!snapshot) {
+    return null;
+  }
+  // Historical rows / degraded runtimes may omit drives entirely even though
+  // the current adapter contract types them as required; the lever module
+  // treats missing drives as inputs_unavailable, never a throw.
+  const drives = (snapshot as Partial<Pick<typeof snapshot, 'drives'>>).drives;
+  return {
+    t: snapshot.t,
+    mood: {
+      valence: snapshot.mood.valence,
+      arousal: snapshot.mood.arousal,
+    },
+    dominant: snapshot.dominant,
+    emotions: { ...snapshot.emotions },
+    drives: drives ? { ...drives } : null,
+  };
+}
+
+interface ObserverEvalLeverStageOptions {
+  settings: ObserverEvalSidecarLeverSettings;
+  persistence: ObserverEvalSidecarLeverPersistencePort;
+  sidecarId: string;
+  retentionDays: number;
+  emitContextCoherence?: (event: ContextCoherenceEvent) => Promise<void>;
+}
+
+interface ObserverEvalCoherenceContext {
+  channelId: string;
+  turnId: TurnID;
+  requestId: string;
+  sessionContext: ContextCoherenceEvent['context'];
+}
+
+function createObserverEvalLeverStage(input: {
+  settings: ObserverEvalSidecarLeverSettings | undefined;
+  persistence: ObserverEvalSidecarPersistencePort | null;
+  sidecarId: string;
+  retentionDays: number;
+  emitContextCoherence?: (event: ContextCoherenceEvent) => Promise<void>;
+}): ObserverEvalLeverStage | null {
+  if (input.settings?.enabled !== true) {
+    return null;
+  }
+  if (!input.persistence || !isLeverPersistencePort(input.persistence)) {
+    // Config validation already fails closed on levers without persistence;
+    // this guards composition paths that inject a bare observation store.
+    return null;
+  }
+  return new ObserverEvalLeverStage({
+    settings: input.settings,
+    persistence: input.persistence,
+    sidecarId: input.sidecarId,
+    retentionDays: input.retentionDays,
+    ...(input.emitContextCoherence
+      ? { emitContextCoherence: input.emitContextCoherence }
+      : {}),
+  });
+}
+
+function isLeverPersistencePort(
+  persistence: ObserverEvalSidecarPersistencePort,
+): persistence is ObserverEvalSidecarPersistencePort & ObserverEvalSidecarLeverPersistencePort {
+  const candidate = persistence as Partial<ObserverEvalSidecarLeverPersistencePort>;
+  return typeof candidate.recordLeverEvent === 'function'
+    && typeof candidate.queryLeverEvents === 'function'
+    && typeof candidate.loadLeverState === 'function'
+    && typeof candidate.saveLeverState === 'function'
+    && typeof candidate.pruneExpiredLeverEvents === 'function';
+}
+
+/**
+ * Lever stage: runs after each persisted observation and records WOULD-ACT
+ * telemetry in eval-owned, non-authoritative tables. It has no live consumer:
+ * the sibling EmoSim Proactivity Port independently owns production impulses.
+ */
+export class ObserverEvalLeverStage {
+  private tracker: ObserverLeverTracker | null = null;
+  private readonly logger = createComponentLogger('ObserverEvalSidecarLevers');
+
+  constructor(private readonly options: ObserverEvalLeverStageOptions) {}
+
+  async evaluateObservation(input: {
+    runId: string;
+    observationId: string;
+    snapshot: ObserverLeverSnapshotInput | null;
+    observedAtMs: number;
+    coherenceContext?: ObserverEvalCoherenceContext;
+  }): Promise<void> {
+    let previousState: ReturnType<ObserverLeverTracker['getState']> | null = null;
+    try {
+      const tracker = await this.ensureTracker();
+      previousState = tracker.getState();
+      const evaluation = tracker.evaluate({
+        snapshot: input.snapshot,
+        observedAtMs: input.observedAtMs,
+      });
+      for (const event of evaluation.events) {
+        await this.options.persistence.recordLeverEvent({
+          eventId: `${input.runId}:lever:${event.lever}:${event.firedAtMs}`,
+          runId: input.runId,
+          lever: event.lever,
+          firedAtMs: event.firedAtMs,
+          observationId: input.observationId,
+          detail: event.detail,
+          stateValues: event.stateValues,
+          sustainMs: event.sustainMs,
+          firstCrossingMs: event.firstCrossingMs,
+          cooldown: event.cooldown,
+          retention: this.makeLeverRetention(event.firedAtMs),
+        });
+        if (
+          event.lever === 'rumination_watch'
+          && input.coherenceContext
+          && this.options.emitContextCoherence
+        ) {
+          await this.options.emitContextCoherence({
+            schemaVersion: 1,
+            id: `${input.observationId}:concern_rumination`,
+            signal: 'concern_rumination',
+            source: 'observer_eval',
+            timestamp: event.firedAtMs,
+            channelId: input.coherenceContext.channelId,
+            turnId: input.coherenceContext.turnId,
+            requestId: input.coherenceContext.requestId,
+            detail: 'rumination_watch',
+            groundTruth: false,
+            context: { ...input.coherenceContext.sessionContext },
+            correlations: [],
+            eligibleForEmotionAppraisal: false,
+            eligibleForMemoryCandidacy: false,
+          });
+        }
+      }
+      await this.persistTrackerState(tracker, evaluation, input.observedAtMs);
+      await this.options.persistence.pruneExpiredLeverEvents(input.observedAtMs);
+    } catch (error) {
+      // Lever failure must not fail the observation. This is not a silent
+      // catch: the failure goes through the sidecar's component logger and is
+      // recorded on the persisted lever state (best effort).
+      const message = error instanceof Error ? error.message : String(error);
+      if (previousState) {
+        // A failed eval write must not consume the shadow crossing. Production
+        // state and delivery are outside this tracker.
+        this.tracker = new ObserverLeverTracker(this.options.settings, previousState);
+      }
+      this.logger.error('Observer eval sidecar lever evaluation failed', {
+        sidecarId: this.options.sidecarId,
+        runId: input.runId,
+        observationId: input.observationId,
+        error: message,
+      });
+      await this.persistEvaluationFailure(message, input.observedAtMs);
+    }
+  }
+
+  private async ensureTracker(): Promise<ObserverLeverTracker> {
+    if (this.tracker) {
+      return this.tracker;
+    }
+    const entries = await this.options.persistence.loadLeverState(this.options.sidecarId);
+    const state = createEmptyObserverLeverTrackerState();
+    for (const entry of entries) {
+      state.levers[entry.lever] = normalizeObserverLeverTrackerState({
+        schemaVersion: state.schemaVersion,
+        levers: { [entry.lever]: entry.state },
+      }).levers[entry.lever];
+    }
+    this.tracker = new ObserverLeverTracker(this.options.settings, state);
+    return this.tracker;
+  }
+
+  private async persistTrackerState(
+    tracker: ObserverLeverTracker,
+    evaluation: ObserverLeverEvaluation,
+    observedAtMs: number,
+  ): Promise<void> {
+    const state = tracker.getState();
+    const entries: ObserverEvalSidecarLeverStateEntry[] = evaluation.entries.map(entry => ({
+      lever: entry.lever,
+      state: {
+        ...state.levers[entry.lever],
+        lastEvaluation: {
+          at: observedAtMs,
+          status: entry.status,
+          outcome: entry.outcome,
+          notes: entry.notes,
+          missingInputs: entry.missingInputs,
+        },
+      },
+    }));
+    await this.options.persistence.saveLeverState({
+      sidecarId: this.options.sidecarId,
+      updatedAtMs: observedAtMs,
+      entries,
+    });
+  }
+
+  private async persistEvaluationFailure(message: string, observedAtMs: number): Promise<void> {
+    try {
+      const state = this.tracker?.getState() ?? createEmptyObserverLeverTrackerState();
+      await this.options.persistence.saveLeverState({
+        sidecarId: this.options.sidecarId,
+        updatedAtMs: observedAtMs,
+        entries: OBSERVER_EVAL_LEVER_NAMES.map(lever => ({
+          lever,
+          state: {
+            ...state.levers[lever],
+            lastEvaluation: {
+              at: observedAtMs,
+              status: 'error',
+              error: message,
+            },
+          },
+        })),
+      });
+    } catch (persistError) {
+      this.logger.error('Observer eval sidecar lever failure could not be persisted', {
+        sidecarId: this.options.sidecarId,
+        error: persistError instanceof Error ? persistError.message : String(persistError),
+      });
+    }
+  }
+
+  private makeLeverRetention(firedAtMs: number): ObserverEvalSidecarRetentionMetadata {
+    const retentionDays = Math.max(OBSERVER_EVAL_LEVER_MIN_RETENTION_DAYS, this.options.retentionDays);
+    return {
+      retentionClass: 'extended',
+      policyId: `${OBSERVER_EVAL_RUN_PREFIX}-lever-events`,
+      capturedAtMs: firedAtMs,
+      retainUntilMs: firedAtMs + (retentionDays * DAY_MS),
+      reason: 'Observer eval sidecar shadow lever WOULD-ACT telemetry retention (>= 90 days for longitudinal review)',
+    };
+  }
+}
+
+export function toObserverEvalPersistenceDeployment(
+  deploymentTarget: ObserverEvalSidecarConfig['deploymentTarget'] | undefined,
+): 'live' | 'eval' | 'test' {
+  if (deploymentTarget === 'live' || deploymentTarget === 'eval') {
+    return deploymentTarget;
+  }
+  return 'test';
+}

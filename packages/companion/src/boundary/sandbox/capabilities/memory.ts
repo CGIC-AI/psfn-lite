@@ -1,0 +1,610 @@
+import { MemoryWriter } from '../../../faculties/memory/writer.js';
+import type { LLMProviderPort } from '../../../core/agent/contracts.js';
+import type { EmbeddingProviderPort } from '../../../shared/contracts/embedding-provider.js';
+import type { MemoryStorePort } from '../../../faculties/memory/memory-store-port.js';
+import type { SessionManager } from '../../../core/session/manager.js';
+import type { MemoryType, MemoryRedactionOperation } from '../../../faculties/memory/types.js';
+import type { SessionSearchHit } from '../../../persistence/sessions/transcript-projection-port.js';
+import {
+  VALID_MEMORY_TYPES,
+} from '../../../faculties/memory/types.js';
+import type { AnalysisWorkbenchEvidence } from '../../../core/tools/analysis-workbench/types.js';
+import { addEvidence, splitCsvTags, toTrimmedString } from './common.js';
+import {
+  runSessionSearch,
+  type SessionSearchResult,
+} from '../../../core/session/search-runtime.js';
+import {
+  canViewerReadSessionChannel,
+  resolveViewerContextFromRequest,
+} from '../../../core/session/session-viewer-access.js';
+import { getRequestContext } from '../../../primitives/llm/request-context.js';
+import {
+  createSubjectAuthorizedMemoryStore,
+  memorySubjectAccessContextFromCorrelation,
+} from '../../../faculties/memory/subject-authorized-store.js';
+import {
+  filterQuarantinedMemories,
+  isMemoryQuarantined,
+  type MemorySessionQuarantineFilter,
+} from '../../../faculties/memory/retrieval/session-quarantine.js';
+import type {
+  EpisodeSearchModeReport,
+  HybridEpisodeSearchPort,
+} from '../../../faculties/memory/retrieval/episode-search.js';
+import { resolveMemoryVisibility } from '../../../faculties/memory/tools/visibility.js';
+import { isMemoryOwnedByCompanion } from '../../../faculties/memory/companion-provenance.js';
+
+/**
+ * Caller-supplied session_search options. `channelId` only narrows the search
+ * scope; the viewer (trust, room privacy, DM flag) always comes from the
+ * admitted request context and is never caller-supplied (psfn-framework-k0sr0).
+ */
+export interface SessionSearchOptions {
+  channelId?: string;
+}
+
+const SESSION_SEARCH_OPTION_KEYS: ReadonlySet<string> = new Set(['channelId']);
+
+function parseSessionSearchOptions(value: unknown): SessionSearchOptions {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('session_search options must be an object');
+  }
+  const unknownKeys = Object.keys(value).filter(key => !SESSION_SEARCH_OPTION_KEYS.has(key));
+  if (unknownKeys.length > 0) {
+    throw new Error(
+      `session_search options accept only channelId (viewer trust comes from the conversation); rejected: ${unknownKeys.join(', ')}`,
+    );
+  }
+  const channelId = (value as { channelId?: unknown }).channelId;
+  if (channelId === undefined) return {};
+  if (typeof channelId !== 'string' || channelId.trim().length === 0) {
+    throw new Error('session_search options.channelId must be a non-empty string');
+  }
+  return { channelId: channelId.trim() };
+}
+
+export interface MemoryCapabilities {
+  memory_search: (query: string, limit?: number) => Promise<Array<{ text: string; type: string; importance: number; similarity: number }>>;
+  episode_search: (query: string, limit?: number) => Promise<{
+    results: Array<{
+      id: string;
+      title: string;
+      landmark: string;
+      meaning?: string;
+      startedAt: string;
+      endedAt: string;
+      fusedScore: number;
+      lexicalScore?: number;
+      semanticSimilarity?: number;
+      matchedTerms: string[];
+      retrievalModes: Array<'lexical' | 'semantic'>;
+    }>;
+    modes: { lexical: EpisodeSearchModeReport; semantic: EpisodeSearchModeReport };
+    degraded: boolean;
+    error?: string;
+  }>;
+  memory_count: () => Promise<number> | number;
+  memory_write: (
+    text: string,
+    type: string,
+    importance?: number,
+    emotionalValence?: number,
+    tags?: string,
+  ) => Promise<{ action: string; id: string }>;
+  memory_import_batch: (
+    records: Array<{ text: string; type: string; importance?: number; emotional_valence?: number; tags?: string }>,
+  ) => Promise<{ written: number; deduplicated: number; errors: number }>;
+  memory_upsert: (
+    text: string,
+    type: string,
+    importance?: number,
+    emotionalValence?: number,
+    tags?: string,
+  ) => Promise<{ action: string; id: string; superseded: boolean }>;
+  memory_redact: (
+    memoryId: string,
+    operation?: MemoryRedactionOperation,
+    reason?: string,
+  ) => Promise<{
+    operation: string;
+    sourceId: string;
+    deleteId?: string;
+    abstractedId?: string;
+    provenanceRef?: string;
+  }>;
+  session_messages: (channelId: string, limit?: number) => Array<{ role: string; content: string; timestamp: number }>;
+  session_search: (
+    query: string,
+    limit?: number,
+    options?: SessionSearchOptions,
+  ) => Promise<SessionSearchResult>;
+  memory_get_by_id: (id: string) => Promise<Record<string, unknown> | null>;
+}
+
+interface MemoryCapabilitySessionPort {
+  getRecentMessages: SessionManager['getRecentMessages'];
+  isSessionRetiredOrQuarantined?: SessionManager['isSessionRetiredOrQuarantined'];
+  getRetiredLogicalSessionIds?: SessionManager['getRetiredLogicalSessionIds'];
+  searchByKeywords?: (query: string, limit?: number) => Promise<SessionSearchHit[]>;
+  searchTranscripts?: (query: string, limit?: number) => Promise<SessionSearchHit[]>;
+}
+
+interface CreateMemoryCapabilitiesOptions {
+  llmProvider: LLMProviderPort;
+  embeddingService: EmbeddingProviderPort | null;
+  memoryStore: MemoryStorePort | null;
+  episodeSearch?: HybridEpisodeSearchPort | null;
+  sessionManager: MemoryCapabilitySessionPort | null;
+  pushEvidence: (entry: AnalysisWorkbenchEvidence) => void;
+  companionId?: string;
+}
+
+function resolveTranscriptSearchPort(
+  sessionManager: MemoryCapabilitySessionPort | null,
+): {
+  searchByKeywords: (query: string, limit?: number) => Promise<SessionSearchHit[]>;
+} | null {
+  if (!sessionManager) {
+    return null;
+  }
+
+  if (typeof sessionManager.searchByKeywords === 'function') {
+    return {
+      searchByKeywords: sessionManager.searchByKeywords.bind(sessionManager),
+    };
+  }
+
+  if (typeof sessionManager.searchTranscripts === 'function') {
+    return {
+      searchByKeywords: sessionManager.searchTranscripts.bind(sessionManager),
+    };
+  }
+
+  return null;
+}
+
+function nextReplInvocationId(): string {
+  return `repl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+// The getAllActiveMemories fallbacks below only run for partial stores that
+// lack countActiveMemories/listMemories; PostgresMemoryStore and the
+// subject-authorized proxy implement both, so production never takes them
+// (psfn-framework-dnaqt).
+function createCompatibleMemoryStore(memoryStore: MemoryStorePort | null): MemoryStorePort | null {
+  if (!memoryStore) {
+    return null;
+  }
+
+  const store = memoryStore as MemoryStorePort & {
+    countActiveMemories?: MemoryStorePort['countActiveMemories'];
+    listMemories?: MemoryStorePort['listMemories'];
+    persistMemoryWrite?: MemoryStorePort['persistMemoryWrite'];
+  };
+
+  if (
+    typeof store.countActiveMemories === 'function'
+    && typeof store.persistMemoryWrite === 'function'
+  ) {
+    return memoryStore;
+  }
+
+  return new Proxy(store, {
+    get(target, prop, receiver) {
+      if (prop === 'countActiveMemories') {
+        return async (): Promise<number> => {
+          if (typeof target.countActiveMemories === 'function') {
+            return target.countActiveMemories();
+          }
+          return (await target.getAllActiveMemories()).length;
+        };
+      }
+
+      if (prop === 'listMemories') {
+        return async (
+          options?: Parameters<MemoryStorePort['listMemories']>[0],
+        ): Promise<Awaited<ReturnType<MemoryStorePort['listMemories']>>> => {
+          if (typeof target.listMemories === 'function') {
+            return target.listMemories(options);
+          }
+          const memories = await target.getAllActiveMemories();
+          const offset = Math.max(0, Math.floor(options?.offset ?? 0));
+          if (options?.limit === undefined) {
+            return memories.slice(offset);
+          }
+          const limit = Math.max(1, Math.floor(options.limit));
+          return memories.slice(offset, offset + limit);
+        };
+      }
+
+      if (prop === 'persistMemoryWrite') {
+        return async (
+          input: Parameters<MemoryStorePort['persistMemoryWrite']>[0],
+        ): Promise<void> => {
+          if (typeof target.persistMemoryWrite === 'function') {
+            await target.persistMemoryWrite(input);
+            return;
+          }
+
+          if (typeof target.insertMemory !== 'function') {
+            throw new Error('memory store missing persistMemoryWrite/insertMemory');
+          }
+
+          const commit = async (): Promise<void> => {
+            await target.insertMemory(input.memory, input.embedding);
+
+            if (input.supersededMemoryIds?.length) {
+              if (typeof target.updateMemory !== 'function') {
+                throw new Error('memory store missing updateMemory for superseded writes');
+              }
+              for (const memoryId of input.supersededMemoryIds) {
+                await target.updateMemory(memoryId, { supersededBy: input.memory.id });
+              }
+            }
+          };
+
+          if (typeof target.runInTransaction === 'function') {
+            await target.runInTransaction(() => commit());
+            return;
+          }
+
+          await commit();
+        };
+      }
+
+      return Reflect.get(target, prop, receiver);
+    },
+  }) as MemoryStorePort;
+}
+
+function isSelfDirectedReflectionRequest(): boolean {
+  const context = getRequestContext();
+  return context?.requesterProvenance === 'self_directed'
+    && context.channelId?.startsWith('internal:reflection:') === true;
+}
+
+export function createMemoryCapabilities(options: CreateMemoryCapabilitiesOptions): MemoryCapabilities {
+  const sessionManager = options.sessionManager;
+  const isSessionRetiredOrQuarantined = sessionManager?.isSessionRetiredOrQuarantined;
+  const getRetiredLogicalSessionIds = sessionManager?.getRetiredLogicalSessionIds;
+  const sessionQuarantineFilter: MemorySessionQuarantineFilter | null =
+    typeof isSessionRetiredOrQuarantined === 'function'
+    && typeof getRetiredLogicalSessionIds === 'function'
+    ? {
+      isSessionRetiredOrQuarantined: logicalSessionId => (
+        isSessionRetiredOrQuarantined.call(sessionManager, logicalSessionId)
+      ),
+      getRetiredLogicalSessionIds: () => getRetiredLogicalSessionIds.call(sessionManager),
+    }
+    : null;
+  const subjectStore = options.memoryStore
+    ? createSubjectAuthorizedMemoryStore(
+      options.memoryStore,
+      () => memorySubjectAccessContextFromCorrelation(getRequestContext()),
+    )
+    : null;
+  const memoryStore = createCompatibleMemoryStore(subjectStore);
+  const writer = (options.embeddingService && memoryStore)
+    ? new MemoryWriter(memoryStore, options.embeddingService, {
+        ...(options.companionId ? { companionId: options.companionId } : {}),
+      })
+    : null;
+
+  const memory_search = async (
+    query: string,
+    limit = 10,
+  ): Promise<Array<{ text: string; type: string; importance: number; similarity: number }>> => {
+    if (
+      !options.embeddingService
+      || !memoryStore
+      || (isSelfDirectedReflectionRequest() && !sessionQuarantineFilter)
+    ) {
+      return [];
+    }
+
+    const embedding = await options.embeddingService.embed(query);
+    const results = filterQuarantinedMemories(
+      sessionQuarantineFilter,
+      // Sandbox memory_search runs against the subject-authorized projection
+      // (createSubjectAuthorizedMemoryStore above); require enforcement so a raw
+      // store can never satisfy this companion-facing recall.
+      await memoryStore.searchByEmbedding(embedding, 0.3, limit, undefined, {
+        authorization: 'subject-enforced',
+      }),
+    ).memories.filter(memory => isMemoryOwnedByCompanion(memory, options.companionId));
+
+    addEvidence(options.pushEvidence, {
+      source: 'memory_search',
+      query,
+      snippet: results[0]?.text ?? '',
+      resultCount: results.length,
+    });
+
+    return results.map(memory => ({
+      text: memory.text,
+      type: memory.type,
+      importance: memory.importance,
+      similarity: memory.similarity,
+    }));
+  };
+
+  const episode_search: MemoryCapabilities['episode_search'] = async (query, limit = 10) => {
+    const normalizedQuery = toTrimmedString(query);
+    const unavailable = (error: string): Awaited<ReturnType<MemoryCapabilities['episode_search']>> => ({
+      results: [],
+      modes: {
+        lexical: { status: 'unavailable', candidateCount: 0 },
+        semantic: { status: 'unavailable', candidateCount: 0 },
+      },
+      degraded: true,
+      error,
+    });
+    if (!normalizedQuery) return unavailable('episode search query must be non-empty');
+    if (!options.episodeSearch) return unavailable('hybrid episode search is not configured');
+    if (isSelfDirectedReflectionRequest() && !sessionQuarantineFilter) {
+      return unavailable('episode search requires session quarantine state during reflection');
+    }
+    const visibility = resolveMemoryVisibility({}, 'episode_search');
+    if (!visibility.ok) return unavailable(visibility.error);
+
+    const response = await options.episodeSearch.search({
+      query: normalizedQuery,
+      limit,
+      channelId: visibility.channelId,
+      trustLevel: visibility.trustLevel,
+      channelDisclosure: {
+        channelPrivacy: visibility.channelVisibility,
+        broadcast: visibility.broadcast,
+      },
+      ...(visibility.canonicalContactId
+        ? { canonicalContactId: visibility.canonicalContactId }
+        : {}),
+      accessScope: 'channel_participant',
+      sessionQuarantineFilter,
+    });
+    addEvidence(options.pushEvidence, {
+      source: 'episode_search',
+      query: normalizedQuery,
+      snippet: response.results[0]?.episode.landmark ?? '',
+      resultCount: response.results.length,
+    });
+    return {
+      results: response.results.map(entry => ({
+        id: entry.episode.id,
+        title: entry.episode.title,
+        landmark: entry.episode.landmark,
+        ...(entry.episode.meaning?.text ? { meaning: entry.episode.meaning.text } : {}),
+        startedAt: entry.episode.startedAt,
+        endedAt: entry.episode.endedAt,
+        fusedScore: entry.fusedScore,
+        ...(entry.lexicalScore !== undefined ? { lexicalScore: entry.lexicalScore } : {}),
+        ...(entry.semanticSimilarity !== undefined
+          ? { semanticSimilarity: entry.semanticSimilarity }
+          : {}),
+        matchedTerms: [...entry.matchedTerms],
+        retrievalModes: [...entry.retrievalModes],
+      })),
+      modes: response.modes,
+      degraded: response.degraded,
+    };
+  };
+
+  const memory_count = (): Promise<number> | number => {
+    if (!memoryStore) {
+      return 0;
+    }
+    return memoryStore.countActiveMemories();
+  };
+
+  const memory_write = async (
+    text: string,
+    type: string,
+    importance?: number,
+    emotionalValence?: number,
+    tags?: string,
+  ): Promise<{ action: string; id: string }> => {
+    if (!writer) {
+      return { action: 'error', id: 'no memory system' };
+    }
+    if (!VALID_MEMORY_TYPES.includes(type as MemoryType)) {
+      return { action: 'error', id: `invalid type: ${type}` };
+    }
+
+    try {
+      const result = await writer.write({
+        text,
+        type: type as MemoryType,
+        importance,
+        emotionalValence,
+        tags: splitCsvTags(tags),
+        sourceRef: `source:repl|operation:memory_write|invocation:${nextReplInvocationId()}`,
+      });
+      return { action: result.action, id: result.memory.id };
+    } catch (error) {
+      return { action: 'error', id: toTrimmedString((error as Error).message) || 'memory write failed' };
+    }
+  };
+
+  const memory_import_batch = async (
+    records: Array<{ text: string; type: string; importance?: number; emotional_valence?: number; tags?: string }>,
+  ): Promise<{ written: number; deduplicated: number; errors: number }> => {
+    if (!writer) {
+      return { written: 0, deduplicated: 0, errors: 0 };
+    }
+
+    const invocationId = nextReplInvocationId();
+    const opts = records.map(record => ({
+      text: record.text,
+      type: record.type as MemoryType,
+      importance: record.importance,
+      emotionalValence: record.emotional_valence,
+      tags: splitCsvTags(record.tags),
+      sourceRef: `source:repl|operation:memory_import_batch|invocation:${invocationId}`,
+    }));
+
+    const result = await writer.importBatch(opts);
+    return {
+      written: result.written,
+      deduplicated: result.deduplicated,
+      errors: result.errors,
+    };
+  };
+
+  const memory_upsert = async (
+    text: string,
+    type: string,
+    importance?: number,
+    emotionalValence?: number,
+    tags?: string,
+  ): Promise<{ action: string; id: string; superseded: boolean }> => {
+    if (!writer) {
+      return { action: 'error', id: 'no memory system', superseded: false };
+    }
+    if (!VALID_MEMORY_TYPES.includes(type as MemoryType)) {
+      return { action: 'error', id: `invalid type: ${type}`, superseded: false };
+    }
+
+    try {
+      const result = await writer.upsert({
+        text,
+        type: type as MemoryType,
+        importance,
+        emotionalValence,
+        tags: splitCsvTags(tags),
+        sourceRef: `source:repl|operation:memory_upsert|invocation:${nextReplInvocationId()}`,
+      });
+
+      return {
+        action: result.action,
+        id: result.memory.id,
+        superseded: result.action === 'superseded',
+      };
+    } catch (error) {
+      return {
+        action: 'error',
+        id: toTrimmedString((error as Error).message) || 'memory upsert failed',
+        superseded: false,
+      };
+    }
+  };
+
+  const memory_redact = async (
+    _memoryId: string,
+    _operation: MemoryRedactionOperation = 'auto',
+    _reason?: string,
+  ): Promise<{
+    operation: string;
+    sourceId: string;
+    deleteId?: string;
+    abstractedId?: string;
+    provenanceRef?: string;
+  }> => {
+    return {
+      operation: 'error',
+      sourceId: 'memory_redact is retired; use the Partner-alerted memory deletion proposal workflow',
+    };
+  };
+
+  const session_messages = (
+    channelId: string,
+    limit = 20,
+  ): Array<{ role: string; content: string; timestamp: number }> => {
+    if (!options.sessionManager) {
+      return [];
+    }
+    // Raw transcript content obeys the same disclosure gate as transcript
+    // search: a channel this conversation cannot read is refused, never
+    // silently emptied (psfn-framework-k0sr0).
+    if (!canViewerReadSessionChannel(resolveViewerContextFromRequest(), channelId)) {
+      throw new Error(`session_messages refused: "${channelId}" is not readable from this conversation`);
+    }
+
+    const entries = options.sessionManager.getRecentMessages(channelId, limit);
+    addEvidence(options.pushEvidence, {
+      source: 'session_messages',
+      query: channelId,
+      snippet: entries[0]?.content ?? '',
+      resultCount: entries.length,
+    });
+
+    return entries.map(entry => ({
+      role: entry.role,
+      content: entry.content,
+      timestamp: entry.timestamp,
+    }));
+  };
+
+  const session_search = async (
+    query: string,
+    limit = 8,
+    searchOptions?: SessionSearchOptions,
+  ): Promise<SessionSearchResult> => {
+    const normalizedQuery = toTrimmedString(query);
+    const scope = parseSessionSearchOptions(searchOptions);
+    const result = await runSessionSearch({
+      transcriptSearch: resolveTranscriptSearchPort(options.sessionManager),
+      llmProvider: options.llmProvider,
+      query: normalizedQuery,
+      limit,
+      summarize: true,
+      ...(scope.channelId ? { targetChannelId: scope.channelId } : {}),
+      viewer: resolveViewerContextFromRequest(),
+    });
+
+    addEvidence(options.pushEvidence, {
+      source: 'session_search',
+      query: normalizedQuery,
+      snippet: result.summary || result.hits[0]?.snippet || '',
+      resultCount: result.hits.length,
+    });
+
+    return result;
+  };
+
+  const memory_get_by_id = async (id: string): Promise<Record<string, unknown> | null> => {
+    if (!memoryStore || (isSelfDirectedReflectionRequest() && !sessionQuarantineFilter)) {
+      return null;
+    }
+
+    const memory = await memoryStore.getById(id);
+    if (!memory
+      || isMemoryQuarantined(sessionQuarantineFilter, memory)
+      || !isMemoryOwnedByCompanion(memory, options.companionId)) {
+      return null;
+    }
+
+    addEvidence(options.pushEvidence, {
+      source: 'memory_get_by_id',
+      query: id,
+      snippet: memory.text,
+      resultCount: 1,
+    });
+
+    return {
+      id: memory.id,
+      text: memory.text,
+      type: memory.type,
+      importance: memory.importance,
+      confidence: memory.confidence,
+      emotionalValence: memory.emotionalValence,
+      salience: memory.salience,
+      sourceRef: memory.sourceRef,
+      tags: memory.tags,
+    };
+  };
+
+  return {
+    memory_search,
+    episode_search,
+    memory_count,
+    memory_write,
+    memory_import_batch,
+    memory_upsert,
+    memory_redact,
+    session_messages,
+    session_search,
+    memory_get_by_id,
+  };
+}

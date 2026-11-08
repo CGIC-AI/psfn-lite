@@ -1,0 +1,384 @@
+import { createHash } from 'node:crypto';
+import type { AdaptiveToolSnapshotTelemetry } from '../agent/adaptive-tools-telemetry.js';
+import type { EmotionalSnapshot } from '../contacts/store/emotional-baseline.js';
+import type { MemoryWithheldSummary } from '../../faculties/memory/withheld-summary.js';
+import type { RecentContactShapeArtifact } from '../../faculties/memory/memory-store-port.js';
+import type {
+  PurrMemory,
+  RetrievalCallerContext,
+  RetrievalModeInput,
+} from '../../faculties/memory/types.js';
+import type { EpisodicRetrievalChain } from '../../faculties/memory/retrieval/episodic.js';
+import type { SessionEntry } from '../session/types.js';
+import type { RolledOutSessionBoundary } from '../session/rolled-out-session-boundary.js';
+import type { SessionContinuityArtifact } from '../session/continuity-artifacts.js';
+import type { IdleGapTexture } from '../scheduler/time-texture.js';
+import type {
+  ContextMessage,
+  FatigueEnforcementMetadata,
+  LLMCapturedProviderWirePayload,
+  LLMProviderObservability,
+  PromptSectionTelemetry,
+  ToolSchema,
+  TurnID,
+} from '../../shared/contracts/runtime-base.js';
+import { cloneAuthenticityProvenance } from '../../shared/authenticity-provenance.js';
+import type { TrustLevel } from '../../system/trust/types.js';
+import type { PromptPlan } from '../agent/substrate-agent/turn-execution/prompt-plan.js';
+
+export type { FatigueEnforcementMetadata };
+
+export type PromptCacheabilityClass = 'static' | 'session_stable' | 'append_only' | 'volatile';
+export type PromptCacheBreaker =
+  | 'prompt_layer'
+  | 'runtime'
+  | 'channel'
+  | 'task'
+  | 'macro'
+  | 'tool'
+  | 'retrieval'
+  | 'scratchpad'
+  | 'session_history';
+
+export interface PromptSectionCacheability {
+  section:
+    | 'staticPrefixTemplate'
+    | 'dynamicSuffixTemplate'
+    | 'renderedStaticPrefix'
+    | 'renderedDynamicSuffix'
+    | 'runtimeContext'
+    | 'memoryContextBlock'
+    | 'scratchpadContext'
+    | 'assembledPrompt'
+    | 'finalSystemPrompt'
+    | 'messages';
+  cacheability: PromptCacheabilityClass;
+  cacheBreakers: PromptCacheBreaker[];
+  reason: string;
+}
+
+export interface TurnPromptSnapshotDynamicSection {
+  identifier: string;
+  /** Required sections fail the turn loudly on unresolved macros (E2.5). */
+  required: boolean;
+  content: string;
+}
+
+export interface TurnPromptSnapshot {
+  staticPrefixTemplate: string;
+  dynamicSuffixTemplate: string;
+  /** Per-layer dynamic sections (dynamicSuffixTemplate = join('\n\n')). */
+  dynamicSuffixSections?: TurnPromptSnapshotDynamicSection[];
+  staticHash: string;
+  versionPointer: string;
+  sectionCacheability?: PromptSectionCacheability[];
+}
+
+export interface TurnSessionContextSnapshot {
+  channelId: string;
+  recentEntries: SessionEntry[];
+  /** Exact deferred-compaction eligibility computed during context assembly. */
+  autoCompactionEligible?: boolean;
+  /** Entries collected from the store before windowing/summarization. */
+  sourceEntryCount?: number;
+  /** Logical-session-bound cutoff when older entries were excluded. */
+  rolledOutSessionBoundary?: RolledOutSessionBoundary;
+  /**
+   * Highest entry id the store served in the raw capture window, before
+   * exclusion/windowing/summarization. A turn that just recorded entry N must
+   * see storeWindowMaxEntryId >= N here; anything lower means the store served
+   * a stale cache and the window is missing the latest turn(s)
+   * (psfn-framework-hgw3.1). Undefined when the store returned no entries.
+   */
+  storeWindowMaxEntryId?: number;
+  /**
+   * Presence-window serve floor applied to this capture (private rooms,
+   * bead s10rm). Absent when the channel is unwindowed.
+   */
+  roomWindowFloorMs?: number;
+  /** Entries dropped by the presence-window gate before assembly. */
+  roomWindowFilteredEntryCount?: number;
+  historySummaryText?: string;
+  historySummaryEntryCount?: number;
+  /**
+   * Channel bonding: foreign entries interleaved into
+   * `recentEntries` from bonded member channels. Foreign entries carry a
+   * `channelBond` metadata marker and NEGATIVE ids (namespaced out of the
+   * target channel's id space). Absent when no bond was active.
+   */
+  bondedEntryCount?: number;
+  /** Bonded member channels that contributed interleaved entries. */
+  bondedMemberChannelIds?: string[];
+  /** Lowest-common privacy the active bond resolved to. */
+  bondedEffectivePrivacy?: string;
+  compactionSummaryTexts: string[];
+  focusKnowledgeTexts: string[];
+  continuityEntries: SessionEntry[];
+  wakeReturnArtifacts?: SessionContinuityArtifact[];
+  orientation?: TurnOrientationSnapshot;
+  intentionAppraisalArtifactCount?: number;
+  compactionPromptText?: string;
+  versionPointer: string;
+}
+
+export interface TurnOrientationSnapshot {
+  fired: boolean;
+  reason: 'idle_gap_exceeded' | 'below_threshold' | 'no_previous_activity' | 'internal_channel';
+  observedAt: number;
+  idleThresholdMs: number;
+  lastActivityAt?: number;
+  idleGapMs?: number;
+  noteText?: string;
+  sessionSummary?: string;
+  continuitySummary?: string;
+  lastUserMessage?: string;
+  openThreadSummary?: string;
+  timeTexture?: IdleGapTexture;
+  sourceCounts: {
+    session: number;
+    continuity: number;
+    focusKnowledge: number;
+  };
+}
+
+export interface TurnMemorySnapshot {
+  channelId: string;
+  recentContactShape?: RecentContactShapeArtifact;
+  emotionalSnapshot?: EmotionalSnapshot;
+  contactEmotionalMemories: PurrMemory[];
+  semanticCandidates: Array<PurrMemory & { similarity: number }>;
+  lexicalCandidates: Array<PurrMemory & { similarity: number }>;
+  episodicChains?: EpisodicRetrievalChain[];
+  proactiveCandidates: PurrMemory[];
+  withheldSummary?: MemoryWithheldSummary;
+  withheldCandidateIds?: string[];
+  callerContext?: RetrievalCallerContext;
+  retrievalMode?: RetrievalModeInput;
+  versionPointer: string;
+}
+
+export interface TurnPromptResponseSnapshot {
+  content: string;
+  reasoning?: string;
+  model?: string;
+  stopReason?: string;
+  errorMessage?: string;
+  toolCallCount?: number;
+}
+
+/**
+ * Turn prompt observability that is NOT derivable from the PromptPlan:
+ * provider wire observability, the model response, section telemetry lists,
+ * and cacheability annotations. The rendered prompt strings and the shipped
+ * message history live on TurnSnapshot.plan (E2.2) — the persisted snapshot
+ * IS the plan; there is no duplicated prompt-string state here.
+ */
+export interface TurnPromptContextSnapshot {
+  currentTurnInput?: string;
+  providerObservability?: LLMProviderObservability;
+  response?: TurnPromptResponseSnapshot;
+  inputSections?: PromptSectionTelemetry[];
+  runtimeContextSections?: PromptSectionTelemetry[];
+  memoryContextSections?: PromptSectionTelemetry[];
+  finalSystemSections?: PromptSectionTelemetry[];
+  sectionCacheability?: PromptSectionCacheability[];
+}
+
+export interface TurnToolContextSnapshot {
+  /**
+   * Resolved tool schemas bound to the turn. Live captures always carry it;
+   * SLIM persisted turn snapshots omit it when byte-identical to
+   * plan.toolDefinitions (bead hgw3.3) — readers fall back to the plan.
+   * Preserve absence; never coerce a missing list to [].
+   */
+  activeTools?: ToolSchema[];
+  adaptiveSnapshot?: AdaptiveToolSnapshotTelemetry;
+}
+
+export interface TurnSnapshot {
+  turnId: TurnID;
+  requestId: string;
+  channelId: string;
+  capturedAt: number;
+  trustLevel: TrustLevel;
+  canonicalContactKey?: string;
+  prompt?: TurnPromptSnapshot;
+  /**
+   * The turn's PromptPlan (schema-versioned): the single assembly artifact.
+   * The persisted turn snapshot IS the plan — the Loom and provider
+   * serialization read the same ordered blocks/messages/tool definitions.
+   */
+  plan?: PromptPlan;
+  promptContext?: TurnPromptContextSnapshot;
+  toolContext?: TurnToolContextSnapshot;
+  sessionContext?: TurnSessionContextSnapshot;
+  memory?: TurnMemorySnapshot;
+  biographicalProjection?: {
+    admittedClaimIds: string[];
+    withheldCount: number;
+    contextChars: number;
+  };
+  fatigue?: FatigueEnforcementMetadata;
+}
+
+export function buildSnapshotVersionPointer(parts: ReadonlyArray<string | number | null | undefined>): string {
+  const payload = parts
+    .map((part) => {
+      if (part === null || part === undefined) return '';
+      return typeof part === 'number' ? String(Math.trunc(part)) : part;
+    })
+    .join('|');
+  return createHash('sha256').update(payload).digest('hex').slice(0, 16);
+}
+
+export function cloneSessionEntry(entry: SessionEntry): SessionEntry {
+  return { ...entry };
+}
+
+export function cloneSessionContinuityArtifact(
+  artifact: SessionContinuityArtifact,
+): SessionContinuityArtifact {
+  return {
+    ...artifact,
+    facets: [...artifact.facets],
+  };
+}
+
+export function cloneOrientationSnapshot(snapshot: TurnOrientationSnapshot): TurnOrientationSnapshot {
+  return {
+    ...snapshot,
+    sourceCounts: { ...snapshot.sourceCounts },
+  };
+}
+
+export function cloneRecentContactShapeArtifact(
+  shape: RecentContactShapeArtifact,
+): RecentContactShapeArtifact {
+  return {
+    ...shape,
+    sourceMemoryIds: [...shape.sourceMemoryIds],
+  };
+}
+
+export function cloneEmotionalSnapshot(snapshot: EmotionalSnapshot): EmotionalSnapshot {
+  return { ...snapshot };
+}
+
+export function cloneContextMessage(message: ContextMessage): ContextMessage {
+  return {
+    ...message,
+    ...(message.provenance ? { provenance: cloneAuthenticityProvenance(message.provenance) } : {}),
+  };
+}
+
+export function cloneProviderObservability(
+  observability: LLMProviderObservability,
+): LLMProviderObservability {
+  return {
+    ...observability,
+    systemRole: { ...observability.systemRole },
+    // Preserve absence: slim persisted snapshots omit the wire capture and the
+    // Garden read path derives it from the plan; [] would mean "captured empty".
+    ...(observability.providerWireMessages
+      ? { providerWireMessages: observability.providerWireMessages.map(message => ({ ...message })) }
+      : {}),
+    // Deep-clone the captured wire body (bead hgw3-80f6) so a persist-time diet
+    // slim mutates the record copy, never the live event-bus snapshot.
+    ...(observability.capturedWirePayload
+      ? { capturedWirePayload: cloneCapturedWirePayload(observability.capturedWirePayload) }
+      : {}),
+  };
+}
+
+export function cloneCapturedWirePayload(
+  payload: LLMCapturedProviderWirePayload,
+): LLMCapturedProviderWirePayload {
+  return {
+    ...payload,
+    ...(payload.body !== undefined
+      ? { body: structuredClone(payload.body) }
+      : {}),
+  };
+}
+
+export function cloneTurnPromptResponseSnapshot(
+  response: TurnPromptResponseSnapshot,
+): TurnPromptResponseSnapshot {
+  return {
+    ...response,
+  };
+}
+
+export function clonePromptSectionCacheability(
+  section: PromptSectionCacheability,
+): PromptSectionCacheability {
+  return {
+    ...section,
+    cacheBreakers: [...section.cacheBreakers],
+  };
+}
+
+export function clonePromptSectionTelemetry(section: PromptSectionTelemetry): PromptSectionTelemetry {
+  return {
+    ...section,
+    ...(section.provenance ? { provenance: cloneAuthenticityProvenance(section.provenance) } : {}),
+    ...(section.scopeProvenance ? { scopeProvenance: { ...section.scopeProvenance } } : {}),
+  };
+}
+
+function cloneUnknownSchemaValue<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map(item => cloneUnknownSchemaValue(item)) as T;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+  const cloned: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value)) {
+    cloned[key] = cloneUnknownSchemaValue(item);
+  }
+  return cloned as T;
+}
+
+export function cloneToolSchema(tool: ToolSchema): ToolSchema {
+  return {
+    ...tool,
+    inputSchema: cloneUnknownSchemaValue(tool.inputSchema),
+  };
+}
+
+export function cloneAdaptiveToolSnapshotTelemetry(
+  snapshot: AdaptiveToolSnapshotTelemetry | null | undefined,
+): AdaptiveToolSnapshotTelemetry | null {
+  if (!snapshot) return null;
+  return {
+    ...snapshot,
+    tools: snapshot.tools.map(tool => ({ ...tool })),
+    skipped: snapshot.skipped.map(skip => ({
+      ...skip,
+      ...(skip.missingTokens ? { missingTokens: [...skip.missingTokens] } : {}),
+    })),
+    counts: { ...snapshot.counts },
+  };
+}
+
+export function cloneMemory<T extends PurrMemory>(memory: T): T {
+  return {
+    ...memory,
+    tags: [...memory.tags],
+    ...(memory.scopeRef ? { scopeRef: { ...memory.scopeRef } } : {}),
+    ...(memory.scopeTags ? { scopeTags: [...memory.scopeTags] } : {}),
+    ...(memory.provenanceRefs ? { provenanceRefs: [...memory.provenanceRefs] } : {}),
+    ...(memory.consentFlags ? { consentFlags: { ...memory.consentFlags } } : {}),
+    ...(memory.embedding ? { embedding: new Float32Array(memory.embedding) } : {}),
+  };
+}
+
+export function cloneScoredMemory(
+  memory: PurrMemory & { similarity: number },
+): PurrMemory & { similarity: number } {
+  return {
+    ...cloneMemory(memory),
+    similarity: memory.similarity,
+  };
+}

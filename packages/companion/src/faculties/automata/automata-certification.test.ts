@@ -1,0 +1,561 @@
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  CHANNEL_INDEX_FILENAME,
+  type ChannelIndexEntry,
+} from '../../persistence/sessions/store-primitives.js';
+import { saveChannelIndex } from '../../persistence/sessions/store/channel-index.js';
+import {
+  createFilesystemExactSessionPurgeSurfaces,
+} from '../../persistence/sessions/exact-session-purge-surfaces.js';
+import { sanitizeChannelId } from '../../persistence/sessions/store-file-contracts.js';
+import { loadAutomataPolicySeedDefaults } from '../../system/config/automata-policy-config.js';
+import { EXTRACTION_AUTOMATA_BUS_ACTIONS } from '../memory/extraction/automata-bus-completion.js';
+import {
+  AUTOMATA_CLASS_GOVERNED_ADAPTERS,
+  AUTOMATA_GOVERNED_LIFECYCLE_ENTRYPOINTS,
+} from './bus/class-adapters.js';
+import { AUTOMATA_BUS_TOOL_ACTIONS } from './bus/worker-access-contracts.js';
+import { PRODUCTION_AUTOMATA_SPAWN_PATHS } from './production-registration.js';
+import { PRODUCTION_AUTOMATA_CLASSES } from './registry-contract.js';
+import type { AutomataBusEvent } from './bus/contract.js';
+import type { PostgresAutomataBusRuntimeStore } from './bus/runtime-store.js';
+import {
+  AUTOMATA_BUS_WORKER_BRIEFING_SCHEMA_VERSION,
+  buildAutomataBusWorkerScope,
+  resolveAutomataBusWorkerFormation,
+  type AutomataBusWorkerAccess,
+  type AutomataBusWorkerPort,
+} from './bus/worker-access.js';
+import {
+  EXACT_SESSION_PURGE_SURFACE_ORDER,
+  InMemoryExactSessionPurgeSagaStore,
+  ProductionExactSessionPurge,
+  type ExactSessionSurfacePurgePort,
+} from './production-exact-session-purge.js';
+import {
+  ProductionAutomataPermanentReferenceCustody,
+  ProductionAutomataRetentionProofSource,
+  ProductionExactSessionPurgeTargetAuthority,
+} from './production-retention-authority.js';
+import { AutomataRetentionCoordinator } from './retention-coordinator.js';
+import { InMemoryAutomataRetentionStore } from './retention-store.js';
+import { AutomataRunRegistry, InMemoryAutomataRunStore } from './run-registry.js';
+import { AUTOMATA_TERMINAL_HANDOFF_SOURCE } from './terminal-lifecycle.js';
+import { NO_AUTOMATA_REDELIVERY } from '../../test-support/automata-run-redelivery.js';
+
+const SRC_DIR = dirname(fileURLToPath(import.meta.url));
+const COMPANION_ID = 'companion-a';
+const RUN_ID = 'run-retention';
+const AUTOMATA_SESSION_ID = 'session-automata';
+const COMPANION_SESSION_ID = 'session-companion';
+const ACTIVE_JOURNAL = 'worker-session.jsonl';
+const ROLLED_JOURNAL = 'worker-session.segment-0002.jsonl';
+const COMPANION_JOURNAL = 'companion-session.jsonl';
+
+function terminalFinding(): AutomataBusEvent {
+  return {
+    schemaVersion: 1,
+    eventId: 'bus-receipt:terminal',
+    companionId: COMPANION_ID,
+    sequence: 1,
+    occurredAt: '2026-08-12T04:00:00.000Z',
+    mustUnderstand: [],
+    context: {
+      automatonClass: 'subagent.bounded',
+      runId: RUN_ID,
+      taskId: 'task-retention',
+      sessionIds: [AUTOMATA_SESSION_ID],
+      artifactRefs: ['artifact:durable-report'],
+    },
+    type: 'finding',
+    body: {
+      claim: 'The durable report was promoted before raw session cleanup.',
+      provenance: 'computed',
+      evidence: [{
+        kind: 'artifact',
+        reference: 'bus-evidence:durable-report',
+        summary: 'Content-addressed report evidence.',
+      }],
+      verification: { status: 'verified', by: 'certification-reviewer' },
+      source: AUTOMATA_TERMINAL_HANDOFF_SOURCE,
+    },
+  };
+}
+
+function indexEntry(channelId: string, filename: string): ChannelIndexEntry {
+  return {
+    channelId,
+    filename,
+    filenames: [filename],
+    messageCount: 1,
+    activeTurnTombstoneCount: 0,
+    activeTurnTombstoneIds: [],
+    archiveFingerprint: 'certification-fixture',
+    compactionFilenames: [],
+    lastTimestamp: 1,
+    lastMessageTimestamp: 1,
+    lastMessageRole: 'user',
+    lastMessagePreview: 'private raw fixture',
+    maxId: 1,
+    lastHmac: null,
+    lastExtractionCoveredUpTo: 0,
+    lastJournalType: 'message',
+  };
+}
+
+describe('Automata governed-class coverage certification', () => {
+  const policy = loadAutomataPolicySeedDefaults();
+
+  it('gives every Bus-eligible production class exactly one governed runtime adapter', () => {
+    const adapted = AUTOMATA_CLASS_GOVERNED_ADAPTERS.map(entry => entry.automatonClass);
+    // Registration and executable coverage are one fact, not two: an eligible
+    // class with no adapter, or an adapter for an excluded class, fails here.
+    expect([...adapted].sort()).toEqual([...policy.bus.eligibleClasses].sort());
+    expect(new Set(adapted).size).toBe(adapted.length);
+    for (const excluded of policy.bus.excludedClasses) {
+      expect(adapted).not.toContain(excluded);
+    }
+  });
+
+  it('proves each registered adapter module actually opens the governed lifecycle', () => {
+    const repoRoot = join(SRC_DIR, '..', '..', '..');
+    for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
+      const source = readFileSync(join(repoRoot, adapter.adapterModule), 'utf8');
+      const opensLifecycle = AUTOMATA_GOVERNED_LIFECYCLE_ENTRYPOINTS.some(
+        entrypoint => source.includes(entrypoint),
+      );
+      expect({ class: adapter.automatonClass, opensLifecycle })
+        .toEqual({ class: adapter.automatonClass, opensLifecycle: true });
+    }
+  });
+
+  it('binds each Bus mode to the lifecycle entrypoint that actually forms it', () => {
+    const repoRoot = join(SRC_DIR, '..', '..', '..');
+    for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
+      const source = readFileSync(join(repoRoot, adapter.adapterModule), 'utf8');
+      // bounded_loop classes form the briefing and tool through the worker
+      // run; single_pass classes go through the handoff-only class wrapper.
+      const entrypoint = adapter.busMode === 'bounded_loop'
+        ? 'openAutomataBusWorkerRun'
+        : 'runGovernedAutomataClass';
+      expect({ class: adapter.automatonClass, entrypoint, wired: source.includes(entrypoint) })
+        .toEqual({ class: adapter.automatonClass, entrypoint, wired: true });
+    }
+  });
+
+  it('keeps registry prompt policy and executable Bus mode as one fact', () => {
+    const promptPolicyByClass = new Map<string, string>(
+      PRODUCTION_AUTOMATA_CLASSES.map(entry => [entry.id, entry.promptPolicy]),
+    );
+    for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
+      // A class may only advertise a Bus-bearing prompt when its worker really
+      // receives the briefing and tool, and vice versa.
+      const advertisesBus = promptPolicyByClass.get(adapter.automatonClass)
+        === 'inherited_identity_bus_task';
+      expect({ class: adapter.automatonClass, advertisesBus })
+        .toEqual({ class: adapter.automatonClass, advertisesBus: adapter.busMode === 'bounded_loop' });
+    }
+    for (const excluded of policy.bus.excludedClasses) {
+      expect({ class: excluded, promptPolicy: promptPolicyByClass.get(excluded) })
+        .not.toEqual({ class: excluded, promptPolicy: 'inherited_identity_bus_task' });
+    }
+  });
+
+  it('declares an explicit owner exclusion for every handoff-only class', () => {
+    for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
+      if (adapter.busMode !== 'single_pass') continue;
+      expect(['companion_identity_turn', 'person_data_boundary', 'no_worker_model_loop'])
+        .toContain(adapter.exclusion);
+      expect(adapter.exclusionRationale.trim().length).toBeGreaterThan(0);
+    }
+  });
+
+  it('declares the exact tool actions each bounded_loop class is granted', () => {
+    for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
+      if (adapter.busMode !== 'bounded_loop') continue;
+      for (const action of adapter.allowedActions) {
+        expect(AUTOMATA_BUS_TOOL_ACTIONS).toContain(action);
+      }
+      // The declaration must match what the runtime enforces: extraction's
+      // read-only set, and the full action set for subagents (which pass none).
+      const enforced = adapter.automatonClass === 'memory.extraction'
+        ? EXTRACTION_AUTOMATA_BUS_ACTIONS
+        : AUTOMATA_BUS_TOOL_ACTIONS;
+      expect([...adapter.allowedActions].sort()).toEqual([...enforced].sort());
+    }
+  });
+
+  it('resolves every production spawn path to a governed adapter or an owner exclusion', () => {
+    const adapted = new Set<string>(AUTOMATA_CLASS_GOVERNED_ADAPTERS.map(entry => entry.automatonClass));
+    const excluded = new Set<string>(policy.bus.excludedClasses);
+    for (const spawn of PRODUCTION_AUTOMATA_SPAWN_PATHS) {
+      expect({ spawn: spawn.id, covered: adapted.has(spawn.classId) !== excluded.has(spawn.classId) })
+        .toEqual({ spawn: spawn.id, covered: true });
+    }
+  });
+});
+
+describe('Automata assembled certification', () => {
+  it('purges eligible worker L0 while preserving promoted evidence and companion-owned L0', async () => {
+    const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-automata-certification-'));
+    const activePath = join(sessionsDir, ACTIVE_JOURNAL);
+    const rolledPath = join(sessionsDir, ROLLED_JOURNAL);
+    const companionPath = join(sessionsDir, COMPANION_JOURNAL);
+    const workerChannelId = 'worker:retention';
+    const workerTurnPath = join(
+      sessionsDir,
+      '_turn_records',
+      `${sanitizeChannelId(workerChannelId)}.jsonl`,
+    );
+    mkdirSync(join(sessionsDir, '_turn_records'));
+    for (const path of [activePath, rolledPath, companionPath, workerTurnPath]) {
+      writeFileSync(path, 'private raw fixture\n');
+    }
+    saveChannelIndex(join(sessionsDir, CHANNEL_INDEX_FILENAME), new Map([
+      [AUTOMATA_SESSION_ID, {
+        ...indexEntry(workerChannelId, ACTIVE_JOURNAL),
+        filenames: [ROLLED_JOURNAL, ACTIVE_JOURNAL],
+      }],
+      [COMPANION_SESSION_ID, indexEntry('companion:permanent', COMPANION_JOURNAL)],
+    ]));
+
+    try {
+      const policy = loadAutomataPolicySeedDefaults();
+      const registry = await AutomataRunRegistry.hydrate({
+        redelivery: NO_AUTOMATA_REDELIVERY,
+        companionId: COMPANION_ID,
+        policy,
+        store: new InMemoryAutomataRunStore(),
+      });
+      await registry.register({
+        runId: RUN_ID,
+        automatonClass: 'subagent.bounded',
+        workerId: 'worker-retention',
+        taskId: 'task-retention',
+        taskLabel: 'Certify retention',
+        taskSummary: 'Promote durable evidence before exact raw cleanup.',
+        sessionIds: [AUTOMATA_SESSION_ID],
+        artifacts: [{ kind: 'report', ref: 'artifact:durable-report', custody: 'durable' }],
+        createdAtMs: 1,
+      });
+      await registry.transition(RUN_ID, {
+        status: 'running',
+        reason: 'agent_initialized',
+        atMs: 2,
+      });
+      await registry.transition(RUN_ID, {
+        status: 'completed',
+        reason: 'completed',
+        outcome: 'completed',
+        atMs: 3,
+      });
+
+      const history = [terminalFinding()];
+      const bus = {
+        readHistory: vi.fn(async () => history),
+      } as unknown as PostgresAutomataBusRuntimeStore;
+      const retention = new InMemoryAutomataRetentionStore();
+      await retention.recordClassification({
+        schemaVersion: 1,
+        companionId: COMPANION_ID,
+        sessionId: AUTOMATA_SESSION_ID,
+        ownership: 'automata',
+        runId: RUN_ID,
+        automatonClass: 'subagent.bounded',
+        workerGeneration: 1,
+        classifiedAtMs: 1,
+        retentionDeadlineMs: 10,
+      });
+      await retention.recordClassification({
+        schemaVersion: 1,
+        companionId: COMPANION_ID,
+        sessionId: COMPANION_SESSION_ID,
+        ownership: 'companion',
+        classifiedAtMs: 1,
+      });
+
+      const proofs = new ProductionAutomataRetentionProofSource({
+        companionId: COMPANION_ID,
+        registry,
+        runs: new InMemoryAutomataRunStore(),
+        bus,
+      });
+      const custody = new ProductionAutomataPermanentReferenceCustody({
+        companionId: COMPANION_ID,
+        registry,
+        runs: new InMemoryAutomataRunStore(),
+        bus,
+      });
+      const authority = new ProductionExactSessionPurgeTargetAuthority({
+        companionId: COMPANION_ID,
+        sessionsDir,
+        classifications: retention,
+        proofs,
+      });
+      const filesystem = createFilesystemExactSessionPurgeSurfaces(sessionsDir);
+      const accelerationSurface = (): ExactSessionSurfacePurgePort => {
+        let present = true;
+        return {
+          remove: async () => {
+            const wasPresent = present;
+            present = false;
+            return wasPresent
+              ? { status: 'removed', removedCount: 1 }
+              : { status: 'already_absent', removedCount: 0 };
+          },
+          isAbsent: async () => !present,
+        };
+      };
+      const rawSurfaces = {
+        ...filesystem,
+        transcript_projection: accelerationSurface(),
+        redis_tail_pointers: accelerationSurface(),
+      };
+      const mutatedSessions: string[] = [];
+      const surfaces = Object.fromEntries(EXACT_SESSION_PURGE_SURFACE_ORDER.map(surface => {
+        const delegate = rawSurfaces[surface];
+        return [surface, {
+          remove: async (...args: Parameters<ExactSessionSurfacePurgePort['remove']>) => {
+            mutatedSessions.push(args[0].sessionId);
+            return await delegate.remove(...args);
+          },
+          isAbsent: (...args: Parameters<ExactSessionSurfacePurgePort['isAbsent']>) => (
+            delegate.isAbsent(...args)
+          ),
+        } satisfies ExactSessionSurfacePurgePort];
+      })) as Record<typeof EXACT_SESSION_PURGE_SURFACE_ORDER[number], ExactSessionSurfacePurgePort>;
+      const purge = new ProductionExactSessionPurge({
+        authority,
+        custody,
+        fence: { runExclusive: async (_input, operation) => await operation() },
+        writeBarrier: { seal: async () => undefined },
+        sagaStore: new InMemoryExactSessionPurgeSagaStore(),
+        surfaces,
+      });
+      const coordinator = new AutomataRetentionCoordinator({
+        store: retention,
+        proofs,
+        custody,
+        purge,
+      });
+
+      await expect(coordinator.run({ companionId: COMPANION_ID, nowMs: 20, limit: 10 }))
+        .resolves.toEqual([{
+          sessionId: AUTOMATA_SESSION_ID,
+          outcome: 'purged',
+          reason: 'eligible',
+        }]);
+
+      expect(mutatedSessions).toEqual(EXACT_SESSION_PURGE_SURFACE_ORDER.map(
+        () => AUTOMATA_SESSION_ID,
+      ));
+      expect(existsSync(activePath)).toBe(false);
+      expect(existsSync(rolledPath)).toBe(false);
+      expect(existsSync(workerTurnPath)).toBe(false);
+      expect(existsSync(companionPath)).toBe(true);
+      expect(retention.listClassifications()).toContainEqual(expect.objectContaining({
+        sessionId: COMPANION_SESSION_ID,
+        ownership: 'companion',
+      }));
+      expect(registry.getRun(RUN_ID)?.artifacts).toContainEqual({
+        kind: 'report',
+        ref: 'artifact:durable-report',
+        custody: 'durable',
+      });
+      expect(history).toEqual([expect.objectContaining({ eventId: 'bus-receipt:terminal' })]);
+      expect(retention.listAuditEvents()).toContainEqual(expect.objectContaining({
+        kind: 'purged',
+        preservedReferenceCount: 3,
+      }));
+      expect(JSON.stringify(retention.listAuditEvents())).not.toContain('private raw fixture');
+    } finally {
+      rmSync(sessionsDir, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers terminal cleanup proof from an exact durable run after restart retention', async () => {
+    const policy = loadAutomataPolicySeedDefaults();
+    const runs = new InMemoryAutomataRunStore();
+    const initial = await AutomataRunRegistry.hydrate({
+      redelivery: NO_AUTOMATA_REDELIVERY,
+      companionId: COMPANION_ID,
+      policy,
+      store: runs,
+      nowMs: 1,
+    });
+    await initial.register({
+      runId: RUN_ID,
+      automatonClass: 'subagent.bounded',
+      workerId: 'worker-retention',
+      taskId: 'task-retention',
+      taskLabel: 'Certify restart retention',
+      taskSummary: 'Recover exact durable proof at raw cleanup time.',
+      sessionIds: [AUTOMATA_SESSION_ID],
+      artifacts: [{ kind: 'report', ref: 'artifact:durable-report', custody: 'durable' }],
+      createdAtMs: 1,
+    });
+    await initial.transition(RUN_ID, {
+      status: 'running',
+      reason: 'agent_initialized',
+      atMs: 2,
+    });
+    await initial.transition(RUN_ID, {
+      status: 'completed',
+      reason: 'completed',
+      outcome: 'completed',
+      atMs: 3,
+    });
+    const cleanupAtMs = policy.rawSessionRetentionMs + 1;
+    const restarted = await AutomataRunRegistry.hydrate({
+      redelivery: NO_AUTOMATA_REDELIVERY,
+      companionId: COMPANION_ID,
+      policy,
+      store: runs,
+      nowMs: cleanupAtMs,
+    });
+    expect(restarted.getRun(RUN_ID)).toBeNull();
+
+    const bus = {
+      readHistory: vi.fn(async () => [terminalFinding()]),
+    } as unknown as PostgresAutomataBusRuntimeStore;
+    const proofs = new ProductionAutomataRetentionProofSource({
+      companionId: COMPANION_ID,
+      registry: restarted,
+      runs,
+      bus,
+    });
+
+    await expect(proofs.loadProof({
+      schemaVersion: 1,
+      companionId: COMPANION_ID,
+      sessionId: AUTOMATA_SESSION_ID,
+      ownership: 'automata',
+      runId: RUN_ID,
+      automatonClass: 'subagent.bounded',
+      workerGeneration: 1,
+      classifiedAtMs: 1,
+      retentionDeadlineMs: cleanupAtMs,
+    })).resolves.toMatchObject({
+      companionId: COMPANION_ID,
+      runId: RUN_ID,
+      runStatus: 'completed',
+      generationState: 'terminal',
+    });
+
+    const custody = new ProductionAutomataPermanentReferenceCustody({
+      companionId: COMPANION_ID,
+      registry: restarted,
+      runs,
+      bus,
+    });
+    await expect(custody.assertResolvable(['artifact:durable-report'], {
+      companionId: COMPANION_ID,
+      runId: RUN_ID,
+    })).resolves.toBeUndefined();
+    await expect(custody.assertResolvable(['artifact:durable-report'], {
+      companionId: 'companion-b',
+      runId: RUN_ID,
+    })).rejects.toThrow('companion scope mismatch');
+  });
+
+  it('measures zero Bus calls for foreground retrieval against one bounded eligible briefing', async () => {
+    vi.useFakeTimers({ now: 0 });
+    try {
+      const brief = vi.fn(async () => {
+        await new Promise(resolve => setTimeout(resolve, 25));
+        return {
+          schemaVersion: AUTOMATA_BUS_WORKER_BRIEFING_SCHEMA_VERSION,
+          text: 'Automata Bus briefing\n- One bounded item.',
+          itemCount: 1,
+          diagnostics: {
+            cache: 'miss',
+            semanticPath: 'exact-fallback',
+            indexState: 'ready',
+            reindexState: 'current',
+            modelIdentity: null,
+            indexingLag: { pendingCount: 0 },
+          },
+        };
+      });
+      const action = vi.fn(async () => ({ ok: true }));
+      const port: AutomataBusWorkerPort = {
+        isClassEligible: () => true,
+        brief,
+        search: action,
+        append: action,
+        correct: action,
+        handoff: action,
+        runs: action,
+        inspect: action,
+      };
+      const access: AutomataBusWorkerAccess = {
+        port,
+        bounds: {
+          maxQueryChars: 120,
+          maxTextChars: 240,
+          maxArrayItems: 8,
+          maxSearchResults: 10,
+          maxRunResults: 20,
+          maxBriefingChars: 400,
+          maxBriefingItems: 4,
+          maxToolResultChars: 1_000,
+        },
+        identity: {
+          companionId: COMPANION_ID,
+          audience: 'eligible-automata',
+          maxSensitivity: 'personal',
+        },
+      };
+
+      const retrievalStart = Date.now();
+      const retrieval = await resolveAutomataBusWorkerFormation({
+        access,
+        scope: buildAutomataBusWorkerScope(access, {
+          automatonClass: 'memory.retrieval',
+          runId: 'retrieval-run',
+          taskId: 'foreground-retrieval',
+        }),
+        query: 'ordinary foreground recall',
+      });
+      const retrievalElapsedMs = Date.now() - retrievalStart;
+
+      const eligibleStart = Date.now();
+      const eligiblePromise = resolveAutomataBusWorkerFormation({
+        access,
+        scope: buildAutomataBusWorkerScope(access, {
+          automatonClass: 'subagent.bounded',
+          runId: 'eligible-run',
+          taskId: 'bounded-briefing',
+        }),
+        query: 'one bounded briefing',
+      });
+      await vi.advanceTimersByTimeAsync(25);
+      const eligible = await eligiblePromise;
+      const eligibleElapsedMs = Date.now() - eligibleStart;
+
+      expect({ retrievalElapsedMs, eligibleElapsedMs }).toEqual({
+        retrievalElapsedMs: 0,
+        eligibleElapsedMs: 25,
+      });
+      expect(retrieval).toBeNull();
+      expect(brief).toHaveBeenCalledOnce();
+      expect(eligible?.promptBlock).toContain('One bounded item.');
+      expect(eligible?.promptBlock.length).toBeLessThan(2_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

@@ -1,0 +1,956 @@
+import { EXTERNAL_MEMORY_CHANNEL, externalMemoryPolicyChannelId } from '../../../shared/routing/external-memory-channel.js';
+import type { ContactStorePort } from '../../../core/contacts/contact-store-port.js';
+import {
+  haveCompatibleContactIntelligenceKinds,
+  MIXED_INTELLIGENCE_CONTACT_MERGE_ERROR,
+} from '../../../core/contacts/contact-merge-policy.js';
+import type {
+  RecentContactShapeArtifact,
+  MemoryStorePort,
+} from '../../../faculties/memory/memory-store-port.js';
+import {
+  CHANNEL_PRIVACY_LEVELS,
+  CONTACT_MUTATION_AUDIT_FIELDS,
+  VALID_RELATIONSHIP_TYPES,
+} from '../../../core/contacts/types.js';
+import type {
+  ChannelPrivacyLevel,
+  Contact,
+  ContactDemographicsUpdate,
+  ContactMutationAuditEntry,
+  ContactMutationAuditField,
+  ContactMutationAuditQuery,
+  RelationshipType,
+  SocialGraphEntity,
+  SocialRelationshipEdge,
+} from '../../../core/contacts/types.js';
+import type { TrustLevel } from '../../../system/trust/types.js';
+import { TRUST_LEVELS } from '../../../system/trust/types.js';
+import {
+  buildRelatedConversationChannelMap,
+} from './contact-session-linker.js';
+import type {
+  AdminContactSocialGraphConnectionView,
+  AdminContactDetailData,
+  AdminContactListData,
+  AdminContactRelationshipScoreReader,
+  AdminContactRelationshipScoreView,
+  AdminContactSocialGraphView,
+  AdminContactsService,
+  ContactUpdateResult,
+} from './types.js';
+import type { SessionStore } from '../../../persistence/sessions/store.js';
+import {
+  resolveFleetGardenContactMutationActor,
+  soleAdminFleetActor,
+  type GardenRequestContext,
+} from '../garden-request-context.js';
+import { createSubjectAuthorizedMemoryStore } from '../../../faculties/memory/subject-authorized-store.js';
+
+function requestActor(context: GardenRequestContext | undefined): string {
+  if (context?.kind !== 'fleet_principal') return 'admin:api';
+  return resolveFleetGardenContactMutationActor(context)?.actorId
+    ?? `fleet-principal:${context.actor.principalId}`;
+}
+
+function isOtherFleetContact(
+  context: GardenRequestContext | undefined,
+  contactId: string,
+): boolean {
+  if (context?.kind !== 'fleet_principal') return false;
+  // D1 sole-admin doctrine: the deployment's single rostered admin owns the
+  // whole contact surface.
+  if (soleAdminFleetActor(context)) return false;
+  return context.actor.contactId !== contactId;
+}
+
+function fleetProfileAccessContext(context: GardenRequestContext & { kind: 'fleet_principal' }): {
+  viewerContactId: string;
+  adminAccessMode?: 'sole_admin' | 'multi_admin';
+  escalated?: boolean;
+} {
+  const adminClass = context.actor.role === 'owner' || context.actor.role === 'admin';
+  return {
+    viewerContactId: context.actor.contactId,
+    ...(adminClass
+      ? {
+          adminAccessMode: context.actor.accessMode,
+          ...(context.actor.sessionAssurance === 'escalated' ? { escalated: true } : {}),
+        }
+      : {}),
+  };
+}
+
+interface ChannelPrivacyUpdate {
+  channel: string;
+  userId?: string;
+  channelId?: string;
+  privacyLevel: ChannelPrivacyLevel;
+}
+
+interface AddChannelLink {
+  channel: string;
+  userId: string;
+  privacyLevel?: ChannelPrivacyLevel;
+}
+
+interface ConversationChannelDeletePayload {
+  channel?: string;
+  channelId?: string;
+}
+
+interface ChannelBondingUpdate {
+  channel: string;
+  userId: string;
+  bonded: boolean;
+}
+
+interface ContactUpdatePayload {
+  displayName?: string;
+  nickname?: string;
+  trustLevel?: TrustLevel;
+  relationshipType?: RelationshipType;
+  notes?: string;
+  timezone?: unknown;
+  isMachineIntelligence?: boolean;
+  // bead fnyb: structured demographics. null clears, absent leaves unchanged.
+  gender?: string | null;
+  pronouns?: string | null;
+  age?: number | null;
+  channelPrivacy?: ChannelPrivacyUpdate[];
+  /** Channel-bonding opt-in per linked channel identity. */
+  channelBonding?: ChannelBondingUpdate[];
+  addChannel?: AddChannelLink;
+}
+
+type ContactTimezonePayload =
+  | { ok: true; present: false }
+  | { ok: true; present: true; timezone: string | undefined }
+  | { ok: false; message: string };
+
+function hasPayloadField(payload: object, field: string): boolean {
+  return Object.prototype.hasOwnProperty.call(payload, field);
+}
+
+function normalizeContactTimezonePayload(payload: { timezone?: unknown }): ContactTimezonePayload {
+  if (!hasPayloadField(payload, 'timezone')) {
+    return { ok: true, present: false };
+  }
+
+  if (payload.timezone === null || payload.timezone === undefined) {
+    return { ok: true, present: true, timezone: undefined };
+  }
+
+  if (typeof payload.timezone !== 'string') {
+    return {
+      ok: false,
+      message: 'timezone must be a valid IANA timezone name string, null, or empty string',
+    };
+  }
+
+  const timezone = payload.timezone.trim();
+  if (!timezone) {
+    return { ok: true, present: true, timezone: undefined };
+  }
+
+  try {
+    const canonicalTimezone = new Intl.DateTimeFormat('en-US', { timeZone: timezone })
+      .resolvedOptions()
+      .timeZone;
+    return { ok: true, present: true, timezone: canonicalTimezone || timezone };
+  } catch {
+    return {
+      ok: false,
+      message: `Invalid timezone: ${timezone}. timezone must be a valid IANA timezone name`,
+    };
+  }
+}
+
+function isMentionOnlyContact(contact: Contact | undefined): boolean {
+  if (!contact) return false;
+  return (contact.channels?.length ?? 0) === 0
+    && (contact.channelIdentities?.length ?? 0) === 0
+    && (contact.conversationChannels?.length ?? 0) === 0;
+}
+
+export class AdminContactsDataService implements AdminContactsService {
+  constructor(private readonly deps: {
+    contactStore?: ContactStorePort | null;
+    memoryStore: MemoryStorePort;
+    /** Raw product store; fleet requests project it through their immutable subject context. */
+    fleetMemoryStore?: MemoryStorePort;
+    sessionStore: SessionStore;
+    relationshipScoreReader?: AdminContactRelationshipScoreReader | null;
+  }) {}
+
+  private profileStore(context?: GardenRequestContext): MemoryStorePort {
+    if (context?.kind !== 'fleet_principal') return this.deps.memoryStore;
+    return createSubjectAuthorizedMemoryStore(
+      this.deps.fleetMemoryStore ?? this.deps.memoryStore,
+      Object.freeze(fleetProfileAccessContext(context)),
+    );
+  }
+
+  private normalizeContactMutationAuditField(value: string | null): ContactMutationAuditField | undefined {
+    const trimmed = value?.trim();
+    return trimmed && (CONTACT_MUTATION_AUDIT_FIELDS as readonly string[]).includes(trimmed)
+      ? trimmed as ContactMutationAuditField
+      : undefined;
+  }
+
+  private parseContactMutationAuditQuery(params?: URLSearchParams): ContactMutationAuditQuery {
+    const rawLimit = params?.get('limit');
+    const parsedLimit = rawLimit ? Number.parseInt(rawLimit, 10) : Number.NaN;
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(parsedLimit, 200)) : 25;
+
+    const contactId = params?.get('contactId')?.trim() || undefined;
+    const actor = params?.get('actor')?.trim() || undefined;
+    const field = this.normalizeContactMutationAuditField(params?.get('field') ?? null);
+
+    return {
+      contactId,
+      actor,
+      field,
+      limit,
+    };
+  }
+
+  async listMutationAuditEntries(query: ContactMutationAuditQuery): Promise<ContactMutationAuditEntry[]> {
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) return [];
+    return contactStore.listMutationAuditEntries(query);
+  }
+
+  private async buildSocialGraphMap(
+    contacts: Contact[],
+    recentContactShapeMap: Map<string, RecentContactShapeArtifact>,
+  ): Promise<Map<string, AdminContactSocialGraphView>> {
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) return new Map();
+
+    const contactById = new Map(contacts.map(contact => [contact.id, contact] as const));
+    const entities = await contactStore.listSocialGraphEntities({
+      viewerTrustLevel: 'primary',
+      viewerChannelPrivacy: 'private',
+      limit: Math.max(contacts.length * 4, 100),
+    });
+    const entityById = new Map(entities.map(entity => [entity.id, entity] as const));
+    const entityByContactId = new Map(
+      entities
+        .filter((entity): entity is SocialGraphEntity & { contactId: string } => typeof entity.contactId === 'string')
+        .map(entity => [entity.contactId, entity] as const),
+    );
+    const edges = await contactStore.listSocialRelationshipEdges({
+      viewerTrustLevel: 'primary',
+      viewerChannelPrivacy: 'private',
+      limit: Math.max(contacts.length * 8, 200),
+    });
+    const edgesByEntityId = new Map<string, SocialRelationshipEdge[]>();
+
+    const addEdge = (entityId: string, edge: SocialRelationshipEdge): void => {
+      const existing = edgesByEntityId.get(entityId);
+      if (existing) {
+        existing.push(edge);
+        return;
+      }
+      edgesByEntityId.set(entityId, [edge]);
+    };
+
+    for (const edge of edges) {
+      addEdge(edge.sourceEntityId, edge);
+      addEdge(edge.targetEntityId, edge);
+    }
+
+    const buildConnection = (
+      entity: SocialGraphEntity,
+      edge: SocialRelationshipEdge,
+    ): AdminContactSocialGraphConnectionView | null => {
+      const neighborEntityId = edge.sourceEntityId === entity.id ? edge.targetEntityId : edge.sourceEntityId;
+      const neighborEntity = entityById.get(neighborEntityId);
+      if (!neighborEntity) return null;
+
+      const neighborContact = neighborEntity.contactId ? contactById.get(neighborEntity.contactId) : undefined;
+      const neighborShape = neighborContact
+        ? recentContactShapeMap.get(neighborContact.id)
+        : undefined;
+      const direction = edge.directional
+        ? (edge.sourceEntityId === entity.id ? 'outgoing' : 'incoming')
+        : 'undirected';
+
+      return {
+        edgeId: edge.id,
+        relationshipType: edge.relationshipType,
+        directional: edge.directional,
+        direction,
+        sensitivity: edge.sensitivity,
+        confidence: edge.confidence,
+        provenanceRefs: edge.provenanceRefs,
+        evidenceMemoryIds: edge.evidenceMemoryIds,
+        createdAt: edge.createdAt,
+        updatedAt: edge.updatedAt,
+        neighbor: {
+          entityId: neighborEntity.id,
+          contactId: neighborEntity.contactId,
+          displayName: neighborContact?.displayName ?? neighborEntity.displayName,
+          source: neighborEntity.source,
+          sensitivity: neighborEntity.sensitivity,
+          confidence: neighborEntity.confidence,
+          provenanceRefs: neighborEntity.provenanceRefs,
+          mentionOnly: isMentionOnlyContact(neighborContact),
+          trustLevel: neighborContact?.trustLevel,
+          relationshipType: neighborContact?.relationshipType,
+          recentContactShapeSummary: neighborShape?.summary,
+          recentContactShapeUpdatedAt: neighborShape?.updatedAt,
+        },
+      };
+    };
+
+    return new Map<string, AdminContactSocialGraphView>(contacts.map((contact) => {
+      const entity = entityByContactId.get(contact.id);
+      if (!entity) {
+        return [contact.id, {
+          edgeCount: 0,
+          neighborCount: 0,
+          evidenceCount: 0,
+          provenanceCount: 0,
+          mentionOnlyNeighborCount: 0,
+          connections: [],
+        } satisfies AdminContactSocialGraphView] as const;
+      }
+
+      const localEdges = edgesByEntityId.get(entity.id) ?? [];
+      const connections = localEdges
+        .map(edge => buildConnection(entity, edge))
+        .filter((connection): connection is AdminContactSocialGraphConnectionView => connection !== null)
+        .sort((left, right) => {
+          if (right.confidence !== left.confidence) return right.confidence - left.confidence;
+          return left.neighbor.displayName.localeCompare(right.neighbor.displayName);
+        });
+      const uniqueNeighborIds = new Set(connections.map(connection => connection.neighbor.entityId));
+      const uniqueMentionOnlyNeighborIds = new Set(
+        connections
+          .filter(connection => connection.neighbor.mentionOnly)
+          .map(connection => connection.neighbor.entityId),
+      );
+      const evidenceIds = new Set(connections.flatMap(connection => connection.evidenceMemoryIds));
+      const provenanceRefs = new Set([
+        ...entity.provenanceRefs,
+        ...connections.flatMap(connection => connection.provenanceRefs),
+        ...connections.flatMap(connection => connection.neighbor.provenanceRefs),
+      ]);
+
+      return [contact.id, {
+        entity: {
+          id: entity.id,
+          displayName: entity.displayName,
+          contactId: entity.contactId,
+          source: entity.source,
+          sensitivity: entity.sensitivity,
+          confidence: entity.confidence,
+          provenanceRefs: entity.provenanceRefs,
+          createdAt: entity.createdAt,
+          updatedAt: entity.updatedAt,
+        },
+        edgeCount: localEdges.length,
+        neighborCount: uniqueNeighborIds.size,
+        evidenceCount: evidenceIds.size,
+        provenanceCount: provenanceRefs.size,
+        mentionOnlyNeighborCount: uniqueMentionOnlyNeighborIds.size,
+        connections,
+      } satisfies AdminContactSocialGraphView] as const;
+    }));
+  }
+
+  private async buildRelationshipScoreMap(
+    contacts: Contact[],
+  ): Promise<Map<string, AdminContactRelationshipScoreView>> {
+    const reader = this.deps.relationshipScoreReader;
+    if (!reader || contacts.length === 0) return new Map();
+    return reader.listContactRelationshipScores(contacts.map(contact => contact.id));
+  }
+
+  async listContacts(
+    params?: URLSearchParams,
+    context?: GardenRequestContext,
+  ): Promise<AdminContactListData> {
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return {
+        contacts: [],
+        recentContactShapeMap: new Map(),
+        relatedChannelMap: new Map(),
+        socialGraphMap: new Map(),
+        relationshipScoreMap: new Map(),
+        verifications: [],
+        mutationAudits: [],
+        mutationAuditQuery: this.parseContactMutationAuditQuery(params),
+      };
+    }
+
+    const fleetContactId = context?.kind === 'fleet_principal'
+      && !soleAdminFleetActor(context)
+      ? context.actor.contactId
+      : null;
+    const contacts = (await contactStore.listAll()).filter(contact => (
+      !fleetContactId || contact.id === fleetContactId
+    ));
+    const allowedContactIds = new Set(contacts.map(contact => contact.id));
+    const recentContactShapeMap = new Map(
+      (await this.profileStore(context).listRecentContactShapes())
+        .filter(shape => allowedContactIds.has(shape.contactId))
+        .map(shape => [shape.contactId, shape] as const),
+    );
+    const relatedChannelMap = buildRelatedConversationChannelMap({
+      contacts,
+      sessionStore: this.deps.sessionStore,
+    });
+    // A social graph necessarily names other contacts. Until its own
+    // co-subject projection exists, a fleet request receives only the exact
+    // current contact and never a graph-derived cross-subject side channel.
+    const socialGraphMap = fleetContactId
+      ? new Map()
+      : await this.buildSocialGraphMap(contacts, recentContactShapeMap);
+    const relationshipScoreMap = await this.buildRelationshipScoreMap(contacts);
+
+    const verifications = fleetContactId
+      ? []
+      : await contactStore.listIdentityLinkVerifications(20);
+    const mutationAuditQuery = this.parseContactMutationAuditQuery(params);
+    const mutationAudits = context?.kind === 'fleet_principal'
+      ? []
+      : await this.listMutationAuditEntries(mutationAuditQuery);
+
+    return {
+      contacts,
+      recentContactShapeMap,
+      relatedChannelMap,
+      socialGraphMap,
+      relationshipScoreMap,
+      verifications,
+      mutationAudits,
+      mutationAuditQuery,
+    };
+  }
+
+  async getContactDetail(
+    contactId: string,
+    context?: GardenRequestContext,
+  ): Promise<AdminContactDetailData | null> {
+    if (isOtherFleetContact(context, contactId)) return null;
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) return null;
+    const contact = await contactStore.getById(contactId);
+    if (!contact) return null;
+
+    const relatedChannels = buildRelatedConversationChannelMap({
+      contacts: [contact],
+      sessionStore: this.deps.sessionStore,
+    }).get(contact.id) ?? [];
+
+    return {
+      contact,
+      recentContactShape: await this.profileStore(context).getRecentContactShape(contact.id),
+      relatedChannels,
+    };
+  }
+
+  private async updateIdentityProfile(
+    contact: Contact,
+    displayName: string,
+    nickname?: string,
+    actor?: string,
+    auditMetadata?: ContactMutationAuditEntry['metadata'],
+  ): Promise<boolean> {
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) return false;
+
+    return contactStore.updateIdentityProfile(contact.id, displayName, nickname, actor, auditMetadata);
+  }
+
+  async createContact(body: string, context?: GardenRequestContext): Promise<ContactUpdateResult> {
+    if (context?.kind === 'fleet_principal') {
+      return { ok: false, message: 'Fleet principals cannot create a different contact' };
+    }
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return { ok: false, message: 'Contact store not available' };
+    }
+
+    let payload: {
+      displayName?: string;
+      trustLevel?: TrustLevel;
+      relationshipType?: RelationshipType;
+      notes?: string;
+      timezone?: unknown;
+    };
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return { ok: false, message: 'Request body must be valid JSON' };
+    }
+
+    const displayName = payload.displayName?.trim();
+    if (!displayName) {
+      return { ok: false, message: 'displayName is required' };
+    }
+
+    if (payload.trustLevel !== undefined) {
+      if (!TRUST_LEVELS.includes(payload.trustLevel)) {
+        return { ok: false, message: `Invalid trust level: ${payload.trustLevel}` };
+      }
+      if (payload.trustLevel === 'primary') {
+        return { ok: false, message: 'Cannot create a contact with primary trust level' };
+      }
+    }
+
+    if (payload.relationshipType !== undefined && !VALID_RELATIONSHIP_TYPES.includes(payload.relationshipType)) {
+      return { ok: false, message: `Invalid relationship type: ${payload.relationshipType}` };
+    }
+
+    const timezonePayload = normalizeContactTimezonePayload(payload);
+    if (!timezonePayload.ok) {
+      return { ok: false, message: timezonePayload.message };
+    }
+
+    const contactInput: Partial<Contact> & { displayName: string } = {
+      displayName,
+      trustLevel: payload.trustLevel ?? 'regular',
+      relationshipType: payload.relationshipType ?? 'acquaintance',
+      notes: payload.notes,
+    };
+    if (timezonePayload.present) {
+      contactInput.timezone = timezonePayload.timezone;
+    }
+
+    const contact = await contactStore.upsert(contactInput, { actor: requestActor(context) });
+
+    return {
+      ok: true,
+      message: 'Contact created',
+      contact,
+      relatedChannels: [],
+    };
+  }
+
+  // bead psfn-framework-qgqw.1 (adjudication R10.3): contacts are archived,
+  // never deleted. The operator DELETE action archives — the contact row, its
+  // memories, audit trail, and snapshotted privacy links persist as grayed-out
+  // history while the contact is removed from live channel-identity resolution.
+  async archiveContact(contactId: string, context?: GardenRequestContext): Promise<ContactUpdateResult> {
+    if (isOtherFleetContact(context, contactId)) return { ok: false, message: 'Contact not found' };
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return { ok: false, message: 'Contact store not available' };
+    }
+
+    const contact = await contactStore.getById(contactId);
+    if (!contact) {
+      return { ok: false, message: 'Contact not found' };
+    }
+
+    if (contact.trustLevel === 'primary') {
+      return { ok: false, message: 'Cannot archive the primary contact' };
+    }
+
+    if (!await contactStore.archiveContact(contactId, requestActor(context))) {
+      return { ok: false, message: 'Failed to archive contact' };
+    }
+
+    return { ok: true, message: 'Contact archived' };
+  }
+
+  async mergeContacts(
+    targetId: string,
+    body: string,
+    context?: GardenRequestContext,
+  ): Promise<ContactUpdateResult> {
+    const fleetMergeUnavailable = context?.kind === 'fleet_principal';
+    if (fleetMergeUnavailable && !soleAdminFleetActor(context)) {
+      return { ok: false, message: 'Fleet contact merging is unavailable' };
+    }
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return { ok: false, message: 'Contact store not available' };
+    }
+
+    let payload: { sourceId?: string };
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return { ok: false, message: 'Request body must be valid JSON' };
+    }
+
+    const sourceId = payload.sourceId?.trim();
+    if (!sourceId) {
+      return { ok: false, message: 'sourceId is required' };
+    }
+
+    if (sourceId === targetId) {
+      return { ok: false, message: 'Cannot merge a contact with itself' };
+    }
+
+    const target = await contactStore.getById(targetId);
+    if (!target) {
+      return { ok: false, message: 'Target contact not found' };
+    }
+
+    const source = await contactStore.getById(sourceId);
+    if (!source) {
+      return { ok: false, message: 'Source contact not found' };
+    }
+
+    if (!haveCompatibleContactIntelligenceKinds(
+      source.isMachineIntelligence,
+      target.isMachineIntelligence,
+    )) {
+      return { ok: false, message: MIXED_INTELLIGENCE_CONTACT_MERGE_ERROR };
+    }
+
+    if (fleetMergeUnavailable) {
+      return { ok: false, message: 'Fleet contact merging is unavailable' };
+    }
+
+    if (!await contactStore.mergeContacts(sourceId, targetId)) {
+      return { ok: false, message: 'Merge failed' };
+    }
+
+    const merged = await contactStore.getById(targetId);
+    if (!merged) {
+      return { ok: false, message: 'Merge succeeded but target not found after merge' };
+    }
+
+    return {
+      ok: true,
+      message: 'Contacts merged',
+      contact: merged,
+      relatedChannels: buildRelatedConversationChannelMap({
+        contacts: [merged],
+        sessionStore: this.deps.sessionStore,
+      }).get(merged.id) ?? [],
+    };
+  }
+
+  async unlinkChannelIdentity(
+    contactId: string,
+    body: string,
+    context?: GardenRequestContext,
+  ): Promise<ContactUpdateResult> {
+    if (isOtherFleetContact(context, contactId)) return { ok: false, message: 'Contact not found' };
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return { ok: false, message: 'Contact store not available' };
+    }
+
+    let payload: { channel?: string; userId?: string };
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return { ok: false, message: 'Request body must be valid JSON' };
+    }
+
+    const channel = payload.channel?.trim();
+    const userId = payload.userId?.trim();
+    if (!channel || !userId) {
+      return { ok: false, message: 'channel and userId are required' };
+    }
+
+    const contact = await contactStore.getById(contactId);
+    if (!contact) {
+      return { ok: false, message: 'Contact not found' };
+    }
+
+    if (!await contactStore.unlinkChannelIdentity(contactId, channel, userId, requestActor(context))) {
+      return { ok: false, message: 'Channel identity not found or already unlinked' };
+    }
+
+    const updated = await contactStore.getById(contactId);
+    return {
+      ok: true,
+      message: 'Channel identity unlinked',
+      contact: updated,
+      relatedChannels: updated
+        ? buildRelatedConversationChannelMap({
+          contacts: [updated],
+          sessionStore: this.deps.sessionStore,
+        }).get(updated.id) ?? []
+        : [],
+    };
+  }
+
+  async deleteConversationChannel(
+    contactId: string,
+    body: string,
+    context?: GardenRequestContext,
+  ): Promise<ContactUpdateResult> {
+    if (isOtherFleetContact(context, contactId)) return { ok: false, message: 'Contact not found' };
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return { ok: false, message: 'Contact store not available' };
+    }
+
+    let payload: ConversationChannelDeletePayload;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      return { ok: false, message: 'Request body must be valid JSON' };
+    }
+
+    const channel = payload.channel?.trim();
+    const channelId = payload.channelId?.trim();
+    if (!channel || !channelId) {
+      return { ok: false, message: 'channel and channelId are required' };
+    }
+
+    const contact = await contactStore.getById(contactId);
+    if (!contact) {
+      return { ok: false, message: 'Contact not found' };
+    }
+
+    if (!await contactStore.deleteConversationChannel(
+      contactId,
+      channel,
+      channelId,
+      requestActor(context),
+    )) {
+      return { ok: false, message: 'Conversation channel not found on contact' };
+    }
+
+    const updated = await contactStore.getById(contactId);
+    return {
+      ok: true,
+      message: 'Conversation channel deleted',
+      contact: updated,
+      relatedChannels: updated
+        ? buildRelatedConversationChannelMap({
+          contacts: [updated],
+          sessionStore: this.deps.sessionStore,
+        }).get(updated.id) ?? []
+        : [],
+    };
+  }
+
+  async updateContact(
+    contactId: string,
+    body: string,
+    context?: GardenRequestContext,
+  ): Promise<ContactUpdateResult> {
+    if (isOtherFleetContact(context, contactId)) {
+      return { ok: false, message: 'Contact not found', failureKind: 'not_found' };
+    }
+    const fleetActor = context?.kind === 'fleet_principal'
+      ? resolveFleetGardenContactMutationActor(context)
+      : null;
+    if (context?.kind === 'fleet_principal' && !fleetActor) {
+      return {
+        ok: false,
+        message: 'Contact mutation requires an authenticated fleet owner',
+        failureKind: 'authorization',
+      };
+    }
+    const actor = fleetActor?.actorId ?? 'admin:api';
+    const auditMetadata = fleetActor?.auditMetadata;
+    const contactStore = this.deps.contactStore;
+    if (!contactStore) {
+      return { ok: false, message: 'Contact store not available' };
+    }
+
+    const contact = await contactStore.getById(contactId);
+    if (!contact) {
+      return { ok: false, message: 'Contact not found' };
+    }
+
+    let payload: ContactUpdatePayload;
+    try {
+      payload = JSON.parse(body) as ContactUpdatePayload;
+    } catch {
+      return { ok: false, message: 'Request body must be valid JSON' };
+    }
+
+    if (payload.channelPrivacy?.some(cp => cp.channel === EXTERNAL_MEMORY_CHANNEL
+      || (cp.channelId && externalMemoryPolicyChannelId(cp.channelId) === EXTERNAL_MEMORY_CHANNEL))) {
+      return { ok: false, message: 'Hermes privacy is owned by api:hermes in Channels; edit its channel settings.' };
+    }
+
+    const timezonePayload = normalizeContactTimezonePayload(payload);
+    if (!timezonePayload.ok) {
+      return { ok: false, message: timezonePayload.message };
+    }
+
+    if (payload.displayName !== undefined || payload.nickname !== undefined) {
+      const displayName = payload.displayName?.trim() ?? contact.displayName;
+      if (!displayName) {
+        return { ok: false, message: 'displayName cannot be empty' };
+      }
+      if (!await this.updateIdentityProfile(contact, displayName, payload.nickname, actor, auditMetadata)) {
+        return { ok: false, message: 'Unable to update identity profile' };
+      }
+    }
+
+    if (payload.trustLevel !== undefined) {
+      if (!TRUST_LEVELS.includes(payload.trustLevel)) {
+        return { ok: false, message: `Invalid trust level: ${payload.trustLevel}` };
+      }
+      if (contact.trustLevel === 'primary' && payload.trustLevel !== 'primary') {
+        return { ok: false, message: 'Primary contact trust is immutable', failureKind: 'immutability' };
+      }
+      if (!await contactStore.setTrustLevel(contactId, payload.trustLevel, actor, { auditMetadata })) {
+        return { ok: false, message: 'Trust transition is not authorized', failureKind: 'authorization' };
+      }
+    }
+
+    if (payload.relationshipType !== undefined) {
+      if (!VALID_RELATIONSHIP_TYPES.includes(payload.relationshipType)) {
+        return { ok: false, message: `Invalid relationship type: ${payload.relationshipType}` };
+      }
+      if (!await contactStore.updateRelationshipType(contactId, payload.relationshipType, actor, auditMetadata)) {
+        return { ok: false, message: 'Relationship transition conflicted with current state', failureKind: 'conflict' };
+      }
+    }
+
+    if (payload.notes !== undefined) {
+      await contactStore.updateNotes(contactId, payload.notes, actor);
+    }
+
+    if (payload.isMachineIntelligence !== undefined) {
+      if (typeof payload.isMachineIntelligence !== 'boolean') {
+        return { ok: false, message: 'isMachineIntelligence must be a boolean' };
+      }
+      if (!await contactStore.setMachineIntelligence(contactId, payload.isMachineIntelligence, actor)) {
+        return { ok: false, message: 'Unable to update machine-intelligence marker' };
+      }
+    }
+
+    if (payload.gender !== undefined || payload.pronouns !== undefined || payload.age !== undefined) {
+      const demographics: ContactDemographicsUpdate = {};
+      if (payload.gender !== undefined) {
+        if (payload.gender !== null && typeof payload.gender !== 'string') {
+          return { ok: false, message: 'gender must be a string or null' };
+        }
+        demographics.gender = payload.gender;
+      }
+      if (payload.pronouns !== undefined) {
+        if (payload.pronouns !== null && typeof payload.pronouns !== 'string') {
+          return { ok: false, message: 'pronouns must be a string or null' };
+        }
+        demographics.pronouns = payload.pronouns;
+      }
+      if (payload.age !== undefined) {
+        if (payload.age !== null && (typeof payload.age !== 'number' || !Number.isFinite(payload.age) || payload.age < 0)) {
+          return { ok: false, message: 'age must be a non-negative number or null' };
+        }
+        demographics.age = payload.age;
+      }
+      if (!await contactStore.updateDemographics(contactId, demographics, actor)) {
+        return { ok: false, message: 'Unable to update demographic fields' };
+      }
+    }
+
+    if (timezonePayload.present) {
+      const currentContact = await contactStore.getById(contactId);
+      if (!currentContact) {
+        return { ok: false, message: 'Contact not found' };
+      }
+      await contactStore.upsert({
+        id: contactId,
+        displayName: currentContact.displayName,
+        timezone: timezonePayload.timezone,
+      }, { actor });
+    }
+
+    // Apply channel privacy updates
+    if (Array.isArray(payload.channelPrivacy)) {
+      for (const cp of payload.channelPrivacy) {
+        if (!cp.channel.trim()) continue;
+        if (!CHANNEL_PRIVACY_LEVELS.includes(cp.privacyLevel)) {
+          return { ok: false, message: `Invalid privacy level: ${cp.privacyLevel}` };
+        }
+        const normalizedChannel = cp.channel.trim();
+        const normalizedUserId = cp.userId?.trim();
+        const normalizedChannelId = cp.channelId?.trim();
+        const updated = normalizedChannelId
+          ? await contactStore.setConversationChannelPrivacy(
+            contactId,
+            normalizedChannel,
+            normalizedChannelId,
+            cp.privacyLevel,
+            actor,
+          )
+          : normalizedUserId
+              ? await contactStore.setChannelPrivacy(
+                contactId,
+                normalizedChannel,
+                normalizedUserId,
+                cp.privacyLevel,
+                actor,
+              )
+              : false;
+        if (!updated) {
+          const target = normalizedChannelId ?? normalizedUserId ?? 'unknown';
+          return { ok: false, message: `Unable to update privacy for ${normalizedChannel}:${target}` };
+        }
+      }
+    }
+
+    // Apply channel-bonding opt-in updates.
+    if (Array.isArray(payload.channelBonding)) {
+      for (const cb of payload.channelBonding) {
+        const normalizedChannel = typeof cb.channel === 'string' ? cb.channel.trim() : '';
+        const normalizedUserId = typeof cb.userId === 'string' ? cb.userId.trim() : '';
+        if (!normalizedChannel || !normalizedUserId) {
+          return { ok: false, message: 'channelBonding entries require channel and userId' };
+        }
+        if (typeof cb.bonded !== 'boolean') {
+          return { ok: false, message: 'channelBonding.bonded must be a boolean' };
+        }
+        if (!await contactStore.setChannelBonding(
+          contactId,
+          normalizedChannel,
+          normalizedUserId,
+          cb.bonded,
+          actor,
+        )) {
+          return { ok: false, message: `Unable to update bonding for ${normalizedChannel}:${normalizedUserId}` };
+        }
+      }
+    }
+
+    // Add new channel link
+    if (payload.addChannel) {
+      const ch = payload.addChannel;
+      if (!ch.channel.trim() || !ch.userId.trim()) {
+        return { ok: false, message: 'Channel and userId are required for addChannel' };
+      }
+      if (ch.privacyLevel && !CHANNEL_PRIVACY_LEVELS.includes(ch.privacyLevel)) {
+        return { ok: false, message: `Invalid privacy level for new channel: ${ch.privacyLevel}` };
+      }
+      const linkResult = await contactStore.linkChannelIdentity(
+        contactId,
+        ch.channel.trim(),
+        ch.userId.trim(),
+        { privacyLevel: ch.privacyLevel },
+        actor,
+      );
+      if (linkResult === 'identity_conflict') {
+        return { ok: false, message: `Identity ${ch.channel}:${ch.userId} is already linked to another contact` };
+      }
+      if (linkResult === 'contact_not_found') {
+        return { ok: false, message: `Contact ${contactId} was not found` };
+      }
+    }
+
+    const updated = await contactStore.getById(contactId);
+    if (!updated) {
+      return { ok: false, message: 'Update failed' };
+    }
+
+    return {
+      ok: true,
+      message: 'Contact updated',
+      contact: updated,
+      relatedChannels: buildRelatedConversationChannelMap({
+        contacts: [updated],
+        sessionStore: this.deps.sessionStore,
+      }).get(updated.id) ?? [],
+    };
+  }
+}

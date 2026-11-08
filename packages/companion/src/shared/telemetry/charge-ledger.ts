@@ -1,0 +1,816 @@
+import { createHash, randomUUID } from 'node:crypto';
+import type { EventBus } from '../event-bus.js';
+import {
+  appendJsonLine,
+  resolveJsonLinesReadLimits,
+  streamJsonLines,
+  streamJsonLinesSync,
+  type JsonLinesReadLimitSettings,
+  type JsonLinesReadLimits,
+} from '../utils/jsonl.js';
+import type { RunChargeEvent } from '../contracts/runtime.js';
+import type {
+  ChargePolicyRuntimeLane,
+  ChargePolicySurface,
+} from '../contracts/charge-policy.js';
+import {
+  hydrateRunChargeRollingWindowFromEvents,
+  RUN_CHARGE_ROLLING_WINDOW_MS,
+  type RunChargeRollingWindowSnapshot,
+} from './run-charge.js';
+
+export interface RunChargeLedgerMetadata {
+  provider?: string;
+  model?: string;
+  modality?: string;
+  referenceModelClass?: string;
+  shardId?: string;
+  subagentId?: string;
+}
+
+export interface RunChargeLedgerEntry {
+  schemaVersion: 1;
+  recordType: 'charge_event';
+  eventId: string;
+  recordedAtMs: number;
+  event: RunChargeEvent;
+  metadata?: RunChargeLedgerMetadata;
+}
+
+export interface RunChargeLedgerQuery {
+  limit?: number;
+  sinceMs?: number;
+  untilMs?: number;
+  runId?: string;
+}
+
+export type RunChargeReconciliationQuery = Pick<RunChargeLedgerQuery, 'sinceMs' | 'untilMs'>;
+
+export interface RunChargeBreakdown {
+  key: string;
+  amount: number;
+  eventCount: number;
+}
+
+export interface RunChargeRunSummary {
+  runId: string;
+  rootRunId: string;
+  parentRunId?: string;
+  startedAtMs: number;
+  updatedAtMs: number;
+  eventCount: number;
+  amount: number;
+  spentByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+  spentBySurface: Partial<Record<ChargePolicySurface, number>>;
+  lineageDepth: number;
+  shardIds: string[];
+  subagentIds: string[];
+  models: string[];
+  lastQuotaByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+  lastSpentAfterByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+  lastRemainingAfterByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+}
+
+export interface RunChargeLedgerAggregates {
+  amount: number;
+  eventCount: number;
+  byLane: RunChargeBreakdown[];
+  bySurface: RunChargeBreakdown[];
+  byLineage: RunChargeBreakdown[];
+}
+
+export interface RunChargeDailySummary {
+  /** UTC calendar day (YYYY-MM-DD), same convention as the model-budget dollar ledger. */
+  dayKey: string;
+  amount: number;
+  eventCount: number;
+  byLane: RunChargeBreakdown[];
+}
+
+/**
+ * Calendar accounting over the same charge events: spend accrues per calendar
+ * day and rolls up month-to-date so charge units reconcile against the
+ * monthly dollar cap in one Garden surface. This is a view over the ledger,
+ * not a second accounting path.
+ */
+export interface RunChargeCalendarAccrual {
+  monthKey: string;
+  monthToDateAmount: number;
+  monthToDateEventCount: number;
+  daily: RunChargeDailySummary[];
+}
+
+export interface RunChargeLedgerData {
+  activeRun: RunChargeRunSummary | null;
+  recentRuns: RunChargeRunSummary[];
+  aggregates: RunChargeLedgerAggregates;
+  calendar: RunChargeCalendarAccrual;
+  events: RunChargeLedgerEntry[];
+}
+
+interface MutableRunSummary {
+  runId: string;
+  rootRunId: string;
+  parentRunId?: string;
+  startedAtMs: number;
+  updatedAtMs: number;
+  eventCount: number;
+  amount: number;
+  spentByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+  spentBySurface: Partial<Record<ChargePolicySurface, number>>;
+  lineageDepth: number;
+  shardIds: Set<string>;
+  subagentIds: Set<string>;
+  models: Set<string>;
+  lastQuotaByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+  lastSpentAfterByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+  lastRemainingAfterByLane: Partial<Record<ChargePolicyRuntimeLane, number>>;
+}
+
+const DEFAULT_EVENT_LIMIT = 200;
+const MAX_EVENT_LIMIT = 2_000;
+const DEFAULT_RECENT_RUN_LIMIT = 24;
+
+function normalizePositiveFiniteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+function normalizeOptionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : undefined;
+}
+
+function normalizeLimit(value: number | undefined): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 1) {
+    return DEFAULT_EVENT_LIMIT;
+  }
+  return Math.min(MAX_EVENT_LIMIT, Math.trunc(value));
+}
+
+function addBreakdown(
+  target: Map<string, RunChargeBreakdown>,
+  key: string,
+  amount: number,
+): void {
+  const existing = target.get(key);
+  if (existing) {
+    existing.amount += amount;
+    existing.eventCount += 1;
+    return;
+  }
+  target.set(key, { key, amount, eventCount: 1 });
+}
+
+function addRecordAmount<T extends string>(
+  target: Partial<Record<T, number>>,
+  key: T,
+  amount: number,
+): void {
+  target[key] = (target[key] ?? 0) + amount;
+}
+
+function sortedBreakdowns(map: Map<string, RunChargeBreakdown>): RunChargeBreakdown[] {
+  return [...map.values()].sort((left, right) => {
+    if (right.amount !== left.amount) return right.amount - left.amount;
+    return left.key.localeCompare(right.key);
+  });
+}
+
+function readMetadataString(details: Record<string, unknown> | undefined, key: string): string | undefined {
+  return normalizeOptionalString(details?.[key]);
+}
+
+function extractMetadata(event: RunChargeEvent): RunChargeLedgerMetadata | undefined {
+  const details = event.details;
+  const metadata: RunChargeLedgerMetadata = {};
+  const provider = readMetadataString(details, 'provider');
+  const model = readMetadataString(details, 'model');
+  const modality = readMetadataString(details, 'modality')
+    ?? (event.surface === 'paidImageGeneration' ? 'image' : undefined);
+  const referenceModelClass = readMetadataString(details, 'referenceModelClass');
+  const shardId = readMetadataString(details, 'shardId');
+  const subagentId = readMetadataString(details, 'subagentId');
+
+  if (provider) metadata.provider = provider;
+  if (model) metadata.model = model;
+  if (modality) metadata.modality = modality;
+  if (referenceModelClass) metadata.referenceModelClass = referenceModelClass;
+  if (shardId) metadata.shardId = shardId;
+  if (subagentId) metadata.subagentId = subagentId;
+
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+}
+
+function cloneChargeEvent(event: RunChargeEvent): RunChargeEvent {
+  return {
+    ...event,
+    lineage: { ...event.lineage },
+    ...(event.details ? { details: { ...event.details } } : {}),
+  };
+}
+
+function createLedgerEntry(event: RunChargeEvent): RunChargeLedgerEntry {
+  const clonedEvent = cloneChargeEvent(event);
+  const metadata = extractMetadata(clonedEvent);
+  const eventId = normalizeOptionalString(clonedEvent.eventId) ?? randomUUID();
+  clonedEvent.eventId = eventId;
+  return {
+    schemaVersion: 1,
+    recordType: 'charge_event',
+    eventId,
+    recordedAtMs: Date.now(),
+    event: clonedEvent,
+    ...(metadata ? { metadata } : {}),
+  };
+}
+
+function durableEventBinding(event: RunChargeEvent): string {
+  const {
+    timestampMs: _timestampMs,
+    spentAfter: _spentAfter,
+    remainingAfter: _remainingAfter,
+    ...binding
+  } = event;
+  return JSON.stringify(binding);
+}
+
+function durableEventDigest(event: RunChargeEvent): string {
+  return createHash('sha256').update(durableEventBinding(event)).digest('base64');
+}
+
+function assertLedgerEntry(value: unknown, lineNumber: number): asserts value is RunChargeLedgerEntry {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: expected object`);
+  }
+  const entry = value as Partial<RunChargeLedgerEntry>;
+  if (entry.schemaVersion !== 1 || entry.recordType !== 'charge_event') {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: unsupported schema`);
+  }
+  if (!normalizeOptionalString(entry.eventId)) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: missing eventId`);
+  }
+  if (normalizePositiveFiniteNumber(entry.recordedAtMs) === undefined) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: missing recordedAtMs`);
+  }
+  const event = entry.event;
+  if (!event || typeof event !== 'object' || Array.isArray(event)) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: missing event`);
+  }
+  const eventId = normalizeOptionalString(entry.eventId);
+  const nestedEventId = normalizeOptionalString(event.eventId);
+  if (nestedEventId && nestedEventId !== eventId) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: eventId does not match event.eventId`);
+  }
+  if (normalizePositiveFiniteNumber(event.timestampMs) === undefined) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: missing event timestamp`);
+  }
+  if (normalizePositiveFiniteNumber(event.amount) === undefined) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: missing event amount`);
+  }
+  const eventLineage = (event as { lineage?: { runId?: unknown; rootRunId?: unknown } }).lineage;
+  if (!eventLineage || !normalizeOptionalString(eventLineage.runId) || !normalizeOptionalString(eventLineage.rootRunId)) {
+    throw new Error(`Invalid charge ledger entry at line ${lineNumber}: missing lineage`);
+  }
+}
+
+/**
+ * Bounded append-only hydration (psfn-framework-z3e2x). The ledger is streamed
+ * one physical row at a time instead of being materialized as a whole-file
+ * string plus a whole-file row array, so transient retention is bounded by the
+ * read chunk plus one row. Malformed rows still fail closed.
+ */
+function visitLedgerRows(onEntry: (entry: RunChargeLedgerEntry) => boolean | void) {
+  return (parsed: unknown, context: { line: number }): boolean | void => {
+    assertLedgerEntry(parsed, context.line);
+    return onEntry(withEventIdentity(parsed));
+  };
+}
+
+function chargeLedgerParseError(path: string) {
+  return (context: { line: number; error: unknown }): never => {
+    throw new Error(
+      `Invalid charge ledger JSON at line ${context.line} of ${path}: ${String(context.error)}`,
+    );
+  };
+}
+
+/**
+ * Resident hydration state (psfn-framework-jjeng). Full rows are retained only
+ * inside the resident horizon; every row's durable identity stays indexed so a
+ * committed retry remains a replay after its row ages out of memory.
+ */
+interface LedgerHydration {
+  /** Rows whose event timestamp is at or after `residentFloorMs`, in file order. */
+  entries: RunChargeLedgerEntry[];
+  /** eventId -> digest of the durable event binding, for every row ever written. */
+  identities: Map<string, string>;
+  residentFloorMs: number;
+}
+
+function hydrationVisitor(hydration: LedgerHydration) {
+  return visitLedgerRows(entry => {
+    // First occurrence wins, matching the historical first-match lookup.
+    if (!hydration.identities.has(entry.eventId)) {
+      hydration.identities.set(entry.eventId, durableEventDigest(entry.event));
+    }
+    if (entry.event.timestampMs >= hydration.residentFloorMs) {
+      hydration.entries.push(entry);
+    }
+  });
+}
+
+function createLedgerHydration(nowMs: number): LedgerHydration {
+  return {
+    entries: [],
+    identities: new Map(),
+    residentFloorMs: resolveResidentFloorMs(nowMs),
+  };
+}
+
+function readLedgerHydrationSync(
+  path: string,
+  limits: JsonLinesReadLimits,
+  nowMs: number,
+): LedgerHydration {
+  const hydration = createLedgerHydration(nowMs);
+  streamJsonLinesSync(path, limits, hydrationVisitor(hydration), {
+    onParseError: chargeLedgerParseError(path),
+  });
+  return hydration;
+}
+
+async function readLedgerHydrationStreaming(
+  path: string,
+  limits: JsonLinesReadLimits,
+  nowMs: number,
+): Promise<LedgerHydration> {
+  const hydration = createLedgerHydration(nowMs);
+  await streamJsonLines(path, limits, hydrationVisitor(hydration), {
+    onParseError: chargeLedgerParseError(path),
+  });
+  return hydration;
+}
+
+/** Stream canonical rows matching `predicate` without materializing the rest. */
+async function readMatchingLedgerEntries(
+  path: string,
+  limits: JsonLinesReadLimits,
+  predicate: (entry: RunChargeLedgerEntry) => boolean,
+): Promise<RunChargeLedgerEntry[]> {
+  const entries: RunChargeLedgerEntry[] = [];
+  await streamJsonLines(path, limits, visitLedgerRows(entry => {
+    if (predicate(entry)) entries.push(entry);
+  }), { onParseError: chargeLedgerParseError(path) });
+  return entries;
+}
+
+function readFirstLedgerEntrySync(
+  path: string,
+  limits: JsonLinesReadLimits,
+  eventId: string,
+): RunChargeLedgerEntry | undefined {
+  let found: RunChargeLedgerEntry | undefined;
+  streamJsonLinesSync(path, limits, visitLedgerRows(entry => {
+    if (entry.eventId !== eventId) return false;
+    found = entry;
+    return true;
+  }), { onParseError: chargeLedgerParseError(path) });
+  return found;
+}
+
+/**
+ * Fresh read-only deployment balance for authorities running outside the
+ * agent process. The JSONL ledger remains canonical; every decision rereads
+ * it so a gateway cannot authorize from stale process-local charge state.
+ */
+export async function readRunChargeRollingWindowFromLedger(
+  path: string,
+  nowMs = Date.now(),
+  settings?: JsonLinesReadLimitSettings | null,
+): Promise<RunChargeRollingWindowSnapshot> {
+  const cutoffMs = nowMs - RUN_CHARGE_ROLLING_WINDOW_MS;
+  const seenEventIds = new Set<string>();
+  const spentByLane: Partial<Record<ChargePolicyRuntimeLane, number>> = {};
+  let entryCount = 0;
+  // The rolling window is folded during the scan, so the decision retains only
+  // in-window event identities rather than the whole ledger. Every row is still
+  // inspected: the window is a filter, never a tail-only truncation.
+  await streamJsonLines(
+    path,
+    resolveJsonLinesReadLimits(settings),
+    visitLedgerRows((entry) => {
+      const event = entry.event;
+      if (event.timestampMs < cutoffMs || event.timestampMs > nowMs || event.amount <= 0) {
+        return;
+      }
+      const eventId = event.eventId.trim() || entry.eventId;
+      if (seenEventIds.has(eventId)) return;
+      seenEventIds.add(eventId);
+      addRecordAmount(spentByLane, event.lane, event.amount);
+      entryCount += 1;
+    }),
+    { onParseError: chargeLedgerParseError(path) },
+  );
+  return {
+    windowMs: RUN_CHARGE_ROLLING_WINDOW_MS,
+    spentByLane,
+    entryCount,
+  };
+}
+
+// Rows persisted before RunChargeEvent carried its own eventId reuse the
+// ledger entry id (always present and unique) as the event identity so
+// rolling-window hydration dedupes by exact identity, never by content.
+function withEventIdentity(entry: RunChargeLedgerEntry): RunChargeLedgerEntry {
+  if (normalizeOptionalString(entry.event.eventId)) {
+    return entry;
+  }
+  return { ...entry, event: { ...entry.event, eventId: entry.eventId } };
+}
+
+function matchesQuery(entry: RunChargeLedgerEntry, query: RunChargeLedgerQuery): boolean {
+  const timestamp = entry.event.timestampMs;
+  if (query.sinceMs !== undefined && timestamp < query.sinceMs) return false;
+  if (query.untilMs !== undefined && timestamp > query.untilMs) return false;
+  if (query.runId) {
+    const lineage = entry.event.lineage;
+    return lineage.runId === query.runId
+      || lineage.rootRunId === query.runId
+      || lineage.parentRunId === query.runId;
+  }
+  return true;
+}
+
+function resolveLineageDepth(entry: RunChargeLedgerEntry): number {
+  const lineage = entry.event.lineage;
+  if (lineage.parentRunId) return 2;
+  return lineage.rootRunId === lineage.runId ? 1 : 2;
+}
+
+function getOrCreateRunSummary(
+  summaries: Map<string, MutableRunSummary>,
+  entry: RunChargeLedgerEntry,
+): MutableRunSummary {
+  const { lineage } = entry.event;
+  const existing = summaries.get(lineage.runId);
+  if (existing) {
+    return existing;
+  }
+  const summary: MutableRunSummary = {
+    runId: lineage.runId,
+    rootRunId: lineage.rootRunId,
+    ...(lineage.parentRunId ? { parentRunId: lineage.parentRunId } : {}),
+    startedAtMs: entry.event.timestampMs,
+    updatedAtMs: entry.event.timestampMs,
+    eventCount: 0,
+    amount: 0,
+    spentByLane: {},
+    spentBySurface: {},
+    lineageDepth: resolveLineageDepth(entry),
+    shardIds: new Set(),
+    subagentIds: new Set(),
+    models: new Set(),
+    lastQuotaByLane: {},
+    lastSpentAfterByLane: {},
+    lastRemainingAfterByLane: {},
+  };
+  summaries.set(lineage.runId, summary);
+  return summary;
+}
+
+function addEntryToRunSummary(summary: MutableRunSummary, entry: RunChargeLedgerEntry): void {
+  const event = entry.event;
+  summary.startedAtMs = Math.min(summary.startedAtMs, event.timestampMs);
+  summary.updatedAtMs = Math.max(summary.updatedAtMs, event.timestampMs);
+  summary.eventCount += 1;
+  summary.amount += event.amount;
+  summary.lineageDepth = Math.max(summary.lineageDepth, resolveLineageDepth(entry));
+  addRecordAmount(summary.spentByLane, event.lane, event.amount);
+  addRecordAmount(summary.spentBySurface, event.surface, event.amount);
+  summary.lastQuotaByLane[event.lane] = event.quota;
+  summary.lastSpentAfterByLane[event.lane] = event.spentAfter;
+  summary.lastRemainingAfterByLane[event.lane] = event.remainingAfter;
+  if (entry.metadata?.shardId) summary.shardIds.add(entry.metadata.shardId);
+  if (entry.metadata?.subagentId) summary.subagentIds.add(entry.metadata.subagentId);
+  if (entry.metadata?.model) summary.models.add(entry.metadata.model);
+}
+
+function finalizeRunSummary(summary: MutableRunSummary): RunChargeRunSummary {
+  return {
+    runId: summary.runId,
+    rootRunId: summary.rootRunId,
+    ...(summary.parentRunId ? { parentRunId: summary.parentRunId } : {}),
+    startedAtMs: summary.startedAtMs,
+    updatedAtMs: summary.updatedAtMs,
+    eventCount: summary.eventCount,
+    amount: summary.amount,
+    spentByLane: { ...summary.spentByLane },
+    spentBySurface: { ...summary.spentBySurface },
+    lineageDepth: summary.lineageDepth,
+    shardIds: [...summary.shardIds].sort(),
+    subagentIds: [...summary.subagentIds].sort(),
+    models: [...summary.models].sort(),
+    lastQuotaByLane: { ...summary.lastQuotaByLane },
+    lastSpentAfterByLane: { ...summary.lastSpentAfterByLane },
+    lastRemainingAfterByLane: { ...summary.lastRemainingAfterByLane },
+  };
+}
+
+function summarizeEntries(entries: RunChargeLedgerEntry[]): {
+  aggregates: RunChargeLedgerAggregates;
+  runs: RunChargeRunSummary[];
+} {
+  const byLane = new Map<string, RunChargeBreakdown>();
+  const bySurface = new Map<string, RunChargeBreakdown>();
+  const byLineage = new Map<string, RunChargeBreakdown>();
+  const runSummaries = new Map<string, MutableRunSummary>();
+  let amount = 0;
+
+  for (const entry of entries) {
+    const event = entry.event;
+    amount += event.amount;
+    addBreakdown(byLane, event.lane, event.amount);
+    addBreakdown(bySurface, event.surface, event.amount);
+    addBreakdown(byLineage, event.lineage.runId, event.amount);
+    addEntryToRunSummary(getOrCreateRunSummary(runSummaries, entry), entry);
+  }
+
+  const runs = [...runSummaries.values()]
+    .map(finalizeRunSummary)
+    .sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+
+  return {
+    aggregates: {
+      amount,
+      eventCount: entries.length,
+      byLane: sortedBreakdowns(byLane),
+      bySurface: sortedBreakdowns(bySurface),
+      byLineage: sortedBreakdowns(byLineage),
+    },
+    runs,
+  };
+}
+
+const CALENDAR_ACCRUAL_DAYS = 31;
+const DAY_MS = 24 * 60 * 60_000;
+
+/**
+ * Full rows stay resident only for the longest window an in-process consumer
+ * needs: the rolling charge-quota window and the calendar accrual view (which
+ * spans the current month, never more than CALENDAR_ACCRUAL_DAYS). Older rows
+ * are read from the canonical JSONL file on demand.
+ */
+const RESIDENT_HORIZON_MS = Math.max(RUN_CHARGE_ROLLING_WINDOW_MS, CALENDAR_ACCRUAL_DAYS * DAY_MS);
+
+function resolveResidentFloorMs(nowMs: number): number {
+  return nowMs - RESIDENT_HORIZON_MS;
+}
+
+function makeChargeDayKey(timestampMs: number): string {
+  return new Date(timestampMs).toISOString().slice(0, 10);
+}
+
+function makeChargeMonthKey(timestampMs: number): string {
+  return new Date(timestampMs).toISOString().slice(0, 7);
+}
+
+function summarizeCalendarAccrual(
+  entries: readonly RunChargeLedgerEntry[],
+  nowMs: number,
+): RunChargeCalendarAccrual {
+  const monthKey = makeChargeMonthKey(nowMs);
+  const windowStartMs = nowMs - (CALENDAR_ACCRUAL_DAYS * DAY_MS);
+  const dailyBuckets = new Map<string, { amount: number; eventCount: number; byLane: Map<string, RunChargeBreakdown> }>();
+  let monthToDateAmount = 0;
+  let monthToDateEventCount = 0;
+
+  for (const entry of entries) {
+    const timestamp = entry.event.timestampMs;
+    if (timestamp > nowMs) continue;
+    if (makeChargeMonthKey(timestamp) === monthKey) {
+      monthToDateAmount += entry.event.amount;
+      monthToDateEventCount += 1;
+    }
+    if (timestamp < windowStartMs) continue;
+    const dayKey = makeChargeDayKey(timestamp);
+    let bucket = dailyBuckets.get(dayKey);
+    if (!bucket) {
+      bucket = { amount: 0, eventCount: 0, byLane: new Map() };
+      dailyBuckets.set(dayKey, bucket);
+    }
+    bucket.amount += entry.event.amount;
+    bucket.eventCount += 1;
+    addBreakdown(bucket.byLane, entry.event.lane, entry.event.amount);
+  }
+
+  const daily = [...dailyBuckets.entries()]
+    .sort(([left], [right]) => right.localeCompare(left))
+    .map(([dayKey, bucket]) => ({
+      dayKey,
+      amount: bucket.amount,
+      eventCount: bucket.eventCount,
+      byLane: sortedBreakdowns(bucket.byLane),
+    }));
+
+  return {
+    monthKey,
+    monthToDateAmount,
+    monthToDateEventCount,
+    daily,
+  };
+}
+
+export interface RunChargeLedgerOptions {
+  now?: () => number;
+  /** Owner-file bounded-read budgets (settings.json ledgerRead* keys). */
+  readLimitSettings?: JsonLinesReadLimitSettings | null;
+}
+
+function cloneLedgerEntry(entry: RunChargeLedgerEntry): RunChargeLedgerEntry {
+  return {
+    ...entry,
+    event: cloneChargeEvent(entry.event),
+    ...(entry.metadata ? { metadata: { ...entry.metadata } } : {}),
+  };
+}
+
+export class RunChargeLedger {
+  /**
+   * Cooperative startup hydration: streams the append-only ledger off the
+   * blocking path so timers and admin work keep advancing on a multi-megabyte
+   * ledger (psfn-framework-z3e2x). Prefer this over the constructor in runtime
+   * wiring; the constructor's synchronous form remains for direct/tool use.
+   */
+  static async open(
+    path: string,
+    eventBus?: Pick<EventBus, 'on'> | null,
+    options: RunChargeLedgerOptions = {},
+  ): Promise<RunChargeLedger> {
+    // Cooperative hydration introduces an await where the synchronous
+    // constructor had none, so buffer charge events for the duration and replay
+    // them once the ledger owns its own subscription. Nothing emitted during
+    // startup hydration can be dropped.
+    const pending: RunChargeEvent[] = [];
+    const detachBuffer = eventBus?.on('agent.charge', (event) => {
+      pending.push(event);
+    }) ?? null;
+    try {
+      const now = options.now ?? (() => Date.now());
+      const hydration = await readLedgerHydrationStreaming(
+        path,
+        resolveJsonLinesReadLimits(options.readLimitSettings),
+        now(),
+      );
+      const ledger = new RunChargeLedger(path, eventBus, options, hydration);
+      detachBuffer?.();
+      for (const event of pending) ledger.recordChargeEvent(event);
+      return ledger;
+    } catch (error) {
+      detachBuffer?.();
+      throw error;
+    }
+  }
+
+  /** Resident rows: every row whose event timestamp is >= residentFloorMs. */
+  private entries: RunChargeLedgerEntry[];
+  private residentFloorMs: number;
+  private readonly identities: Map<string, string>;
+  private readonly readLimits: JsonLinesReadLimits;
+  private unsubscribe?: () => void;
+  private readonly now: () => number;
+
+  constructor(
+    private readonly path: string,
+    eventBus?: Pick<EventBus, 'on'> | null,
+    options: RunChargeLedgerOptions = {},
+    hydration?: LedgerHydration,
+  ) {
+    this.now = options.now ?? (() => Date.now());
+    this.readLimits = resolveJsonLinesReadLimits(options.readLimitSettings);
+    const hydrated = hydration ?? readLedgerHydrationSync(path, this.readLimits, this.now());
+    this.entries = hydrated.entries;
+    this.identities = hydrated.identities;
+    this.residentFloorMs = hydrated.residentFloorMs;
+    hydrateRunChargeRollingWindowFromEvents(this.entries.map(entry => entry.event), this.now());
+    if (eventBus) {
+      this.unsubscribe = eventBus.on('agent.charge', (event) => {
+        this.recordChargeEvent(event);
+      });
+    }
+  }
+
+  close(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+  }
+
+  /** Number of full rows held in memory (bounded by the resident horizon). */
+  get residentEntryCount(): number {
+    return this.entries.length;
+  }
+
+  recordChargeEvent(event: RunChargeEvent): RunChargeLedgerEntry {
+    return this.commitChargeEvent(event).entry;
+  }
+
+  commitChargeEvent(event: RunChargeEvent): {
+    outcome: 'recorded' | 'replayed';
+    entry: RunChargeLedgerEntry;
+  } {
+    const entry = createLedgerEntry(event);
+    if (this.isReplay(entry.eventId, entry.event)) {
+      return { outcome: 'replayed', entry: cloneLedgerEntry(this.findRecordedEntry(entry.eventId)) };
+    }
+    appendJsonLine(this.path, entry);
+    this.identities.set(entry.eventId, durableEventDigest(entry.event));
+    this.entries.push(entry);
+    this.pruneResidentEntries();
+    return { outcome: 'recorded', entry };
+  }
+
+  probeChargeEvent(event: RunChargeEvent): 'absent' | 'replayed' {
+    const eventId = normalizeOptionalString(event.eventId);
+    if (!eventId) {
+      throw new Error('Charge ledger probe requires an event identity');
+    }
+    return this.isReplay(eventId, event) ? 'replayed' : 'absent';
+  }
+
+  /**
+   * The identity index covers every row ever written, including rows no longer
+   * resident, so replay detection and collision rejection never depend on the
+   * resident horizon.
+   */
+  private isReplay(eventId: string, event: RunChargeEvent): boolean {
+    const recordedDigest = this.identities.get(eventId);
+    if (recordedDigest === undefined) return false;
+    if (recordedDigest !== durableEventDigest(event)) {
+      throw new Error(`Charge ledger event identity collision for ${eventId}`);
+    }
+    return true;
+  }
+
+  private findRecordedEntry(eventId: string): RunChargeLedgerEntry {
+    const resident = this.entries.find(candidate => candidate.eventId === eventId);
+    if (resident) return resident;
+    const persisted = readFirstLedgerEntrySync(this.path, this.readLimits, eventId);
+    if (!persisted) {
+      throw new Error(`Charge ledger identity ${eventId} is indexed but missing from ${this.path}`);
+    }
+    return persisted;
+  }
+
+  private pruneResidentEntries(): void {
+    const floorMs = resolveResidentFloorMs(this.now());
+    if (floorMs <= this.residentFloorMs) return;
+    this.residentFloorMs = floorMs;
+    this.entries = this.entries.filter(entry => entry.event.timestampMs >= floorMs);
+  }
+
+  /**
+   * Resident rows answer a query only when its lower bound is inside the
+   * resident horizon; otherwise the canonical JSONL file is streamed so
+   * history older than the horizon keeps its pre-bounding semantics.
+   */
+  private async readMatching(query: RunChargeLedgerQuery): Promise<RunChargeLedgerEntry[]> {
+    if (query.sinceMs !== undefined && query.sinceMs >= this.residentFloorMs) {
+      return this.entries.filter(entry => matchesQuery(entry, query));
+    }
+    return await readMatchingLedgerEntries(this.path, this.readLimits, entry => matchesQuery(entry, query));
+  }
+
+  async listEntries(query: RunChargeLedgerQuery = {}): Promise<RunChargeLedgerEntry[]> {
+    const limit = normalizeLimit(query.limit);
+    return (await this.readMatching(query))
+      .sort((left, right) => right.event.timestampMs - left.event.timestampMs)
+      .slice(0, limit)
+      .map(cloneLedgerEntry);
+  }
+
+  /** Complete internal read for aggregate reconciliation; unlike listEntries, this is not display-limited. */
+  async listReconciliationEntries(query: RunChargeReconciliationQuery = {}): Promise<RunChargeLedgerEntry[]> {
+    return (await this.readMatching(query))
+      .sort((left, right) => left.event.timestampMs - right.event.timestampMs || left.eventId.localeCompare(right.eventId))
+      .map(cloneLedgerEntry);
+  }
+
+  async getData(query: RunChargeLedgerQuery = {}): Promise<RunChargeLedgerData> {
+    const allMatchingEntries = (await this.readMatching(query))
+      .sort((left, right) => right.event.timestampMs - left.event.timestampMs);
+    const { aggregates, runs } = summarizeEntries(allMatchingEntries);
+    const limit = normalizeLimit(query.limit);
+    return {
+      activeRun: runs[0] ?? null,
+      recentRuns: runs.slice(0, DEFAULT_RECENT_RUN_LIMIT),
+      aggregates,
+      // Calendar accrual always reflects the full ledger, not the query
+      // filter: per-day reset semantics must not shift with the view. Its
+      // month-to-date and daily windows lie inside the resident horizon.
+      calendar: summarizeCalendarAccrual(this.entries, this.now()),
+      events: allMatchingEntries.slice(0, limit).map(cloneLedgerEntry),
+    };
+  }
+}

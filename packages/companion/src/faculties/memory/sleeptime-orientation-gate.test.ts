@@ -1,0 +1,196 @@
+import { describe, it, expect, vi } from 'vitest';
+import { fromAny } from '@total-typescript/shoehorn';
+import type { DeterministicGateEvent } from '../../shared/event-bus.js';
+import type { EpisodicProcessingRestWindowConfig } from '../../system/config/scheduler-config.js';
+import {
+  SleeptimeMemoryAgent,
+  SLEEPTIME_MEMORY_ACTION_KIND,
+  type SleeptimeMemoryAgentOptions,
+} from './sleeptime-agent.js';
+
+const NOW_MS = Date.parse('2026-07-02T04:00:00.000Z');
+const DAY_MS = 24 * 60 * 60_000;
+
+function alwaysOpenRestWindow(): EpisodicProcessingRestWindowConfig {
+  return {
+    enabled: true,
+    startLocalTime: '00:00',
+    endLocalTime: '00:00',
+    timeZone: 'UTC',
+    inactivityThresholdMinutes: 60,
+  };
+}
+
+function makeReviewAgent() {
+  return {
+    handleMessage: vi.fn(async () => ({
+      content: JSON.stringify({
+        orient: { persona: 'p', human: 'h', goals: 'g' },
+        memory_writes: [],
+      }),
+    })),
+  };
+}
+
+function makeSnapshot(updatedAtMs: number) {
+  return {
+    version: 1,
+    updatedAt: new Date(updatedAtMs).toISOString(),
+    blocks: {
+      // Non-empty: an already-oriented companion, so the baseline (updatedAt)
+      // governs the gate rather than the first-rewrite fail-open path.
+      persona: { label: 'persona', content: 'Existing persona.', maxChars: 2400 },
+      human: { label: 'human', content: 'Existing human notes.', maxChars: 2400, trustLevel: 'trusted' },
+      goals: { label: 'goals', content: 'Existing goals.', maxChars: 1600 },
+    },
+  };
+}
+
+function makeEntries(count: number, timestamp: number) {
+  return Array.from({ length: count }, (_unused, index) => ({
+    id: index + 1,
+    channelId: 'terminal:test',
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    content: `message ${String(index)}`,
+    timestamp,
+  }));
+}
+
+function makeAgent(input: {
+  updatedAtMs: number;
+  entries: ReturnType<typeof makeEntries>;
+  events: DeterministicGateEvent[];
+}): {
+  agent: SleeptimeMemoryAgent;
+  reviewAgent: ReturnType<typeof makeReviewAgent>;
+  rethink: ReturnType<typeof vi.fn>;
+  listRecentlyResolvedConcerns: ReturnType<typeof vi.fn>;
+} {
+  const reviewAgent = makeReviewAgent();
+  const rethink = vi.fn();
+  const listRecentlyResolvedConcerns = vi.fn().mockResolvedValue([]);
+  const workItem = {
+    purpose: 'sleeptime_consolidation' as const,
+    logicalSessionId: 'terminal:test',
+    revision: input.entries.at(-1)?.id ?? 1,
+    activityKind: 'direct_message' as const,
+    occurredAtMs: NOW_MS - 2 * 60 * 60_000,
+    checkpointRevision: 0,
+    completedStages: [],
+    claimantId: 'companion:sleeptime',
+    claimedAtMs: NOW_MS,
+  };
+  const options: SleeptimeMemoryAgentOptions = {
+    agent: reviewAgent,
+    episodicStore: { searchByTime: vi.fn().mockResolvedValue([]) },
+    sessionManager: {
+      resolveSessionChannelId: vi.fn((channelId: string) => channelId),
+      getRecentMessagesAtOrBefore: vi.fn().mockReturnValue(input.entries),
+    },
+    conversationalActivityWorkset: fromAny({
+      enumerate: vi.fn(async () => [workItem]),
+      claim: vi.fn(async () => workItem),
+      resumeClaim: vi.fn(async () => workItem),
+      checkpointStage: vi.fn(async () => undefined),
+      recordFailure: vi.fn(async () => undefined),
+      checkpoint: vi.fn(async () => undefined),
+    }),
+    coreMemoryStore: {
+      getSnapshot: vi.fn().mockReturnValue(makeSnapshot(input.updatedAtMs)),
+      rethink,
+    },
+    resolvedConcernStore: { listRecentlyResolvedConcerns },
+    memoryWriter: { write: vi.fn().mockResolvedValue({ action: 'created' }) },
+    sleepConsolidator: { run: vi.fn() },
+    arcWeaver: { run: vi.fn() },
+    dreamMeaningPass: { run: vi.fn() },
+    sleeptimeWikiPass: { run: vi.fn() },
+    restWindow: alwaysOpenRestWindow(),
+    orientationRewriteGate: { minNewEntriesSinceRewrite: 4, refreshAfterQuietDays: 7 },
+    onGateEvent: (event) => input.events.push(event),
+    now: () => NOW_MS,
+  };
+  return { agent: new SleeptimeMemoryAgent(options), reviewAgent, rethink, listRecentlyResolvedConcerns };
+}
+
+function makeAction() {
+  return {
+    id: 'sleeptime-action-1',
+    kind: SLEEPTIME_MEMORY_ACTION_KIND,
+    payload: { sessionId: 'terminal:test' },
+    dedupeKey: `${SLEEPTIME_MEMORY_ACTION_KIND}:terminal:test`,
+    channelId: 'terminal:test',
+    sourceMessageId: 'msg-1',
+    inferredAt: NOW_MS,
+  };
+}
+
+describe('SleeptimeMemoryAgent orientation-rewrite gate (jpvd.4)', () => {
+  it('skips the orient plan LLM call with zero spend when nothing changed', async () => {
+    const events: DeterministicGateEvent[] = [];
+    // Rewritten yesterday, only 2 new turns since => below the 4-turn minimum
+    // and not stale (1 day < 7) => gate closed.
+    const { agent, reviewAgent, rethink, listRecentlyResolvedConcerns } = makeAgent({
+      updatedAtMs: NOW_MS - DAY_MS,
+      entries: makeEntries(2, NOW_MS - 60_000),
+      events,
+    });
+
+    await expect(agent.execute(makeAction())).resolves.toMatchObject({
+      outcome: 'complete', completedSessions: 1,
+    });
+
+    expect(reviewAgent.handleMessage).not.toHaveBeenCalled();
+    expect(rethink).not.toHaveBeenCalled();
+    expect(listRecentlyResolvedConcerns).not.toHaveBeenCalled();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      lane: 'orientation_rewrite',
+      outcome: 'skipped',
+      reason: 'no_change',
+      sessionId: 'terminal:test',
+    });
+    expect(events[0].inputs.newEntriesSinceRewrite).toBe(2);
+  });
+
+  it('runs the orient rewrite when enough new turns accumulated since the last rewrite', async () => {
+    const events: DeterministicGateEvent[] = [];
+    const { agent, reviewAgent, rethink, listRecentlyResolvedConcerns } = makeAgent({
+      updatedAtMs: NOW_MS - DAY_MS,
+      entries: makeEntries(5, NOW_MS - 60_000),
+      events,
+    });
+
+    await expect(agent.execute(makeAction())).resolves.toMatchObject({
+      outcome: 'complete', completedSessions: 1,
+    });
+
+    expect(reviewAgent.handleMessage).toHaveBeenCalledOnce();
+    expect(rethink).toHaveBeenCalledOnce();
+    expect(listRecentlyResolvedConcerns).toHaveBeenCalledOnce();
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      lane: 'orientation_rewrite',
+      outcome: 'ran',
+      reason: 'evidence_of_change',
+    });
+  });
+
+  it('re-opens on any activity once the last rewrite is stale beyond the quiet-day floor', async () => {
+    const events: DeterministicGateEvent[] = [];
+    // Only 1 new turn (below the 4 minimum) but the last rewrite is 30 days old.
+    const { agent, reviewAgent, listRecentlyResolvedConcerns } = makeAgent({
+      updatedAtMs: NOW_MS - 30 * DAY_MS,
+      entries: makeEntries(1, NOW_MS - 60_000),
+      events,
+    });
+
+    await expect(agent.execute(makeAction())).resolves.toMatchObject({
+      outcome: 'complete', completedSessions: 1,
+    });
+
+    expect(reviewAgent.handleMessage).toHaveBeenCalledOnce();
+    expect(listRecentlyResolvedConcerns).toHaveBeenCalledOnce();
+    expect(events[0].outcome).toBe('ran');
+  });
+});

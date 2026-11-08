@@ -1,0 +1,624 @@
+import { randomUUID } from 'node:crypto';
+import { Type } from '@sinclair/typebox';
+import { CANONICAL_TOOL_SURFACE_DESCRIPTIONS } from '../agent/tool-surface/descriptions.js';
+import type { AgentToolResult } from '../../boundary/pi-agent/index.js';
+import type { SubstrateAgentTool } from '../../boundary/pi-agent/index.js';
+import type { TextContent } from '@earendil-works/pi-ai';
+import type { LLMProviderPort } from '../agent/contracts.js';
+import type { PromptRegistryStatePort } from '../identity/prompt-state-port.js';
+import type { SessionManager } from '../session/manager.js';
+import {
+  readLastActiveSession,
+  writeLastActiveSession,
+} from '../../system/lifecycle/notifications.js';
+import { inferSessionChannelType } from '../session/session-id.js';
+import { getRequestContext } from '../../primitives/llm/request-context.js';
+import {
+  internalToolFailureResult,
+  textResult,
+  textResultWithError,
+} from './results.js';
+import { executeCompleteFocusAction, executeStartFocusAction } from './focus.js';
+import {
+  SESSION_CONTINUITY_FACETS,
+  SESSION_CONTINUITY_OCCASIONS,
+  type SessionContinuityFacet,
+  type SessionContinuityOccasion,
+} from '../session/continuity-artifacts.js';
+import {
+  executeSessionGrepAction,
+  executeSessionSearchAction,
+  type SessionGrepToolOptions,
+  type SessionSearchWithin,
+} from './session-search.js';
+import { toErrorMessage } from '../../shared/utils/errors.js';
+import {
+  canViewerReadSessionChannel,
+  gateSessionSummariesForViewer,
+  resolveViewerContextFromRequest,
+} from '../session/session-viewer-access.js';
+import { isCapturedSessionOwnerInvariantError } from '../session/manager/captured-session-owner.js';
+import { createComponentLogger } from '../../shared/logger.js';
+
+const DEFAULT_SESSION_PREFIX = 'api:session';
+const DEFAULT_SESSION_LIST_LIMIT = 20;
+const MAX_SESSION_LIST_LIMIT = 100;
+const log = createComponentLogger('SessionTool');
+const SESSION_TOOL_ACTION_NAMES = [
+  'list',
+  'new',
+  'resume',
+  'search',
+  'grep',
+  'wake_return',
+  'start_focus',
+  'complete_focus',
+] as const;
+const SESSION_TOOL_ACTION_HELP = [
+  'list',
+  'new',
+  'resume',
+  'search',
+  'grep',
+  'wake_return',
+  'start_focus',
+  'complete_focus',
+].join(', ');
+type SessionToolActionName = (typeof SESSION_TOOL_ACTION_NAMES)[number];
+type SessionToolAction =
+  | 'list'
+  | 'new'
+  | 'resume'
+  | 'search'
+  | 'grep'
+  | 'wake_return'
+  | 'start_focus'
+  | 'complete_focus';
+
+interface SessionToolOptions {
+  dataDir: string;
+  now?: () => number;
+}
+
+export interface SessionNewToolOptions extends SessionToolOptions {
+  idFactory?: (timestamp: number) => string;
+  seedSession?: (sessionId: string) => void;
+  setActiveSession?: (sessionId: string) => void;
+}
+
+export interface UnifiedSessionToolOptions extends SessionNewToolOptions {
+  manager: SessionManager;
+  llmProvider: LLMProviderPort;
+  sessionsDir: string;
+  runRipgrep?: SessionGrepToolOptions['runRipgrep'];
+  /** Prompt registry backing the action=search summarize=true summary prompt. */
+  promptRegistry?: PromptRegistryStatePort | null;
+}
+
+type SessionToolManager = Pick<
+SessionManager,
+  'appendSystemNote'
+  | 'listRecentSessions'
+  | 'getSessionActivity'
+  | 'setActiveContextSession'
+  | 'getActiveContextSessionForTool'
+  | 'recordSessionContinuityArtifact'
+>;
+
+interface ResolvedPreviousSession {
+  sessionId: string | null;
+  channelType: string | null;
+}
+
+interface SessionNewParams {
+  metadata?: Record<string, unknown>;
+}
+
+interface SessionToolParams extends SessionNewParams {
+  action?: SessionToolActionName;
+  limit?: number;
+  sessionId?: string;
+  query?: string;
+  summarize?: boolean;
+  pattern?: string;
+  mode?: 'literal' | 'regex';
+  caseSensitive?: boolean;
+  channelId?: string;
+  within?: SessionSearchWithin;
+  scope?: string;
+  conclusion?: string;
+  summary?: string;
+  nextAnchor?: string;
+  facets?: SessionContinuityFacet[];
+  occasion?: SessionContinuityOccasion;
+}
+
+interface SessionNewDetails {
+  action: 'new';
+  switched: true;
+  previousSessionId: string | null;
+  previousChannelType: string | null;
+  newSessionId: string;
+  newChannelType: string;
+  timestamp: number;
+}
+
+function normalizeSessionId(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function normalizeChannelType(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function toMetadata(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
+function resolvePreviousSession(dataDir: string, metadata: Record<string, unknown>): ResolvedPreviousSession {
+  const hintedId = normalizeSessionId(metadata.previousSessionId ?? metadata.sessionId);
+  if (hintedId) {
+    return {
+      sessionId: hintedId,
+      channelType: (
+        normalizeChannelType(metadata.previousChannelType)
+        ?? normalizeChannelType(metadata.channelType)
+        ?? inferSessionChannelType(hintedId)
+        ?? null
+      ),
+    };
+  }
+
+  const active = readLastActiveSession(dataDir);
+  if (!active?.sessionId) {
+    return { sessionId: null, channelType: null };
+  }
+
+  return {
+    sessionId: active.sessionId,
+    channelType: active.channelType ?? inferSessionChannelType(active.sessionId) ?? null,
+  };
+}
+
+function buildSessionId(timestamp: number): string {
+  return `${DEFAULT_SESSION_PREFIX}-${timestamp.toString(36)}-${randomUUID().slice(0, 8)}`;
+}
+
+function normalizeListLimit(rawLimit: number | undefined): number {
+  if (!Number.isFinite(rawLimit) || rawLimit === undefined) {
+    return DEFAULT_SESSION_LIST_LIMIT;
+  }
+  return Math.max(1, Math.min(MAX_SESSION_LIST_LIMIT, Math.floor(rawLimit)));
+}
+
+function buildListPayload(
+  manager: SessionToolManager,
+  dataDir: string,
+  limit: number,
+): Record<string, unknown> {
+  const activeSessionId = manager.getActiveContextSessionForTool()
+    ?? readLastActiveSession(dataDir)?.sessionId
+    ?? null;
+  // Previews and author names are channel content: a session the current
+  // conversation cannot read is withheld whole, with a content-free count.
+  const { visible, gatedOutCount } = gateSessionSummariesForViewer(
+    resolveViewerContextFromRequest(),
+    manager.listRecentSessions(limit),
+  );
+  const sessions = visible.map((session) => ({
+    sessionId: session.sessionId,
+    channelType: session.channelType ?? null,
+    lastActivityAt: session.lastActivityAt,
+    messageCount: session.messageCount,
+    lastRole: session.lastRole,
+    lastAuthorName: session.lastAuthorName ?? null,
+    lastMessagePreview: session.lastMessagePreview,
+    isActive: activeSessionId != null && session.sessionId === activeSessionId,
+  }));
+
+  return {
+    activeSessionId,
+    count: sessions.length,
+    gatedOutCount,
+    ...(gatedOutCount > 0
+      ? { gatedNote: 'Some recent sessions are withheld because they are not readable from this conversation.' }
+      : {}),
+    sessions,
+  };
+}
+
+function isBackgroundContinuationContext(): boolean {
+  const requestContext = getRequestContext();
+  if (!requestContext) {
+    return false;
+  }
+  if (requestContext.callType === 'background') {
+    return true;
+  }
+  return false;
+}
+
+function rejectBackgroundSessionMutation(action: 'new' | 'resume') {
+  return textResultWithError(
+    `session action="${action}" is unavailable during background continuation execution. Start a foreground turn to switch sessions.`,
+    true,
+  );
+}
+
+function normalizeSessionAction(params: SessionToolParams): SessionToolAction {
+  const rawAction = typeof params.action === 'string' ? params.action.trim() : '';
+  if (!rawAction) {
+    const hasNonListParams = Object.entries(params).some(([key, value]) => (
+      key !== 'action'
+      && key !== 'limit'
+      && value !== undefined
+    ));
+    if (!hasNonListParams) {
+      return 'list';
+    }
+    throw new Error(`action is required unless using the default list behavior (${SESSION_TOOL_ACTION_HELP})`);
+  }
+
+  switch (rawAction) {
+    case 'list':
+      return 'list';
+    case 'new':
+      return 'new';
+    case 'resume':
+      return 'resume';
+    case 'search':
+      return 'search';
+    case 'grep':
+      return 'grep';
+    case 'wake_return':
+      return 'wake_return';
+    case 'start_focus':
+      return 'start_focus';
+    case 'complete_focus':
+      return 'complete_focus';
+    default:
+      throw new Error(`action must be one of: ${SESSION_TOOL_ACTION_HELP}`);
+  }
+}
+
+function normalizeWakeReturnOccasion(value: unknown): SessionContinuityOccasion {
+  if (value === undefined || value === null) return 'return';
+  if (typeof value !== 'string') {
+    throw new Error(`occasion must be one of: ${SESSION_CONTINUITY_OCCASIONS.join(', ')}`);
+  }
+  const trimmed = value.trim();
+  if ((SESSION_CONTINUITY_OCCASIONS as readonly string[]).includes(trimmed)) {
+    return trimmed as SessionContinuityOccasion;
+  }
+  throw new Error(`occasion must be one of: ${SESSION_CONTINUITY_OCCASIONS.join(', ')}`);
+}
+
+function normalizeWakeReturnSessionId(
+  manager: SessionToolManager,
+  dataDir: string,
+  rawSessionId: unknown,
+): string {
+  const explicitSessionId = normalizeSessionId(rawSessionId);
+  if (explicitSessionId) return explicitSessionId;
+
+  const activeSessionId = manager.getActiveContextSessionForTool()
+    ?? readLastActiveSession(dataDir)?.sessionId
+    ?? null;
+  if (!activeSessionId) {
+    throw new Error('action=wake_return requires sessionId when no active session is available');
+  }
+  return activeSessionId;
+}
+
+function normalizeWakeReturnSummary(value: unknown): string {
+  const normalized = normalizeSessionId(value);
+  if (!normalized) {
+    throw new Error('action=wake_return requires a non-empty summary');
+  }
+  return normalized;
+}
+
+function normalizeWakeReturnNextAnchor(value: unknown): string | undefined {
+  return normalizeSessionId(value) ?? undefined;
+}
+
+async function executeSessionNewAction(
+  options: SessionNewToolOptions,
+  params: SessionNewParams,
+): Promise<AgentToolResult<SessionNewDetails | { isError?: boolean }>> {
+  const now = options.now ?? Date.now;
+  if (isBackgroundContinuationContext()) {
+    return rejectBackgroundSessionMutation('new');
+  }
+  const metadata = toMetadata(params.metadata);
+  const previous = resolvePreviousSession(options.dataDir, metadata);
+  const timestamp = now();
+  const newSessionId = normalizeSessionId(
+    options.idFactory?.(timestamp) ?? buildSessionId(timestamp),
+  );
+  if (!newSessionId) {
+    return textResultWithError('session action="new" failed: generated session ID is invalid.', true);
+  }
+
+  const newChannelType = inferSessionChannelType(newSessionId) ?? 'api';
+  try {
+    options.setActiveSession?.(newSessionId);
+    options.seedSession?.(newSessionId);
+    writeLastActiveSession(options.dataDir, {
+      sessionId: newSessionId,
+      channelType: newChannelType,
+      timestamp,
+    });
+  } catch (error) {
+    if (isCapturedSessionOwnerInvariantError(error)) throw error;
+    log.error('session action=new failed', { error: toErrorMessage(error) });
+    return internalToolFailureResult();
+  }
+
+  const details: SessionNewDetails = {
+    action: 'new',
+    switched: true,
+    previousSessionId: previous.sessionId,
+    previousChannelType: previous.channelType,
+    newSessionId,
+    newChannelType,
+    timestamp,
+  };
+
+  return {
+    content: [{
+      type: 'text',
+      text:
+        `session action="new": active context switched to "${newSessionId}"`
+        + `${previous.sessionId ? ` (previous "${previous.sessionId}")` : ''}.`,
+    }] satisfies TextContent[],
+    details,
+  };
+}
+
+async function executeSessionListAction(
+  manager: SessionToolManager,
+  options: SessionToolOptions,
+  params: { limit?: number },
+): Promise<AgentToolResult<Record<string, never>>> {
+  const limit = normalizeListLimit(params.limit);
+  return textResult(JSON.stringify(buildListPayload(manager, options.dataDir, limit), null, 2));
+}
+
+async function executeSessionResumeAction(
+  manager: SessionToolManager,
+  options: SessionToolOptions,
+  params: { sessionId: string },
+): Promise<AgentToolResult<{ isError?: boolean }>> {
+  const now = options.now ?? Date.now;
+  if (isBackgroundContinuationContext()) {
+    return rejectBackgroundSessionMutation('resume');
+  }
+  const requestedSessionId = params.sessionId.trim();
+  if (!requestedSessionId) {
+    return textResultWithError('session action="resume" requires a non-empty sessionId.', true);
+  }
+
+  const target = manager.getSessionActivity(requestedSessionId);
+  if (!target) {
+    return textResultWithError(`Session not found: ${requestedSessionId}`, true);
+  }
+  if (!canViewerReadSessionChannel(resolveViewerContextFromRequest(), target.channelId)) {
+    return textResultWithError(
+      `session action="resume" refused: ${requestedSessionId} is not readable from this conversation.`,
+      true,
+    );
+  }
+
+  const previousSessionId = manager.getActiveContextSessionForTool()
+    ?? readLastActiveSession(options.dataDir)?.sessionId
+    ?? null;
+  manager.setActiveContextSession(target.sessionId);
+  writeLastActiveSession(options.dataDir, {
+    sessionId: target.sessionId,
+    channelType: target.channelType,
+    timestamp: now(),
+  });
+
+  return textResult(JSON.stringify({
+    resumed: true,
+    previousSessionId,
+    session: {
+      sessionId: target.sessionId,
+      channelType: target.channelType ?? null,
+      lastActivityAt: target.lastActivityAt,
+      messageCount: target.messageCount,
+      lastRole: target.lastRole,
+      lastAuthorName: target.lastAuthorName ?? null,
+      lastMessagePreview: target.lastMessagePreview,
+    },
+  }, null, 2));
+}
+
+export function createSessionTool(options: UnifiedSessionToolOptions): SubstrateAgentTool {
+  const now = options.now ?? Date.now;
+  const grepOptions: SessionGrepToolOptions = {
+    sessionsDir: options.sessionsDir,
+    sessionRouteState: options.manager,
+    latestCompactionSource: options.manager,
+    ...(options.runRipgrep ? { runRipgrep: options.runRipgrep } : {}),
+  };
+
+  return {
+    name: 'session',
+    label: 'session',
+    description: CANONICAL_TOOL_SURFACE_DESCRIPTIONS.session,
+    parameters: Type.Object({
+      action: Type.Optional(Type.Union(SESSION_TOOL_ACTION_NAMES.map((action) => Type.Literal(action)), {
+        description:
+          'Session action. Defaults to list when omitted and no action-specific parameters are provided.',
+      })),
+      limit: Type.Optional(Type.Integer({
+        minimum: 1,
+        maximum: MAX_SESSION_LIST_LIMIT,
+        description: 'Optional result limit for list/search/grep actions.',
+      })),
+      sessionId: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Session ID for action=resume or action=wake_return. Defaults to the active session for wake_return.',
+      })),
+      query: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Transcript query for action=search.',
+      })),
+      summarize: Type.Optional(Type.Boolean({
+        description: 'When true, action=search adds a short synthesis over the visible hits.',
+      })),
+      pattern: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Literal text or regex pattern for action=grep.',
+      })),
+      mode: Type.Optional(Type.Union([
+        Type.Literal('literal'),
+        Type.Literal('regex'),
+      ], {
+        description: 'Match mode for action=grep. Defaults to literal.',
+      })),
+      caseSensitive: Type.Optional(Type.Boolean({
+        description: 'Case-sensitive match flag for action=grep.',
+      })),
+      metadata: Type.Optional(Type.Record(
+        Type.String(),
+        Type.Unknown(),
+        {
+          description: 'Optional metadata for action=new.',
+        },
+      )),
+      channelId: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Optional exact channel/session scope filter or focus target channel.',
+      })),
+      within: Type.Optional(Type.Literal('latest_compaction_source', {
+        description:
+          'For search/grep, restrict results to the verified exact source of the current channel\'s latest compaction summary.',
+      })),
+      scope: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Focus scope for action=start_focus.',
+      })),
+      conclusion: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Optional completion notes for action=complete_focus.',
+      })),
+      summary: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Wake-return summary for action=wake_return: where this session left off.',
+      })),
+      nextAnchor: Type.Optional(Type.String({
+        minLength: 1,
+        description: 'Optional pending intent or concrete next step for action=wake_return.',
+      })),
+      facets: Type.Optional(Type.Array(Type.Union(
+        SESSION_CONTINUITY_FACETS.map((facet) => Type.Literal(facet)),
+      ), {
+        description: 'Optional continuity facets for action=wake_return.',
+      })),
+      occasion: Type.Optional(Type.Union(
+        SESSION_CONTINUITY_OCCASIONS.map((occasion) => Type.Literal(occasion)),
+        {
+          description: 'Wake-return occasion for action=wake_return. Defaults to return.',
+        },
+      )),
+    }),
+    execute: async (
+      _toolCallId: string,
+      params: SessionToolParams,
+      signal?: AbortSignal,
+    ): Promise<AgentToolResult<Record<string, unknown>>> => {
+      try {
+        switch (normalizeSessionAction(params)) {
+          case 'list':
+            return executeSessionListAction(options.manager, options, {
+              ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
+            });
+          case 'new':
+            return await executeSessionNewAction(options, {
+              ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
+            }) as AgentToolResult<Record<string, unknown>>;
+          case 'resume':
+            return executeSessionResumeAction(options.manager, options, {
+              sessionId: typeof params.sessionId === 'string' ? params.sessionId : '',
+            });
+          case 'search':
+            return executeSessionSearchAction({
+              transcriptSearch: options.manager,
+              llmProvider: options.llmProvider,
+              promptRegistry: options.promptRegistry ?? null,
+              latestCompactionSource: options.manager,
+            }, {
+              query: typeof params.query === 'string' ? params.query : '',
+              ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
+              ...(typeof params.channelId === 'string' ? { channelId: params.channelId } : {}),
+              ...(typeof params.summarize === 'boolean' ? { summarize: params.summarize } : {}),
+              ...(params.within === 'latest_compaction_source' ? { within: params.within } : {}),
+            }, signal);
+          case 'grep':
+            return executeSessionGrepAction(grepOptions, {
+              pattern: typeof params.pattern === 'string' ? params.pattern : '',
+              ...(typeof params.mode === 'string' ? { mode: params.mode } : {}),
+              ...(typeof params.caseSensitive === 'boolean' ? { caseSensitive: params.caseSensitive } : {}),
+              ...(typeof params.limit === 'number' ? { limit: params.limit } : {}),
+              ...(typeof params.channelId === 'string' ? { channelId: params.channelId } : {}),
+              ...(params.within === 'latest_compaction_source' ? { within: params.within } : {}),
+            }, signal);
+          case 'wake_return': {
+            const sessionId = normalizeWakeReturnSessionId(
+              options.manager,
+              options.dataDir,
+              params.sessionId,
+            );
+            // A wake_return artifact is injected into that session's future
+            // prompt context, so writing it obeys the same viewer gate as
+            // reading the session (psfn-framework-4i11j). Fail closed.
+            const targetChannelId = options.manager.getSessionActivity(sessionId)?.channelId ?? sessionId;
+            if (!canViewerReadSessionChannel(resolveViewerContextFromRequest(), targetChannelId)) {
+              return textResultWithError(
+                `session action="wake_return" refused: ${sessionId} is not writable from this conversation.`,
+                true,
+              );
+            }
+            const nextAnchor = normalizeWakeReturnNextAnchor(params.nextAnchor);
+            const artifact = options.manager.recordSessionContinuityArtifact({
+              sessionId,
+              kind: 'wake_return',
+              occasion: normalizeWakeReturnOccasion(params.occasion),
+              summary: normalizeWakeReturnSummary(params.summary),
+              createdAt: new Date(now()).toISOString(),
+              ...(nextAnchor ? { nextAnchor } : {}),
+              ...(Array.isArray(params.facets) ? { facets: params.facets } : {}),
+            });
+            return textResult(JSON.stringify({
+              action: 'wake_return',
+              recorded: true,
+              artifact,
+            }, null, 2));
+          }
+          case 'start_focus':
+            return executeStartFocusAction(options.manager, {
+              scope: typeof params.scope === 'string' ? params.scope : '',
+              ...(typeof params.channelId === 'string' ? { channelId: params.channelId } : {}),
+            });
+          case 'complete_focus':
+            return executeCompleteFocusAction(options.manager, options.llmProvider, {
+              ...(typeof params.channelId === 'string' ? { channelId: params.channelId } : {}),
+              ...(typeof params.conclusion === 'string' ? { conclusion: params.conclusion } : {}),
+            });
+        }
+      } catch (error) {
+        if (isCapturedSessionOwnerInvariantError(error)) throw error;
+        log.error('session tool action failed', { error: toErrorMessage(error) });
+        return internalToolFailureResult();
+      }
+    },
+  };
+}

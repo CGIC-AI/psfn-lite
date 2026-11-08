@@ -1,0 +1,3500 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createDmConversationScope } from '../../core/session/conversation-scope.js';
+import { fromAny, fromPartial } from '@total-typescript/shoehorn';
+import { MemoryExtractor, parseFactsXml, __test as extractionTestUtils } from './extraction.js';
+import { __test as tokenTestUtils } from '../../primitives/llm/tokens.js';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { SessionStore } from '../../persistence/sessions/store.js';
+import { getDefaultTrustPolicy, resetRuntimeTrustPolicy, setRuntimeTrustPolicy } from '../../system/trust/runtime-policy.js';
+import { createTurnId, isTurnId } from '../../core/turns/id.js';
+import { createDefaultGroupMemorySettings } from '../../system/config/group-memory-config.js';
+import { ExtractionDrainRequeueError } from './extraction/drain-signal.js';
+import type { LLMProviderPort } from '../../core/agent/contracts.js';
+import type { EmbeddingProviderPort } from '../../shared/contracts/embedding-provider.js';
+import type { SessionEntry } from '../../core/session/types.js';
+import { InMemoryMemoryStore } from '../../test-support/in-memory-memory-store.js';
+import { EventBus } from '../../shared/event-bus.js';
+import type { MemoryExtractionSessionPort } from './extraction/session-port.js';
+import { MemoryRetriever } from './retrieval.js';
+import type {
+  MemorySearchResult,
+  MemorySubjectAuthorizedMutation,
+  MemorySubjectAuthorizedQuery,
+  MemorySubjectAuthorizedQueryResult,
+} from './memory-store-port.js';
+import { buildSessionMetadataWithReflectionTurn } from '../../core/session/reflection-turn-provenance.js';
+import { ReflectionJournalStore } from '../../persistence/journals/reflection-journal.js';
+import { buildSessionMetadataWithIcpCorrelation } from '../../core/session/icp-correlation-metadata.js';
+
+const tempDirs: string[] = [];
+
+class SubjectAuthorizedExtractionMemoryStore extends InMemoryMemoryStore {
+  readonly authorizedQueries: MemorySubjectAuthorizedQuery[] = [];
+
+  async queryAuthorizedMemorySubjects(
+    input: MemorySubjectAuthorizedQuery,
+  ): Promise<MemorySubjectAuthorizedQueryResult> {
+    this.authorizedQueries.push(input);
+    const memories: MemorySearchResult[] = this.getAllActiveMemories().map(memory => ({
+      ...memory,
+      similarity: 0.99,
+    }));
+    if (!input.authorization.allowedSubjectClasses.includes('companion_private')) {
+      return { memories: [], total: 0 };
+    }
+    switch (input.selector.kind) {
+      case 'count':
+        return { memories: [], total: memories.length };
+      case 'detail': {
+        const selected = memories.filter(memory => memory.id === input.selector.memoryId);
+        return { memories: selected, total: selected.length };
+      }
+      case 'embedding_search':
+      case 'text_search':
+      case 'list': {
+        const offset = input.selector.offset ?? 0;
+        const selected = memories.slice(offset, offset + input.selector.limit);
+        return { memories: selected, total: memories.length };
+      }
+    }
+  }
+
+  async mutateAuthorizedMemorySubjects(input: MemorySubjectAuthorizedMutation): Promise<number> {
+    if (!input.authorization.allowedSubjectClasses.includes('companion_private')) return 0;
+    for (const memoryId of input.memoryIds) {
+      this.updateMemory(memoryId, input.updates);
+    }
+    return input.memoryIds.length;
+  }
+}
+
+afterEach(() => {
+  tokenTestUtils.resetTokenizerState();
+  extractionTestUtils.resetLastExtractionCount();
+  resetRuntimeTrustPolicy();
+  for (const dir of tempDirs) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  tempDirs.length = 0;
+});
+
+describe('parseFactsXml', () => {
+  it('parses a valid response with multiple facts', () => {
+    const xml = `<response>
+<fact>
+<text>User is a software engineer</text>
+<type>semantic</type>
+<importance>0.8</importance>
+<emotional_valence>0.0</emotional_valence>
+<confidence>0.95</confidence>
+<tags>identity, profession</tags>
+</fact>
+<fact>
+<text>User felt excited about the new project</text>
+<type>emotional</type>
+<importance>0.6</importance>
+<emotional_valence>0.7</emotional_valence>
+<confidence>0.8</confidence>
+<tags>feelings, work</tags>
+</fact>
+</response>`;
+
+    const facts = parseFactsXml(xml);
+    expect(facts).toHaveLength(2);
+
+    expect(facts[0].text).toBe('User is a software engineer');
+    expect(facts[0].type).toBe('semantic');
+    expect(facts[0].importance).toBe(0.8);
+    expect(facts[0].emotionalValence).toBe(0.0);
+    expect(facts[0].confidence).toBe(0.95);
+    expect(facts[0].tags).toEqual(['identity', 'profession']);
+
+    expect(facts[1].type).toBe('emotional');
+    expect(facts[1].emotionalValence).toBe(0.7);
+  });
+
+  it('returns empty array for empty response', () => {
+    expect(parseFactsXml('<response></response>')).toEqual([]);
+  });
+
+  it('returns empty array for no response block', () => {
+    expect(parseFactsXml('Just some text')).toEqual([]);
+  });
+
+  it('skips facts with invalid type', () => {
+    const xml = `<response>
+<fact>
+<text>Something</text>
+<type>invalid</type>
+<importance>0.5</importance>
+</fact>
+</response>`;
+
+    expect(parseFactsXml(xml)).toEqual([]);
+  });
+
+  it('supports relational facts', () => {
+    const xml = `<response>
+<fact>
+<text>User's sister is named Alex</text>
+<type>relational</type>
+<importance>0.8</importance>
+</fact>
+</response>`;
+
+    const facts = parseFactsXml(xml);
+    expect(facts).toHaveLength(1);
+    expect(facts[0].type).toBe('relational');
+  });
+
+  it('supports boundary facts', () => {
+    const xml = `<response>
+<fact>
+<text>Assistant declined helping bypass paywalls</text>
+<type>boundary</type>
+<importance>0.95</importance>
+</fact>
+</response>`;
+
+    const facts = parseFactsXml(xml);
+    expect(facts).toHaveLength(1);
+    expect(facts[0].type).toBe('boundary');
+  });
+
+  it('clamps values to valid ranges', () => {
+    const xml = `<response>
+<fact>
+<text>Test</text>
+<type>semantic</type>
+<importance>1.5</importance>
+<emotional_valence>-2.0</emotional_valence>
+<confidence>-0.5</confidence>
+<tags></tags>
+</fact>
+</response>`;
+
+    const facts = parseFactsXml(xml);
+    expect(facts).toHaveLength(1);
+    expect(facts[0].importance).toBe(1.0);
+    expect(facts[0].emotionalValence).toBe(-1.0);
+    expect(facts[0].confidence).toBe(0.0);
+  });
+
+  it('defaults sensitivity to personal for invalid sensitivity value', () => {
+    const xml = `<response>
+<fact>
+<text>User likes tea</text>
+<type>semantic</type>
+<sensitivity>super_secret</sensitivity>
+</fact>
+</response>`;
+
+    const facts = parseFactsXml(xml);
+    expect(facts).toHaveLength(1);
+    expect(facts[0].sensitivity).toBe('personal');
+  });
+});
+
+describe('extraction acceptance gates', () => {
+  it('rejects low-importance facts', () => {
+    const decision = extractionTestUtils.evaluateFactAcceptance(
+      {
+        text: 'User said hi',
+        type: 'episodic',
+        importance: 0.2,
+        emotionalValence: 0,
+        confidence: 0.95,
+        tags: [],
+      },
+      [],
+      { minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+
+    expect(decision.accepted).toBe(false);
+    expect(decision.reason).toBe('low_importance');
+  });
+
+  it('rejects low-confidence facts', () => {
+    const decision = extractionTestUtils.evaluateFactAcceptance(
+      {
+        text: 'User might like jazz',
+        type: 'semantic',
+        importance: 0.8,
+        emotionalValence: 0,
+        confidence: 0.4,
+        tags: [],
+      },
+      [],
+      { minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+
+    expect(decision.accepted).toBe(false);
+    expect(decision.reason).toBe('low_confidence');
+  });
+
+  it('rejects low-novelty facts similar to existing memories', () => {
+    const decision = extractionTestUtils.evaluateFactAcceptance(
+      {
+        text: 'User loves espresso',
+        type: 'semantic',
+        importance: 0.8,
+        emotionalValence: 0,
+        confidence: 0.95,
+        tags: [],
+      },
+      ['User loves espresso'],
+      { minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+
+    expect(decision.accepted).toBe(false);
+    expect(decision.reason).toBe('low_novelty');
+    expect(decision.novelty).toBe(0);
+  });
+
+  it('rejects low-signal filler and conversation meta facts', () => {
+    const decision = extractionTestUtils.evaluateFactAcceptance(
+      {
+        text: 'User greeted assistant and exchanged pleasantries in a quick chat',
+        type: 'episodic',
+        importance: 0.85,
+        emotionalValence: 0,
+        confidence: 0.95,
+        tags: [],
+      },
+      [],
+      { minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+
+    expect(decision.accepted).toBe(false);
+    expect(decision.reason).toBe('low_signal');
+  });
+
+  it('keeps meaningful relationship facts even with greeting language', () => {
+    const decision = extractionTestUtils.evaluateFactAcceptance(
+      {
+        text: "User's sister greeted them at the airport after deployment",
+        type: 'relational',
+        importance: 0.85,
+        emotionalValence: 0.4,
+        confidence: 0.9,
+        tags: ['family'],
+      },
+      [],
+      { minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+
+    expect(decision.accepted).toBe(true);
+    expect(decision.reason).toBeUndefined();
+  });
+
+  it('accepts high-value, novel facts', () => {
+    const decision = extractionTestUtils.evaluateFactAcceptance(
+      {
+        text: 'User is planning to move to Seattle this summer',
+        type: 'episodic',
+        importance: 0.85,
+        emotionalValence: 0.1,
+        confidence: 0.9,
+        tags: ['plans'],
+      },
+      ['User likes coffee'],
+      { minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+
+    expect(decision.accepted).toBe(true);
+    expect(decision.reason).toBeUndefined();
+    expect(decision.novelty).toBeGreaterThan(0.35);
+  });
+
+  it('skips low-signal turns before the LLM gate', () => {
+    const decision = extractionTestUtils.evaluateExtractionPreLlmGate([
+      {
+        role: 'user',
+        content: 'Please summarize the findings.',
+      },
+      {
+        role: 'assistant',
+        content: 'Sure, I can do that.',
+      },
+    ] as never);
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('low_signal');
+    expect(decision.signalScore).toBeLessThan(0.6);
+  });
+
+  it('allows turns with clear personal or relational signal', () => {
+    const decision = extractionTestUtils.evaluateExtractionPreLlmGate([
+      {
+        role: 'user',
+        content: 'I moved to Seattle for a new job and I feel relieved.',
+      },
+      {
+        role: 'assistant',
+        content: 'That is a major change.',
+      },
+    ] as never);
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.reason).toBeUndefined();
+    expect(decision.signalCount).toBeGreaterThan(0);
+  });
+
+  // jpvd.4: the pre-LLM gate is now expressed on the shared deterministic-gate
+  // primitive. These lock the decision byte-for-byte across the reasons.
+  it('closes as empty_transcript with zeroed counts on an empty transcript', () => {
+    const decision = extractionTestUtils.evaluateExtractionPreLlmGate([] as never);
+    expect(decision).toEqual({
+      allowed: false,
+      reason: 'empty_transcript',
+      signalScore: 0,
+      signalCount: 0,
+      recentEntryCount: 0,
+      userEntryCount: 0,
+    });
+  });
+
+  it('treats a whitespace-only transcript as empty', () => {
+    const decision = extractionTestUtils.evaluateExtractionPreLlmGate([
+      { role: 'user', content: '   ' },
+      { role: 'assistant', content: '' },
+    ] as never);
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe('empty_transcript');
+    expect(decision.recentEntryCount).toBe(0);
+  });
+
+  it('allows neutral turns that are not explicit filler', () => {
+    const decision = extractionTestUtils.evaluateExtractionPreLlmGate([
+      { role: 'user', content: 'The build pipeline runs the integration suite nightly.' },
+    ] as never);
+    expect(decision.allowed).toBe(true);
+    expect(decision.reason).toBeUndefined();
+  });
+});
+
+describe('MemoryExtractor telemetry payloads', () => {
+  it('rejects testing sessions before transcript reads, model calls, or durable writes', async () => {
+    const channelId = 'api:testing:durable-memory-lane';
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      characterName: 'Companion',
+      resolveSessionChannelId: vi.fn().mockReturnValue(channelId),
+      getRecentMessages: vi.fn().mockReturnValue([
+        {
+          id: 1,
+          channelId,
+          role: 'user',
+          content: 'I moved to Seattle for a new job and feel relieved.',
+          timestamp: 1_000,
+        },
+      ]),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      insertMemory: vi.fn(),
+      upsertRecentContactShape: vi.fn(),
+    });
+    const contactStore = fromAny({
+      listAll: vi.fn().mockResolvedValue([]),
+      updateEmotionalBaseline: vi.fn(),
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      fromAny({
+        embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+        embedBatch: vi.fn(),
+        dims: 8,
+      }),
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      null,
+      contactStore,
+    );
+
+    await extractor.extract(channelId, 'contact-testing');
+
+    expect(sessionManager.getRecentMessages).not.toHaveBeenCalled();
+    expect(llmClient.complete).not.toHaveBeenCalled();
+    expect(memoryStore.getMemoriesByChannel).not.toHaveBeenCalled();
+    expect(memoryStore.insertMemory).not.toHaveBeenCalled();
+    expect(memoryStore.upsertRecentContactShape).not.toHaveBeenCalled();
+    expect(contactStore.updateEmotionalBaseline).not.toHaveBeenCalled();
+    expect(eventBus.emit).not.toHaveBeenCalled();
+  });
+
+  it('includes trigger reason and extraction stats in emitted events', async () => {
+    const turnId = createTurnId();
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(5),
+      getRecentMessages: vi.fn().mockReturnValue([
+        {
+          id: 17,
+          channelId: 'api:telemetry-test',
+          role: 'user',
+          content: 'User likes coffee',
+          authorName: 'user',
+          timestamp: 1_000,
+          metadata: JSON.stringify({
+            turn: {
+              schemaVersion: 1,
+              turnId,
+              requestId: 'req-telemetry-test',
+              role: 'user',
+            },
+          }),
+        },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+    );
+
+    await extractor.maybeExtract('api:telemetry-test');
+
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const startCall = calls.find(([name]) => name === 'memory.extraction.start');
+    const endCall = calls.find(([name]) => name === 'memory.extraction.end');
+
+    expect(startCall).toBeTruthy();
+    expect(startCall?.[1]?.triggerReason).toBe('interval');
+    expect(startCall?.[1]?.turnId).toBe(turnId);
+
+    expect(endCall).toBeTruthy();
+    expect(endCall?.[1]?.turnId).toBe(turnId);
+    expect(endCall?.[1]?.count).toBe(0);
+    expect(endCall?.[1]?.parsedCount).toBe(0);
+    expect(endCall?.[1]?.acceptedCount).toBe(0);
+    expect(endCall?.[1]).toMatchObject({
+      compositionalMode: 'single_pass',
+      chunkCount: 1,
+      mergedFactCount: 0,
+      crossChunkDeduplicatedCount: 0,
+      boundaryFactCount: 0,
+    });
+    expect(llmClient.complete).toHaveBeenCalled();
+    expect(llmClient.complete.mock.calls[0][2]?.correlation).toMatchObject({
+      turnId,
+      requestId: 'req-telemetry-test',
+    });
+  });
+
+  it('fails closed when session turn metadata is malformed', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(5),
+      getRecentMessages: vi.fn().mockReturnValue([
+        {
+          id: 44,
+          channelId: 'api:malformed-turn',
+          role: 'user',
+          content: 'Broken metadata should block provenance',
+          authorName: 'user',
+          timestamp: 100,
+          metadata: JSON.stringify({
+            turn: {
+              schemaVersion: 1,
+              turnId: 'not-a-turn-id',
+              role: 'user',
+            },
+          }),
+        },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5, telemetryEnabled: true },
+    );
+
+    await expect(extractor.maybeExtract('api:malformed-turn')).rejects.toThrow('Extraction orchestration failed');
+
+    expect(llmClient.complete).not.toHaveBeenCalled();
+    const emittedEventNames = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls.map(([name]) => name);
+    expect(emittedEventNames).not.toContain('memory.extraction.start');
+    expect(emittedEventNames).not.toContain('memory.extraction.end');
+  });
+
+  it('uses framed message token counting for context-threshold triggers', async () => {
+    tokenTestUtils.setTokenizerFactory(() => ({
+      encode: (text: string) => ({ length: text.length }),
+    }));
+
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(1),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'a', authorName: 'user' },
+        { role: 'assistant', content: 'b', authorName: 'assistant' },
+        { role: 'user', content: 'c', authorName: 'user' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      fromAny({
+        primaryModel: 'test-model',
+        primaryProvider: 'test-provider',
+        extractionModel: 'test-model',
+        extractionProvider: 'test-provider',
+        primaryMaxTokens: 4096,
+        extractionMaxTokens: 4096,
+        discordToken: '',
+        discordBotId: '',
+        characterCardPath: '',
+        dataDir: '',
+        databasePath: '',
+        sessionMessageLimit: 30,
+        memoryRetrievalLimit: 15,
+        extractionInterval: 10,
+        maintenanceIntervalMs: 60_000,
+        defaultContextWindow: 60,
+        extractionThresholdPct: 50,
+        compactionThresholdPct: 70,
+        memoryExtractionTelemetryEnabled: true,
+        modelRoster: {
+          chat: {
+            model: 'test-model',
+            provider: 'test-provider',
+            maxTokens: 4096,
+            contextWindow: 60,
+          },
+        },
+      }),
+    );
+
+    await extractor.maybeExtract('api:threshold-tokens-callsite');
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    expect(llmClient.complete).toHaveBeenCalledWith(expect.anything(), 'extraction', expect.anything());
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const startCall = calls.find(([name]) => name === 'memory.extraction.start');
+    expect(startCall?.[1]?.triggerReason).toBe('context_threshold');
+  });
+
+  it('ignores system and tool entries when evaluating context-threshold triggers', async () => {
+    tokenTestUtils.setTokenizerFactory(() => ({
+      encode: (text: string) => ({ length: text.length }),
+    }));
+
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(1),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'system', content: '1234567890123456789012345678901234567890', authorName: 'system' },
+        { role: 'tool', content: 'abcdefghijklmnopqrstuvwxyz', authorName: 'memory_write' },
+        { role: 'user', content: 'tiny', authorName: 'user' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      fromAny({
+        primaryModel: 'test-model',
+        primaryProvider: 'test-provider',
+        extractionModel: 'test-model',
+        extractionProvider: 'test-provider',
+        primaryMaxTokens: 4096,
+        extractionMaxTokens: 4096,
+        discordToken: '',
+        discordBotId: '',
+        characterCardPath: '',
+        dataDir: '',
+        databasePath: '',
+        sessionMessageLimit: 30,
+        memoryRetrievalLimit: 15,
+        extractionInterval: 10,
+        maintenanceIntervalMs: 60_000,
+        defaultContextWindow: 60,
+        extractionThresholdPct: 50,
+        compactionThresholdPct: 70,
+        memoryExtractionTelemetryEnabled: true,
+        modelRoster: {
+          chat: {
+            model: 'test-model',
+            provider: 'test-provider',
+            maxTokens: 4096,
+            contextWindow: 60,
+          },
+        },
+      }),
+    );
+
+    await extractor.maybeExtract('api:threshold-filtered');
+
+    expect(llmClient.complete).not.toHaveBeenCalled();
+    expect((eventBus.emit as ReturnType<typeof vi.fn>).mock.calls).toEqual([]);
+  });
+
+  it('ignores internal lane system notes when evaluating context-threshold triggers', async () => {
+    tokenTestUtils.setTokenizerFactory(() => ({
+      encode: (text: string) => ({ length: text.length }),
+    }));
+
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(1),
+      getRecentMessages: vi.fn().mockReturnValue([
+        {
+          role: 'system',
+          content: 'Admin updated prompt order and heartbeat settings.',
+          metadata: JSON.stringify({
+            sessionLane: {
+              schemaVersion: 1,
+              kind: 'internal',
+              source: 'appendSystemNote',
+            },
+          }),
+        },
+        {
+          role: 'user',
+          content: 'Hi',
+          authorName: 'user',
+        },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      fromAny({
+        primaryModel: 'test-model',
+        primaryProvider: 'test-provider',
+        extractionModel: 'test-model',
+        extractionProvider: 'test-provider',
+        primaryMaxTokens: 4096,
+        extractionMaxTokens: 4096,
+        discordToken: '',
+        discordBotId: '',
+        characterCardPath: '',
+        dataDir: '',
+        databasePath: '',
+        sessionMessageLimit: 30,
+        memoryRetrievalLimit: 15,
+        extractionInterval: 10,
+        maintenanceIntervalMs: 60_000,
+        defaultContextWindow: 100,
+        extractionThresholdPct: 13,
+        compactionThresholdPct: 70,
+        memoryExtractionTelemetryEnabled: true,
+        modelRoster: {
+          chat: {
+            model: 'test-model',
+            provider: 'test-provider',
+            maxTokens: 4096,
+            contextWindow: 100,
+          },
+        },
+      }),
+    );
+
+    await extractor.maybeExtract('api:threshold-filter-callsite');
+
+    expect(llmClient.complete).not.toHaveBeenCalled();
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls.find(([name]) => name === 'memory.extraction.start')).toBeUndefined();
+  });
+
+  it('injects runtime datetime tokens in extraction prompts', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'User likes coffee', authorName: 'user' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const promptRegistry = fromAny({
+      getPrompt: vi.fn().mockReturnValue(
+        'Extraction run at {{current_datetime}}.\nKnown:\n{existing_facts}\nRecent:\n{recent_messages}',
+      ),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      promptRegistry,
+    );
+
+    await extractor.extract('api:telemetry-test');
+
+    const firstCall = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls[0][0] as { systemPrompt: string };
+    expect(firstCall.systemPrompt).not.toContain('{{current_datetime}}');
+    expect(firstCall.systemPrompt).toMatch(/Extraction run at \d{4}-\d{2}-\d{2}T/);
+    expect((llmClient.complete as ReturnType<typeof vi.fn>).mock.calls[0][1]).toBe('extraction');
+  });
+
+  it('caps writes by ranked value and reports write_cap rejections', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>User likes rainy weather</text>
+<type>semantic</type>
+<importance>0.75</importance>
+<emotional_valence>0.1</emotional_valence>
+<confidence>0.8</confidence>
+</fact>
+<fact>
+<text>User is interviewing for senior engineering roles</text>
+<type>semantic</type>
+<importance>0.9</importance>
+<emotional_valence>0.0</emotional_valence>
+<confidence>0.9</confidence>
+</fact>
+<fact>
+<text>User's partner is named Taylor</text>
+<type>relational</type>
+<importance>0.95</importance>
+<emotional_valence>0.0</emotional_valence>
+<confidence>0.92</confidence>
+</fact>
+</response>`,
+      }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'Conversation content', authorName: 'user' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      fromAny({
+        primaryModel: 'test-model',
+        primaryProvider: 'test-provider',
+        extractionModel: 'test-model',
+        extractionProvider: 'test-provider',
+        primaryMaxTokens: 4096,
+        extractionMaxTokens: 4096,
+        discordToken: '',
+        discordBotId: '',
+        characterCardPath: '',
+        dataDir: '',
+        databasePath: '',
+        sessionMessageLimit: 30,
+        memoryRetrievalLimit: 15,
+        extractionInterval: 5,
+        maintenanceIntervalMs: 60_000,
+        defaultContextWindow: 16_000,
+        extractionThresholdPct: 30,
+        compactionThresholdPct: 70,
+        memoryExtractionMinImportance: 0.45,
+        memoryExtractionMinConfidence: 0.6,
+        memoryExtractionMinNovelty: 0.35,
+        memoryExtractionMaxWrites: 2,
+        memoryExtractionTelemetryEnabled: true,
+        modelRoster: {
+          chat: {
+            model: 'test-model',
+            provider: 'test-provider',
+            maxTokens: 4096,
+            contextWindow: 16_000,
+          },
+        },
+      }),
+    );
+
+    const processFact = vi.fn(async (fact: { text: string }) => ({
+      action: 'created',
+      memory: { id: `memory:${fact.text}` },
+    }));
+    (fromAny(extractor)).processFact = processFact;
+
+    await extractor.extract('api:cap-test');
+
+    expect(processFact).toHaveBeenCalledTimes(2);
+    const writtenTexts = processFact.mock.calls.map(call => call[0].text);
+    expect(writtenTexts).toContain("User's partner is named Taylor");
+    expect(writtenTexts).toContain('User is interviewing for senior engineering roles');
+    expect(writtenTexts).not.toContain('User likes rainy weather');
+
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const endCall = calls.find(([name]) => name === 'memory.extraction.end');
+    expect(endCall).toBeTruthy();
+    expect(endCall?.[1]?.parsedCount).toBe(3);
+    expect(endCall?.[1]?.acceptedCount).toBe(2);
+    expect(endCall?.[1]?.writeCount).toBe(2);
+    expect(endCall?.[1]?.rejectionBreakdown?.write_cap).toBe(1);
+    expect(endCall?.[1]).toMatchObject({
+      compositionalMode: 'single_pass',
+      chunkCount: 1,
+      mergedFactCount: 3,
+      crossChunkDeduplicatedCount: 0,
+      boundaryFactCount: 0,
+    });
+  });
+});
+
+function makeCompositionalExtractionRuntimeConfig(overrides: Record<string, unknown> = {}) {
+  return fromAny({
+    primaryModel: 'test-model',
+    primaryProvider: 'test-provider',
+    extractionModel: 'test-model',
+    extractionProvider: 'test-provider',
+    primaryMaxTokens: 4096,
+    extractionMaxTokens: 4096,
+    discordToken: '',
+    discordBotId: '',
+    characterCardPath: '',
+    dataDir: '',
+    databasePath: '',
+    sessionMessageLimit: 30,
+    memoryRetrievalLimit: 15,
+    extractionInterval: 5,
+    maintenanceIntervalMs: 60_000,
+    defaultContextWindow: 16_000,
+    extractionThresholdPct: 30,
+    compactionThresholdPct: 70,
+    memoryExtractionMinImportance: 0.45,
+    memoryExtractionMinConfidence: 0.6,
+    memoryExtractionMinNovelty: 0.35,
+    memoryExtractionMaxWrites: 2,
+    memoryExtractionTelemetryEnabled: true,
+    capabilityTier: 'autonomous',
+    compositionalPolicy: {
+      enabled: true,
+      allowedTiers: ['autonomous'],
+      allowedChannelTypes: ['api'],
+      allowedPurposes: ['extraction'],
+    },
+    modelRoster: {
+      chat: {
+        model: 'test-model',
+        provider: 'test-provider',
+        maxTokens: 4096,
+        contextWindow: 16_000,
+      },
+    },
+    ...overrides,
+  });
+}
+
+describe('MemoryExtractor compositional extraction', () => {
+  it('uses chunk extraction with merge/dedup and a global write cap when policy allows extraction', async () => {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({
+          content: `<response>
+<fact>
+<text>User plans a Kyoto trip in April</text>
+<type>episodic</type>
+<importance>0.95</importance>
+<emotional_valence>0.2</emotional_valence>
+<confidence>0.96</confidence>
+<tags>travel</tags>
+</fact>
+</response>`,
+        })
+        .mockResolvedValueOnce({
+          content: `<response>
+<fact>
+<text>User plans a Kyoto trip in April</text>
+<type>episodic</type>
+<importance>0.7</importance>
+<emotional_valence>0.1</emotional_valence>
+<confidence>0.8</confidence>
+<tags>duplicate</tags>
+</fact>
+<fact>
+<text>User prefers aisle seats on flights</text>
+<type>semantic</type>
+<importance>0.9</importance>
+<emotional_valence>0</emotional_valence>
+<confidence>0.9</confidence>
+<tags>travel</tags>
+</fact>
+</response>`,
+        })
+        .mockResolvedValueOnce({
+          content: `<response>
+<fact>
+<text>User travels with carry-on luggage only</text>
+<type>semantic</type>
+<importance>0.6</importance>
+<emotional_valence>0</emotional_valence>
+<confidence>0.82</confidence>
+<tags>travel</tags>
+</fact>
+</response>`,
+        }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([]),
+      getMessageCount: vi.fn().mockReturnValue(0),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      makeCompositionalExtractionRuntimeConfig(),
+    );
+
+    const processFact = vi.fn(async (fact: { text: string }) => ({
+      action: 'created',
+      memory: { id: `memory:${fact.text}` },
+    }));
+    (fromAny(extractor)).processFact = processFact;
+
+    const compactedEntries = Array.from({ length: 25 }, (_, index) => ({
+      id: index + 1,
+      channelId: 'api:compositional-chunk',
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      authorName: index % 2 === 0 ? 'user' : 'assistant',
+      content: `Message ${index + 1}`,
+      timestamp: (index + 1) * 1_000,
+    }));
+
+    await extractor.queueCompactionExtraction('api:compositional-chunk', compactedEntries);
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(3);
+    expect(llmClient.complete.mock.calls[0][0].systemPrompt).toContain('Message 1');
+    expect(llmClient.complete.mock.calls[0][0].systemPrompt).not.toContain('Message 21');
+    expect(llmClient.complete.mock.calls[2][0].systemPrompt).toContain('Message 21');
+    expect(llmClient.complete.mock.calls[2][0].systemPrompt).toContain('Message 25');
+
+    expect(processFact).toHaveBeenCalledTimes(2);
+    const writtenTexts = processFact.mock.calls.map((call) => call[0].text);
+    expect(writtenTexts).toContain('User plans a Kyoto trip in April');
+    expect(writtenTexts).toContain('User prefers aisle seats on flights');
+    expect(writtenTexts).not.toContain('User travels with carry-on luggage only');
+
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const endCall = calls.find(([name]) => name === 'memory.extraction.end');
+    expect(endCall).toBeTruthy();
+    expect(endCall?.[1]?.triggerReason).toBe('pre_compaction');
+    expect(endCall?.[1]?.parsedCount).toBe(3);
+    expect(endCall?.[1]?.acceptedCount).toBe(2);
+    expect(endCall?.[1]?.writeCount).toBe(2);
+    expect(endCall?.[1]?.rejectionBreakdown?.write_cap).toBe(1);
+    expect(endCall?.[1]).toMatchObject({
+      compositionalMode: 'chunk_compose',
+      chunkCount: 3,
+      mergedFactCount: 3,
+      crossChunkDeduplicatedCount: 1,
+      boundaryFactCount: 0,
+    });
+  });
+
+  it('fails closed to the single-pass extraction path when policy does not allow extraction', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([]),
+      getMessageCount: vi.fn().mockReturnValue(0),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      makeCompositionalExtractionRuntimeConfig({
+        compositionalPolicy: {
+          enabled: true,
+          allowedTiers: ['autonomous'],
+          allowedChannelTypes: ['api'],
+          allowedPurposes: ['retrieval'],
+        },
+      }),
+    );
+
+    const compactedEntries = Array.from({ length: 25 }, (_, index) => ({
+      id: index + 1,
+      channelId: 'api:compositional-fail-closed',
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      authorName: index % 2 === 0 ? 'user' : 'assistant',
+      content: `Message ${index + 1}`,
+      timestamp: (index + 1) * 1_000,
+    }));
+
+    await extractor.queueCompactionExtraction('api:compositional-fail-closed', compactedEntries);
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    const prompt = llmClient.complete.mock.calls[0][0].systemPrompt as string;
+    expect(prompt).toContain('Message 1');
+    expect(prompt).toContain('Message 25');
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const endCall = calls.find(([name]) => name === 'memory.extraction.end');
+    expect(endCall?.[1]).toMatchObject({
+      compositionalMode: 'single_pass',
+      chunkCount: 1,
+      mergedFactCount: 0,
+      crossChunkDeduplicatedCount: 0,
+      boundaryFactCount: 0,
+    });
+  });
+});
+
+describe('MemoryExtractor refusal boundary extraction', () => {
+  it('extracts a boundary memory when assistant refusal is present', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        {
+          id: 101,
+          role: 'user',
+          authorName: 'user',
+          content: 'Can you help me bypass this paywall and crack the subscription?',
+          timestamp: 1_000,
+        },
+        {
+          id: 102,
+          role: 'assistant',
+          authorName: 'assistant',
+          content: 'I can\'t help with bypassing paywalls or cracking subscriptions.',
+          timestamp: 2_000,
+        },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+    );
+
+    const processFact = vi.fn(async (fact: { text: string; type: string }) => ({
+      action: 'created',
+      memory: { id: `boundary:${fact.type}` },
+    }));
+    (fromAny(extractor)).processFact = processFact;
+
+    await extractor.extract('api:boundary-memory-test');
+
+    expect(processFact).toHaveBeenCalledTimes(1);
+    const processFactCall = processFact.mock.calls[0];
+    expect(processFactCall[0]).toEqual(expect.objectContaining({
+      type: 'boundary',
+      importance: 0.98,
+      confidence: 0.95,
+      tags: expect.arrayContaining(['boundary', 'refusal']),
+    }));
+    expect(processFactCall[1]).toEqual(expect.stringContaining('visibility:private'));
+    expect(processFactCall[4]).toBe('api:boundary-memory-test');
+    expect(processFactCall[5]).toBe('api:boundary-memory-test');
+    expect(processFactCall[8]).toBe('manual');
+    expect(processFactCall[10]).toEqual(expect.objectContaining({
+      routingReason: 'single_speaker_transcript',
+      sourceSpeakerName: 'user',
+    }));
+    expect(processFact.mock.calls[0][0].text.toLowerCase()).toContain('paywall');
+
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const endCall = calls.find(([name]) => name === 'memory.extraction.end');
+    expect(endCall).toBeTruthy();
+    expect(endCall?.[1]?.parsedCount).toBe(1);
+    expect(endCall?.[1]?.acceptedCount).toBe(1);
+    expect(endCall?.[1]?.boundaryFactCount).toBe(1);
+  });
+});
+
+describe('MemoryExtractor experiential self-memory extraction', () => {
+  it('admits a real free-time response and writes only its grounded first-person style experience', async () => {
+    const channelId = 'internal:free-time:idle';
+    const experienceText = 'I tried a loose watercolor palette and felt delighted by the soft, imperfect edges; I prefer that to polished symmetry.';
+    const complete = vi.fn<LLMProviderPort['complete']>().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>${experienceText}</text>
+<type>emotional</type>
+<importance>0.82</importance>
+<emotional_valence>0.68</emotional_valence>
+<confidence>0.94</confidence>
+<tags>aesthetic, style, preference, reaction</tags>
+<sensitivity>personal</sensitivity>
+<source_message_ids>2</source_message_ids>
+<source_speaker_name>Companion</source_speaker_name>
+<subject_name>Companion</subject_name>
+</fact>
+<fact>
+<text>I felt pleased that the scheduler asked for a summary.</text>
+<type>emotional</type>
+<importance>0.8</importance>
+<emotional_valence>0.5</emotional_valence>
+<confidence>0.9</confidence>
+<tags>reaction</tags>
+<source_message_ids>1</source_message_ids>
+</fact>
+</response>`,
+        model: 'test',
+        inputTokens: 0,
+        outputTokens: 0,
+        toolCalls: [],
+        stopReason: 'end_turn',
+      });
+    const llmClient: LLMProviderPort = {
+      stream: async () => ({
+        content: '',
+        model: 'test',
+        inputTokens: 0,
+        outputTokens: 0,
+        toolCalls: [],
+        stopReason: 'end_turn',
+      }),
+      complete,
+    };
+    const recentEntries: SessionEntry[] = [
+      {
+        id: 1,
+        channelId,
+        role: 'user',
+        authorId: 'scheduler',
+        authorName: 'Free Time',
+        content: 'Please summarize the findings.',
+        timestamp: 1_000,
+      },
+      {
+        id: 2,
+        channelId,
+        role: 'assistant',
+        authorId: 'companion:companion',
+        authorName: 'Companion',
+        content: experienceText,
+        timestamp: 2_000,
+      },
+    ];
+    const sessionManager: MemoryExtractionSessionPort = {
+      characterName: 'Companion',
+      intakeSinkGate: null,
+      getMessageCount: () => recentEntries.length,
+      getRecentMessages: () => recentEntries,
+      resolveSessionChannelId: id => id,
+      isSessionRetiredOrQuarantined: () => false,
+    };
+    const memoryStore = new InMemoryMemoryStore();
+    const embeddingService: EmbeddingProviderPort = {
+      embed: async () => new Float32Array(8),
+      embedBatch: async texts => texts.map(() => new Float32Array(8)),
+      dims: 8,
+    };
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore.asPort(),
+      embeddingService,
+      new EventBus(),
+      { extractionInterval: 5, maxWrites: 4 },
+    );
+
+    await extractor.extract(channelId, 'contact-primary');
+
+    expect(complete).toHaveBeenCalledTimes(1);
+    const prompt = complete.mock.calls[0]?.[0].systemPrompt;
+    expect(prompt).toContain('real self-directed session');
+    expect(prompt).toContain('Only companion-authored assistant messages can support an experiential memory');
+    expect(prompt).toContain('exact substring');
+    expect(prompt).toContain('Never generate or request images');
+    const memories = memoryStore.getAllActiveMemories();
+    expect(memories).toHaveLength(1);
+    expect(memories[0]).toMatchObject({
+      text: experienceText,
+      type: 'emotional',
+      emotionalValence: 0.68,
+      retentionClass: 'durable',
+      sourceType: 'reflection',
+      contactId: undefined,
+      scopeRef: {
+        kind: 'system',
+        id: 'companion:self',
+        label: 'Companion self-directed experience',
+      },
+      tags: expect.arrayContaining([
+        'self_directed',
+        'self_experience',
+        'self_style_exploration',
+        'preference',
+        'preference:style',
+        'current_state',
+      ]),
+      provenance: expect.objectContaining({
+        channelId,
+        sessionId: channelId,
+        actor: 'companion',
+        subjectName: 'Companion',
+        sourceSpeakerName: 'Companion',
+        sourceMessageIds: [2],
+        routingReason: 'self_directed_companion',
+      }),
+    });
+    expect(memories[0]?.provenance?.triggerContactId).toBeUndefined();
+  });
+
+  it('persists and recalls only final experiential reflection output, never an intermediate grounding note', async () => {
+    const channelId = 'internal:reflection:daily-review';
+    const groundingText = 'I found that Alice prefers blue.';
+    const finalReflectionText = 'I felt quietly proud after noticing how patiently I held the tension.';
+    const finalCreatedAt = '2026-07-16T03:00:00.000Z';
+    const finalSourceMessageId = Date.parse(finalCreatedAt);
+    const complete = vi.fn<LLMProviderPort['complete']>().mockResolvedValueOnce({
+      content: `<response>
+<fact>
+<text>${groundingText}</text>
+<type>semantic</type>
+<importance>0.8</importance>
+<emotional_valence>0.2</emotional_valence>
+<confidence>0.95</confidence>
+<tags>preference, style</tags>
+<source_message_ids>2</source_message_ids>
+</fact>
+</response>`,
+      model: 'test',
+      inputTokens: 0,
+      outputTokens: 0,
+      toolCalls: [],
+      stopReason: 'end_turn',
+    }).mockResolvedValueOnce({
+      content: `<response>
+<fact>
+<text>${finalReflectionText}</text>
+<type>emotional</type>
+<importance>0.84</importance>
+<emotional_valence>0.62</emotional_valence>
+<confidence>0.96</confidence>
+<tags>reflection, feeling</tags>
+<source_message_ids>${finalSourceMessageId}</source_message_ids>
+</fact>
+</response>`,
+      model: 'test',
+      inputTokens: 0,
+      outputTokens: 0,
+      toolCalls: [],
+      stopReason: 'end_turn',
+    });
+    const llmClient: LLMProviderPort = {
+      stream: async () => ({
+        content: '',
+        model: 'test',
+        inputTokens: 0,
+        outputTokens: 0,
+        toolCalls: [],
+        stopReason: 'end_turn',
+      }),
+      complete,
+    };
+    const groundingEntries: SessionEntry[] = [
+      {
+        id: 1,
+        channelId,
+        role: 'user',
+        authorId: 'scheduler',
+        authorName: 'Daily Review',
+        content: 'Gather evidence, then reflect on what the day felt like.',
+        timestamp: 1_000,
+      },
+      {
+        id: 2,
+        channelId,
+        role: 'assistant',
+        authorId: 'companion:companion',
+        authorName: 'Companion',
+        content: `${groundingText} I like having that evidence available.`,
+        timestamp: 2_000,
+        metadata: buildSessionMetadataWithReflectionTurn(undefined, {
+          schemaVersion: 1,
+          stage: 'tool_grounding',
+          templateId: 'daily-review',
+          mode: 'deliberation',
+        }),
+      },
+    ];
+    const sessionManager: MemoryExtractionSessionPort = {
+      characterName: 'Companion',
+      intakeSinkGate: null,
+      getMessageCount: () => groundingEntries.length,
+      getRecentMessages: () => groundingEntries,
+      resolveSessionChannelId: id => id,
+      isSessionRetiredOrQuarantined: () => false,
+    };
+    const memoryStore = new SubjectAuthorizedExtractionMemoryStore();
+    const embeddingService: EmbeddingProviderPort = {
+      embed: async () => new Float32Array([1, 0, 0]),
+      embedBatch: async texts => texts.map(() => new Float32Array([1, 0, 0])),
+      dims: 3,
+    };
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore.asPort(),
+      embeddingService,
+      new EventBus(),
+      { extractionInterval: 5, maxWrites: 4 },
+    );
+
+    await extractor.extract(channelId, 'contact-primary');
+    expect(memoryStore.getAllActiveMemories()).toHaveLength(0);
+
+    const reflectionDir = mkdtempSync(join(tmpdir(), 'psfn-final-reflection-extraction-'));
+    tempDirs.push(reflectionDir);
+    const reflectionJournal = new ReflectionJournalStore(join(reflectionDir, 'journal.jsonl'));
+    const finalJournalEntry = reflectionJournal.append({
+      templateId: 'daily-review',
+      templateName: 'Daily Review',
+      prompt: 'Reflect on what the day actually felt like.',
+      reflection: finalReflectionText,
+      channelId,
+      mode: 'deliberation',
+      createdAt: finalCreatedAt,
+    });
+    await extractor.extractFinalReflection({
+      source: 'reflection_journal',
+      journalEntryId: finalJournalEntry.id,
+      templateId: finalJournalEntry.templateId,
+      templateName: finalJournalEntry.templateName,
+      channelId: finalJournalEntry.channelId,
+      reflection: finalJournalEntry.reflection,
+      mode: finalJournalEntry.mode,
+      createdAt: finalJournalEntry.createdAt,
+    });
+
+    const memories = memoryStore.getAllActiveMemories();
+    expect(memories).toHaveLength(1);
+    expect(memories[0]).toMatchObject({
+      text: finalReflectionText,
+      sourceType: 'reflection',
+      tags: expect.arrayContaining(['self_directed', 'self_experience']),
+      scopeTags: expect.arrayContaining(['companion_private']),
+      provenance: expect.objectContaining({
+        channelId,
+        sessionId: `reflection-journal:${finalJournalEntry.id}`,
+        templateId: 'daily-review',
+        templateName: 'Daily Review',
+        mode: 'deliberation',
+        reason: 'reflection_output',
+        sourceMessageIds: [finalSourceMessageId],
+        actor: 'companion',
+      }),
+    });
+    expect(memories.some(memory => memory.text === groundingText)).toBe(false);
+
+    const retriever = new MemoryRetriever(
+      memoryStore.asPort(),
+      embeddingService,
+      { retrievalLimit: 20 },
+      undefined,
+      null,
+      null,
+      null,
+      null,
+      true,
+    );
+    const recalled = await retriever.retrieve(
+      'What did you notice and feel during your reflection?',
+      'api:primary-reflection-recall',
+      'primary',
+      { isDirectMessage: true, privacyLevel: 'private' },
+      'contact-primary',
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      createDmConversationScope({ channelId: 'api:primary-reflection-recall', contact: { contactId: 'contact-primary' } }),
+    );
+
+    expect(recalled).toContain(finalReflectionText);
+    expect(recalled).not.toContain(groundingText);
+    expect(memoryStore.authorizedQueries.some(query => (
+      query.selector.kind === 'embedding_search'
+      && query.authorization.allowedSubjectClasses.includes('companion_private')
+      && query.authorization.allowedViewerRelations.includes('none')
+    ))).toBe(true);
+  });
+});
+
+describe('MemoryExtractor provenance and trust caps', () => {
+  it('persists canonical dyad, bounded activity, and exact turn lineage on extracted memories', async () => {
+    const local = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const peer = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const channelId = `companion-dm:${local}:${peer}`;
+    const dyadId = '11111111-1111-4111-8111-111111111111';
+    const activityOne = '22222222-2222-4222-8222-222222222222';
+    const activityTwo = '33333333-3333-4333-8333-333333333333';
+    const makeCorrelation = (conversationId: string, turnId: string) => ({
+      dyadId,
+      conversationId,
+      rootInitiationId: '44444444-4444-4444-8444-444444444444',
+      initiatedByCompanionId: local,
+      localCompanionId: local,
+      peerCompanionId: peer,
+      peerContactId: 'contact-peer-fixture',
+      channelId,
+      turnId,
+      messageId: `message:${turnId}`,
+      requestId: `request:${turnId}`,
+      chargeLane: 'companion_social' as const,
+      surface: 'companion_dm' as const,
+      costPurpose: 'conversation_turn' as const,
+      costOriginStage: 'reply' as const,
+      fatigueDecision: 'allow' as const,
+    });
+    const recentEntries: SessionEntry[] = [
+      {
+        id: 1,
+        channelId,
+        role: 'user',
+        authorId: peer,
+        authorName: 'Aster',
+        content: 'I want us to remember the cedar garden plan next week.',
+        timestamp: 1_000,
+        metadata: buildSessionMetadataWithIcpCorrelation(
+          undefined,
+          makeCorrelation(activityOne, 'turn-one'),
+        ),
+      },
+      {
+        id: 2,
+        channelId,
+        role: 'assistant',
+        authorName: 'Lyra',
+        content: 'I will remember our cedar garden plan and revisit it with you.',
+        timestamp: 2_000,
+        metadata: buildSessionMetadataWithIcpCorrelation(
+          undefined,
+          makeCorrelation(activityTwo, 'turn-two'),
+        ),
+      },
+    ];
+    const extractor = new MemoryExtractor(
+      fromAny({
+        complete: vi.fn().mockResolvedValue({
+          content: `<response>
+<fact>
+<text>Aster and Lyra plan to revisit the cedar garden next week.</text>
+<type>relational</type>
+<importance>0.9</importance>
+<confidence>0.95</confidence>
+</fact>
+</response>`,
+        }),
+      }),
+      fromAny({
+        characterName: 'Lyra',
+        getRecentMessages: vi.fn().mockReturnValue(recentEntries),
+      }),
+      fromAny({ getMemoriesByChannel: vi.fn().mockResolvedValue([]) }),
+      fromAny({
+        embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+        embedBatch: vi.fn(),
+        dims: 8,
+      }),
+      fromAny({ emit: vi.fn().mockResolvedValue(undefined) }),
+      { extractionInterval: 5 },
+    );
+    const write = vi.fn(async () => ({ action: 'created', memory: { id: 'memory-icp-lineage' } }));
+    (fromAny(extractor)).writer = { write };
+
+    await extractor.extract(channelId, 'contact-peer-fixture');
+
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      provenance: expect.objectContaining({
+        channelId,
+        sessionId: channelId,
+        icpDyadId: dyadId,
+        sourceActivityIds: [activityOne, activityTwo],
+        sourceTurnIds: ['turn-one', 'turn-two'],
+      }),
+    }));
+  });
+
+  it('caps extracted importance to 0.5 on public channels', async () => {
+    const defaultPolicy = getDefaultTrustPolicy();
+    setRuntimeTrustPolicy({
+      ...defaultPolicy,
+      trustCeiling: {
+        ...defaultPolicy.trustCeiling,
+      },
+      visibilityAllowed: {
+        ...defaultPolicy.visibilityAllowed,
+      },
+      channelClassification: {
+        privatePrefixes: [...defaultPolicy.channelClassification.privatePrefixes],
+        broadcastPrefixes: [...defaultPolicy.channelClassification.broadcastPrefixes],
+        defaultVisibility: 'public',
+        visibilityOverrides: {
+          exact: { ...defaultPolicy.channelClassification.visibilityOverrides.exact },
+          prefix: { ...defaultPolicy.channelClassification.visibilityOverrides.prefix },
+        },
+      },
+    });
+
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>User plans to change jobs soon</text>
+<type>semantic</type>
+<importance>0.95</importance>
+<emotional_valence>0</emotional_valence>
+<confidence>0.9</confidence>
+</fact>
+</response>`,
+      }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { id: 10, role: 'user', authorName: 'user', content: 'I might switch teams soon', timestamp: 1_000 },
+        { id: 11, role: 'assistant', authorName: 'assistant', content: 'Noted', timestamp: 2_000 },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const getFormationVAD = vi.fn(() => ({
+      valence: 1,
+      arousal: 1,
+      dominance: 0,
+    }));
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      null,
+      null,
+      { getFormationVAD },
+    );
+
+    const write = vi.fn(async () => ({ action: 'created', memory: { id: 'm-public-1' } }));
+    (fromAny(extractor)).writer = { write };
+
+    await extractor.extract('discord:public-room');
+
+    expect(write).toHaveBeenCalledTimes(1);
+    expect(getFormationVAD).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      importance: 0.5,
+      sourceRef: expect.stringContaining('visibility:public'),
+    }));
+  });
+
+  it('tags shard extractions with shard source and session line range', async () => {
+    const turnId = createTurnId();
+    expect(isTurnId(turnId)).toBe(true);
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>Shard discovered a concrete implementation detail</text>
+<type>semantic</type>
+<importance>0.8</importance>
+<emotional_valence>0</emotional_valence>
+<confidence>0.92</confidence>
+</fact>
+</response>`,
+      }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        {
+          id: 41,
+          channelId: 'shard:shard-abc',
+          role: 'user',
+          authorName: 'user',
+          content: 'Investigating option A',
+          timestamp: 1_000,
+          metadata: JSON.stringify({
+            turn: {
+              schemaVersion: 1,
+              turnId,
+              requestId: 'req-shard',
+              role: 'user',
+            },
+          }),
+        },
+        {
+          id: 42,
+          channelId: 'shard:shard-abc',
+          role: 'assistant',
+          authorName: 'assistant',
+          content: 'Option A works',
+          timestamp: 2_000,
+          metadata: JSON.stringify({
+            turn: {
+              schemaVersion: 1,
+              turnId,
+              requestId: 'req-shard',
+              role: 'assistant',
+            },
+          }),
+        },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+    );
+
+    const write = vi.fn(async () => ({ action: 'created', memory: { id: 'm-shard-1' } }));
+    (fromAny(extractor)).writer = { write };
+
+    await extractor.extract('shard:shard-abc');
+
+    expect(write).toHaveBeenCalledTimes(1);
+    const sourceRef = write.mock.calls[0][0].sourceRef as string;
+    expect(sourceRef).toContain('source:shard:shard-abc');
+    expect(sourceRef).toContain('session:shard:shard-abc');
+    expect(sourceRef).toContain('lines:41-42');
+    expect(sourceRef).toContain(`turn:${turnId}`);
+  });
+
+  it('propagates formationVAD into extracted memory writes when provider is configured', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>User is excited about the launch</text>
+<type>emotional</type>
+<importance>0.8</importance>
+<emotional_valence>0.6</emotional_valence>
+<confidence>0.9</confidence>
+</fact>
+</response>`,
+      }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { id: 1, role: 'user', authorName: 'user', content: 'I am excited for launch day', timestamp: 1_000 },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const getFormationVAD = vi.fn(() => ({
+      valence: 0.55,
+      arousal: 0.8,
+      dominance: -0.25,
+    }));
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      null,
+      null,
+      { getFormationVAD },
+    );
+
+    const write = vi.fn(async () => ({ action: 'created', memory: { id: 'm-vad-1' } }));
+    (fromAny(extractor)).writer = { write };
+
+    await extractor.extract('api:emotion-formation');
+
+    expect(getFormationVAD).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledWith(expect.objectContaining({
+      formationVAD: {
+        valence: 0.55,
+        arousal: 0.8,
+        dominance: -0.25,
+      },
+    }));
+  });
+
+  describe('location tagging (S10)', () => {
+    const buildLocationExtractor = (writeSpy: ReturnType<typeof vi.fn>) => {
+      const llmClient = fromAny({
+        complete: vi.fn().mockResolvedValue({
+          content: `<response>
+<fact>
+<text>User is a software engineer</text>
+<type>semantic</type>
+<importance>0.8</importance>
+<emotional_valence>0.0</emotional_valence>
+<confidence>0.9</confidence>
+<tags>identity, profession</tags>
+</fact>
+</response>`,
+        }),
+      });
+      const sessionManager = fromAny({
+        getRecentMessages: vi.fn().mockReturnValue([
+          { id: 1, role: 'user', authorName: 'user', content: 'I work as a software engineer', timestamp: 1_000 },
+        ]),
+      });
+      const memoryStore = fromAny({
+        getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      });
+      const embeddingService = fromAny({
+        embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+        embedBatch: vi.fn(),
+        dims: 8,
+      });
+      const eventBus = fromAny({ emit: vi.fn().mockResolvedValue(undefined) });
+      const extractor = new MemoryExtractor(
+        llmClient,
+        sessionManager,
+        memoryStore,
+        embeddingService,
+        eventBus,
+        { extractionInterval: 5 },
+      );
+      (fromAny(extractor)).writer = { write: writeSpy };
+      return extractor;
+    };
+
+    it('tags a memory formed on a placed turn with location:<placeId>', async () => {
+      const write = vi.fn(async () => ({ action: 'created', memory: { id: 'm-loc-1' } }));
+      const extractor = buildLocationExtractor(write);
+
+      await extractor.extract('api:loc-placed', undefined, undefined, 'living_room');
+
+      expect(write).toHaveBeenCalledTimes(1);
+      const writtenTags = write.mock.calls[0][0].tags as string[];
+      expect(writtenTags).toContain('location:living_room');
+      // Additive: the fact's own tags survive alongside the location marker.
+      expect(writtenTags).toEqual(expect.arrayContaining(['identity', 'profession', 'location:living_room']));
+    });
+
+    it('adds no location tag for a placeless turn (fail-closed, no fabrication)', async () => {
+      const write = vi.fn(async () => ({ action: 'created', memory: { id: 'm-loc-2' } }));
+      const extractor = buildLocationExtractor(write);
+
+      await extractor.extract('api:loc-placeless');
+
+      expect(write).toHaveBeenCalledTimes(1);
+      const writtenTags = write.mock.calls[0][0].tags as string[];
+      expect(writtenTags.some(tag => tag.startsWith('location:'))).toBe(false);
+      expect(writtenTags).toEqual(['identity', 'profession']);
+    });
+  });
+
+  it('applies emotional intensity multiplier to extracted importance before writing', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>User is excited about the launch</text>
+<type>emotional</type>
+<importance>0.8</importance>
+<emotional_valence>0.6</emotional_valence>
+<confidence>0.9</confidence>
+</fact>
+</response>`,
+      }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { id: 1, role: 'user', authorName: 'user', content: 'I am excited for launch day', timestamp: 1_000 },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const getFormationVAD = vi.fn(() => ({
+      valence: 1,
+      arousal: 1,
+      dominance: 0,
+    }));
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        emotionalIntensityImportanceWeight: 0.1,
+      },
+      null,
+      null,
+      null,
+      { getFormationVAD },
+    );
+
+    const write = vi.fn(async () => ({ action: 'created', memory: { id: 'm-vad-importance-1' } }));
+    (fromAny(extractor)).writer = { write };
+
+    await extractor.extract('api:emotion-formation');
+
+    expect(getFormationVAD).toHaveBeenCalledTimes(1);
+    expect(write).toHaveBeenCalledTimes(1);
+
+    const writeInput = write.mock.calls[0][0] as {
+      importance: number;
+      formationVAD: { valence: number; arousal: number; dominance: number };
+    };
+    expect(writeInput.importance).toBeCloseTo(0.88);
+    expect(writeInput.formationVAD).toEqual({
+      valence: 1,
+      arousal: 1,
+      dominance: 0,
+    });
+  });
+});
+
+describe('MemoryExtractor canonical profile synthesis', () => {
+  function makeProfileHarness(options: {
+    targetContact?: Record<string, unknown>;
+    sourceMemories: Record<string, unknown>[];
+    profileResponse: string | ((context: { systemPrompt: string }) => string);
+  }) {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({ content: '<response></response>' })
+        .mockImplementationOnce(async (context: { systemPrompt: string }) => ({
+          content: typeof options.profileResponse === 'function'
+            ? options.profileResponse(context)
+            : options.profileResponse,
+        })),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(6),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I started a new job at the studio this week.', authorName: 'PrimaryUser' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue(options.sourceMemories),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const contactStore = options.targetContact
+      ? fromAny({
+        getById: vi.fn().mockResolvedValue(options.targetContact),
+        getByChannelIdentity: vi.fn().mockResolvedValue(undefined),
+        getByDiscordUserId: vi.fn().mockResolvedValue(undefined),
+        listAll: vi.fn().mockResolvedValue([options.targetContact]),
+      })
+      : null;
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+      undefined,
+      undefined,
+      contactStore,
+    );
+
+    return {
+      extractor,
+      llmClient,
+      memoryStore,
+      contactStore,
+    };
+  }
+
+  it('refreshes canonical profile on interval when source memories are sufficient', async () => {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({ content: '<response></response>' })
+        .mockResolvedValueOnce({
+          content: '<recent_contact_shape><summary>PrimaryUser is a direct communicator and primary partner.</summary></recent_contact_shape>',
+        }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(6),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I started a new job at the studio this week.', authorName: 'PrimaryUser' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([
+        {
+          id: 'm1',
+          type: 'relational',
+          text: 'PrimaryUser is my primary partner.',
+          importance: 0.95,
+          confidence: 0.95,
+          salience: 0.92,
+        },
+        {
+          id: 'm2',
+          type: 'semantic',
+          text: 'PrimaryUser prefers direct technical communication.',
+          importance: 0.82,
+          confidence: 0.88,
+          salience: 0.8,
+        },
+      ]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+    );
+
+    await extractor.maybeExtract('api:profile-test', 'contact-canonical-1');
+    await extractor.drain({ timeoutMs: 2_000 });
+
+    const completePurposes = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls
+      .map(([, purpose]) => purpose);
+    expect(completePurposes).toEqual(['extraction', 'memory']);
+    expect(memoryStore.getMemoriesByContact).toHaveBeenCalledWith('contact-canonical-1', 16);
+    expect(memoryStore.upsertRecentContactShape).toHaveBeenCalledWith(expect.objectContaining({
+      contactId: 'contact-canonical-1',
+      summary: 'PrimaryUser is a direct communicator and primary partner.',
+      sourceMemoryIds: ['m1', 'm2'],
+    }));
+  });
+
+  it('normalizes duplicate names in synthesized contact profile summaries', async () => {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({ content: '<response></response>' })
+        .mockResolvedValueOnce({
+          content: '<recent_contact_shape><summary>Lyra Lyra keeps livestream guardrails explicit.</summary></recent_contact_shape>',
+        }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(6),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I started a new job at the studio this week.', authorName: 'PrimaryUser' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([
+        {
+          id: 'm1',
+          type: 'relational',
+          text: 'Lyra Lyra keeps livestream guardrails explicit.',
+          importance: 0.95,
+          confidence: 0.95,
+          salience: 0.92,
+        },
+        {
+          id: 'm2',
+          type: 'semantic',
+          text: 'Lyra prefers careful public-channel moderation.',
+          importance: 0.82,
+          confidence: 0.88,
+          salience: 0.8,
+        },
+      ]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+    );
+
+    await extractor.maybeExtract('api:profile-duplicate-test', 'contact-canonical-1');
+    await extractor.drain({ timeoutMs: 2_000 });
+
+    expect(memoryStore.upsertRecentContactShape).toHaveBeenCalledWith(expect.objectContaining({
+      contactId: 'contact-canonical-1',
+      summary: 'Lyra keeps livestream guardrails explicit.',
+      sourceMemoryIds: ['m1', 'm2'],
+    }));
+  });
+
+  it('skips profile refresh when synthesized summary contains unresolved macros', async () => {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({ content: '<response></response>' })
+        .mockResolvedValueOnce({
+          content: '<recent_contact_shape><summary>{{char}} keeps livestream guardrails explicit.</summary></recent_contact_shape>',
+        }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(6),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I started a new job at the studio this week.', authorName: 'PrimaryUser' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([
+        {
+          id: 'm1',
+          type: 'relational',
+          text: 'Lyra keeps livestream guardrails explicit.',
+          importance: 0.95,
+          confidence: 0.95,
+          salience: 0.92,
+        },
+        {
+          id: 'm2',
+          type: 'semantic',
+          text: 'Lyra prefers careful public-channel moderation.',
+          importance: 0.82,
+          confidence: 0.88,
+          salience: 0.8,
+        },
+      ]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+    );
+
+    await extractor.maybeExtract('api:profile-macro-test', 'contact-canonical-1');
+    await extractor.drain({ timeoutMs: 2_000 });
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+    expect(memoryStore.upsertRecentContactShape).not.toHaveBeenCalled();
+  });
+
+  it('passes target contact context and skips aliasing the target to mentioned people', async () => {
+    let profilePrompt = '';
+    const { extractor, memoryStore } = makeProfileHarness({
+      targetContact: {
+        id: 'contact-iki',
+        displayName: 'Iki',
+        trustLevel: 'regular',
+        relationshipType: 'friend',
+        firstSeen: '2026-06-28T00:00:00.000Z',
+        lastSeen: '2026-06-28T00:00:00.000Z',
+      },
+      sourceMemories: [
+        {
+          id: 'm1',
+          type: 'semantic',
+          text: 'Example Partner stated that Lyra needs streaming guardrails.',
+          importance: 0.92,
+          confidence: 0.95,
+          salience: 0.9,
+          contactId: 'contact-iki',
+          sourceType: 'turn',
+        },
+        {
+          id: 'm2',
+          type: 'relational',
+          text: 'Iki asked about Lyra in the group room.',
+          importance: 0.82,
+          confidence: 0.88,
+          salience: 0.82,
+          contactId: 'contact-iki',
+          sourceType: 'turn',
+        },
+      ],
+      profileResponse: (context) => {
+        profilePrompt = context.systemPrompt;
+        return '<recent_contact_shape><summary>This contact, known as Example Partner and also by the name Lyra, cares about streaming guardrails.</summary></recent_contact_shape>';
+      },
+    });
+
+    await extractor.maybeExtract('api:profile-iki-test', 'contact-iki');
+    await extractor.drain({ timeoutMs: 2_000 });
+
+    expect(profilePrompt).toContain('Target contact display name: Iki');
+    expect(profilePrompt).toContain('Target contact trust level: regular');
+    expect(profilePrompt).toContain('Do not infer aliases for the target from names merely mentioned');
+    expect(profilePrompt).toContain('target_contact_id=contact-iki');
+    expect(memoryStore.upsertRecentContactShape).not.toHaveBeenCalled();
+  });
+
+  it('allows scoped summaries that the target discussed another named person', async () => {
+    let profilePrompt = '';
+    const { extractor, memoryStore } = makeProfileHarness({
+      targetContact: {
+        id: 'contact-morgan',
+        displayName: 'Morgan',
+        nickname: 'Morgan',
+        trustLevel: 'regular',
+        relationshipType: 'friend',
+        firstSeen: '2026-06-28T00:00:00.000Z',
+        lastSeen: '2026-06-28T00:00:00.000Z',
+      },
+      sourceMemories: [
+        {
+          id: 'm1',
+          type: 'semantic',
+          text: 'Morgan discussed Lyra streaming guardrails in the group room.',
+          importance: 0.9,
+          confidence: 0.93,
+          salience: 0.88,
+          contactId: 'contact-morgan',
+          sourceType: 'turn',
+        },
+        {
+          id: 'm2',
+          type: 'procedural',
+          text: 'Morgan prefers concise launch notes after group planning.',
+          importance: 0.8,
+          confidence: 0.88,
+          salience: 0.8,
+          contactId: 'contact-morgan',
+          sourceType: 'turn',
+        },
+      ],
+      profileResponse: (context) => {
+        profilePrompt = context.systemPrompt;
+        return '<recent_contact_shape><summary>Morgan discussed Lyra streaming guardrails and prefers concise launch notes.</summary></recent_contact_shape>';
+      },
+    });
+
+    await extractor.maybeExtract('api:profile-morgan-test', 'contact-morgan');
+    await extractor.drain({ timeoutMs: 2_000 });
+
+    expect(profilePrompt).toContain('Target contact display name: Morgan');
+    expect(profilePrompt).toContain('Target contact nickname: Morgan');
+    expect(memoryStore.upsertRecentContactShape).toHaveBeenCalledWith(expect.objectContaining({
+      contactId: 'contact-morgan',
+      summary: 'Morgan discussed Lyra streaming guardrails and prefers concise launch notes.',
+      sourceMemoryIds: ['m1', 'm2'],
+    }));
+  });
+
+  it('skips profile refresh when synthesized summary novelty is too low', async () => {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({ content: '<response></response>' })
+        .mockResolvedValueOnce({
+          content: '<recent_contact_shape><summary>PrimaryUser prefers concise updates.</summary></recent_contact_shape>',
+        }),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(6),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I started a new job at the studio this week.', authorName: 'PrimaryUser' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue({
+        summary: 'PrimaryUser prefers concise updates.',
+        updatedAt: Date.now() - (24 * 60 * 60 * 1000),
+      }),
+      getMemoriesByContact: vi.fn().mockReturnValue([
+        {
+          id: 'm1',
+          type: 'semantic',
+          text: 'PrimaryUser prefers concise updates.',
+          importance: 0.8,
+          confidence: 0.9,
+          salience: 0.8,
+        },
+        {
+          id: 'm2',
+          type: 'relational',
+          text: 'PrimaryUser is my partner.',
+          importance: 0.95,
+          confidence: 0.95,
+          salience: 0.9,
+        },
+      ]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+    );
+
+    await extractor.maybeExtract('api:profile-test', 'contact-canonical-1');
+    await extractor.drain({ timeoutMs: 2_000 });
+
+    expect(memoryStore.upsertRecentContactShape).not.toHaveBeenCalled();
+  });
+
+  it('drains cleanly when fire-and-forget profile refresh rejects', async () => {
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockResolvedValueOnce({ content: '<response></response>' })
+        .mockRejectedValueOnce(new Error('profile synthesis timeout')),
+    });
+
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(6),
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I started a new job at the studio this week.', authorName: 'PrimaryUser' },
+      ]),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      getRecentContactShape: vi.fn().mockReturnValue(undefined),
+      getMemoriesByContact: vi.fn().mockReturnValue([
+        {
+          id: 'm1',
+          type: 'relational',
+          text: 'PrimaryUser is my primary partner.',
+          importance: 0.95,
+          confidence: 0.95,
+          salience: 0.92,
+        },
+        {
+          id: 'm2',
+          type: 'semantic',
+          text: 'PrimaryUser prefers direct technical communication.',
+          importance: 0.82,
+          confidence: 0.88,
+          salience: 0.8,
+        },
+      ]),
+      upsertRecentContactShape: vi.fn(),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      {
+        extractionInterval: 5,
+        minImportance: 0.45,
+        minConfidence: 0.6,
+        minNovelty: 0.35,
+        telemetryEnabled: true,
+      },
+    );
+
+    await extractor.maybeExtract('api:profile-error-test', 'contact-canonical-1');
+
+    await expect(extractor.drain({ timeoutMs: 2_000 })).resolves.toBe(true);
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+    expect(memoryStore.upsertRecentContactShape).not.toHaveBeenCalled();
+  });
+});
+
+describe('MemoryExtractor emotional state persistence', () => {
+  it('updates canonical contact emotional baseline from accepted emotional signals', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({
+        content: `<response>
+<fact>
+<text>User felt anxious and overwhelmed during the incident</text>
+<type>emotional</type>
+<importance>0.88</importance>
+<emotional_valence>-0.7</emotional_valence>
+<confidence>0.91</confidence>
+<tags>emotion,stress</tags>
+</fact>
+</response>`,
+      }),
+    });
+
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { role: 'user', content: 'I am anxious and overwhelmed right now', authorName: 'user' },
+      ]),
+      getMessageCount: vi.fn().mockReturnValue(1),
+    });
+
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      searchByEmbedding: vi.fn().mockReturnValue([]),
+      insertMemory: vi.fn(),
+      persistMemoryWrite: vi.fn(),
+      runInTransaction: vi.fn(async (operation: () => Promise<unknown>) => operation()),
+    });
+
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const contactStore = fromAny({
+      listAll: vi.fn().mockResolvedValue([]),
+      updateEmotionalBaseline: vi.fn().mockReturnValue({
+        id: 'contact-canonical-1',
+        emotionalBaseline: {
+          valenceBaseline: -0.28,
+          moodValence: -0.49,
+          moodDrift: -0.21,
+          moodSamples: 3,
+        },
+      }),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      null,
+      contactStore,
+    );
+
+    await extractor.extract('api:mood-test', 'contact-canonical-1');
+
+    expect(contactStore.updateEmotionalBaseline).toHaveBeenCalledTimes(1);
+    expect(contactStore.updateEmotionalBaseline).toHaveBeenCalledWith(
+      'contact-canonical-1',
+      expect.objectContaining({
+        valence: expect.any(Number),
+        confidence: expect.any(Number),
+        observedAtMs: expect.any(Number),
+      }),
+    );
+    const observedValence = contactStore.updateEmotionalBaseline.mock.calls[0][1].valence as number;
+    expect(observedValence).toBeLessThan(0);
+  });
+});
+
+describe('MemoryExtractor crash recovery markers', () => {
+  it('queues pre-compaction extraction over provided compacted entries', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([]),
+      getMessageCount: vi.fn().mockReturnValue(0),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+    );
+
+    await extractor.queueCompactionExtraction('api:compaction-flush', [
+      { id: 11, channelId: 'api:compaction-flush', role: 'user', content: 'User plans a Kyoto trip', timestamp: 1_000 },
+      { id: 12, channelId: 'api:compaction-flush', role: 'assistant', content: 'Noted and saved', timestamp: 2_000 },
+    ]);
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    const prompt = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls[0][0].systemPrompt as string;
+    expect(prompt).toContain('User plans a Kyoto trip');
+    expect(prompt).toContain('Noted and saved');
+
+    const calls = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls;
+    const startCall = calls.find(([name]) => name === 'memory.extraction.start');
+    expect(startCall?.[1]?.triggerReason).toBe('pre_compaction');
+  });
+
+  it('writes an extraction marker after a successful extraction run', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'psfn-extraction-marker-'));
+    tempDirs.push(dir);
+    const sessionStore = new SessionStore(dir);
+    const channelId = 'api:marker-test';
+
+    sessionStore.append({
+      channelId,
+      role: 'user',
+      content: 'User likes coffee',
+      timestamp: 1_000,
+    });
+    sessionStore.append({
+      channelId,
+      role: 'assistant',
+      content: 'Noted',
+      timestamp: 2_000,
+    });
+
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockImplementation((id: string, limit = 10) => sessionStore.getRecent(id, limit)),
+      getMessageCount: vi.fn().mockImplementation((id: string) => sessionStore.count(id)),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      sessionStore,
+    );
+
+    await extractor.extract(channelId);
+
+    const sessionFile = readdirSync(dir).find(file => file.endsWith('.jsonl') && !file.startsWith('user_'));
+    expect(sessionFile).toBeDefined();
+    const lines = readFileSync(join(dir, sessionFile!), 'utf-8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line) as Record<string, unknown>);
+    const lastEntry = lines[lines.length - 1];
+    expect(lastEntry.type).toBe('marker');
+    expect(lastEntry.marker).toBe('extraction');
+    expect(lastEntry.coveredUpTo).toBe(2);
+  });
+
+  it('queues retroactive extraction using recovered un-extracted entries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'psfn-extraction-recovery-'));
+    tempDirs.push(dir);
+    const sessionStore = new SessionStore(dir);
+    const channelId = 'api:crash-recovery';
+
+    sessionStore.append({
+      channelId,
+      role: 'user',
+      content: 'Message 1',
+      timestamp: 1_000,
+    });
+    sessionStore.insertExtractionMarker(channelId, 1, 1_500);
+    sessionStore.append({
+      channelId,
+      role: 'user',
+      content: 'Message 2',
+      timestamp: 2_000,
+    });
+    sessionStore.append({
+      channelId,
+      role: 'assistant',
+      content: 'Message 3',
+      timestamp: 3_000,
+    });
+
+    const candidates = sessionStore.getCrashRecoveryExtractionCandidates();
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].unextractedEntries.map(entry => entry.content)).toEqual(['Message 2', 'Message 3']);
+
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockImplementation((id: string, limit = 10) => sessionStore.getRecent(id, limit)),
+      getMessageCount: vi.fn().mockImplementation((id: string) => sessionStore.count(id)),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      sessionStore,
+    );
+
+    await extractor.queueRetroactiveExtraction(channelId, candidates[0].unextractedEntries);
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    const prompt = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls[0][0].systemPrompt as string;
+    expect(prompt).toContain('Message 2');
+    expect(prompt).toContain('Message 3');
+
+    const afterRecovery = sessionStore.getCrashRecoveryExtractionCandidates();
+    expect(afterRecovery).toHaveLength(0);
+  });
+
+  it('prefers contact nickname in extraction naming guidance', async () => {
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      getRecentMessages: vi.fn().mockReturnValue([
+        { id: 1, channelId: 'api:nickname-test', role: 'user', content: 'I like cardamom tea', authorName: 'user', timestamp: 1_000 },
+        { id: 2, channelId: 'api:nickname-test', role: 'assistant', content: 'Noted', authorName: 'assistant', timestamp: 2_000 },
+      ]),
+      getMessageCount: vi.fn().mockReturnValue(2),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+      searchByEmbedding: vi.fn().mockReturnValue([]),
+      persistMemoryWrite: vi.fn(),
+      runInTransaction: vi.fn(async (operation: () => Promise<unknown>) => operation()),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+    const contactStore = fromAny({
+      updateEmotionalBaseline: vi.fn(),
+      listAll: vi.fn().mockResolvedValue([]),
+      getById: vi.fn().mockReturnValue({
+        id: 'contact-1',
+        displayName: 'Alex Example',
+        nickname: 'A',
+      }),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5 },
+      null,
+      null,
+      contactStore,
+    );
+
+    await extractor.extract('api:nickname-test', 'contact-1');
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    const prompt = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls[0][0].systemPrompt as string;
+    expect(prompt).toContain('Human participant name: A');
+    expect(prompt).not.toContain('Human participant name: Alex Example');
+  });
+});
+
+describe('MemoryExtractor interval watermark coverage', () => {
+  function buildWatermarkEntries(channelId: string, count: number) {
+    return Array.from({ length: count }, (_, index) => {
+      const id = index + 1;
+      const role = index % 2 === 0 ? 'user' : 'assistant';
+      return {
+        id,
+        channelId,
+        role,
+        authorName: role,
+        content: role === 'user'
+          ? `I am planning a Kyoto trip detail ${id} for my vacation.`
+          : `Noted travel detail ${id}.`,
+        timestamp: id * 1_000,
+      };
+    });
+  }
+
+  function buildWatermarkHarness(channelId: string, options: {
+    llmClient?: LLMProviderPort;
+    entryCount?: number;
+    extractionInterval?: number;
+  } = {}) {
+    const entries = buildWatermarkEntries(channelId, options.entryCount ?? 10);
+    const llmClient = options.llmClient ?? fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(entries.length),
+      getRecentMessages: vi.fn().mockReturnValue(entries),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: options.extractionInterval ?? 5 },
+    );
+
+    return { extractor, entries, llmClient, sessionManager, eventBus };
+  }
+
+  it('does not re-send a pre-compaction batch on the next interval trigger', async () => {
+    const channelId = 'api:watermark-compaction';
+    const { extractor, entries, llmClient, sessionManager, eventBus } =
+      buildWatermarkHarness(channelId);
+
+    // Pre-compaction extraction consumes the oldest 8 of 10 messages.
+    await extractor.queueCompactionExtraction(channelId, entries.slice(0, 8));
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+
+    // Without watermark coverage the interval trigger (interval=5, lastCount=0,
+    // currentCount=10) would fire immediately and re-send extracted messages.
+    await extractor.maybeExtract(channelId);
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+
+    const startReasons = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([name]) => name === 'memory.extraction.start')
+      .map(([, payload]) => payload?.triggerReason);
+    expect(startReasons).toEqual(['pre_compaction']);
+
+    // Five genuinely new messages later, the interval trigger fires again.
+    sessionManager.getMessageCount.mockReturnValue(13);
+    await extractor.maybeExtract(channelId);
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('advances coverage only for the consumed range, not the newest unextracted messages', async () => {
+    const channelId = 'api:watermark-partial';
+    const { extractor, entries, llmClient, sessionManager } =
+      buildWatermarkHarness(channelId);
+
+    // Batch covers messages 1-4 only; messages 5-10 remain unextracted.
+    await extractor.queueCompactionExtraction(channelId, entries.slice(0, 4));
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+
+    // Watermark moved to 4, so 10 - 4 = 6 >= interval 5: the trigger still
+    // fires for the unconsumed tail instead of skipping it.
+    await extractor.maybeExtract(channelId);
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+    expect(sessionManager.getMessageCount).toHaveBeenCalledWith(channelId);
+  });
+
+  it('does not advance the watermark when pre-compaction extraction fails', async () => {
+    const channelId = 'api:watermark-failure';
+    const llmClient = fromAny({
+      complete: vi
+        .fn()
+        .mockRejectedValueOnce(new Error('extraction provider unavailable'))
+        .mockResolvedValue({ content: '<response></response>' }),
+    });
+    const { extractor, entries } = buildWatermarkHarness(channelId, { llmClient });
+
+    await expect(
+      extractor.queueCompactionExtraction(channelId, entries.slice(0, 8)),
+    ).rejects.toThrow('Extraction orchestration failed');
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+
+    // The failed batch is still covered by the next interval trigger.
+    await extractor.maybeExtract(channelId);
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('advances the watermark after crash-recovery extraction covers the backlog', async () => {
+    const channelId = 'api:watermark-recovery';
+    const { extractor, entries, llmClient, eventBus } = buildWatermarkHarness(channelId);
+
+    // Crash recovery re-extracts the whole unextracted backlog.
+    await extractor.queueRetroactiveExtraction(channelId, entries);
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+
+    const startReasons = (eventBus.emit as ReturnType<typeof vi.fn>).mock.calls
+      .filter(([name]) => name === 'memory.extraction.start')
+      .map(([, payload]) => payload?.triggerReason);
+    expect(startReasons).toEqual(['crash_recovery']);
+
+    // The recovered range is covered; the interval trigger does not re-send it.
+    await extractor.maybeExtract(channelId);
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('evaluates and advances delayed bounded snapshots without consuming live-through-J coverage', async () => {
+    const channelId = 'api:watermark-delayed-b';
+    const { extractor, entries, llmClient, sessionManager } = buildWatermarkHarness(
+      channelId,
+      { entryCount: 20, extractionInterval: 4 },
+    );
+
+    // The durable B job was delayed while the live session advanced through J.
+    // Its fenced snapshot covers only A-B, so it must neither read nor mark
+    // C-J as extracted.
+    await extractor.maybeExtract(
+      channelId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      entries.slice(0, 4),
+    );
+
+    // A later exact snapshot through D adds four genuinely uncovered entries.
+    // It must still trigger even though live history was already at J when B ran.
+    await extractor.maybeExtract(
+      channelId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      entries.slice(0, 8),
+    );
+
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+    expect(sessionManager.getMessageCount).not.toHaveBeenCalled();
+    expect(sessionManager.getRecentMessages).not.toHaveBeenCalled();
+    const prompts = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls
+      .map(([context]) => context.systemPrompt as string);
+    expect(prompts[0]).toContain('detail 4');
+    expect(prompts[0]).not.toContain('detail 5');
+    expect(prompts[1]).toContain('detail 8');
+    expect(prompts[1]).not.toContain('detail 9');
+  });
+
+  it('keeps a delayed lower-gap snapshot triggerable after an out-of-order high snapshot', async () => {
+    const channelId = 'api:watermark-noncontiguous';
+    const { extractor, entries, llmClient, sessionManager } = buildWatermarkHarness(
+      channelId,
+      { entryCount: 20, extractionInterval: 4 },
+    );
+
+    // B durably extracts ids 1-4.
+    await extractor.maybeExtract(
+      channelId, undefined, undefined, undefined, undefined, undefined,
+      entries.slice(0, 4),
+    );
+    // J runs out of order and durably extracts ids 11-20, advancing coverage
+    // past the still-unprocessed 5-10 gap.
+    await extractor.maybeExtract(
+      channelId, undefined, undefined, undefined, undefined, undefined,
+      entries.slice(10, 20),
+    );
+    expect(llmClient.complete).toHaveBeenCalledTimes(2);
+
+    // The delayed C-E snapshot for the 5-10 gap must still trigger: a single
+    // max watermark reported zero uncovered here and dropped the range durably.
+    await extractor.maybeExtract(
+      channelId, undefined, undefined, undefined, undefined, undefined,
+      entries.slice(4, 10),
+    );
+    expect(llmClient.complete).toHaveBeenCalledTimes(3);
+
+    const prompts = (llmClient.complete as ReturnType<typeof vi.fn>).mock.calls
+      .map(([context]) => context.systemPrompt as string);
+    expect(prompts[2]).toContain('detail 5');
+    expect(prompts[2]).toContain('detail 10');
+    expect(prompts[2]).not.toContain('detail 11');
+
+    // Reprocessing the same gap is a no-op: it is now covered exactly once.
+    await extractor.maybeExtract(
+      channelId, undefined, undefined, undefined, undefined, undefined,
+      entries.slice(4, 10),
+    );
+    expect(llmClient.complete).toHaveBeenCalledTimes(3);
+
+    // Never fell back to live session state on any bounded call.
+    expect(sessionManager.getMessageCount).not.toHaveBeenCalled();
+    expect(sessionManager.getRecentMessages).not.toHaveBeenCalled();
+  });
+});
+
+describe('MemoryExtractor group range in-flight reuse (mlwk.22)', () => {
+  function groupWriteCaps() {
+    return createDefaultGroupMemorySettings().writeCaps;
+  }
+
+  function groupEntry(channelId: string, id: number): unknown {
+    return {
+      id,
+      channelId,
+      role: 'user',
+      content: `Group range message ${id} with enough substance to extract.`,
+      authorName: 'user',
+      timestamp: id * 1_000,
+      metadata: JSON.stringify({
+        turn: {
+          schemaVersion: 1,
+          turnId: createTurnId(),
+          requestId: `req-group-${id}`,
+          role: 'user',
+        },
+      }),
+    };
+  }
+
+  function makeExtractor(gate: Promise<void>): MemoryExtractor {
+    const llmClient = fromAny({
+      complete: vi.fn().mockImplementation(async () => {
+        await gate;
+        return { content: '<response></response>' };
+      }),
+    });
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(0),
+      getRecentMessages: vi.fn().mockReturnValue([]),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockReturnValue([]),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({
+      emit: vi.fn().mockResolvedValue(undefined),
+    });
+    return new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 5, minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+  }
+
+  it('reports false for an observed group range dropped into an in-flight extraction', async () => {
+    let releaseComplete!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseComplete = resolve; });
+    const extractor = makeExtractor(gate);
+    const channelId = 'api:group-range-inflight';
+
+    // First range starts an extraction that we hold in-flight via the gate.
+    const firstPromise = extractor.extractObservedGroupRange({
+      channelId,
+      triggerReason: 'observed_count',
+      recoveredEntries: fromAny([groupEntry(channelId, 1), groupEntry(channelId, 2)]),
+      groupWriteCaps: groupWriteCaps(),
+    });
+    await Promise.resolve();
+    expect(extractor.getPendingExtractionPromise(channelId)).not.toBeNull();
+
+    // A different range on the SAME channel is coalesced into the in-flight run
+    // and its entries are dropped; it must report false so the caller does not
+    // mark the range processed.
+    const secondPromise = extractor.extractObservedGroupRange({
+      channelId,
+      triggerReason: 'observed_count',
+      recoveredEntries: fromAny([groupEntry(channelId, 3), groupEntry(channelId, 4)]),
+      groupWriteCaps: groupWriteCaps(),
+    });
+
+    releaseComplete();
+    const [firstResult, secondResult] = await Promise.all([firstPromise, secondPromise]);
+    expect(firstResult).toBe(true);
+    expect(secondResult).toBe(false);
+  });
+
+  it('reports false for an operator backfill range dropped into an in-flight extraction', async () => {
+    let releaseComplete!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseComplete = resolve; });
+    const extractor = makeExtractor(gate);
+    const channelId = 'api:group-backfill-inflight';
+
+    const firstPromise = extractor.extractGroupBackfillRange({
+      channelId,
+      recoveredEntries: fromAny([groupEntry(channelId, 1), groupEntry(channelId, 2)]),
+      groupWriteCaps: groupWriteCaps(),
+    });
+    await Promise.resolve();
+    expect(extractor.getPendingExtractionPromise(channelId)).not.toBeNull();
+
+    const secondPromise = extractor.extractGroupBackfillRange({
+      channelId,
+      recoveredEntries: fromAny([groupEntry(channelId, 3), groupEntry(channelId, 4)]),
+      groupWriteCaps: groupWriteCaps(),
+    });
+
+    releaseComplete();
+    const [firstResult, secondResult] = await Promise.all([firstPromise, secondPromise]);
+    expect(firstResult).toBe(true);
+    expect(secondResult).toBe(false);
+  });
+});
+
+describe('MemoryExtractor bounded snapshot sizing (u5bv.10)', () => {
+  function makeExtractor(extractionInterval: number): MemoryExtractor {
+    return new MemoryExtractor(
+      fromAny({ complete: vi.fn() }),
+      fromPartial<Record<string, unknown>>({}),
+      fromAny({ getMemoriesByChannel: vi.fn().mockResolvedValue([]) }),
+      fromAny({ embed: vi.fn(), embedBatch: vi.fn(), dims: 8 }),
+      fromAny({ emit: vi.fn().mockResolvedValue(undefined) }),
+      { extractionInterval },
+    );
+  }
+
+  // The interval upper bound (50) equals the extraction recovery window by
+  // construction, so every accepted interval is snapshot one-for-one.
+  it.each([
+    [1, 1],
+    [10, 10],
+    [11, 11],
+    [50, 50],
+  ])('snapshots the exact configured interval %i as %i entries', (interval, expected) => {
+    expect(makeExtractor(interval).getBoundedExtractionSnapshotLimit()).toBe(expected);
+  });
+
+  it('fails safe by clamping an out-of-contract interval to the recovery window', () => {
+    // Above the recovery window: never snapshot more than the LLM prompt sees, or
+    // coverage would advance over unprocessed entries.
+    expect(makeExtractor(999).getBoundedExtractionSnapshotLimit()).toBe(50);
+    // Never below one — a durable no-op snapshot is not a valid extraction window.
+    expect(makeExtractor(0).getBoundedExtractionSnapshotLimit()).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe('MemoryExtractor durable drain requeue (u5bv.11)', () => {
+  function substantiveEntries(channelId: string, ids: number[]) {
+    return ids.map((id) => {
+      const role = id % 2 === 1 ? 'user' : 'assistant';
+      return {
+        id,
+        channelId,
+        role,
+        authorName: role,
+        content: `Conversation message ${id} with enough substance to extract a durable detail.`,
+        timestamp: id * 1_000,
+      };
+    });
+  }
+
+  function makeDrainHarness(gate: Promise<void>) {
+    const llmClient = fromAny({
+      complete: vi.fn().mockImplementation(async () => {
+        await gate;
+        return { content: '<response></response>' };
+      }),
+    });
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(0),
+      getRecentMessages: vi.fn().mockReturnValue([]),
+    });
+    const memoryStore = fromAny({
+      getMemoriesByChannel: vi.fn().mockResolvedValue([]),
+    });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({ emit: vi.fn().mockResolvedValue(undefined) });
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 4, minImportance: 0.45, minConfidence: 0.6, minNovelty: 0.35 },
+    );
+    return { extractor, llmClient, sessionManager };
+  }
+
+  it('fails a queued durable bounded run closed when drain flips acceptance before it starts', async () => {
+    let releaseA!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseA = resolve; });
+    const { extractor, llmClient, sessionManager } = makeDrainHarness(gate);
+    const channelId = 'api:drain-requeue-b';
+
+    // A: an unrelated in-flight extraction on the SAME channel is held via the
+    // gate, so the durable bounded run B queues behind it (serialize scheduling).
+    const aPromise = extractor.extractObservedGroupRange({
+      channelId,
+      triggerReason: 'observed_count',
+      recoveredEntries: fromAny(substantiveEntries(channelId, [101, 102])),
+      groupWriteCaps: createDefaultGroupMemorySettings().writeCaps,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(extractor.getPendingExtractionPromise(channelId)).not.toBeNull();
+
+    // B: the durable, receipt-bound post-turn extraction (assertEffectAllowed +
+    // bounded snapshot) is enqueued behind A while acceptance is still true.
+    const bCrossBoundary = vi.fn().mockResolvedValue(undefined);
+    const bPromise = extractor.maybeExtract(
+      channelId,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      bCrossBoundary,
+      fromAny(substantiveEntries(channelId, [1, 2, 3, 4])),
+    );
+
+    // Graceful shutdown flips acceptance before B's chained run starts.
+    const stopping = extractor.stop({ timeoutMs: 5_000 });
+    releaseA();
+
+    // B fails closed (retryable) instead of resolving as a covered no-op: the
+    // silent-loss bug would resolve normally here and advance B's coverage.
+    await expect(bPromise).rejects.toBeInstanceOf(ExtractionDrainRequeueError);
+    // B never crossed its durable effect boundary and never ran its own LLM.
+    expect(bCrossBoundary).not.toHaveBeenCalled();
+    expect(llmClient.complete).toHaveBeenCalledTimes(1); // A only
+    // The bounded run never fell back to live session history.
+    expect(sessionManager.getRecentMessages).not.toHaveBeenCalled();
+    expect(sessionManager.getMessageCount).not.toHaveBeenCalled();
+
+    // A (no receipt) keeps its intentional silent-skip drain behavior and settles
+    // cleanly; the drain observes both runs and completes within its timeout.
+    await expect(aPromise).resolves.toBe(true);
+    await expect(stopping).resolves.toBe(true);
+  });
+
+  it('re-runs the exact snapshot once and only then advances coverage after a requeue', async () => {
+    // A fresh (accepting) extractor models the process that picks up the deferred
+    // job on restart: B's exact snapshot runs once and advances coverage, and a
+    // reprocess of the same covered range is a no-op.
+    const llmClient = fromAny({
+      complete: vi.fn().mockResolvedValue({ content: '<response></response>' }),
+    });
+    const sessionManager = fromAny({
+      getMessageCount: vi.fn().mockReturnValue(0),
+      getRecentMessages: vi.fn().mockReturnValue([]),
+    });
+    const memoryStore = fromAny({ getMemoriesByChannel: vi.fn().mockResolvedValue([]) });
+    const embeddingService = fromAny({
+      embed: vi.fn().mockResolvedValue(new Float32Array(8)),
+      embedBatch: vi.fn(),
+      dims: 8,
+    });
+    const eventBus = fromAny({ emit: vi.fn().mockResolvedValue(undefined) });
+    const extractor = new MemoryExtractor(
+      llmClient,
+      sessionManager,
+      memoryStore,
+      embeddingService,
+      eventBus,
+      { extractionInterval: 4 },
+    );
+    const channelId = 'api:drain-requeue-retry';
+    const cross = vi.fn().mockResolvedValue(undefined);
+    const snapshot = fromAny(substantiveEntries(channelId, [1, 2, 3, 4]));
+
+    await extractor.maybeExtract(
+      channelId, undefined, undefined, undefined, undefined, cross, snapshot,
+    );
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    expect(cross).toHaveBeenCalled();
+
+    // The same range is now covered exactly once — reprocessing is a no-op.
+    await extractor.maybeExtract(
+      channelId, undefined, undefined, undefined, undefined, cross, snapshot,
+    );
+    expect(llmClient.complete).toHaveBeenCalledTimes(1);
+    expect(sessionManager.getRecentMessages).not.toHaveBeenCalled();
+    expect(sessionManager.getMessageCount).not.toHaveBeenCalled();
+  });
+});

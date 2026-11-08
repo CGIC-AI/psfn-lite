@@ -28,6 +28,8 @@ export default [
     '.agents/**',
     '.claude/**',
     '.codex/**',
+    // Extracted donor tree: own tsconfig and the donor's compiler settings (docs/development.md).
+    'packages/companion/**',
   ]),
   {
     linterOptions: {

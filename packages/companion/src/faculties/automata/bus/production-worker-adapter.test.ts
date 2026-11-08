@@ -1,0 +1,604 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  hashHealthEventSubject,
+  type HealthEvent,
+} from '../../../shared/contracts/health-event.js';
+
+import { loadAutomataPolicySeedDefaults } from '../../../system/config/automata-policy-config.js';
+import type { LLMProviderPort } from '../../../core/agent/contracts.js';
+import { AutomataRunRegistry, InMemoryAutomataRunStore } from '../run-registry.js';
+import {
+  AUTOMATA_BUS_LESSON_ATTRIBUTION_FEATURE,
+  type AutomataBusEvent,
+} from './contract.js';
+import type { AutomataBusProductionRuntime } from './production-runtime.js';
+import type { PostgresAutomataBusRuntimeStore } from './runtime-store.js';
+import {
+  CanonicalAutomataBusWriter,
+  createProductionAutomataBusWorkerAccess,
+  createAutomataTerminalLifecycleAdapter,
+  parseTerminalClaim,
+} from './production-worker-adapter.js';
+import { createAutomataBusReviewerModelAdapter } from './production-reviewer-adapters.js';
+import {
+  AUTOMATA_BUS_WORKER_BRIEFING_SCHEMA_VERSION,
+  buildAutomataBusWorkerScope,
+  resolveAutomataBusWorkerFormation,
+} from './worker-access.js';
+import { NO_AUTOMATA_REDELIVERY } from '../../../test-support/automata-run-redelivery.js';
+
+const WORKER_BOUNDS = {
+  maxQueryChars: 120,
+  maxTextChars: 240,
+  maxArrayItems: 8,
+  maxSearchResults: 10,
+  maxRunResults: 20,
+  maxBriefingChars: 400,
+  maxBriefingItems: 4,
+  maxToolResultChars: 1_000,
+} as const;
+
+function createHarness() {
+  const events = new Map<string, {
+    event: AutomataBusEvent;
+    audiences: string[];
+    sensitivity: string;
+  }>();
+  const order: string[] = [];
+  const store = {
+    appendAllocated: vi.fn(async (input: {
+      eventId: string;
+      createEvent(sequence: number): unknown;
+      audiences: string[];
+      sensitivity: string;
+    }) => {
+      const incumbent = events.get(input.eventId);
+      const event = input.createEvent(
+        incumbent?.event.sequence ?? events.size + 1,
+      ) as AutomataBusEvent;
+      if (incumbent) {
+        const same = JSON.stringify(incumbent.event) === JSON.stringify(event)
+          && JSON.stringify(incumbent.audiences) === JSON.stringify([...input.audiences].sort())
+          && incumbent.sensitivity === input.sensitivity;
+        if (!same) {
+          throw new Error(`Automata Bus eventId ${input.eventId} was reused with different content`);
+        }
+        return { event: incumbent.event, inserted: false };
+      }
+      order.push('persist');
+      events.set(event.eventId, {
+        event,
+        audiences: [...input.audiences].sort(),
+        sensitivity: input.sensitivity,
+      });
+      return { event, inserted: true };
+    }),
+    readHistory: vi.fn(async () => [...events.values()].map(value => value.event)),
+    readEventById: vi.fn(async (input: { eventId: string }) => (
+      events.get(input.eventId)?.event ?? null
+    )),
+  } as unknown as PostgresAutomataBusRuntimeStore;
+  const canonical = {
+    getCurrentByEventIds: vi.fn(async (input: { eventIds: string[] }) => {
+      order.push('hydrate');
+      const event = events.get(input.eventIds[0]!)?.event;
+      if (!event || event.type !== 'finding') return [];
+      return [{
+        eventId: event.eventId,
+        companionId: event.companionId,
+        sequence: event.sequence,
+        occurredAt: event.occurredAt,
+        automatonClass: event.context.automatonClass,
+        taskId: event.context.taskId,
+        runId: event.context.runId,
+        claim: event.body.claim,
+        provenance: event.body.provenance,
+        verificationStatus: event.body.verification.status,
+        audience: 'operator' as const,
+        sensitivity: 'confidential' as const,
+      }];
+    }),
+  };
+  const indexing = {
+    indexCurrentFinding: vi.fn(async (finding: { eventId: string }) => {
+      order.push('index');
+      return {
+        status: 'indexed' as const,
+        eventId: finding.eventId,
+        modelIdentity: { provider: 'test', model: 'test', dimensions: 2 },
+      };
+    }),
+  };
+  const runtime = { canonical, indexing } as unknown as AutomataBusProductionRuntime;
+  return {
+    events,
+    order,
+    store,
+    writer: new CanonicalAutomataBusWriter({
+      companionId: 'companion-a',
+      store,
+      runtime,
+    }),
+  };
+}
+
+async function createRegistry() {
+  const registry = await AutomataRunRegistry.hydrate({
+    redelivery: NO_AUTOMATA_REDELIVERY,
+    companionId: 'companion-a',
+    policy: loadAutomataPolicySeedDefaults(),
+    store: new InMemoryAutomataRunStore(),
+  });
+  await registry.register({
+    runId: 'subagent-1',
+    automatonClass: 'subagent.bounded',
+    workerId: 'subagent-1',
+    taskId: 'task-1',
+    taskLabel: 'Inspect production runtime',
+    taskSummary: 'Inspect production runtime',
+    sessionIds: ['subagent:subagent-1'],
+    createdAtMs: 1_700_000_000_000,
+  });
+  await registry.transition('subagent-1', {
+    status: 'running',
+    reason: 'agent_initialized',
+    atMs: 1_700_000_000_010,
+  });
+  await registry.transition('subagent-1', {
+    status: 'completed',
+    reason: 'completed',
+    outcome: 'completed',
+    atMs: 1_700_000_000_100,
+  });
+  return registry;
+}
+
+describe('production Automata Bus lifecycle composition', () => {
+  it('forms a worker spawn from a production briefing with internal query diagnostics', async () => {
+    const harness = createHarness();
+    const registry = await createRegistry();
+    const createSpawnBriefing = vi.fn(async () => ({
+      text: 'Automata Bus briefing\n- Production finding.',
+      itemCount: 1,
+      diagnostics: {
+        cache: 'miss' as const,
+        semanticPath: 'ann' as const,
+        indexState: 'ready' as const,
+        reindexState: 'current' as const,
+        modelIdentity: { provider: 'test', model: 'test', dimensions: 2 },
+        indexingLag: { pendingCount: 0 },
+      },
+    }));
+    const access = createProductionAutomataBusWorkerAccess({
+      companionId: 'companion-a',
+      registry,
+      store: harness.store,
+      runtime: {
+        query: { createSpawnBriefing },
+      } as unknown as AutomataBusProductionRuntime,
+      writer: harness.writer,
+      bounds: WORKER_BOUNDS,
+    });
+    const workerScope = buildAutomataBusWorkerScope(access, {
+      automatonClass: 'subagent.bounded',
+      runId: 'subagent-1',
+      taskId: 'task-1',
+    });
+
+    const formation = await resolveAutomataBusWorkerFormation({
+      access,
+      scope: workerScope,
+      query: 'Inspect production runtime',
+    });
+
+    expect(formation?.briefing).toEqual({
+      schemaVersion: AUTOMATA_BUS_WORKER_BRIEFING_SCHEMA_VERSION,
+      text: 'Automata Bus briefing\n- Production finding.',
+      itemCount: 1,
+      diagnostics: {
+        cache: 'miss',
+        semanticPath: 'ann',
+        indexState: 'ready',
+        reindexState: 'current',
+        modelIdentity: { provider: 'test', model: 'test', dimensions: 2 },
+        indexingLag: { pendingCount: 0 },
+      },
+    });
+  });
+
+  it('marks attributed findings with the required negotiated feature', async () => {
+    const harness = createHarness();
+    const registry = await createRegistry();
+    const run = registry.getRun('subagent-1');
+    if (!run) throw new Error('expected test run');
+
+    const result = await harness.writer.append({
+      eventId: 'finding-attributed',
+      occurredAt: '2026-08-11T12:00:00.000Z',
+      run,
+      type: 'finding',
+      body: {
+        claim: 'The worker omitted a repository instruction.',
+        provenance: 'computed',
+        evidence: [{ kind: 'artifact', reference: 'artifact:test', summary: 'Reviewed output.' }],
+        verification: { status: 'pending' },
+        lessonAttribution: {
+          promptRevision: 'sha256:prompt-r1',
+          toolName: 'repo',
+          failureCategory: 'missing-instruction',
+          lessonCode: 'read-before-edit',
+          contradictionEventIds: [],
+        },
+      },
+      audiences: ['operator'],
+      sensitivity: 'personal',
+    });
+
+    expect(result.event.mustUnderstand).toContain(AUTOMATA_BUS_LESSON_ATTRIBUTION_FEATURE);
+  });
+
+  it('persists, hydrates, and only then indexes the canonical terminal finding', async () => {
+    const harness = createHarness();
+    const lifecycle = createAutomataTerminalLifecycleAdapter({
+      companionId: 'companion-a',
+      registry: await createRegistry(),
+      store: harness.store,
+      writer: harness.writer,
+    });
+    const receipt = await lifecycle.recordTerminalHandoff({
+      idempotencyKey: 'terminal-key',
+      lineage: {
+        automatonClass: 'subagent.bounded' as const,
+        runId: 'subagent-1',
+        taskId: 'task-1',
+        workerId: 'subagent-1',
+        sessionIds: ['subagent:subagent-1'],
+      },
+      lifecycleState: 'completed',
+      outcome: 'completed',
+      stateReason: 'completed',
+      resultKind: 'final',
+      handoffKind: 'useful',
+      usage: {
+        model: 'test-model',
+        inputTokens: 10,
+        outputTokens: 5,
+        durationMs: 100,
+        turns: 1,
+      },
+      outputRefs: [{ kind: 'session_output', ref: 'session:output:1', custody: 'pending' }],
+      occurredAtMs: 1_700_000_000_100,
+    });
+
+    expect(receipt.inserted).toBe(true);
+    expect(harness.order).toEqual(['persist', 'hydrate', 'index']);
+  });
+
+  it('replays exactly after artifact linking and converges a changed replay on the durable terminal', async () => {
+    const harness = createHarness();
+    const registry = await createRegistry();
+    const lifecycle = createAutomataTerminalLifecycleAdapter({
+      companionId: 'companion-a',
+      registry,
+      store: harness.store,
+      writer: harness.writer,
+    });
+    const input = {
+      idempotencyKey: 'terminal-key',
+      lineage: {
+        automatonClass: 'subagent.bounded' as const,
+        runId: 'subagent-1',
+        taskId: 'task-1',
+        workerId: 'subagent-1',
+        sessionIds: ['subagent:subagent-1'],
+      },
+      lifecycleState: 'completed' as const,
+      outcome: 'completed' as const,
+      stateReason: 'completed',
+      resultKind: 'final' as const,
+      handoffKind: 'useful' as const,
+      usage: {
+        model: 'test-model',
+        inputTokens: 10,
+        outputTokens: 5,
+        durationMs: 100,
+        turns: 1,
+      },
+      outputRefs: [{ kind: 'session_output', ref: 'session:output:1', custody: 'pending' as const }],
+      occurredAtMs: 1_700_000_000_100,
+    };
+    const first = await lifecycle.recordTerminalHandoff(input);
+    await registry.linkArtifacts('subagent-1', [{
+      kind: 'automata_bus_handoff',
+      ref: first.handoffRef,
+      custody: 'durable',
+    }]);
+    const replay = await lifecycle.recordTerminalHandoff(input);
+
+    expect(replay).toMatchObject({ inserted: false, handoffRef: first.handoffRef });
+    expect(replay.persistedOutcome).toEqual({
+      lifecycleState: 'completed',
+      outcome: 'completed',
+      stateReason: 'completed',
+    });
+    expect(replay.occurredAtMs).toBe(1_700_000_000_100);
+
+    // 8n40k: a re-run after a crash between the handoff commit and terminalize
+    // recomputes a DIFFERENT terminal. The durable Bus finding is authoritative:
+    // the replay reads it back instead of appending a conflicting event.
+    const diverged = await lifecycle.recordTerminalHandoff({
+      ...input,
+      lifecycleState: 'failed' as const,
+      outcome: 'blocked' as const,
+      stateReason: 'changed-under-replay',
+      failureReason: 'the re-run failed',
+      occurredAtMs: 1_700_000_999_999,
+    });
+    expect(diverged).toMatchObject({ inserted: false, handoffRef: first.handoffRef });
+    expect(diverged.persistedOutcome).toEqual({
+      lifecycleState: 'completed',
+      outcome: 'completed',
+      stateReason: 'completed',
+    });
+    expect(diverged.occurredAtMs).toBe(1_700_000_000_100);
+    expect(harness.events.size).toBe(1);
+  });
+});
+
+// psfn-framework-zu8d2 — a replay whose recomputed terminal disagrees with the
+// durable Bus finding was previously visible only as a WARN line. It is now an
+// alertable, content-free health condition grouped by the handoff KIND.
+describe('terminal-handoff replay divergence health condition (zu8d2)', () => {
+  const baseInput = {
+    idempotencyKey: 'terminal-key',
+    lineage: {
+      automatonClass: 'subagent.bounded' as const,
+      runId: 'subagent-1',
+      taskId: 'task-1',
+      workerId: 'subagent-1',
+      sessionIds: ['subagent:subagent-1'],
+    },
+    lifecycleState: 'completed' as const,
+    outcome: 'completed' as const,
+    stateReason: 'completed',
+    resultKind: 'final' as const,
+    handoffKind: 'useful' as const,
+    usage: {
+      model: 'test-model',
+      inputTokens: 10,
+      outputTokens: 5,
+      durationMs: 100,
+      turns: 1,
+    },
+    outputRefs: [{ kind: 'session_output' as const, ref: 'session:output:1', custody: 'pending' as const }],
+    occurredAtMs: 1_700_000_000_100,
+  };
+
+  async function lifecycleWithHealth() {
+    const harness = createHarness();
+    const emitted: HealthEvent[] = [];
+    const lifecycle = createAutomataTerminalLifecycleAdapter({
+      companionId: 'companion-a',
+      registry: await createRegistry(),
+      store: harness.store,
+      writer: harness.writer,
+      health: {
+        publisher: {
+          emit: async (_event, data) => {
+            emitted.push(data.event);
+          },
+        },
+        source: { owner: { kind: 'system' }, process: 'agent' },
+      },
+    });
+    return { lifecycle, emitted };
+  }
+
+  it('emits nothing when the replay agrees with the durable finding', async () => {
+    const { lifecycle, emitted } = await lifecycleWithHealth();
+
+    await lifecycle.recordTerminalHandoff(baseInput);
+    const replay = await lifecycle.recordTerminalHandoff(baseInput);
+
+    expect(replay.inserted).toBe(false);
+    expect(emitted).toEqual([]);
+  });
+
+  it('emits one content-free event per divergence, grouped by the handoff kind', async () => {
+    const { lifecycle, emitted } = await lifecycleWithHealth();
+
+    await lifecycle.recordTerminalHandoff(baseInput);
+    const diverged = await lifecycle.recordTerminalHandoff({
+      ...baseInput,
+      lifecycleState: 'failed' as const,
+      outcome: 'blocked' as const,
+      stateReason: 'changed-under-replay',
+      failureReason: 'the re-run failed',
+      occurredAtMs: 1_700_000_999_999,
+    });
+    // The durable finding still wins: the condition reports a disagreement, it
+    // does not change the convergence contract.
+    expect(diverged.persistedOutcome).toEqual({
+      lifecycleState: 'completed',
+      outcome: 'completed',
+      stateReason: 'completed',
+    });
+    await vi.waitFor(() => {
+      expect(emitted).toHaveLength(1);
+    });
+    expect(emitted[0]).toMatchObject({
+      code: 'terminal_handoff_replay_diverged',
+      severity: 'warning',
+      owner: { kind: 'system' },
+      provenance: { process: 'agent', component: 'automata' },
+    });
+    // Content-free: the run id, class and reason text never leave the emitter.
+    expect(emitted[0]!.provenance.subjectHash)
+      .toBe(hashHealthEventSubject('terminal_handoff_replay:useful'));
+    expect(emitted[0]!.evidence).toEqual({});
+    expect(JSON.stringify(emitted[0])).not.toContain('subagent-1');
+    expect(JSON.stringify(emitted[0])).not.toContain('changed-under-replay');
+
+    // A second divergence of the same handoff kind lands in the same group, so
+    // the repeated-failure detector opens one episode rather than two.
+    await lifecycle.recordTerminalHandoff({
+      ...baseInput,
+      stateReason: 'changed-again',
+      occurredAtMs: 1_700_001_999_999,
+    });
+    await vi.waitFor(() => {
+      expect(emitted).toHaveLength(2);
+    });
+    expect(emitted[1]!.provenance.subjectHash).toBe(emitted[0]!.provenance.subjectHash);
+  });
+});
+
+describe('persisted automata terminal claim', () => {
+  const lineage = {
+    automatonClass: 'subagent.bounded' as const,
+    runId: 'subagent-1',
+    taskId: 'task-1',
+    workerId: 'subagent-1',
+    sessionIds: ['subagent:subagent-1'],
+  };
+
+  async function claimFor(
+    overrides: Partial<Parameters<
+      ReturnType<typeof createAutomataTerminalLifecycleAdapter>['recordTerminalHandoff']
+    >[0]> = {},
+  ): Promise<string> {
+    const harness = createHarness();
+    const lifecycle = createAutomataTerminalLifecycleAdapter({
+      companionId: 'companion-a',
+      registry: await createRegistry(),
+      store: harness.store,
+      writer: harness.writer,
+    });
+    await lifecycle.recordTerminalHandoff({
+      idempotencyKey: 'terminal-key',
+      lineage,
+      lifecycleState: 'completed',
+      outcome: 'completed',
+      stateReason: 'completed',
+      resultKind: 'final',
+      handoffKind: 'useful',
+      outputRefs: [],
+      occurredAtMs: 1_700_000_000_100,
+      ...overrides,
+    });
+    const event = [...harness.events.values()][0]?.event;
+    if (!event || event.type !== 'finding') throw new Error('no terminal finding persisted');
+    return event.body.claim;
+  }
+
+  it('round-trips the terminal facts it serialized', async () => {
+    expect(parseTerminalClaim(await claimFor(), 'subagent.bounded')).toEqual({
+      lifecycleState: 'completed',
+      outcome: 'completed',
+      stateReason: 'completed',
+    });
+  });
+
+  it('round-trips a multi-line failure reason after summary and usage lines', async () => {
+    const claim = await claimFor({
+      lifecycleState: 'failed',
+      outcome: 'blocked',
+      stateReason: 'failed',
+      failureReason: 'first line\nsecond line',
+      resultKind: 'none',
+      summary: 'A class-authored process line.',
+      usage: {
+        model: 'test-model',
+        inputTokens: 10,
+        outputTokens: 5,
+        durationMs: 100,
+        turns: 1,
+      },
+    });
+    expect(parseTerminalClaim(claim, 'subagent.bounded')).toEqual({
+      lifecycleState: 'failed',
+      outcome: 'blocked',
+      stateReason: 'failed',
+      failureReason: 'first line\nsecond line',
+    });
+  });
+
+  it('refuses a claim it did not write or that belongs to another class', async () => {
+    expect(() => parseTerminalClaim('Some unrelated finding claim.', 'subagent.bounded'))
+      .toThrow(/lifecycle state/u);
+    const claim = await claimFor();
+    expect(() => parseTerminalClaim(claim, 'memory.sleeptime'))
+      .toThrow(/different automaton class/u);
+  });
+});
+
+describe('production Automata Bus reviewer model composition', () => {
+  it('routes review through the scheduled maintenance work spec, charge surface, and owner model slot', async () => {
+    const complete = vi.fn<LLMProviderPort['complete']>(async () => ({
+      content: JSON.stringify({
+        status: 'complete',
+        decision: { outcome: 'no-change', reason: 'Evidence agrees.', evidenceRefs: [] },
+      }),
+      toolCalls: [],
+      model: 'test-model',
+      inputTokens: 10,
+      outputTokens: 5,
+      stopReason: 'end_turn',
+    }));
+    const adapter = createAutomataBusReviewerModelAdapter({
+      llmProvider: { complete } as LLMProviderPort,
+    });
+
+    const result = await adapter.review({
+      scope: {
+        companionId: 'companion-a',
+        audience: 'operator',
+        maxSensitivity: 'confidential',
+      },
+      reviewerRunId: 'review-run-1',
+      cluster: {
+        clusterId: 'cluster-1',
+        kind: 'duplicate',
+        eventIds: ['event-a', 'event-b'],
+        similarityScore: 1,
+      },
+      findings: [],
+      work: {
+        purpose: 'background',
+        model: 'gpt-5.4-nano',
+        durable: true,
+        maxOutputTokens: 1_200,
+        deadlineMs: 120_000,
+        tokenCeiling: 4_000,
+        costCeilingUsd: 0.25,
+        cancellation: 'caller_signal',
+        retryPolicy: 'none',
+        chargeLane: 'maintenance',
+        chargeSurface: 'externalModelConsult',
+      },
+    });
+
+    expect(result).toEqual({
+      status: 'complete',
+      decision: { outcome: 'no-change', reason: 'Evidence agrees.', evidenceRefs: [] },
+    });
+    expect(complete).toHaveBeenCalledWith(
+      expect.any(Object),
+      'background',
+      expect.objectContaining({
+        modelHint: { slotKey: 'gpt-5.4-nano', maxTokens: 1_200 },
+        workSpec: expect.objectContaining({
+          lane: 'maintenance_reflection',
+          durable: true,
+          maxOutputTokens: 1_200,
+          deadlineMs: 120_000,
+          tokenCeiling: 4_000,
+          costCeilingUsd: 0.25,
+          cancellation: 'caller_signal',
+          retryPolicy: 'none',
+        }),
+      }),
+    );
+  });
+});

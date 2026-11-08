@@ -1,0 +1,961 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import type { LLMProviderPort } from '../../../core/agent/contracts.js';
+import { createDefaultBiographicalDepthPolicy } from '../../../system/config/biographical-depth-policy.js';
+import { normalizeBiographicalCandidatePolicy } from '../../../system/config/biographical-candidate-policy.js';
+import type { BiographicalCandidatePolicy } from '../../../system/config/biographical-candidate-policy.js';
+import { InMemoryMemoryStore } from '../../../test-support/in-memory-memory-store.js';
+import type { MemoryStorePort } from '../memory-store-port.js';
+import type { PurrMemory } from '../types.js';
+import type { ContactStorePort } from '../../../core/contacts/contact-store-port.js';
+import { InMemoryBiographicalProfileStore } from './in-memory-store.js';
+import { createBiographySynthesisTargetPort } from './synthesis-targets.js';
+import { BiographySynthesisService } from './synthesis-service.js';
+import type {
+  BiographySynthesisTarget,
+  BiographySynthesisTargetPort,
+} from './synthesis-service.js';
+import type { BiographicalSubjectRef } from './types.js';
+
+const NOW = new Date('2026-02-01T00:00:00.000Z');
+const COMPANION_SUBJECT: Extract<BiographicalSubjectRef, { kind: 'companion' }> = {
+  kind: 'companion',
+  companionId: 'companion-invented',
+  subjectVersion: 1,
+};
+const CONTACT_SUBJECT: Extract<BiographicalSubjectRef, { kind: 'contact' }> = {
+  kind: 'contact',
+  contactId: 'contact-invented',
+  subjectVersion: 1,
+};
+
+const POLICY: BiographicalCandidatePolicy = normalizeBiographicalCandidatePolicy({
+  schemaVersion: 1,
+  admittedSourceTypes: ['semantic', 'episodic', 'reflection', 'relational'],
+  maximumSourceSensitivity: 'personal',
+  excludedLifecycleStates: [
+    'quarantined',
+    'tombstoned',
+    'cogsec_blocked',
+    'revoked',
+    'superseded',
+  ],
+  budgets: {
+    maxPendingCandidates: 100,
+    maxCandidatesPerAutomataRun: 20,
+    maxSourcesPerCandidate: 8,
+    maxReviewReceiptsPerCandidate: 8,
+  },
+  reviewTriggers: ['human_subject', 'inferred_basis', 'imported_basis', 'relational_claim'],
+  companionOnlyAutoactivation: {
+    enabled: true,
+    scopes: ['companion_self'],
+    admittedClaimKinds: ['nickname', 'role', 'stable-preference'],
+    admittedBases: ['explicit'],
+    maximumSensitivity: 'personal',
+  },
+  projectionScopes: ['companion_self', 'current_author', 'explicitly_relevant_subject'],
+});
+
+function memory(id: string, overrides: Partial<PurrMemory> = {}): PurrMemory {
+  return {
+    id,
+    text: `Memory ${id}`,
+    type: 'semantic',
+    importance: 0.6,
+    confidence: 0.9,
+    emotionalValence: 0.1,
+    salience: 0.4,
+    sourceRef: 'test:biography-synthesis',
+    extractedAt: 1_700_000_000_000,
+    lastAccessed: 1_700_000_000_000,
+    accessCount: 0,
+    tags: [],
+    sensitivity: 'personal',
+    consentFlags: {},
+    provenance: { subjectContactId: CONTACT_SUBJECT.contactId },
+    ...overrides,
+  };
+}
+
+/** A memory the companion authored about itself, in its own private silo. */
+function companionMemory(id: string, overrides: Partial<PurrMemory> = {}): PurrMemory {
+  return memory(id, {
+    sourceType: 'reflection',
+    provenance: {},
+    ...overrides,
+  });
+}
+
+function targetPort(targets: readonly BiographySynthesisTarget[]): BiographySynthesisTargetPort {
+  return { listTargets: async () => targets };
+}
+
+const CONTACT_TARGET: BiographySynthesisTarget = {
+  subject: CONTACT_SUBJECT,
+  socialContext: {
+    kind: 'companion_contact_dyad',
+    companionId: COMPANION_SUBJECT.companionId,
+    contactId: CONTACT_SUBJECT.contactId,
+  },
+  depth: 'full',
+};
+
+const COMPANION_TARGET: BiographySynthesisTarget = {
+  subject: COMPANION_SUBJECT,
+  socialContext: { kind: 'companion_self', companionId: COMPANION_SUBJECT.companionId },
+  depth: 'full',
+};
+
+interface RecordingModel {
+  readonly port: LLMProviderPort;
+  readonly prompts: string[];
+}
+
+function recordingModel(responses: readonly string[]): RecordingModel {
+  const prompts: string[] = [];
+  let index = 0;
+  const port = {
+    complete: async (request: { systemPrompt?: string }) => {
+      prompts.push(request.systemPrompt ?? '');
+      const content = responses[Math.min(index, responses.length - 1)] ?? '';
+      index += 1;
+      return { content, model: 'test-model', usage: { inputTokens: 0, outputTokens: 0 } };
+    },
+  } as unknown as LLMProviderPort;
+  return { port, prompts };
+}
+
+function candidatesResponse(candidates: readonly unknown[]): string {
+  return `<biographical_candidates>${JSON.stringify(candidates)}</biographical_candidates>`;
+}
+
+function sharedLanguageCandidate(sourceMemoryIds: readonly string[], phrase = 'pier o\'clock') {
+  return {
+    kind: 'shared-language',
+    value: {
+      kind: 'shared-language',
+      schemaVersion: 1,
+      languageType: 'phrase',
+      phrase,
+      meaning: 'time to go and watch the sunset together',
+    },
+    basis: 'explicit',
+    confidence: 0.9,
+    sourceMemoryIds: [...sourceMemoryIds],
+  };
+}
+
+/** The governed context the group's authority vouched for (zu8d2). */
+const GROUP_CONTEXT_ID = 'channel-group-invented';
+
+const GROUP_TARGET: BiographySynthesisTarget = {
+  subject: COMPANION_SUBJECT,
+  socialContext: {
+    kind: 'companion_group',
+    companionId: COMPANION_SUBJECT.companionId,
+    contactIds: ['contact-a-invented', 'contact-b-invented'],
+  },
+  depth: 'full',
+  evidenceScope: { governedContextIds: [GROUP_CONTEXT_ID] },
+};
+
+function preferenceCandidate(sourceMemoryIds: readonly string[], target = 'concise explanations') {
+  return {
+    kind: 'stable-preference',
+    value: {
+      kind: 'stable-preference',
+      schemaVersion: 1,
+      domain: 'communication',
+      target,
+      polarity: 'prefers',
+    },
+    basis: 'explicit',
+    confidence: 0.9,
+    sourceMemoryIds: [...sourceMemoryIds],
+  };
+}
+
+function buildService(input: {
+  memoryStore: MemoryStorePort;
+  profileStore: InMemoryBiographicalProfileStore;
+  model: RecordingModel;
+  targets: readonly BiographySynthesisTarget[];
+  runId?: string;
+  policy?: BiographicalCandidatePolicy;
+}): BiographySynthesisService {
+  return new BiographySynthesisService({
+    memoryStore: input.memoryStore,
+    profileStore: input.profileStore,
+    llmClient: input.model.port,
+    promptRegistry: null,
+    targets: targetPort(input.targets),
+    companionSubject: COMPANION_SUBJECT,
+    candidatePolicy: () => input.policy ?? POLICY,
+    depthPolicy: () => createDefaultBiographicalDepthPolicy(),
+    now: () => NOW,
+    newRunId: () => input.runId ?? 'biography-synthesis:test-run',
+  });
+}
+
+/** POLICY with a different fleet-wide pending cap (a18qq). */
+function policyWithPendingCap(maxPendingCandidates: number): BiographicalCandidatePolicy {
+  return normalizeBiographicalCandidatePolicy({
+    ...POLICY,
+    budgets: { ...POLICY.budgets, maxPendingCandidates },
+  });
+}
+
+describe('BiographySynthesisService', () => {
+  // psfn-framework-uz787 — a group target is anchored on the companion but is
+  // not autobiography: only shared-language is n-ary, and the participant set
+  // comes from the runtime authority that vouched for the membership.
+  describe('companion_group targets (uz787)', () => {
+    function groupFixture() {
+      const memories = new InMemoryMemoryStore();
+      memories.insertMemory(companionMemory('mem-group-a', {
+        text: "The three of us started saying pier o'clock when the light goes gold.",
+        provenance: { channelId: GROUP_CONTEXT_ID },
+      }));
+      return { memories, profileStore: new InMemoryBiographicalProfileStore(() => NOW) };
+    }
+
+    it('binds the authority participant set, not anything the model names', async () => {
+      const { memories, profileStore } = groupFixture();
+      const model = recordingModel([candidatesResponse([sharedLanguageCandidate(['mem-group-a'])])]);
+
+      const telemetry = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model,
+        targets: [GROUP_TARGET],
+      }).run();
+
+      expect(telemetry.candidatesStaged).toBe(1);
+      const staged = await profileStore.listCandidates({ limit: 10 });
+      expect(staged[0]?.socialContext).toEqual(GROUP_TARGET.socialContext);
+      const claim = await profileStore.getClaim(staged[0]!.claimId);
+      expect(claim?.kind).toBe('shared-language');
+      expect(claim?.subject).toEqual(COMPANION_SUBJECT);
+      // The exact canonical set, canonically ordered, and no dyad fallback.
+      expect(claim?.participants?.map(participant => (
+        participant.kind === 'contact' ? participant.contactId : participant.kind
+      ))).toEqual(['contact-a-invented', 'contact-b-invented']);
+      expect(claim?.relatedSubject).toBeUndefined();
+      // The prompt states the set as fixed rather than inviting one.
+      expect(model.prompts[0]).toContain('contact-a-invented, contact-b-invented');
+      expect(model.prompts[0]).toContain('do not propose a different one');
+      expect(model.prompts[0]).toContain('shared-language');
+    });
+
+    it('admits only shared-language from a group scan', async () => {
+      const { memories, profileStore } = groupFixture();
+      // The synthesizer proposes a preference, which is not an n-ary kind.
+      const model = recordingModel([candidatesResponse([preferenceCandidate(['mem-group-a'])])]);
+
+      const telemetry = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model,
+        targets: [GROUP_TARGET],
+      }).run();
+
+      expect(telemetry.candidatesStaged).toBe(0);
+      expect(await profileStore.listCandidates({ limit: 10 })).toHaveLength(0);
+    });
+
+    it('keeps a group scan from overwriting the autobiography no-change cursor', async () => {
+      const { memories, profileStore } = groupFixture();
+      const model = recordingModel([candidatesResponse([sharedLanguageCandidate(['mem-group-a'])])]);
+      await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model,
+        targets: [GROUP_TARGET],
+      }).run();
+
+      // The same evidence, scanned as the companion's own autobiography, is
+      // still open: the group pass wrote its own participant-keyed cursor.
+      const selfModel = recordingModel([candidatesResponse([preferenceCandidate(['mem-group-a'])])]);
+      const selfRun = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: selfModel,
+        targets: [COMPANION_TARGET],
+        runId: 'biography-synthesis:self-run',
+      }).run();
+      expect(selfRun.targetsUnchanged).toBe(0);
+      expect(selfModel.prompts).toHaveLength(1);
+    });
+
+    // psfn-framework-zu8d2 — a group scan is anchored on the COMPANION's
+    // subject, so subject authorization alone admits her whole private silo.
+    // Group evidence must come from the group's own governed context.
+    describe('governed evidence scope (zu8d2)', () => {
+      function siloFixture() {
+        const memories = new InMemoryMemoryStore();
+        // In the group's governed context: real evidence for a group fact.
+        memories.insertMemory(companionMemory('mem-in-context', {
+          text: "The three of us started saying pier o'clock when the light goes gold.",
+          provenance: { channelId: GROUP_CONTEXT_ID },
+        }));
+        // Same silo, different governed context: a private DM the group was
+        // never part of. Authorized for the companion, evidence for nobody else.
+        memories.insertMemory(companionMemory('mem-other-context', {
+          text: 'She told me in confidence that she is leaving the job.',
+          provenance: { channelId: 'channel-private-invented' },
+        }));
+        // Same silo, no provenance at all: a solitary reflection. Unprovable
+        // provenance is not evidence, so it must fail closed.
+        memories.insertMemory(companionMemory('mem-no-context', {
+          text: 'I keep thinking about the way the harbour smelled this morning.',
+        }));
+        return { memories, profileStore: new InMemoryBiographicalProfileStore(() => NOW) };
+      }
+
+      it('offers the model only evidence from the group governed context', async () => {
+        const { memories, profileStore } = siloFixture();
+        const model = recordingModel([
+          candidatesResponse([sharedLanguageCandidate(['mem-in-context'])]),
+        ]);
+
+        const telemetry = await buildService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          model,
+          targets: [GROUP_TARGET],
+        }).run();
+
+        expect(telemetry.sourcesAdmitted).toBe(1);
+        const prompt = model.prompts[0] ?? '';
+        expect(prompt).toContain('mem-in-context');
+        expect(prompt).not.toContain('mem-other-context');
+        expect(prompt).not.toContain('mem-no-context');
+        expect(prompt).not.toContain('leaving the job');
+        expect(prompt).not.toContain('harbour smelled');
+        expect(telemetry.candidatesStaged).toBe(1);
+      });
+
+      it('refuses a candidate that cites out-of-context evidence', async () => {
+        const { memories, profileStore } = siloFixture();
+        // The model cites a memory it was never shown: the source binding must
+        // reject it rather than let a silo row back in through the response.
+        const model = recordingModel([
+          candidatesResponse([sharedLanguageCandidate(['mem-other-context'])]),
+        ]);
+
+        const telemetry = await buildService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          model,
+          targets: [GROUP_TARGET],
+        }).run();
+
+        expect(telemetry.candidatesStaged).toBe(0);
+        expect(await profileStore.listCandidates({ limit: 10 })).toHaveLength(0);
+      });
+
+      it('still scans the whole silo for the companion own autobiography', async () => {
+        const { memories, profileStore } = siloFixture();
+        const model = recordingModel([
+          candidatesResponse([preferenceCandidate(['mem-in-context'])]),
+        ]);
+
+        const telemetry = await buildService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          model,
+          targets: [COMPANION_TARGET],
+        }).run();
+
+        // Subject-scoped targets are untouched by zu8d2: all three rows.
+        expect(telemetry.sourcesAdmitted).toBe(3);
+      });
+
+      // The bead's own acceptance shape: a FAKE group-membership authority
+      // wired end to end, proving the silo-wide read is gone rather than that
+      // one hand-built target happens to carry a scope.
+      it('excludes silo-wide evidence end to end from a wired membership authority', async () => {
+        const { memories, profileStore } = siloFixture();
+        const model = recordingModel([
+          candidatesResponse([sharedLanguageCandidate(['mem-in-context'])]),
+        ]);
+        const targets = createBiographySynthesisTargetPort({
+          contactStore: {
+            getByTrustLevel: vi.fn(async () => []),
+            countVerifiedIdentityLinks: vi.fn(async () => 0),
+          } as unknown as ContactStorePort,
+          companionSubject: COMPANION_SUBJECT,
+          depthPolicy: () => createDefaultBiographicalDepthPolicy(),
+          groupMembershipAuthority: {
+            listVerifiedGroups: async () => [{
+              contextId: GROUP_CONTEXT_ID,
+              governanceAuthorityRef: 'participation-authority:group-invented',
+              verified: true,
+              contactIds: ['contact-a-invented', 'contact-b-invented'],
+            }],
+          },
+        });
+        const listed = await targets.listTargets(10);
+        const groupTarget = listed.find(
+          target => target.socialContext.kind === 'companion_group',
+        );
+        expect(groupTarget).toBeDefined();
+
+        const telemetry = await new BiographySynthesisService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          llmClient: model.port,
+          promptRegistry: null,
+          targets: targetPort([groupTarget!]),
+          companionSubject: COMPANION_SUBJECT,
+          candidatePolicy: () => POLICY,
+          depthPolicy: () => createDefaultBiographicalDepthPolicy(),
+          now: () => NOW,
+          newRunId: () => 'biography-synthesis:authority-run',
+        }).run();
+
+        expect(telemetry.sourcesAdmitted).toBe(1);
+        const prompt = model.prompts[0] ?? '';
+        expect(prompt).toContain('mem-in-context');
+        expect(prompt).not.toContain('mem-other-context');
+        expect(prompt).not.toContain('mem-no-context');
+      });
+
+      it('gives two same-membership groups separate no-change cursors', async () => {
+        const { memories, profileStore } = siloFixture();
+        memories.insertMemory(companionMemory('mem-second-group', {
+          text: "In the other chat the three of us say 'harbour light' for the same hour.",
+          provenance: { channelId: 'channel-second-group-invented' },
+        }));
+        const secondGroupTarget: BiographySynthesisTarget = {
+          ...GROUP_TARGET,
+          evidenceScope: { governedContextIds: ['channel-second-group-invented'] },
+        };
+        const model = recordingModel([
+          candidatesResponse([sharedLanguageCandidate(['mem-in-context'])]),
+          candidatesResponse([
+            sharedLanguageCandidate(['mem-second-group'], 'harbour light'),
+          ]),
+        ]);
+
+        await new BiographySynthesisService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          llmClient: model.port,
+          promptRegistry: null,
+          targets: targetPort([GROUP_TARGET, secondGroupTarget]),
+          companionSubject: COMPANION_SUBJECT,
+          candidatePolicy: () => POLICY,
+          depthPolicy: () => createDefaultBiographicalDepthPolicy(),
+          now: () => NOW,
+          newRunId: () => 'biography-synthesis:two-groups',
+        }).run();
+
+        // Same participant set, two governed contexts, two bodies of evidence:
+        // a shared cursor would make each pass reopen the other one forever.
+        const second = await buildService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          model: recordingModel([candidatesResponse([])]),
+          targets: [GROUP_TARGET, secondGroupTarget],
+          runId: 'biography-synthesis:two-groups-again',
+        }).run();
+        expect(second.targetsUnchanged).toBe(2);
+      });
+
+      it('fails a group target that carries no governed evidence scope', async () => {
+        const { memories, profileStore } = siloFixture();
+        const model = recordingModel([
+          candidatesResponse([sharedLanguageCandidate(['mem-in-context'])]),
+        ]);
+        const { evidenceScope: _unscoped, ...unscopedTarget } = GROUP_TARGET;
+
+        const telemetry = await buildService({
+          memoryStore: memories.asPort(),
+          profileStore,
+          model,
+          targets: [unscopedTarget],
+        }).run();
+
+        // Fail closed: no model call, no candidate, and the failure is counted.
+        expect(telemetry.targetsFailed).toBe(1);
+        expect(model.prompts).toHaveLength(0);
+        expect(telemetry.candidatesStaged).toBe(0);
+      });
+    });
+  });
+
+  // psfn-framework-a18qq — under a saturated human-review backlog the pending
+  // cap threw in `writeCandidate`, i.e. AFTER the model call. Every tick then
+  // re-synthesized the same evidence and threw again. The pass now reads the
+  // pending budget first and declines to spend anything it cannot stage.
+  describe('pending candidate budget (a18qq)', () => {
+    function fixture() {
+      const memories = new InMemoryMemoryStore();
+      memories.insertMemory(memory('mem-contact-a', {
+        text: 'They asked for short answers again today.',
+      }));
+      memories.insertMemory(companionMemory('mem-self-a', {
+        text: 'I keep choosing concise explanations when I write.',
+        provenance: {},
+      }));
+      return { memories, profileStore: new InMemoryBiographicalProfileStore(() => NOW) };
+    }
+
+    it('makes no model call when the pending cap is already full', async () => {
+      const { memories, profileStore } = fixture();
+      // Fill the budget with one real staged candidate.
+      const first = recordingModel([candidatesResponse([preferenceCandidate(['mem-contact-a'])])]);
+      const firstRun = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: first,
+        targets: [CONTACT_TARGET],
+      }).run();
+      expect(firstRun.candidatesStaged).toBe(1);
+      expect(firstRun.pendingBudgetExhausted).toBe(false);
+      expect(await profileStore.countPendingCandidates()).toBe(1);
+
+      // A cap of one is now exhausted. A DIFFERENT target with unseen evidence
+      // would otherwise be synthesized; the pass must not spend a model call.
+      const second = recordingModel([candidatesResponse([preferenceCandidate(['mem-self-a'])])]);
+      const blocked = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: second,
+        targets: [COMPANION_TARGET],
+        runId: 'biography-synthesis:blocked-run',
+        policy: policyWithPendingCap(1),
+      }).run();
+
+      expect(second.prompts).toHaveLength(0);
+      expect(blocked.pendingBudgetExhausted).toBe(true);
+      expect(blocked.outcome).toBe('complete');
+      expect(blocked.candidatesStaged).toBe(0);
+      expect(blocked.targetsScanned).toBe(0);
+      expect(blocked.targetsFailed).toBe(0);
+      // Nothing was staged, so the durable cursor never advanced: the target is
+      // still open for the pass that runs once the backlog drains.
+      expect(await profileStore.countPendingCandidates()).toBe(1);
+    });
+
+    it('resumes synthesis as soon as the backlog leaves headroom', async () => {
+      const { memories, profileStore } = fixture();
+      const first = recordingModel([candidatesResponse([preferenceCandidate(['mem-contact-a'])])]);
+      await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: first,
+        targets: [CONTACT_TARGET],
+      }).run();
+      expect(await profileStore.countPendingCandidates()).toBe(1);
+
+      // One slot of headroom is enough: the gate is headroom-driven, never a
+      // latch that stays closed once tripped.
+      const second = recordingModel([candidatesResponse([preferenceCandidate(['mem-self-a'])])]);
+      const resumed = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: second,
+        targets: [COMPANION_TARGET],
+        runId: 'biography-synthesis:resumed-run',
+        policy: policyWithPendingCap(2),
+      }).run();
+
+      expect(second.prompts).toHaveLength(1);
+      expect(resumed.pendingBudgetExhausted).toBe(false);
+      expect(resumed.candidatesStaged).toBe(1);
+      expect(await profileStore.countPendingCandidates()).toBe(2);
+    });
+
+    it('keeps writeCandidate as the authority: the advisory read never admits', async () => {
+      const { memories, profileStore } = fixture();
+      const first = recordingModel([candidatesResponse([preferenceCandidate(['mem-contact-a'])])]);
+      await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: first,
+        targets: [CONTACT_TARGET],
+      }).run();
+
+      // The advisory read says there is headroom, but the authoritative check
+      // inside writeCandidate re-counts under the capacity lock and refuses.
+      expect(await profileStore.countPendingCandidates()).toBe(1);
+      const second = recordingModel([candidatesResponse([preferenceCandidate(['mem-self-a'])])]);
+      const racy = await buildService({
+        memoryStore: memories.asPort(),
+        profileStore,
+        model: second,
+        targets: [COMPANION_TARGET],
+        runId: 'biography-synthesis:racy-run',
+        // Headroom of one by the advisory read, but the store's own policy…
+        policy: policyWithPendingCap(2),
+      }).run();
+      expect(racy.candidatesStaged).toBe(1);
+
+      // …a third pass under the now-exhausted cap declines before the model,
+      // and even a caller that skipped the pre-check would still be refused.
+      await expect(profileStore.writeCandidate({
+        claim: {
+          subject: COMPANION_SUBJECT,
+          kind: 'nickname',
+          value: { kind: 'nickname', nickname: 'Moth', scope: 'self' },
+          basis: 'explicit',
+          confidence: 1,
+          sources: [{
+            ref: 'memory:mem-self-a',
+            revision: '2026-02-01T00:00:00.000Z',
+            evidenceDigest: 'b'.repeat(64),
+            sensitivityAtProjection: 'personal',
+            subjectEvidenceDigest: 'b'.repeat(64),
+            consentFingerprint: 'b'.repeat(64),
+          }],
+          now: NOW,
+        },
+        automataRunId: 'biography-synthesis:direct-write',
+        automataAuthorityRef: 'automata:test',
+        policy: policyWithPendingCap(2),
+      })).rejects.toThrow('biography candidate pending budget exhausted');
+    });
+  });
+
+  it('stages typed candidates from sources in different sessions without activating them', async () => {
+    const memories = new InMemoryMemoryStore();
+    // Two independent silos-in-time: different sessions and channels, one
+    // canonical contact. Collection is subject-scoped, not session-scoped.
+    memories.insertMemory(memory('mem-session-a', {
+      text: 'They asked for short answers again today.',
+      provenance: { subjectContactId: CONTACT_SUBJECT.contactId, channelId: 'channel-a' },
+    }));
+    memories.insertMemory(memory('mem-session-b', {
+      type: 'episodic',
+      text: 'In a different room they repeated the same request.',
+      provenance: { subjectContactId: CONTACT_SUBJECT.contactId, channelId: 'channel-b' },
+    }));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    const model = recordingModel([
+      candidatesResponse([preferenceCandidate(['mem-session-a', 'mem-session-b'])]),
+    ]);
+
+    const telemetry = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model,
+      targets: [CONTACT_TARGET],
+    }).run();
+
+    expect(telemetry.candidatesStaged).toBe(1);
+    const staged = await profileStore.listCandidates({ limit: 10 });
+    expect(staged).toHaveLength(1);
+    expect(staged[0]?.stage).toBe('automata_synthesis');
+    expect(staged[0]?.socialContext).toEqual(CONTACT_TARGET.socialContext);
+    expect(staged[0]?.rationale).toBe('new_subject_claim');
+    // Evidence from two sessions coalesced into one candidate's source set.
+    const claim = await profileStore.getClaim(staged[0]!.claimId);
+    expect(claim?.status).toBe('candidate');
+    expect(claim?.sources.map(source => source.ref).sort()).toEqual([
+      'memory:mem-session-a',
+      'memory:mem-session-b',
+    ]);
+    // Nothing was activated: the portable projection sees no active claim.
+    expect(await profileStore.listClaims({ status: 'active' })).toHaveLength(0);
+  });
+
+  it('never lets an above-ceiling source reach the prompt, a candidate, or telemetry', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('mem-admissible', {
+      text: 'They prefer concise explanations.',
+    }));
+    memories.insertMemory(memory('mem-intimate', {
+      text: 'SECRET-INTIMATE-BODY',
+      sensitivity: 'intimate',
+    }));
+    memories.insertMemory(memory('mem-emotional-type', {
+      type: 'emotional',
+      text: 'SECRET-EMOTIONAL-BODY',
+    }));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    // The synthesizer tries to cite the excluded sources anyway.
+    const model = recordingModel([
+      candidatesResponse([
+        preferenceCandidate(['mem-admissible']),
+        preferenceCandidate(['mem-intimate'], 'intimate detail'),
+        preferenceCandidate(['mem-emotional-type'], 'emotional detail'),
+      ]),
+    ]);
+
+    const telemetry = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model,
+      targets: [CONTACT_TARGET],
+    }).run();
+
+    const prompt = model.prompts.join('\n');
+    expect(prompt).toContain('mem-admissible');
+    expect(prompt).not.toContain('SECRET-INTIMATE-BODY');
+    expect(prompt).not.toContain('SECRET-EMOTIONAL-BODY');
+    expect(prompt).not.toContain('mem-intimate');
+    expect(prompt).not.toContain('mem-emotional-type');
+    expect(telemetry.sourcesWithheldByPolicy).toBe(2);
+
+    const staged = await profileStore.listCandidates({ limit: 10 });
+    expect(staged).toHaveLength(1);
+    const claim = await profileStore.getClaim(staged[0]!.claimId);
+    expect(claim?.sources.map(source => source.ref)).toEqual(['memory:mem-admissible']);
+    // Candidates citing an unavailable source are withheld, not admitted.
+    expect(telemetry.candidatesWithheld).toBe(2);
+    // Telemetry is content-free: no ref, id, or body of any excluded source.
+    const serializedTelemetry = JSON.stringify(telemetry);
+    expect(serializedTelemetry).not.toContain('mem-intimate');
+    expect(serializedTelemetry).not.toContain('SECRET');
+    expect(serializedTelemetry).not.toContain(CONTACT_SUBJECT.contactId);
+  });
+
+  it('keeps a companion silo out of a contact scan and a contact silo out of a self scan', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(companionMemory('mem-companion-private', {
+      text: 'COMPANION-ONLY-BODY',
+    }));
+    memories.insertMemory(memory('mem-contact', { text: 'CONTACT-ONLY-BODY' }));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    const model = recordingModel([candidatesResponse([])]);
+
+    await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model,
+      targets: [CONTACT_TARGET],
+    }).run();
+    expect(model.prompts.join('\n')).toContain('CONTACT-ONLY-BODY');
+    expect(model.prompts.join('\n')).not.toContain('COMPANION-ONLY-BODY');
+
+    const selfModel = recordingModel([candidatesResponse([])]);
+    await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: selfModel,
+      targets: [COMPANION_TARGET],
+    }).run();
+    expect(selfModel.prompts.join('\n')).toContain('COMPANION-ONLY-BODY');
+    expect(selfModel.prompts.join('\n')).not.toContain('CONTACT-ONLY-BODY');
+  });
+
+  it('is idempotent across a restart on unchanged sources', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('mem-stable'));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    const response = candidatesResponse([preferenceCandidate(['mem-stable'])]);
+
+    const first = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([response]),
+      targets: [CONTACT_TARGET],
+      runId: 'biography-synthesis:run-1',
+    }).run();
+    // A restart gives the pass a new run id. The durable stage cursor survives
+    // it, so the unchanged silo is skipped before any model call: idempotence
+    // is now free rather than paid for with a duplicate synthesis.
+    const restartModel = recordingModel([response]);
+    const second = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: restartModel,
+      targets: [CONTACT_TARGET],
+      runId: 'biography-synthesis:run-2',
+    }).run();
+
+    expect(first.candidatesStaged).toBe(1);
+    expect(first.targetsUnchanged).toBe(0);
+    expect(second.candidatesStaged).toBe(0);
+    expect(second.targetsUnchanged).toBe(1);
+    expect(second.outcome).toBe('complete');
+    expect(restartModel.prompts).toEqual([]);
+    expect(await profileStore.listCandidates({ limit: 10 })).toHaveLength(1);
+  });
+
+  it('resumes behind policy-empty pages after restart and new head arrivals', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('old-identity', { extractedAt: 1 }));
+    memories.insertMemory(memory('recent-b', { extractedAt: 2, type: 'emotional' }));
+    memories.insertMemory(memory('recent-c', { extractedAt: 2, type: 'emotional' }));
+    memories.insertMemory(memory('foreign', {
+      extractedAt: 1, provenance: { subjectContactId: 'other-contact' },
+    }));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    const model = recordingModel([candidatesResponse([preferenceCandidate(['old-identity'])])]);
+    const policy = normalizeBiographicalCandidatePolicy({
+      ...POLICY, budgets: { ...POLICY.budgets, maxSourcesPerCandidate: 1, maxCandidatesPerAutomataRun: 2 },
+    });
+    const run = () => buildService({
+      memoryStore: memories.asPort(), profileStore, model, policy, targets: [CONTACT_TARGET],
+    }).run();
+    expect(await run()).toMatchObject({ sourcesScanned: 2, sourcesAdmitted: 0 });
+    expect(model.prompts).toEqual([]);
+    memories.insertMemory(memory('new-head', { extractedAt: 3, type: 'emotional' }));
+    expect(await run()).toMatchObject({ sourcesScanned: 1, candidatesStaged: 1 });
+    expect(model.prompts).toHaveLength(1);
+    expect(model.prompts[0]).toContain('old-identity');
+    expect(model.prompts[0]).not.toContain('foreign');
+    // The next cycle reuses page attestations, including the old source after
+    // a changed boundary, without paying again for identical admitted inputs.
+    await run();
+    expect(await run()).toMatchObject({ targetsUnchanged: 1, candidatesStaged: 0 });
+    expect(model.prompts).toHaveLength(1);
+  });
+
+  it('retries the same source page when candidate staging fails', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('old', { extractedAt: 1 }));
+    memories.insertMemory(memory('new', { extractedAt: 2 }));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    const model = recordingModel([candidatesResponse([preferenceCandidate(['new'])])]);
+    const policy = normalizeBiographicalCandidatePolicy({
+      ...POLICY, budgets: { ...POLICY.budgets, maxSourcesPerCandidate: 1, maxCandidatesPerAutomataRun: 1 },
+    });
+    const options = { memoryStore: memories.asPort(), profileStore, model, policy, targets: [CONTACT_TARGET] };
+    vi.spyOn(profileStore, 'writeCandidate').mockRejectedValueOnce(new Error('staging unavailable'));
+    await buildService(options).run();
+    expect(await buildService(options).run()).toMatchObject({ candidatesStaged: 1 });
+    expect(model.prompts).toHaveLength(2);
+    expect(model.prompts.every(prompt => prompt.includes('Memory new') && !prompt.includes('Memory old'))).toBe(true);
+    await buildService(options).run();
+    expect(model.prompts[2]).toContain('Memory old');
+    expect(model.prompts[2]).not.toContain('Memory new');
+  });
+
+  it('re-opens a target whose admitted evidence changed, and yields at a safe boundary', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('mem-stable'));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+    const response = candidatesResponse([preferenceCandidate(['mem-stable'])]);
+    await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([response]),
+      targets: [CONTACT_TARGET],
+      runId: 'biography-synthesis:run-1',
+    }).run();
+
+    // New admitted evidence changes the digest, so the cursor no longer holds.
+    memories.insertMemory(memory('mem-new'));
+    const changedModel = recordingModel([
+      candidatesResponse([preferenceCandidate(['mem-stable', 'mem-new'])]),
+    ]);
+    const changed = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: changedModel,
+      targets: [CONTACT_TARGET],
+      runId: 'biography-synthesis:run-3',
+    }).run();
+    expect(changed.targetsUnchanged).toBe(0);
+    expect(changedModel.prompts).toHaveLength(1);
+
+    // A yield at the first safe boundary stops the pass with work remaining and
+    // reports it, rather than silently dropping the untouched targets.
+    const yielded = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([response, response]),
+      targets: [CONTACT_TARGET, COMPANION_TARGET],
+      runId: 'biography-synthesis:run-4',
+    }).run({ onSafeBoundary: async () => 'yield' });
+    expect(yielded.outcome).toBe('yield');
+    expect(yielded.targetsRemaining).toBe(1);
+  });
+
+  it('supersedes rather than duplicates when the same claim recurs over drifted sources', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('mem-first'));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+
+    await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([candidatesResponse([preferenceCandidate(['mem-first'])])]),
+      targets: [CONTACT_TARGET],
+      runId: 'biography-synthesis:run-1',
+    }).run();
+
+    memories.insertMemory(memory('mem-second', { text: 'Same preference, said again.' }));
+    const second = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([
+        candidatesResponse([preferenceCandidate(['mem-first', 'mem-second'])]),
+      ]),
+      targets: [CONTACT_TARGET],
+      runId: 'biography-synthesis:run-2',
+    }).run();
+
+    expect(second.candidatesSuperseded).toBe(1);
+    const all = await profileStore.listCandidates({ limit: 10 });
+    expect(all).toHaveLength(2);
+    const superseded = all.find(record => record.stage === 'superseded');
+    const open = all.find(record => record.stage === 'automata_synthesis');
+    expect(superseded).toBeDefined();
+    expect(open?.supersedesCandidateId).toBe(superseded?.id);
+    expect(open?.rationale).toBe('recurring_evidence');
+    // The predecessor's receipts survive: history is append-only.
+    expect(superseded?.receipts.some(receipt => receipt.authority === 'automata')).toBe(true);
+    expect(
+      superseded?.receipts.some(receipt => receipt.reason === 'owner_policy_supersession'),
+    ).toBe(true);
+  });
+
+  it('keeps contradicting readings of the same evidence as separate candidates', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(memory('mem-ambiguous'));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+
+    const telemetry = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([candidatesResponse([
+        preferenceCandidate(['mem-ambiguous'], 'concise explanations'),
+        {
+          ...preferenceCandidate(['mem-ambiguous'], 'concise explanations'),
+          value: {
+            kind: 'stable-preference',
+            schemaVersion: 1,
+            domain: 'communication',
+            target: 'concise explanations',
+            polarity: 'avoids',
+          },
+        },
+      ])]),
+      targets: [CONTACT_TARGET],
+    }).run();
+
+    expect(telemetry.candidatesStaged).toBe(2);
+    const staged = await profileStore.listCandidates({ limit: 10 });
+    expect(new Set(staged.map(record => record.claimDigest)).size).toBe(2);
+    expect(staged.every(record => record.stage === 'automata_synthesis')).toBe(true);
+  });
+
+  it('refuses a dyadic kind in a companion self scan', async () => {
+    const memories = new InMemoryMemoryStore();
+    memories.insertMemory(companionMemory('mem-self'));
+    const profileStore = new InMemoryBiographicalProfileStore(() => NOW);
+
+    const telemetry = await buildService({
+      memoryStore: memories.asPort(),
+      profileStore,
+      model: recordingModel([candidatesResponse([{
+        kind: 'relationship',
+        value: { kind: 'relationship', relationshipType: 'friend' },
+        basis: 'explicit',
+        confidence: 0.9,
+        sourceMemoryIds: ['mem-self'],
+      }])]),
+      targets: [COMPANION_TARGET],
+    }).run();
+
+    expect(telemetry.candidatesStaged).toBe(0);
+    expect(telemetry.candidatesWithheld).toBe(1);
+    expect(await profileStore.listCandidates({ limit: 10 })).toHaveLength(0);
+  });
+});

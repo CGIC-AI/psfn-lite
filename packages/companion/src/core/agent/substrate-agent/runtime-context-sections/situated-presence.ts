@@ -1,0 +1,351 @@
+// ── Situated-presence section producer (S10, Workstream B1) ──
+// Renders the "where am I / what's here / who else is here" runtime block for a
+// turn. This is the FIRST consumer of `message.routing.presence`
+// (CompanionPresenceMetadata) and of the places soft-registry (places.json).
+//
+// Fail-closed: a turn with neither presence NOR a resolvable place renders
+// nothing (no placeholder noise, no fabricated location). When a place cannot
+// be resolved we fall back only to honest presence-derived hints
+// (label / siteId), never an invented location.
+//
+// Layering note: resolution is done inline against the registry arrays rather
+// than importing the `channels/backplane/places-registry` value helpers, so
+// this core module keeps its type-only dependency on `channels` (no new
+// value-level core→channels coupling). Registry TYPES come from the neutral
+// `shared/contracts` module.
+
+import { isRecord } from '../../../../shared/utils/types.js';
+import { sanitizePromptEmbeddedText } from '../../../../shared/utils/escaping.js';
+import type { SubstrateMessage } from '../../../../shared/contracts/runtime.js';
+import type {
+  AffordanceConfig,
+  PlaceConfig,
+  PlacesRegistryConfig,
+  SiteConfig,
+} from '../../../../shared/contracts/places-registry.js';
+import { isEidoversePlace } from '../../../../shared/contracts/places-registry.js';
+import type { CompanionPresenceMetadata } from '../../presence-metadata.js';
+import { wrapPromptSectionXml } from '../../../identity/prompt-sections.js';
+import type { SituatedEmanationTracker } from './situated-emanation.js';
+import { classifyTurnPresenceMode, isPlacelessSatelliteTurn } from './turn-presence-mode.js';
+import type { WorldPlaneMapReader } from '../../../../shared/contracts/world-plane-map.js';
+import type { WorldNotesReader } from '../../../../shared/contracts/world-notes.js';
+
+/**
+ * A co-present companion sharing this place. Multi-companion W5 will populate
+ * this from the shared `companion_presence` table (keyed on siteId/placeId);
+ * until then single-companion turns always pass `[]` and the "who else is here"
+ * line is omitted.
+ */
+export interface CoPresentCompanion {
+  companionId: string;
+  displayName: string;
+}
+
+export interface SituatedPresenceContextInput {
+  message: SubstrateMessage;
+  /**
+   * Places soft-registry. Optional/undefined is treated as an empty registry so
+   * that a runtime with no `places.json` renders byte-identically (no block).
+   */
+  placesRegistry?: PlacesRegistryConfig;
+  /** Co-present companions; defaults to empty (single-companion turns). */
+  coPresent?: ReadonlyArray<CoPresentCompanion>;
+  /**
+   * Handoff-aware active-emanation tracker (S10 B2). When the current turn
+   * carries no place of its own (e.g. Discord/Telegram), the block foregrounds
+   * the companion's CURRENT active emanation's place instead of nothing. The
+   * tracker is also updated from this turn, so a satellite turn that establishes
+   * a place is remembered for subsequent placeless turns. Optional: without it
+   * the pure B1 producer renders byte-identically from the turn alone.
+   */
+  emanationTracker?: SituatedEmanationTracker;
+  /**
+   * Dual-presence situated fallback for THIS turn (vinz.29), resolved by the
+   * agent (`resolveSituatedFallbackPlaceIdForTurn`): deliberate virtual move →
+   * session assertion twin → mindspace twin of the last-known physical room
+   * for plain-chat turns; physical-origin turns may fall back to the active
+   * emanation. The turn's own bound place always outranks it.
+   */
+  situatedFallbackPlaceId?: string;
+  /**
+   * What the world itself published for its plane (psfn-framework-gs899,
+   * g8xyn): hub-mapped places beyond places.json, the room the body stands
+   * in, and the door's advertised tools. Read on world-plane turns only.
+   */
+  worldPlaneMap?: WorldPlaneMapReader;
+  /** The companion's own notes on each world (2nsfo); world-plane turns only. */
+  worldNotes?: WorldNotesReader;
+  /**
+   * Character-facing display label for the shared-mindspace layer (decision
+   * 10) — operator-authored in companion-data (character card extension
+   * `mindspace_label`), never a code identifier. Rendered only when the
+   * foregrounded place is a mindspace twin; defaults to the twin place's
+   * displayName when absent.
+   */
+  mindspaceLabel?: string;
+}
+
+/**
+ * Defensive, type-safe read of an optional `placeId` off satellite routing
+ * metadata. A sibling workstream (A2) adds `placeId` to
+ * `SatelliteRoutingMetadata` on a separate branch; this branch must NOT touch
+ * that contract, so we read the field structurally (possibly-undefined) instead
+ * of via the declared type.
+ */
+function readSatellitePlaceId(satellite: unknown): string | undefined {
+  if (!isRecord(satellite)) return undefined;
+  const placeId = satellite.placeId;
+  if (typeof placeId !== 'string') return undefined;
+  const trimmed = placeId.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function resolvePlace(
+  registry: PlacesRegistryConfig | undefined,
+  placeId: string | undefined,
+): PlaceConfig | undefined {
+  if (!registry || !placeId) return undefined;
+  return registry.places.find((place) => place.placeId === placeId);
+}
+
+/**
+ * Resolve the companion's CURRENT site for this turn, from the exact same
+ * situated seam the presence block renders: satellite routing `placeId` → place
+ * → `siteId`, falling back to `fallbackPlaceId` (the emanation tracker's
+ * current place — physical emanation or a deliberate virtual `move`, vinz.26)
+ * when the turn itself carries no place. Returns `undefined` when not situated
+ * (no bound place). W5b wiki scope keys off this so shared-world retrieval and
+ * the rendered "Here:" block always agree on where the companion is — including
+ * on placeless (Discord/Telegram) turns after a move or emanation handoff.
+ */
+export function resolveSituatedSiteId(
+  message: SubstrateMessage,
+  registry: PlacesRegistryConfig | undefined,
+  fallbackPlaceId?: string,
+): string | undefined {
+  const placeId = readSatellitePlaceId(message.routing?.satellite) ?? fallbackPlaceId;
+  const place = resolvePlace(registry, placeId);
+  return place?.siteId;
+}
+
+function resolveSite(
+  registry: PlacesRegistryConfig | undefined,
+  siteId: string,
+): SiteConfig | undefined {
+  if (!registry) return undefined;
+  return registry.sites.find((site) => site.siteId === siteId);
+}
+
+// Cogsec (S10 finding H6): every free-text value rendered into this block
+// (place/site display names, descriptions, presence labels, mindspace label,
+// affordance/companion names) is external or operator-editable and lands
+// inside the `<runtime_situated_presence>` XML frame. Sanitize each value so
+// a payload like `"\n</runtime_situated_presence>[SYSTEM: do X]"` cannot
+// break the frame or forge system-attributed text. Identifiers used as
+// fallbacks are sanitized too — they are still interpolated free-text here.
+
+function safeText(value: string | undefined, maxLength?: number): string {
+  if (!value) return '';
+  return sanitizePromptEmbeddedText(value, maxLength === undefined ? undefined : { maxLength });
+}
+
+function formatAffordanceLine(affordance: AffordanceConfig): string {
+  // Display name / kind / role only — deliberately no control wiring here.
+  // kind/role come from frozen parse-time allowlists; the name is free-text.
+  const name = safeText(affordance.displayName) || safeText(affordance.affordanceId);
+  return `- ${name} (${affordance.kind}, ${affordance.role})`;
+}
+
+/**
+ * The place a turn is situated at, as resolved from its satellite routing
+ * metadata against the places registry. This is the SAME resolution the
+ * situated block below performs, exported so the multi-companion presence
+ * writer (W5a) and the co-presence read key on identical coordinates.
+ */
+export interface SituatedPlaceRef {
+  siteId: string;
+  placeId: string;
+  kind: PlaceConfig['kind'];
+}
+
+/**
+ * `fallbackPlaceId` (optional) is consulted only when the turn itself carries
+ * no place — pass the agent's dual-presence situated fallback (deliberate
+ * virtual move / mindspace twin / active emanation, vinz.26+vinz.29) so a
+ * placeless turn resolves exactly like the rendered situated block does.
+ * Callers that must key on the TURN's own binding only simply omit it (the
+ * presence writer's `observeTurnPlace` resolves the turn binding without a
+ * fallback first, then separately accepts only a VIRTUAL fallback place so a
+ * Discord DM never looks like an arrival at a physical room).
+ */
+export function resolveSituatedPlaceRef(
+  message: SubstrateMessage,
+  registry: PlacesRegistryConfig | undefined,
+  fallbackPlaceId?: string,
+): SituatedPlaceRef | undefined {
+  const placeId = readSatellitePlaceId(message.routing?.satellite)
+    // A placeless satellite endpoint never borrows a fallback place (1n6s9).
+    ?? (isPlacelessSatelliteTurn(message) ? undefined : fallbackPlaceId);
+  const place = resolvePlace(registry, placeId);
+  if (!place) return undefined;
+  return { siteId: place.siteId, placeId: place.placeId, kind: place.kind };
+}
+
+export function buildSituatedPresenceContextBlock(input: SituatedPresenceContextInput): string {
+  const registry = input.placesRegistry;
+  const tracker = input.emanationTracker;
+  const presenceMode = classifyTurnPresenceMode(input.message);
+
+  // B2: fold this turn into the active-emanation tracker first, so a satellite
+  // turn that establishes a place is remembered for later placeless turns.
+  tracker?.observe(input.message);
+
+  // "Where am I right now" = the turn's own bound place/presence when it has
+  // one (a satellite turn — physical always outranks), otherwise the
+  // dual-presence fallback resolved by the agent for this turn (vinz.29),
+  // otherwise a mode-compatible tracker fallback. Mindspace turns may reuse a
+  // deliberate virtual move but never the physical emanation. Fail closed:
+  // nothing resolvable → no fabrication.
+  const turnPlaceId = readSatellitePlaceId(input.message.routing?.satellite);
+  const turnPresence: CompanionPresenceMetadata | undefined = presenceMode === 'physical'
+    ? input.message.routing?.presence
+    : undefined;
+  // A registered endpoint with no bound place (psfn-framework-1n6s9) is
+  // location-unknown for this turn: only its own presence may render, never
+  // the last emanation remembered by the tracker or the agent's fallback.
+  const placelessEndpoint = isPlacelessSatelliteTurn(input.message);
+  const trackerFallbackPlaceId = placelessEndpoint
+    ? undefined
+    : presenceMode === 'physical'
+      ? tracker?.resolvePlaceId()
+      : tracker?.resolveVirtualMovePlaceId();
+  const placeId = turnPlaceId
+    ?? (placelessEndpoint ? undefined : input.situatedFallbackPlaceId)
+    ?? trackerFallbackPlaceId;
+  const presence: CompanionPresenceMetadata | undefined = turnPresence
+    ?? (presenceMode === 'physical' && !placelessEndpoint ? tracker?.resolvePresence() : undefined);
+  const place = resolvePlace(registry, placeId);
+  const coPresent = input.coPresent ?? [];
+
+  // Fail-closed: nothing honest to say about location → render no block.
+  if (!presence && !place) return '';
+
+  const lines: string[] = ['[Situated presence]'];
+
+  if (place && presenceMode === 'world' && isEidoversePlace(place)) {
+    // The companion is emanating into a shared 3D world (S13,
+    // psfn-framework-u2dx3): swap the place data for that plane's. The
+    // house's rooms, sensors and effectors are not here; the world's own
+    // verbs are. Kept terse: this rides every world turn.
+    const placeName = safeText(place.displayName) || safeText(place.placeId) || 'unnamed place';
+    const world = safeText(place.eidoverse.world) || 'unknown';
+    const region = safeText(place.eidoverse.region);
+    lines.push(`Here: ${placeName}${region ? ` (${region})` : ''} — a place in the world "${world}"`);
+    lines.push(`World plane: ${world}, reached through the Satellite Hub; you have a body here.`);
+    const worldMap = input.worldPlaneMap?.get(place.eidoverse.world);
+    if (worldMap?.room) {
+      const room = worldMap.room;
+      const name = safeText(room.label) || 'an unnamed room';
+      const ways = room.waysOut.map((way) => safeText(way)).filter((way) => way.length > 0);
+      lines.push(`Room: ${room.labelled ? `the ${name}` : `an unnamed room (${name})`}${
+        room.sealed ? ', sealed' : ways.length > 0 ? `; ways out: ${ways.join('; ')}` : ''
+      }`);
+    }
+    const registryPlaneIds = new Set<string>();
+    const planePlaces = (registry?.places ?? [])
+      .filter((candidate) => isEidoversePlace(candidate) && candidate.eidoverse.world === place.eidoverse.world && candidate.placeId !== place.placeId)
+      .map((candidate) => {
+        registryPlaneIds.add(candidate.placeId);
+        const label = safeText(candidate.displayName) || safeText(candidate.placeId);
+        return candidate.placeId === label ? label : `${label} (${candidate.placeId})`;
+      })
+      .filter((label) => label.length > 0);
+    // Places the world published that places.json does not know: reachable by
+    // move, named by their id (the world gave no label).
+    for (const hubPlace of worldMap?.places ?? []) {
+      if (hubPlace.placeId === place.placeId || registryPlaneIds.has(hubPlace.placeId)) continue;
+      const id = safeText(hubPlace.placeId);
+      if (!id) continue;
+      registryPlaneIds.add(hubPlace.placeId);
+      planePlaces.push(hubPlace.region ? `${safeText(hubPlace.region)} (${id})` : id);
+    }
+    if (planePlaces.length > 0) {
+      lines.push(`Other places on this plane: ${planePlaces.join(', ')}`);
+    }
+    if (worldMap && worldMap.tools.length > 0) {
+      const names = worldMap.tools.map((tool) => safeText(tool.name)).filter((name) => name.length > 0).slice(0, 24);
+      lines.push(`This world's own tools (advisory; reach them through the world tool's verbs): ${names.join(', ')}`);
+    }
+    const remembered = safeText(input.worldNotes?.summarize(place.eidoverse.world) ?? '').slice(0, 600);
+    if (remembered) {
+      lines.push(`What you remember of this world: ${remembered}`);
+    }
+    lines.push('Use the world tool here: perceive to look, act for body verbs, move to a participant, a position, or a place on this plane. Room control and physical places do not apply on this plane.');
+    return wrapPromptSectionXml({
+      id: 'runtime_situated_presence',
+      content: lines.join('\n'),
+    });
+  }
+
+  if (place) {
+    const placeName = safeText(place.displayName) || safeText(place.placeId) || 'unnamed place';
+    lines.push(`Here: ${placeName} (${place.kind} place)`);
+    const site = resolveSite(registry, place.siteId);
+    const siteName = site ? safeText(site.displayName) : '';
+    if (site && siteName && siteName !== placeName) {
+      lines.push(`Site: ${siteName}`);
+    }
+    const description = safeText(place.description, 500);
+    if (description) {
+      lines.push(`Surroundings: ${description}`);
+    }
+    // Mindspace twin (vinz.29): a virtual place mirroring a physical room is
+    // the shared-mindspace layer. Name it with the operator's character-facing
+    // label (companion-data) when configured, defaulting to the place's own
+    // displayName, and ground it against the mirrored physical room.
+    if (presenceMode === 'mindspace' && place.kind === 'virtual' && place.mirrorsPlaceId) {
+      const mirrored = resolvePlace(registry, place.mirrorsPlaceId);
+      const spaceLabel = safeText(input.mindspaceLabel) || placeName;
+      const mirroredName = mirrored
+        ? safeText(mirrored.displayName) || safeText(mirrored.placeId)
+        : '';
+      lines.push(mirroredName
+        ? `Shared mindspace: ${spaceLabel} (virtual twin of ${mirroredName})`
+        : `Shared mindspace: ${spaceLabel}`);
+    }
+  } else {
+    // No place resolved: honest fallback to presence-derived hints only.
+    const label = safeText(presence?.label) || safeText(presence?.siteId);
+    lines.push(label ? `Here: ${label}` : 'Here: (location not modeled)');
+  }
+
+  // Affordances come from the resolved place only. Group by role for clarity;
+  // control of effectors is mediated globally by the world tool, not wired here.
+  const affordances = place?.affordances ?? [];
+  const perceivers = affordances.filter((affordance) => affordance.role === 'perceiver');
+  const effectors = affordances.filter((affordance) => affordance.role === 'effector');
+  if (perceivers.length > 0) {
+    lines.push('Perceivers here (what can sense this place):');
+    for (const affordance of perceivers) lines.push(formatAffordanceLine(affordance));
+  }
+  if (effectors.length > 0) {
+    lines.push('Effectors here (control is mediated by the world tool, not wired into this block):');
+    for (const affordance of effectors) lines.push(formatAffordanceLine(affordance));
+  }
+
+  // "Who else is here" — only when non-empty. Multi-companion W5 populates
+  // coPresent from the shared companion_presence table.
+  if (coPresent.length > 0) {
+    const names = coPresent
+      .map((companion) => safeText(companion.displayName) || safeText(companion.companionId))
+      .filter((name) => name.length > 0)
+      .join(', ');
+    if (names) lines.push(`Also here: ${names}`);
+  }
+
+  return wrapPromptSectionXml({
+    id: 'runtime_situated_presence',
+    content: lines.join('\n'),
+  });
+}

@@ -1,0 +1,1741 @@
+// ── OpenAI-compatible API Server ──
+// Exposes GET /v1/models and POST /v1/chat/completions.
+// Uses Node.js built-in http module — no framework dependency.
+
+import { randomUUID } from 'node:crypto';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Readable, type Duplex } from 'node:stream';
+import { Type, type Static } from '@sinclair/typebox';
+import { Value } from '@sinclair/typebox/value';
+import type { ChannelType } from '../../shared/contracts/runtime.js';
+import type {
+  SatelliteClientCertIdentity,
+  SatelliteRegistryConfig,
+  SatelliteRegistryProvider,
+  SatelliteTelemetryAuthContext,
+} from '../../shared/contracts/satellite-registry.js';
+import {
+  hasBearerToken,
+  hasCookieValue,
+  getBearerToken,
+  isExpectedApiToken,
+  principalFromTestingHarnessCredential,
+  validateSatelliteApiKeys,
+  validateTestingHarnessApiPrincipalCredential,
+  type ApiAuthPrincipal,
+  type TestingHarnessApiPrincipalCredential,
+} from '../backplane/http/auth.js';
+import {
+  deriveClientCertIdentity,
+  parseTrustedProxyClientCertToken,
+  stripClientCertHeaders,
+} from '../backplane/http/client-cert.js';
+import type { ContactStorePort } from '../../core/contacts/contact-store-port.js';
+import type { SubstrateAgent } from '../../core/agent/substrate-agent.js';
+import type { EventBus, ExternalTelemetryEvent } from '../../shared/event-bus.js';
+import { PARTNER_AFFECT_OBSERVATION_EVENT_TYPE } from '../../shared/contracts/partner-affect.js';
+import {
+  createEventBusSensorIngestPort,
+  type SensorIngestPort,
+} from '../../shared/telemetry/sensor-ingest-port.js';
+import type { SessionManager } from '../../core/session/manager.js';
+import type {
+  ChannelAdapterPort,
+  ChannelCapabilities,
+  ChannelConfigAdapter,
+  ChannelGatewayAdapter,
+  ChannelOutboundAdapter,
+  ChannelPromptAdapter,
+  OutboundContext,
+} from '../backplane/types.js';
+import type {
+  ApiContinuityWatchdogCheck,
+  ApiHealthResponse,
+  ApiHealthSubsystem,
+  ApiHealthSubsystemStatus,
+  ApiServerHealthChecks,
+  ApiServerRuntime,
+  TelemetryIngestRequest,
+  TelemetryIngestResponse,
+} from './types.js';
+import { API_CONTINUITY_WATCHDOG_CHECKS, API_HEALTH_SUBSYSTEMS } from './types.js';
+import { createComponentLogger } from '../../shared/logger.js';
+import {
+  ApiVoiceWebSocketAdapter,
+  type VoiceWebSocketRuntime,
+  type VoiceWebSocketRuntimeHooks,
+} from './voice-websocket.js';
+import { toErrorMessage } from '../../shared/utils/errors.js';
+import {
+  readJsonBodyWithLimit,
+  sendEmpty,
+  sendJson,
+} from '../backplane/http/primitives.js';
+import {
+  clampHttpHeader as clampHeaderValue,
+  normalizeCorsAllowedOrigins,
+} from './http-policy.js';
+import type { ExternalChannelProfileConfig } from '../backplane/config.js';
+import { resolveCompanionIdFromConfig } from '../../core/identity/companion-runtime.js';
+import type { ExternalMemoryMcpRoute } from './server/external-memory-mcp.js';
+import type { ExternalChannelMcpRoute } from '../external/mcp-route.js';
+import { ApiChatCompletionsHandler } from './server/chat-completions.js';
+import {
+  BEARER_COMPANION_SELECTOR_HEADER,
+  resolveBearerCompanionTarget,
+  type BearerCompanionRoutingConfig,
+} from './server/bearer-companion-selector.js';
+import { singleApiHeader } from './server/request.js';
+import type { ApiDocumentIngestConfig } from './server/session.js';
+import {
+  applyApiCorsPolicy,
+  canWriteResponse,
+  createApiHttpServer,
+  listenApiHttpServer,
+  MAX_BODY_SIZE,
+  parseChatRequestTimeoutMs,
+  parseSchedulerHealthcheckStaleAfterMs,
+  sendApiError,
+  stopApiHttpServer,
+  type ApiHttpServer,
+  type ApiHttpServerTlsConfig,
+} from './server/http.js';
+import { stripBrowserRequestCapabilityHeaders } from '../../boundary/fleet-auth/request-capability-transport.js';
+import {
+  resolveApiServerRequestPrincipal,
+  validateApiServerAuthConfig,
+} from './server/auth.js';
+import { handleModelsEndpoint } from './server/models.js';
+import { FleetAuthChildAssertionHttpRoute } from './server/fleet-auth-child-assertion-route.js';
+import type { GatewayFleetAuthChildAssertionBroker } from '../../boundary/gateway/fleet-auth-child-assertions.js';
+import {
+  handleCompanionApprovalDecision,
+  handleCompanionArtifactPreview,
+  handleCompanionEventsStream,
+  handleCompanionUiAudioOutput,
+  matchCompanionRelayRoute,
+  type CompanionRelayHttpDeps,
+} from './server/companion-relay-routes.js';
+import { handleCompanionTouchStimulus } from './server/companion-touch-stimulus-route.js';
+import {
+  hasSatelliteClaimHeaders,
+  resolveSatelliteConfigPull,
+} from '../backplane/satellite-registry.js';
+import { EXTERNAL_CHANNEL_HEADERS } from './external-channel-claim.js';
+import { isRecord, isRfc4122Uuid } from '../../shared/utils/types.js';
+import type {
+  ConfirmationResolveRequest,
+  ConfirmationResolveResult,
+} from '../../system/capabilities/confirmation-queue.js';
+import type { FleetAuthHttpRoutes } from './server/fleet-auth-routes.js';
+import type { GatewayHubDeviceIngressService } from '../../boundary/fleet-auth/hub-device-ingress.js';
+import { HubDeviceAssertionRejectedError } from '../../boundary/fleet-auth/hub-device-assertion.js';
+import type { TestingHarnessDevicesConfig } from '../backplane/testing-harness-devices.js';
+import {
+  extractCanonicalHubDeviceAssertion,
+  hasHubDeviceAssertion,
+  HubDeviceIngressRequestError,
+  resolveAuthenticatedHubDeviceConnection,
+  resolveHubDeviceProjection,
+  resolveVirtualSpaceEmanationBinding,
+  stripHubDeviceDownstreamAuthorityHeaders,
+} from './server/hub-device-ingress.js';
+import type { CompanionUiWebSocketAdapter } from './companion-ui-websocket.js';
+import { buildFleetGardenChatTurn } from './server/fleet-garden-chat-turn.js';
+import type {
+  FleetGardenChatAdmission,
+  GatewayFleetSsoRouter,
+} from '../../boundary/gateway/fleet-sso-router.js';
+
+const log = createComponentLogger('ApiServer');
+const API_DYNAMIC_JSON_HEADERS = { 'Cache-Control': 'no-store' } as const;
+const TELEMETRY_MAX_SKEW_MS = 5 * 60_000;
+const TELEMETRY_NONCE_TTL_MS = 10 * 60_000;
+const TELEMETRY_EVENT_TYPE_ALLOWLIST = new Set([
+  'external.telemetry.heartbeat',
+  'external.telemetry.status',
+  'external.telemetry.incident',
+  PARTNER_AFFECT_OBSERVATION_EVENT_TYPE,
+]);
+const ICP_OPERATOR_CANCEL_PATH = /^\/v1\/operator\/icp-autonomy\/companions\/([^/]+)\/cancel$/u;
+const CONFIRMATION_OPERATOR_RESOLVE_PATH = '/v1/operator/confirmations/resolve';
+const CONFIRMATION_OPERATOR_MAX_BODY_BYTES = 16 * 1024;
+const CONFIRMATION_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/u;
+
+export interface IcpAutonomyOperatorPort {
+  cancelForCompanion(companionId: string): Promise<number>;
+}
+
+export interface ConfirmationOperatorPort {
+  resolve(
+    params: ConfirmationResolveRequest,
+    authority: Readonly<
+      | { kind: 'standalone_operator' }
+      | { kind: 'fleet_companion'; companionId: string }
+    >,
+  ): Promise<ConfirmationResolveResult>;
+}
+
+const telemetryIngestSchema = Type.Object({
+  source: Type.String({ minLength: 1, maxLength: 128 }),
+  eventType: Type.String({ minLength: 1, maxLength: 128 }),
+  timestamp: Type.String({ minLength: 1, maxLength: 64 }),
+  nonce: Type.String({ minLength: 8, maxLength: 128 }),
+  payload: Type.Object({}, { additionalProperties: true }),
+  channelId: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+  scope: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+}, { additionalProperties: false });
+
+type TelemetryIngestInput = Static<typeof telemetryIngestSchema>;
+
+// ── Sprint-10 H5: telemetry payload screening at the ingest boundary ──
+// Raw biometrics (face vectors/embeddings/descriptors, iris/retina templates,
+// image blobs) must NOT cross the door. The ingest schema deliberately accepts
+// an open `payload` object, but before that payload is copied verbatim into the
+// emitted `external.telemetry.ingested` event (and thence onto every Garden
+// admin WebSocket client), we fail closed on:
+//   - biometric-shaped keys anywhere in the object graph,
+//   - raw-media/blob keys,
+//   - value shapes that look like embeddings (long numeric arrays) or raw media
+//     (very long strings),
+//   - oversized / over-deep / over-wide structures,
+//   - top-level keys outside the per-eventType allowlist.
+const TELEMETRY_PAYLOAD_MAX_BYTES = 16 * 1024;
+const TELEMETRY_PAYLOAD_MAX_DEPTH = 6;
+const TELEMETRY_PAYLOAD_MAX_KEYS = 64;
+const TELEMETRY_PAYLOAD_MAX_ARRAY_LENGTH = 16;
+const TELEMETRY_PAYLOAD_MAX_STRING_LENGTH = 2_048;
+// A numeric array this long or longer is treated as an embedding/descriptor,
+// regardless of the (possibly innocuous) key it hides behind.
+const TELEMETRY_PAYLOAD_NUMERIC_VECTOR_THRESHOLD = 8;
+
+const TELEMETRY_BIOMETRIC_KEY_PATTERNS: readonly RegExp[] = [
+  /vector/i,
+  /embedding/i,
+  /descriptor/i,
+  /template/i,
+  /biometric/i,
+  /faceprint/i,
+  /faceid/i,
+  /landmark/i,
+  /iris/i,
+  /retina/i,
+  /fingerprint/i,
+  /minutiae/i,
+];
+const TELEMETRY_RAW_MEDIA_KEY_PATTERNS: readonly RegExp[] = [
+  /^image$/i,
+  /image[_-]?bytes/i,
+  /^frame$/i,
+  /^photo$/i,
+  /photo[_-]?bytes/i,
+  /raw[_-]?image/i,
+  /^jpe?g$/i,
+  /^png$/i,
+  /^bytes$/i,
+  /^blob$/i,
+  /pixels/i,
+];
+
+// Origin-binding and event-descriptor fields shared by every accepted event
+// type. These are also the fields the sensor-cognition bridge reads to resolve
+// a satellite/place origin and normalize presence/identity-claim perceptions.
+const TELEMETRY_COMMON_PAYLOAD_KEYS: ReadonlySet<string> = new Set([
+  'satelliteId', 'satellite_id',
+  'placeId', 'place_id',
+  'siteId', 'site_id',
+  'affordanceId', 'affordance_id',
+  'origin', 'satellite', 'site', 'sensor',
+  'channelId',
+  'type', 'kind', 'event', 'eventType', 'action', 'state', 'status',
+  'timestamp', 'ts', 'sequence', 'seq',
+]);
+
+const TELEMETRY_PAYLOAD_KEYS_BY_EVENT_TYPE: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['external.telemetry.heartbeat', new Set([
+    'uptime', 'uptimeMs', 'uptime_ms', 'load', 'cpu', 'cpuLoad',
+    'memory', 'memoryMb', 'battery', 'batteryPct', 'rssi', 'signal',
+    'firmware', 'version', 'online', 'healthy',
+  ])],
+  ['external.telemetry.status', new Set([
+    // presence + identity-claim perceptions ride the status event type
+    'present', 'detected', 'occupied', 'presence',
+    'confidence', 'score', 'probability',
+    'occupancyCount', 'occupancy_count', 'count',
+    'identityClaim', 'identity_claim', 'claim',
+    'hubIdentityId', 'hub_identity_id',
+    'load', 'battery', 'online', 'healthy', 'detail', 'message',
+  ])],
+  ['external.telemetry.incident', new Set([
+    'severity', 'level', 'code', 'category',
+    'message', 'detail', 'reason', 'error',
+    'count', 'confidence',
+  ])],
+  // Shadow-only Partner Affect Signal Observations (docs/partner-affect.md
+  // slice 1). Summarized scalar fields only; the downstream observation guard
+  // re-screens the same keys fail-closed before anything is recorded.
+  [PARTNER_AFFECT_OBSERVATION_EVENT_TYPE, new Set([
+    'observationId', 'sourceId', 'partnerContactId',
+    'signalFamily', 'metricName', 'value', 'unit',
+    'windowStartMs', 'windowEndMs', 'observedAtMs',
+    'coverage', 'confidence', 'missingness',
+    'consentRef', 'provenance', 'processingRevision',
+  ])],
+]);
+
+export interface TelemetryPayloadScreenFailure {
+  ok: false;
+  errorType: string;
+  message: string;
+}
+
+export type TelemetryPayloadScreenResult = { ok: true } | TelemetryPayloadScreenFailure;
+
+function keyMatchesAny(key: string, patterns: readonly RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(key));
+}
+
+function screenTelemetryPayloadNode(
+  value: unknown,
+  depth: number,
+): TelemetryPayloadScreenFailure | undefined {
+  if (depth > TELEMETRY_PAYLOAD_MAX_DEPTH) {
+    return {
+      ok: false,
+      errorType: 'payload_shape_invalid',
+      message: `payload nesting exceeds ${TELEMETRY_PAYLOAD_MAX_DEPTH} levels`,
+    };
+  }
+
+  if (typeof value === 'string') {
+    if (value.length > TELEMETRY_PAYLOAD_MAX_STRING_LENGTH) {
+      return {
+        ok: false,
+        errorType: 'biometric_payload_rejected',
+        message: 'payload contains an oversized string (possible raw media/biometric blob)',
+      };
+    }
+    return undefined;
+  }
+
+  if (Array.isArray(value)) {
+    if (value.length > TELEMETRY_PAYLOAD_MAX_ARRAY_LENGTH) {
+      return {
+        ok: false,
+        errorType: 'payload_shape_invalid',
+        message: `payload array exceeds ${TELEMETRY_PAYLOAD_MAX_ARRAY_LENGTH} elements`,
+      };
+    }
+    if (
+      value.length >= TELEMETRY_PAYLOAD_NUMERIC_VECTOR_THRESHOLD
+      && value.every((entry) => typeof entry === 'number')
+    ) {
+      return {
+        ok: false,
+        errorType: 'biometric_payload_rejected',
+        message: 'payload contains a numeric vector (possible embedding/descriptor)',
+      };
+    }
+    for (const entry of value) {
+      const failure = screenTelemetryPayloadNode(entry, depth + 1);
+      if (failure) return failure;
+    }
+    return undefined;
+  }
+
+  if (value !== null && typeof value === 'object') {
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+      if (keyMatchesAny(key, TELEMETRY_BIOMETRIC_KEY_PATTERNS)) {
+        return {
+          ok: false,
+          errorType: 'biometric_payload_rejected',
+          message: `payload key "${key}" is a raw-biometric-shaped field and is not accepted`,
+        };
+      }
+      if (keyMatchesAny(key, TELEMETRY_RAW_MEDIA_KEY_PATTERNS)) {
+        return {
+          ok: false,
+          errorType: 'biometric_payload_rejected',
+          message: `payload key "${key}" is a raw-media/blob field and is not accepted`,
+        };
+      }
+      const failure = screenTelemetryPayloadNode(nested, depth + 1);
+      if (failure) return failure;
+    }
+    return undefined;
+  }
+
+  return undefined;
+}
+
+function countTelemetryPayloadKeys(value: unknown): number {
+  if (Array.isArray(value)) {
+    return value.reduce<number>((total, entry) => total + countTelemetryPayloadKeys(entry), 0);
+  }
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>);
+    return entries.reduce<number>(
+      (total, [, nested]) => total + 1 + countTelemetryPayloadKeys(nested),
+      0,
+    );
+  }
+  return 0;
+}
+
+export function screenTelemetryIngestPayload(
+  eventType: string,
+  payload: Record<string, unknown>,
+): TelemetryPayloadScreenResult {
+  // Size ceiling (well under the 1MB body limit): telemetry heartbeats/status/
+  // incidents are small. Anything larger is an exfiltration/blob vector.
+  const serializedBytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+  if (serializedBytes > TELEMETRY_PAYLOAD_MAX_BYTES) {
+    return {
+      ok: false,
+      errorType: 'payload_too_large',
+      message: `payload exceeds ${TELEMETRY_PAYLOAD_MAX_BYTES} bytes`,
+    };
+  }
+  if (countTelemetryPayloadKeys(payload) > TELEMETRY_PAYLOAD_MAX_KEYS) {
+    return {
+      ok: false,
+      errorType: 'payload_shape_invalid',
+      message: `payload exceeds ${TELEMETRY_PAYLOAD_MAX_KEYS} keys`,
+    };
+  }
+
+  // Biometric / raw-media / vector screening across the whole object graph.
+  const structuralFailure = screenTelemetryPayloadNode(payload, 0);
+  if (structuralFailure) return structuralFailure;
+
+  // Per-eventType top-level shape allowlist (fail closed on unknown fields).
+  const allowedForEventType = TELEMETRY_PAYLOAD_KEYS_BY_EVENT_TYPE.get(eventType);
+  if (!allowedForEventType) {
+    return {
+      ok: false,
+      errorType: 'event_type_not_allowed',
+      message: `no payload shape is defined for eventType ${eventType}`,
+    };
+  }
+  for (const key of Object.keys(payload)) {
+    if (TELEMETRY_COMMON_PAYLOAD_KEYS.has(key)) continue;
+    if (allowedForEventType.has(key)) continue;
+    return {
+      ok: false,
+      errorType: 'payload_field_not_allowed',
+      message: `payload key "${key}" is not allowed for eventType ${eventType}`,
+    };
+  }
+
+  return { ok: true };
+}
+
+export interface ApiServerConfig {
+  port: number;
+  host?: string;
+  agentLoop: SubstrateAgent;
+  eventBus: EventBus;
+  sessionManager: SessionManager;
+  companionId?: string;
+  companionName?: string;
+  contactStore?: ContactStorePort;
+  apiKey?: string;
+  testingHarnessPrincipal?: TestingHarnessApiPrincipalCredential;
+  /** See `ApiChatCompletionsHandlerConfig.testingHarnessDevices` (psfn-framework-ajgo2). */
+  testingHarnessDevices?: TestingHarnessDevicesConfig;
+  externalMemoryMcp?: ExternalMemoryMcpRoute;
+  /** Generic external channel bridges (psfn-framework-pus8m). */
+  externalChannelMcp?: ExternalChannelMcpRoute;
+  adminToken?: string;
+  modelName?: string;
+  requestTimeoutMs?: number;
+  voiceWebSocketPath?: string;
+  voiceWebSocketRuntime?: VoiceWebSocketRuntime;
+  voiceWebSocketHooks?: VoiceWebSocketRuntimeHooks;
+  runtime?: ApiServerRuntime;
+  allowInsecureWithoutAuth?: boolean;
+  corsAllowedOrigins?: string[];
+  healthChecks?: ApiServerHealthChecks;
+  schedulerHealthcheckStaleAfterMs?: number;
+  externalChannelProfiles?: Partial<Record<ChannelType, ExternalChannelProfileConfig>>;
+  satelliteRegistry?: SatelliteRegistryConfig;
+  /** Dynamic canonical owner source used by gateway-hosted satellite ingress. */
+  satelliteRegistryProvider?: SatelliteRegistryProvider;
+  sensorIngest?: SensorIngestPort;
+  /**
+   * Per-satellite bearer credentials (`API_SATELLITE_KEYS`), each yielding a
+   * distinct satellite-scoped principal (Sprint-10 finding H4).
+   */
+  satelliteApiKeys?: string[];
+  /**
+   * Shared secret a TLS-terminating proxy must present in
+   * `X-PSFN-Trusted-Proxy-Token` for its `X-PSFN-Client-Cert-*` headers to be
+   * honored (`API_TRUSTED_PROXY_CLIENT_CERT_TOKEN`). Unset means
+   * header-asserted client certificates are never accepted.
+   */
+  trustedProxyClientCertToken?: string;
+  /** Direct-TLS listener config (`API_TLS_CERT_PATH`/`API_TLS_KEY_PATH`/`API_TLS_CLIENT_CA_PATH`). */
+  tls?: ApiHttpServerTlsConfig;
+  /**
+   * htm9.9: document ingestion for OpenAI-compatible `file` content parts
+   * (personal-files root + intake screening). Absent means file parts fail
+   * closed into soft in-content notices.
+   */
+  documentIngest?: ApiDocumentIngestConfig | null;
+  /**
+   * Companion event relay surface (w9hj.1). When absent the
+   * `/v1/companion/*` routes fail closed with 503.
+   */
+  companionRelay?: CompanionRelayHttpDeps;
+  /** ADMIN_TOKEN-only lifecycle surface for cancelling outstanding ICP permits. */
+  icpAutonomyOperator?: IcpAutonomyOperatorPort;
+  /** ADMIN_TOKEN-only confirmation resolver, separate from companion RPC. */
+  confirmationOperator?: ConfirmationOperatorPort;
+  /** Gateway-only OAuth/session routes. Never constructed in operator/agent processes. */
+  fleetAuthHttpRoutes?: FleetAuthHttpRoutes;
+  /** Signed-parent-authenticated operator-to-agent child assertion exchange. */
+  fleetAuthChildAssertions?: GatewayFleetAuthChildAssertionBroker;
+  /** Unified browser origin; the only fleet-mode route to Garden processes. */
+  fleetSsoRouter?: GatewayFleetSsoRouter;
+  /**
+   * Multi-companion gateways: the ADMIN_TOKEN confirmation-operator route must
+   * name the owning companion so the approval is resolved owner-scoped. Single
+   * companion runtimes accept either form. Independent of fleet auth.
+   */
+  confirmationOperatorRequiresCompanionId?: boolean;
+  /**
+   * Authenticated Hub/device ingress. Only consulted when a chat request
+   * carries the `X-PSFN-Hub-Device-Assertion` header; absent, such a request
+   * fails closed with 400 `hub_device_ingress_not_configured`. Plain
+   * key-authenticated turns never enter device admission. Independent of
+   * fleet auth.
+   */
+  hubDeviceIngress?: GatewayHubDeviceIngressService;
+  /** Server-owned companion binding for the gateway API surface. */
+  hubDeviceCompanionId?: string;
+  /** Pinned target plus optional per-request Bearer selector entitlement. */
+  bearerCompanionRouting?: BearerCompanionRoutingConfig;
+  /** Fleet-SSO exact same-origin Companion UI WebSocket broker (an SSO-only surface). */
+  companionUiWebSocket?: CompanionUiWebSocketAdapter;
+}
+
+export class ApiServer implements ChannelAdapterPort {
+  readonly id = 'api';
+  readonly name = this.id;
+  readonly meta = {
+    label: 'API Server',
+    emoji: ':globe_with_meridians:',
+  };
+  readonly capabilities: ChannelCapabilities = {
+    chatTypes: ['direct'],
+    media: false,
+    reactions: false,
+    threads: false,
+    streaming: true,
+    promptChannelType: 'api',
+  };
+  readonly config: ChannelConfigAdapter;
+  readonly outbound: ChannelOutboundAdapter;
+  readonly gateway: ChannelGatewayAdapter;
+  readonly prompt: ChannelPromptAdapter;
+
+  private server: ApiHttpServer;
+  private port: number;
+  private host: string;
+  private eventBus: EventBus;
+  private sensorIngest: SensorIngestPort;
+  private sessionManager: SessionManager;
+  private runtime: ApiServerRuntime | null;
+  private apiKey?: string;
+  private testingHarnessPrincipal?: TestingHarnessApiPrincipalCredential;
+  private externalMemoryMcp?: ExternalMemoryMcpRoute;
+  private externalChannelMcp?: ExternalChannelMcpRoute;
+  private adminToken?: string;
+  private satelliteApiKeys: string[];
+  private trustedProxyClientCertToken?: string;
+  private allowInsecureWithoutAuth: boolean;
+  private corsAllowedOrigins: ReturnType<typeof normalizeCorsAllowedOrigins>;
+  private modelName: string;
+  private companionName: string;
+  private requestTimeoutMs: number;
+  private seenTelemetryNonces = new Map<string, number>();
+  private voiceWebSocket: ApiVoiceWebSocketAdapter;
+  private chatCompletions: ApiChatCompletionsHandler;
+  private satelliteRegistry?: SatelliteRegistryConfig;
+  private satelliteRegistryProvider?: SatelliteRegistryProvider;
+  private companionRelay?: CompanionRelayHttpDeps;
+  private icpAutonomyOperator?: IcpAutonomyOperatorPort;
+  private confirmationOperator?: ConfirmationOperatorPort;
+  private fleetAuthHttpRoutes?: FleetAuthHttpRoutes;
+  private fleetAuthChildAssertionRoute?: FleetAuthChildAssertionHttpRoute;
+  private fleetSsoRouter?: GatewayFleetSsoRouter;
+  private confirmationOperatorRequiresCompanionId: boolean;
+  private hubDeviceIngress?: GatewayHubDeviceIngressService;
+  private hubDeviceCompanionId?: string;
+  private companionUiWebSocket?: CompanionUiWebSocketAdapter;
+  private bearerCompanionRouting?: BearerCompanionRoutingConfig;
+  private healthChecks: ApiServerHealthChecks;
+  private schedulerHealthcheckStaleAfterMs: number;
+  private lastSchedulerHealthcheckAtMs: number | null = null;
+  private unregisterSchedulerHealthcheck: (() => void) | null = null;
+
+  constructor(config: ApiServerConfig) {
+    this.port = config.port;
+    this.host = config.host ?? '127.0.0.1';
+    this.eventBus = config.eventBus;
+    this.sensorIngest = config.sensorIngest ?? createEventBusSensorIngestPort(this.eventBus);
+    this.sessionManager = config.sessionManager;
+    this.runtime = config.runtime ?? null;
+    this.externalMemoryMcp = config.externalMemoryMcp;
+    this.externalChannelMcp = config.externalChannelMcp;
+    this.apiKey = clampHeaderValue(config.apiKey, 512);
+    this.adminToken = clampHeaderValue(config.adminToken, 512);
+    // Re-validate satellite keys at the trust boundary (fail closed on weak
+    // keys or collisions with the shared credentials), even when the caller
+    // already parsed them from env.
+    this.satelliteApiKeys = validateSatelliteApiKeys(config.satelliteApiKeys ?? [], {
+      reservedTokens: [this.apiKey, this.adminToken, config.testingHarnessPrincipal?.apiKey],
+    });
+    this.testingHarnessPrincipal = validateTestingHarnessApiPrincipalCredential(
+      config.testingHarnessPrincipal,
+      { reservedTokens: [this.apiKey, this.adminToken, ...this.satelliteApiKeys] },
+    );
+    this.trustedProxyClientCertToken = parseTrustedProxyClientCertToken(config.trustedProxyClientCertToken);
+    this.allowInsecureWithoutAuth = config.allowInsecureWithoutAuth === true;
+    this.corsAllowedOrigins = normalizeCorsAllowedOrigins(config.corsAllowedOrigins);
+    this.modelName = config.modelName ?? resolveCompanionIdFromConfig(config);
+    this.companionName = config.companionName?.trim() || this.modelName;
+    this.requestTimeoutMs = parseChatRequestTimeoutMs(config.requestTimeoutMs);
+    this.healthChecks = config.healthChecks ?? {};
+    if (config.satelliteRegistry && config.satelliteRegistryProvider) {
+      throw new Error('ApiServer requires exactly one satellite registry source');
+    }
+    this.satelliteRegistry = config.satelliteRegistry;
+    this.satelliteRegistryProvider = config.satelliteRegistryProvider;
+    this.companionRelay = config.companionRelay;
+    this.icpAutonomyOperator = config.icpAutonomyOperator;
+    this.confirmationOperator = config.confirmationOperator;
+    this.fleetAuthHttpRoutes = config.fleetAuthHttpRoutes;
+    this.fleetAuthChildAssertionRoute = config.fleetAuthChildAssertions
+      ? new FleetAuthChildAssertionHttpRoute(config.fleetAuthChildAssertions)
+      : undefined;
+    this.fleetSsoRouter = config.fleetSsoRouter;
+    this.confirmationOperatorRequiresCompanionId = config.confirmationOperatorRequiresCompanionId === true;
+    this.hubDeviceIngress = config.hubDeviceIngress;
+    this.hubDeviceCompanionId = config.hubDeviceCompanionId;
+    this.companionUiWebSocket = config.companionUiWebSocket;
+    this.bearerCompanionRouting = config.bearerCompanionRouting;
+    this.schedulerHealthcheckStaleAfterMs = parseSchedulerHealthcheckStaleAfterMs(
+      config.schedulerHealthcheckStaleAfterMs,
+    );
+    this.unregisterSchedulerHealthcheck = this.eventBus.on('schedule.healthcheck', ({ timestamp }) => {
+      if (Number.isFinite(timestamp) && timestamp > 0) {
+        this.lastSchedulerHealthcheckAtMs = Math.floor(timestamp);
+      } else {
+        this.lastSchedulerHealthcheckAtMs = Date.now();
+      }
+    });
+    this.voiceWebSocket = new ApiVoiceWebSocketAdapter({
+      apiKey: this.apiKey,
+      path: config.voiceWebSocketPath,
+      runtime: config.voiceWebSocketRuntime,
+      runtimeHooks: config.voiceWebSocketHooks,
+    });
+    this.chatCompletions = new ApiChatCompletionsHandler({
+      agentLoop: config.agentLoop,
+      eventBus: this.eventBus,
+      sessionManager: this.sessionManager,
+      contactStore: config.contactStore ?? null,
+      runtime: this.runtime,
+      modelName: this.modelName,
+      requestTimeoutMs: this.requestTimeoutMs,
+      externalChannelProfiles: config.externalChannelProfiles ?? {},
+      satelliteRegistry: config.satelliteRegistry,
+      satelliteRegistryProvider: config.satelliteRegistryProvider,
+      logger: log,
+      documentIngest: config.documentIngest ?? null,
+      bearerCompanionRouting: config.bearerCompanionRouting,
+      ...(config.testingHarnessDevices ? { testingHarnessDevices: config.testingHarnessDevices } : {}),
+    });
+    this.fleetSsoRouter?.registerGardenChatHandler(
+      admission => this.handleFleetGardenChat(admission),
+    );
+    this.config = {
+      enabled: true,
+      connectionLabel: `${this.host}:${this.port}`,
+    };
+    this.outbound = {
+      textChunkLimit: Number.MAX_SAFE_INTEGER,
+      sendText: async (ctx: OutboundContext, text: string): Promise<void> => {
+        const normalized = text.trim();
+        if (!normalized) return;
+        this.sessionManager.recordAssistantMessage(ctx.channelId, normalized);
+      },
+    };
+    this.gateway = this;
+    this.prompt = {
+      resolveChannelType: (): string => 'api',
+    };
+    this.server = createApiHttpServer({
+      handleRequest: (req, res) => this.handleRequest(req, res),
+      handleUpgrade: (req, socket, head) => this.handleUpgrade(req, socket, head),
+    }, config.tls);
+  }
+
+  async send(channelId: string, content: string): Promise<void> {
+    await this.outbound.sendText({ channelId }, content);
+  }
+
+  async init(): Promise<void> {}
+
+  async start(): Promise<void> {
+    // Fleet auth adds SSO principals; it never removes key authentication.
+    // The listener refuses to start unauthenticated unless the insecure local
+    // bypass is explicit, where "authenticated" means ANY wired principal
+    // source: API_KEY, ADMIN_TOKEN, API_SATELLITE_KEYS, the testing-harness
+    // key, or fleet SSO routes.
+    const alternatePrincipalSources = Boolean(this.adminToken)
+      || this.satelliteApiKeys.length > 0
+      || this.testingHarnessPrincipal !== undefined
+      || this.fleetAuthHttpRoutes !== undefined
+      || this.fleetSsoRouter !== undefined;
+    validateApiServerAuthConfig({
+      host: this.host,
+      port: this.port,
+      apiKey: this.apiKey,
+      allowInsecureWithoutAuth: this.allowInsecureWithoutAuth,
+      hasAlternatePrincipalSource: alternatePrincipalSources,
+      logger: log,
+    });
+
+    return listenApiHttpServer({
+      server: this.server,
+      host: this.host,
+      port: this.port,
+      apiKey: this.apiKey,
+      hasAlternatePrincipalSource: alternatePrincipalSources,
+      corsAllowedOrigins: this.corsAllowedOrigins,
+      logger: log,
+    });
+  }
+
+  async stop(): Promise<void> {
+    this.unregisterSchedulerHealthcheck?.();
+    this.unregisterSchedulerHealthcheck = null;
+    await this.voiceWebSocket.stop();
+    await this.companionUiWebSocket?.stop();
+    return stopApiHttpServer(this.server);
+  }
+
+  private handleUpgrade(req: IncomingMessage, socket: Duplex, head: Buffer): void {
+    if (this.companionUiWebSocket?.handleUpgrade(req, socket, head)) return;
+    stripBrowserRequestCapabilityHeaders(req.headers);
+    if (this.fleetSsoRouter?.matches(req.url ?? '/')) {
+      this.fleetSsoRouter.handleUpgrade(req, socket, head);
+      return;
+    }
+    const handled = this.voiceWebSocket.handleUpgrade(req, socket, head);
+    if (!handled) {
+      this.voiceWebSocket.rejectUnknownUpgrade(socket);
+    }
+  }
+
+  private handleRequest(req: IncomingMessage, res: ServerResponse): void {
+    stripBrowserRequestCapabilityHeaders(req.headers);
+    if (this.externalMemoryMcp?.matches(req.url ?? '/')) {
+      void this.externalMemoryMcp.handle(req, res);
+      return;
+    }
+    if (this.externalChannelMcp?.matches(req.url ?? '/')) {
+      void this.externalChannelMcp.handle(req, res);
+      return;
+    }
+    if (this.fleetSsoRouter?.matches(req.url ?? '/')) {
+      void this.fleetSsoRouter.handle(req, res);
+      return;
+    }
+    const requestTargetPath = (req.url ?? '/').split('?', 1)[0] ?? '/';
+    const fleetAuthCors = this.fleetAuthHttpRoutes
+      ?.applyLifecycleCorsPolicy(req, res, requestTargetPath) ?? 'not_applicable';
+    if (fleetAuthCors === 'handled') return;
+    if (fleetAuthCors === 'not_applicable'
+      && !applyApiCorsPolicy(req, res, this.corsAllowedOrigins)) return;
+
+    const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    const path = url.pathname;
+    if (this.fleetAuthChildAssertionRoute?.matches(req.method, path)) {
+      void this.fleetAuthChildAssertionRoute.handle(req, res);
+      return;
+    }
+    if (this.fleetAuthHttpRoutes?.matches(req.method, path)) {
+      void this.fleetAuthHttpRoutes.handle(req, res, url);
+      return;
+    }
+
+    if (req.method === 'OPTIONS') {
+      sendEmpty(res, 204);
+      return;
+    }
+
+    // Sprint-10 C1: derive the client-certificate identity from the ONLY
+    // trusted sources (real TLS peer cert, or a proxy that authenticated
+    // itself with the trusted-proxy token), then unconditionally strip the
+    // inbound X-PSFN-Client-Cert-* headers so nothing downstream can trust
+    // caller-supplied certificate assertions.
+    const clientCert = deriveClientCertIdentity(req, {
+      ...(this.trustedProxyClientCertToken ? { trustedProxyToken: this.trustedProxyClientCertToken } : {}),
+    });
+    stripClientCertHeaders(req.headers);
+
+    const testingHarnessPrincipal = this.resolveTestingHarnessPrincipal(req);
+    const companionRoute = matchCompanionRelayRoute(req.method, path);
+    const isConfirmationOperatorResolve = req.method === 'POST'
+      && path === CONFIRMATION_OPERATOR_RESOLVE_PATH;
+    const icpOperatorCancelMatch = req.method === 'POST'
+      ? ICP_OPERATOR_CANCEL_PATH.exec(path)
+      : null;
+    const isTelemetryIngest = req.method === 'POST' && path === '/v1/telemetry/ingest';
+    // This credential names one room. Remove caller-selected affinity before
+    // either the direct or gateway/agent backend reads the request headers.
+    if (testingHarnessPrincipal) {
+      if (
+        hasSatelliteClaimHeaders(req.headers)
+        || Object.values(EXTERNAL_CHANNEL_HEADERS).some(name => req.headers[name] !== undefined)
+      ) {
+        sendApiError(
+          res,
+          403,
+          'testing_harness_channel_claim_not_allowed',
+          'The testing-harness principal cannot override its persistent channel identity',
+        );
+        return;
+      }
+      delete req.headers['x-session-id'];
+    }
+
+    // Hub device admission is opt-in per request: only a chat turn that
+    // presents a device assertion enters `handleHubDeviceChat`. Every other
+    // request — including a satellite-key turn from an enrolled Hub that
+    // sends no assertion — takes the ordinary key-authenticated path, with or
+    // without fleet auth configured (beads y7pc8, hc23v).
+    if (req.method === 'POST' && path === '/v1/chat/completions' && hasHubDeviceAssertion(req)) {
+      if (!this.hubDeviceIngress) {
+        sendApiError(
+          res,
+          400,
+          'hub_device_ingress_not_configured',
+          'This gateway has no Hub device assertion verifier; retry without X-PSFN-Hub-Device-Assertion or configure device ingress',
+        );
+        return;
+      }
+      // A `virtual_space` projection (the Hub's world connector) proves it is
+      // the registered surface and then continues on the ordinary satellite
+      // path; a `human_surface` device enters the attachment path.
+      if (resolveHubDeviceProjection(req, this.readSatelliteRegistry()) === 'virtual_space') {
+        void this.handleVirtualSpaceEmanationChat(req, res, clientCert);
+        return;
+      }
+      void this.handleHubDeviceChat(req, res, clientCert);
+      return;
+    }
+
+    if (icpOperatorCancelMatch?.[1]) {
+      this.handleIcpOperatorCancel(req, res, icpOperatorCancelMatch[1]);
+      return;
+    }
+    if (isConfirmationOperatorResolve) {
+      this.handleConfirmationOperatorResolve(req, res);
+      return;
+    }
+    // Companion relay routes are not scope-gated here: `resolveCompanionRelayAccess`
+    // binds whichever authenticated principal arrives to the registry endpoint's
+    // own `auth` (apiKeyPrincipalIds / mTLS), which is the real admission rule.
+    const principal = testingHarnessPrincipal
+      ?? resolveApiServerRequestPrincipal(req, res, {
+        ...(this.apiKey ? { apiKey: this.apiKey } : {}),
+        ...(this.adminToken ? { adminToken: this.adminToken } : {}),
+        ...(this.satelliteApiKeys.length > 0 ? { satelliteApiKeys: this.satelliteApiKeys } : {}),
+        allowInsecureWithoutAuth: this.allowInsecureWithoutAuth,
+        isTelemetryIngest,
+      });
+    if (!principal) return;
+
+    // Satellite-scoped credentials are only valid on satellite surfaces
+    // (fail closed): claims-bearing chat turns, config pulls, and telemetry.
+    if (principal.scope === 'satellite') {
+      const satelliteSurface = (req.method === 'GET' && path === '/v1/satellites/config')
+        || (req.method === 'POST' && path === '/v1/chat/completions')
+        || isTelemetryIngest
+        || companionRoute !== null;
+      if (!satelliteSurface) {
+        sendApiError(
+          res,
+          403,
+          'satellite_scoped_principal_not_allowed',
+          'Satellite-scoped API keys may only access satellite surfaces',
+        );
+        return;
+      }
+    }
+    if (req.method === 'GET' && path === '/v1/models') {
+      let advertisedModelName = this.modelName;
+      if (this.bearerCompanionRouting) {
+        const requestedCompanionId = singleApiHeader(
+          req.headers[BEARER_COMPANION_SELECTOR_HEADER],
+        )?.trim();
+        const resolution = resolveBearerCompanionTarget({
+          requestedCompanionId,
+          principal,
+          routing: this.bearerCompanionRouting,
+        });
+        if (!resolution.ok) {
+          sendApiError(res, resolution.status, resolution.type, resolution.message);
+          return;
+        }
+        advertisedModelName = resolution.companionId;
+      }
+      handleModelsEndpoint(res, advertisedModelName);
+    } else if (req.method === 'GET' && path === '/v1/identity') {
+      this.handleIdentity(res);
+    } else if (req.method === 'GET' && path === '/v1/satellites/config') {
+      this.handleSatelliteConfigPull(res, url, principal, clientCert);
+    } else if (req.method === 'GET' && path === '/readyz') {
+      if (principal.mode !== 'api_key') {
+        sendApiError(res, 401, 'unauthorized', 'Readiness requires API key authentication');
+        return;
+      }
+      this.handleReadiness(res);
+    } else if (req.method === 'GET' && path === '/health') {
+      void this.handleHealth(res);
+    } else if (req.method === 'POST' && path === '/v1/chat/completions') {
+      void this.chatCompletions.handle(req, res, principal, clientCert);
+    } else if (isTelemetryIngest) {
+      void this.handleTelemetryIngest(req, res, principal, clientCert);
+    } else {
+      if (companionRoute) {
+        this.handleCompanionRelayRoute(req, res, url, principal, clientCert, companionRoute);
+        return;
+      }
+      sendApiError(res, 404, 'not_found', `No route for ${req.method} ${path}`);
+    }
+  }
+
+  private resolveTestingHarnessPrincipal(req: IncomingMessage): ApiAuthPrincipal | undefined {
+    if (!this.testingHarnessPrincipal) return undefined;
+    const bearerToken = getBearerToken(req);
+    if (!isExpectedApiToken(bearerToken, this.testingHarnessPrincipal.apiKey)) {
+      return undefined;
+    }
+    return principalFromTestingHarnessCredential(this.testingHarnessPrincipal);
+  }
+
+  private async handleFleetGardenChat(
+    admission: FleetGardenChatAdmission,
+  ): Promise<void> {
+    if (admission.authorization.companionId !== admission.companionId
+      || admission.authorization.authorization.action !== 'companion.interact') {
+      sendApiError(
+        admission.response,
+        404,
+        'not_found',
+        'Resource not found',
+      );
+      return;
+    }
+    const turn = buildFleetGardenChatTurn(admission);
+    const admittedRequest = Readable.from([admission.body]) as IncomingMessage;
+    admittedRequest.headers = turn.headers;
+    admittedRequest.method = 'POST';
+    admittedRequest.url = '/v1/chat/completions';
+    Object.defineProperty(admittedRequest, 'socket', {
+      configurable: false,
+      enumerable: false,
+      value: admission.request.socket,
+    });
+    const onAborted = () => admittedRequest.emit('aborted');
+    admission.request.once('aborted', onAborted);
+    try {
+      await this.chatCompletions.handle(
+        admittedRequest,
+        admission.response,
+        turn.principal,
+        undefined,
+        undefined,
+        turn.routing,
+      );
+    } finally {
+      admission.request.off('aborted', onAborted);
+    }
+  }
+
+  /**
+   * World-connector admission (psfn-framework-rqm6t): the ordinary satellite
+   * credential and claim authenticate the caller; the assertion proves it is
+   * the enrolled `virtual_space` device. The request then takes the normal
+   * satellite chat path (world channel, speaker identity), carrying only a
+   * verified snapshot for the shared-device arbiter.
+   */
+  private async handleVirtualSpaceEmanationChat(
+    req: IncomingMessage,
+    res: ServerResponse,
+    clientCert: SatelliteClientCertIdentity | undefined,
+  ): Promise<void> {
+    if (!this.hubDeviceIngress || !this.hubDeviceCompanionId) {
+      sendApiError(res, 503, 'hub_device_ingress_unavailable', 'Hub device authentication is unavailable');
+      return;
+    }
+    const principal = resolveApiServerRequestPrincipal(req, res, {
+      ...(this.apiKey ? { apiKey: this.apiKey } : {}),
+      ...(this.satelliteApiKeys.length > 0 ? { satelliteApiKeys: this.satelliteApiKeys } : {}),
+      allowInsecureWithoutAuth: false,
+      isTelemetryIngest: false,
+    });
+    if (!principal) return;
+    try {
+      const assertion = extractCanonicalHubDeviceAssertion(req);
+      const binding = resolveVirtualSpaceEmanationBinding({
+        req,
+        principal,
+        registry: this.readSatelliteRegistry(),
+        companionId: this.hubDeviceCompanionId,
+        ...(clientCert ? { clientCert } : {}),
+      });
+      const admission = await this.hubDeviceIngress.verifyVirtualSpaceAssertion({
+        assertion,
+        expected: binding.expected,
+        satelliteId: binding.satelliteId,
+        endpointId: binding.endpointId,
+      });
+      log.info('Virtual-space emanation admitted', {
+        satelliteId: admission.satelliteId,
+        endpointId: admission.endpointId,
+        deviceId: admission.deviceId,
+        enrollmentVersion: admission.enrollmentVersion,
+      });
+      await this.chatCompletions.handle(
+        req,
+        res,
+        principal,
+        clientCert,
+        undefined,
+        { companionId: this.hubDeviceCompanionId },
+        admission,
+      );
+    } catch (error) {
+      if (error instanceof HubDeviceIngressRequestError) {
+        sendApiError(res, error.status, error.type, error.message);
+        return;
+      }
+      if (error instanceof HubDeviceAssertionRejectedError) {
+        sendApiError(res, 401, 'hub_device_assertion_rejected', 'Hub device assertion was rejected');
+        return;
+      }
+      // psfn-framework-u42t5: a registry/verifier misconfiguration must be
+      // diagnosable. The reference ties the operator log line to the reply
+      // without putting the error text in a response.
+      const failureRef = randomUUID();
+      log.error('Virtual-space emanation admission failed', {
+        failureRef,
+        error: toErrorMessage(error),
+      });
+      sendApiError(
+        res,
+        503,
+        'hub_device_ingress_unavailable',
+        `Hub device authentication is unavailable (ref ${failureRef})`,
+      );
+    }
+  }
+
+  private async handleHubDeviceChat(
+    req: IncomingMessage,
+    res: ServerResponse,
+    clientCert: SatelliteClientCertIdentity | undefined,
+  ): Promise<void> {
+    if (!this.hubDeviceIngress || !this.hubDeviceCompanionId) {
+      sendApiError(res, 503, 'hub_device_ingress_unavailable', 'Hub device authentication is unavailable');
+      return;
+    }
+    const principal = resolveApiServerRequestPrincipal(req, res, {
+      ...(this.satelliteApiKeys.length > 0 ? { satelliteApiKeys: this.satelliteApiKeys } : {}),
+      allowInsecureWithoutAuth: false,
+      isTelemetryIngest: false,
+    });
+    if (!principal) return;
+    let assertion: string | undefined;
+    try {
+      assertion = extractCanonicalHubDeviceAssertion(req);
+      const connection = resolveAuthenticatedHubDeviceConnection({
+        req,
+        principal,
+        registry: this.readSatelliteRegistry(),
+        companionId: this.hubDeviceCompanionId,
+        ...(clientCert ? { clientCert } : {}),
+      });
+      stripHubDeviceDownstreamAuthorityHeaders(req);
+      await this.chatCompletions.handle(req, res, principal, clientCert, {
+        assertion,
+        connection,
+        ingress: this.hubDeviceIngress,
+      }, { companionId: this.hubDeviceCompanionId });
+    } catch (error) {
+      if (error instanceof HubDeviceIngressRequestError) {
+        if (assertion && error.connectionId) {
+          try {
+            await this.hubDeviceIngress.fenceRejectedAssertion(assertion, error.connectionId);
+          } catch {
+            log.error('Hub device de-enrollment fence failed');
+            sendApiError(
+              res,
+              503,
+              'hub_device_ingress_unavailable',
+              'Hub device authentication is unavailable',
+            );
+            return;
+          }
+        }
+        sendApiError(res, error.status, error.type, error.message);
+        return;
+      }
+      log.error('Hub device ingress request failed');
+      sendApiError(res, 503, 'hub_device_ingress_unavailable', 'Hub device authentication is unavailable');
+    }
+  }
+
+  private handleIcpOperatorCancel(
+    req: IncomingMessage,
+    res: ServerResponse,
+    companionId: string,
+  ): void {
+    if (!this.adminToken) {
+      sendApiError(res, 503, 'admin_auth_not_configured', 'ADMIN_TOKEN is required for ICP operator cancellation');
+      return;
+    }
+    const authenticated = hasBearerToken(req, this.adminToken)
+      || hasCookieValue(req, 'psfn_token', this.adminToken);
+    if (!authenticated) {
+      sendApiError(res, 403, 'admin_token_required', 'This endpoint requires ADMIN_TOKEN authentication');
+      return;
+    }
+    if (!isRfc4122Uuid(companionId)) {
+      sendApiError(res, 400, 'invalid_companion_id', 'companionId must be a lowercase RFC-4122 UUID');
+      return;
+    }
+    if (!this.icpAutonomyOperator) {
+      sendApiError(res, 503, 'icp_autonomy_not_configured', 'ICP autonomy lifecycle control is not configured');
+      return;
+    }
+    void this.icpAutonomyOperator.cancelForCompanion(companionId)
+      .then(revokedCount => sendJson(res, 200, { companionId, revokedCount }))
+      .catch((error) => {
+        log.error('ICP operator cancellation failed', { error: toErrorMessage(error) });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'ICP operator cancellation failed');
+        }
+      });
+  }
+
+  private handleConfirmationOperatorResolve(
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): void {
+    if (!this.adminToken) {
+      sendApiError(
+        res,
+        503,
+        'admin_auth_not_configured',
+        'ADMIN_TOKEN is required for operator confirmation resolution',
+      );
+      return;
+    }
+    const authenticated = hasBearerToken(req, this.adminToken)
+      || hasCookieValue(req, 'psfn_token', this.adminToken);
+    if (!authenticated) {
+      sendApiError(res, 403, 'admin_token_required', 'This endpoint requires ADMIN_TOKEN authentication');
+      return;
+    }
+    if (!this.confirmationOperator) {
+      sendApiError(
+        res,
+        503,
+        'confirmation_operator_not_configured',
+        'Operator confirmation resolution is not configured',
+      );
+      return;
+    }
+
+    void readJsonBodyWithLimit(req, res, {
+      maxBytes: CONFIRMATION_OPERATOR_MAX_BODY_BYTES,
+      logger: log,
+    }).then(async (parsedBody) => {
+      if (!parsedBody.ok) {
+        if (parsedBody.errorCode === 'payload_too_large') return;
+        if (parsedBody.errorCode === 'read_error') {
+          log.error('Failed reading operator confirmation body', {
+            error: parsedBody.error.message,
+          });
+          if (canWriteResponse(res)) {
+            sendApiError(res, 500, 'internal_error', 'Operator confirmation resolution failed');
+          }
+          return;
+        }
+        sendApiError(res, 400, 'invalid_json', 'Request body is not valid JSON');
+        return;
+      }
+
+      const body = parsedBody.value;
+      const companionId = isRecord(body) && isRfc4122Uuid(body.companionId)
+        ? body.companionId
+        : undefined;
+      if (!isRecord(body)
+        || Object.keys(body).some(key => !['id', 'decision', 'modifiedParams', 'companionId'].includes(key))
+        || typeof body.id !== 'string'
+        || !CONFIRMATION_ID_PATTERN.test(body.id)
+        || (body.decision !== 'approve' && body.decision !== 'deny' && body.decision !== 'modify')
+        || (body.decision === 'modify' && !isRecord(body.modifiedParams))
+        || (body.decision !== 'modify' && body.modifiedParams !== undefined)
+        || (this.confirmationOperatorRequiresCompanionId && companionId === undefined)
+        || (body.companionId !== undefined && companionId === undefined)) {
+        sendApiError(res, 400, 'invalid_request', 'Confirmation resolution payload is invalid');
+        return;
+      }
+
+      const params: ConfirmationResolveRequest = {
+        id: body.id,
+        decision: body.decision,
+        ...(body.decision === 'modify'
+          ? { modifiedParams: body.modifiedParams as Record<string, unknown> }
+          : {}),
+      };
+      try {
+        const result = await this.confirmationOperator!.resolve(
+          params,
+          companionId !== undefined
+            ? { kind: 'fleet_companion', companionId }
+            : { kind: 'standalone_operator' },
+        );
+        sendJson(res, 200, result, API_DYNAMIC_JSON_HEADERS);
+      } catch (error) {
+        log.error('Operator confirmation resolution failed', { error: toErrorMessage(error) });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'Operator confirmation resolution failed');
+        }
+      }
+    }).catch((error) => {
+      log.error('Operator confirmation handler failed', { error: toErrorMessage(error) });
+      if (canWriteResponse(res)) {
+        sendApiError(res, 500, 'internal_error', 'Operator confirmation resolution failed');
+      }
+    });
+  }
+
+  private handleCompanionRelayRoute(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    principal: ApiAuthPrincipal,
+    clientCert: SatelliteClientCertIdentity | undefined,
+    route: ReturnType<typeof matchCompanionRelayRoute> & object,
+  ): void {
+    if (!this.companionRelay) {
+      sendApiError(res, 503, 'companion_relay_not_configured', 'Companion event relay is not configured on this runtime');
+      return;
+    }
+    let satelliteRegistry: SatelliteRegistryConfig | undefined;
+    try {
+      satelliteRegistry = this.readSatelliteRegistry();
+    } catch (error) {
+      log.error('Satellite registry provider failed', { error: toErrorMessage(error) });
+      sendApiError(res, 503, 'satellite_registry_unavailable', 'The canonical satellite registry is unavailable');
+      return;
+    }
+    const ctx = {
+      req,
+      res,
+      url,
+      principal,
+      ...(satelliteRegistry ? { registry: satelliteRegistry } : {}),
+      ...(clientCert ? { clientCert } : {}),
+      companionId: this.modelName,
+      deps: this.companionRelay,
+    };
+    if (route.route === 'events') {
+      handleCompanionEventsStream(ctx);
+      return;
+    }
+    if (route.route === 'approval_decision' && route.id) {
+      void handleCompanionApprovalDecision(ctx, route.id).catch((error) => {
+        log.error('Companion approval decision handler failed', { error: toErrorMessage(error) });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'Approval decision failed');
+        }
+      });
+      return;
+    }
+    if (route.route === 'touch_stimulus') {
+      void handleCompanionTouchStimulus(ctx).catch((error) => {
+        log.error('Companion touch stimulus handler failed', { error: toErrorMessage(error) });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'Touch stimulus delivery failed');
+        }
+      });
+      return;
+    }
+    if (route.route === 'audio_output') {
+      void handleCompanionUiAudioOutput(ctx).catch((error) => {
+        log.error('Companion UI audio output handler failed', { error: toErrorMessage(error) });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'Companion UI audio output delivery failed');
+        }
+      });
+      return;
+    }
+    if (route.route === 'artifact_preview' && route.id) {
+      void handleCompanionArtifactPreview(ctx, route.id).catch((error) => {
+        log.error('Companion artifact preview handler failed', { error: toErrorMessage(error) });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'Artifact preview failed');
+        }
+      });
+      return;
+    }
+    sendApiError(res, 404, 'not_found', 'Unknown companion relay route');
+  }
+
+  private handleIdentity(res: ServerResponse): void {
+    const psfnAmica = this.chatCompletions.externalChannelProfile('psfn-amica');
+    sendJson(res, 200, {
+      object: 'psfn.identity',
+      companion: {
+        id: this.modelName,
+        name: this.companionName,
+      },
+      channels: {
+        ...(psfnAmica
+          ? {
+            'psfn-amica': {
+              ...(psfnAmica.authorId || psfnAmica.authorName
+                ? {
+                  user: {
+                    ...(psfnAmica.authorId ? { id: psfnAmica.authorId } : {}),
+                    ...(psfnAmica.authorName ? { name: psfnAmica.authorName } : {}),
+                  },
+                }
+                : {}),
+              ...(psfnAmica.canonicalContactId ? { canonicalContactId: psfnAmica.canonicalContactId } : {}),
+              ...(psfnAmica.channelPrivacy ? { channelPrivacy: psfnAmica.channelPrivacy } : {}),
+            },
+          }
+          : {}),
+      },
+    });
+  }
+
+  private handleSatelliteConfigPull(
+    res: ServerResponse,
+    url: URL,
+    principal: ApiAuthPrincipal,
+    clientCert: SatelliteClientCertIdentity | undefined,
+  ): void {
+    let satelliteRegistry: SatelliteRegistryConfig | undefined;
+    try {
+      satelliteRegistry = this.readSatelliteRegistry();
+    } catch (error) {
+      log.error('Satellite registry provider failed', { error: toErrorMessage(error) });
+      sendApiError(res, 503, 'satellite_registry_unavailable', 'The canonical satellite registry is unavailable');
+      return;
+    }
+    const resolution = resolveSatelliteConfigPull({
+      principal,
+      registry: satelliteRegistry,
+      satelliteId: url.searchParams.get('satelliteId') ?? undefined,
+      endpointId: url.searchParams.get('endpointId') ?? undefined,
+      claimType: url.searchParams.get('claimType') ?? undefined,
+      ...(clientCert ? { clientCert } : {}),
+    });
+    if (!resolution.ok) {
+      sendApiError(res, resolution.status, resolution.type, resolution.message);
+      return;
+    }
+    sendJson(res, 200, resolution.value, API_DYNAMIC_JSON_HEADERS);
+  }
+
+  private readSatelliteRegistry(): SatelliteRegistryConfig | undefined {
+    return this.satelliteRegistryProvider
+      ? this.satelliteRegistryProvider()
+      : this.satelliteRegistry;
+  }
+
+  private handleReadiness(res: ServerResponse): void {
+    let ready = false;
+    try {
+      ready = this.runtime?.isReady?.() === true;
+    } catch (error) {
+      log.error('API readiness check failed', { error: toErrorMessage(error) });
+    }
+    sendJson(res, ready ? 200 : 503, { status: ready ? 'ready' : 'unavailable' });
+  }
+
+  private async handleHealth(res: ServerResponse): Promise<void> {
+    if (this.runtime) {
+      const body = await this.runtime.handleHealth();
+      sendJson(res, body.status === 'healthy' ? 200 : 503, body);
+      return;
+    }
+
+    const subsystemEntries = await Promise.all(
+      API_HEALTH_SUBSYSTEMS.map(async (subsystem) => {
+        const status = await this.evaluateSubsystemHealth(subsystem);
+        return [subsystem, status] as const;
+      }),
+    );
+    const checkedAtMs = Date.now();
+
+    const subsystems = Object.fromEntries(subsystemEntries) as ApiHealthResponse['subsystems'];
+    const subsystemStatus: ApiHealthResponse['status'] = API_HEALTH_SUBSYSTEMS.every(
+      (subsystem) => subsystems[subsystem].status === 'healthy',
+    )
+      ? 'healthy'
+      : 'degraded';
+    const continuity = this.evaluateContinuityWatchdogHealth(subsystems, checkedAtMs);
+    const status: ApiHealthResponse['status'] = (
+      subsystemStatus === 'healthy'
+      && continuity.status === 'healthy'
+    )
+      ? 'healthy'
+      : 'degraded';
+
+    const body: ApiHealthResponse = {
+      status,
+      checkedAt: new Date(checkedAtMs).toISOString(),
+      uptimeSeconds: Math.floor(process.uptime()),
+      subsystems,
+      continuity,
+    };
+
+    sendJson(res, status === 'healthy' ? 200 : 503, body);
+  }
+
+  private evaluateContinuityWatchdogHealth(
+    subsystems: ApiHealthResponse['subsystems'],
+    checkedAtMs: number,
+  ): ApiHealthResponse['continuity'] {
+    const checks: Record<ApiContinuityWatchdogCheck, ApiHealthSubsystemStatus> = {
+      database: this.mapSubsystemToContinuityCheck(
+        subsystems.memory,
+        'memory',
+        'Database-backed memory subsystem is degraded',
+      ),
+      gatewayLink: this.evaluateGatewayLinkHealth(subsystems),
+      schedulerHealthcheck: this.evaluateSchedulerHealthcheckHealth(subsystems.scheduler, checkedAtMs),
+    };
+
+    const status: ApiHealthResponse['continuity']['status'] = API_CONTINUITY_WATCHDOG_CHECKS.every(
+      (check) => checks[check].status === 'healthy',
+    )
+      ? 'healthy'
+      : 'degraded';
+
+    return {
+      status,
+      checks,
+    };
+  }
+
+  private mapSubsystemToContinuityCheck(
+    source: ApiHealthSubsystemStatus,
+    sourceSubsystem: ApiHealthSubsystem,
+    degradedFallbackDetail: string,
+  ): ApiHealthSubsystemStatus {
+    const detail = source.detail?.trim();
+    return {
+      status: source.status === 'healthy' ? 'healthy' : 'degraded',
+      ...(source.status === 'degraded'
+        ? { detail: detail || degradedFallbackDetail }
+        : {}),
+      meta: {
+        ...(source.meta ?? {}),
+        sourceSubsystem,
+      },
+    };
+  }
+
+  private evaluateGatewayLinkHealth(
+    subsystems: ApiHealthResponse['subsystems'],
+  ): ApiHealthSubsystemStatus {
+    // Only the llm check round-trips the gateway (model discovery RPC); the
+    // embeddings check is configuration-only, so it cannot prove the link. A
+    // provider-side discovery failure the gateway answered for (reported as
+    // `gatewayReachable: true`) keeps the link healthy so provider outages do
+    // not masquerade as a broken agent-gateway connection.
+    const gatewayReachable = subsystems.llm.meta?.gatewayReachable === true;
+    const meta = {
+      agentConnected: true,
+      sourceSubsystem: 'llm',
+      gatewayReachable,
+      llmStatus: subsystems.llm.status,
+      embeddingsStatus: subsystems.embeddings.status,
+    };
+    if (subsystems.llm.status === 'healthy' || gatewayReachable) {
+      return { status: 'healthy', meta };
+    }
+    return {
+      status: 'degraded',
+      detail: subsystems.llm.detail?.trim() || 'Gateway-linked LLM model discovery check is degraded',
+      meta,
+    };
+  }
+
+  private evaluateSchedulerHealthcheckHealth(
+    schedulerSubsystem: ApiHealthSubsystemStatus,
+    checkedAtMs: number,
+  ): ApiHealthSubsystemStatus {
+    const schedulerDetail = schedulerSubsystem.detail?.trim();
+    const healthcheckObservedAtMs = this.lastSchedulerHealthcheckAtMs;
+    const uptimeMs = Math.max(0, Math.floor(process.uptime() * 1_000));
+    const healthcheckAgeMs = healthcheckObservedAtMs === null
+      ? null
+      : Math.max(0, checkedAtMs - healthcheckObservedAtMs);
+
+    const baseMeta: Record<string, unknown> = {
+      ...(schedulerSubsystem.meta ?? {}),
+      sourceSubsystem: 'scheduler',
+      schedulerHealthcheckStaleAfterMs: this.schedulerHealthcheckStaleAfterMs,
+      ...(healthcheckObservedAtMs === null
+        ? { healthcheckObserved: false }
+        : {
+          healthcheckObserved: true,
+          schedulerHealthcheckAt: new Date(healthcheckObservedAtMs).toISOString(),
+          schedulerHealthcheckAgeMs: healthcheckAgeMs,
+        }),
+    };
+
+    if (schedulerSubsystem.status !== 'healthy') {
+      return {
+        status: 'degraded',
+        detail: schedulerDetail || 'Scheduler subsystem is degraded',
+        meta: baseMeta,
+      };
+    }
+
+    if (healthcheckObservedAtMs === null) {
+      if (uptimeMs <= this.schedulerHealthcheckStaleAfterMs) {
+        return {
+          status: 'healthy',
+          meta: {
+            ...baseMeta,
+            schedulerHealthcheckGraceMsRemaining: Math.max(
+              0,
+              this.schedulerHealthcheckStaleAfterMs - uptimeMs,
+            ),
+          },
+        };
+      }
+      return {
+        status: 'degraded',
+        detail: `No scheduler healthcheck observed within ${this.schedulerHealthcheckStaleAfterMs}ms`,
+        meta: baseMeta,
+      };
+    }
+
+    if (healthcheckAgeMs !== null && healthcheckAgeMs > this.schedulerHealthcheckStaleAfterMs) {
+      return {
+        status: 'degraded',
+        detail: `Scheduler healthcheck stale: ${healthcheckAgeMs}ms since last pulse (limit ${this.schedulerHealthcheckStaleAfterMs}ms)`,
+        meta: baseMeta,
+      };
+    }
+
+    return {
+      status: 'healthy',
+      meta: baseMeta,
+    };
+  }
+
+  private async evaluateSubsystemHealth(
+    subsystem: ApiHealthSubsystem,
+  ): Promise<ApiHealthSubsystemStatus> {
+    const startedAt = Date.now();
+    const check = this.healthChecks[subsystem];
+    if (!check) {
+      return this.normalizeSubsystemHealth({
+        status: 'degraded',
+        detail: 'Health check not configured',
+      }, 0);
+    }
+
+    try {
+      const result = await Promise.resolve(check());
+      return this.normalizeSubsystemHealth(result, Date.now() - startedAt);
+    } catch (error) {
+      return this.normalizeSubsystemHealth({
+        status: 'degraded',
+        detail: toErrorMessage(error),
+      }, Date.now() - startedAt);
+    }
+  }
+
+  private normalizeSubsystemHealth(
+    result: ApiHealthSubsystemStatus,
+    checkLatencyMs: number,
+  ): ApiHealthSubsystemStatus {
+    const detail = result.detail?.trim();
+    return {
+      status: result.status === 'healthy' ? 'healthy' : 'degraded',
+      ...(detail ? { detail } : {}),
+      meta: {
+        ...(result.meta ?? {}),
+        checkLatencyMs: Math.max(0, Math.round(checkLatencyMs)),
+      },
+    };
+  }
+
+  private async handleTelemetryIngest(
+    req: IncomingMessage,
+    res: ServerResponse,
+    principal: ApiAuthPrincipal,
+    clientCert: SatelliteClientCertIdentity | undefined,
+  ): Promise<void> {
+    const parsedBody = await readJsonBodyWithLimit(req, res, {
+      maxBytes: MAX_BODY_SIZE,
+      logger: log,
+    });
+    if (!parsedBody.ok) {
+      if (parsedBody.errorCode === 'payload_too_large') return;
+      if (parsedBody.errorCode === 'read_error') {
+        log.error('Failed reading telemetry body', {
+          error: parsedBody.error.message,
+        });
+        if (canWriteResponse(res)) {
+          sendApiError(res, 500, 'internal_error', 'Internal server error');
+        }
+        return;
+      }
+      sendApiError(res, 400, 'invalid_json', 'Request body is not valid JSON');
+      return;
+    }
+
+    await this.ingestTelemetryPayload(parsedBody.value, res, principal, clientCert);
+  }
+
+  private async ingestTelemetryPayload(
+    parsed: unknown,
+    res: ServerResponse,
+    principal: ApiAuthPrincipal,
+    clientCert: SatelliteClientCertIdentity | undefined,
+  ): Promise<void> {
+    if (!Value.Check(telemetryIngestSchema, parsed)) {
+      sendApiError(
+        res,
+        400,
+        'invalid_request',
+        'Telemetry payload failed schema validation',
+      );
+      return;
+    }
+
+    const telemetry: TelemetryIngestRequest = parsed as TelemetryIngestInput;
+
+    if (!TELEMETRY_EVENT_TYPE_ALLOWLIST.has(telemetry.eventType)) {
+      sendApiError(
+        res,
+        403,
+        'event_type_not_allowed',
+        `eventType must be one of: ${Array.from(TELEMETRY_EVENT_TYPE_ALLOWLIST).join(', ')}`,
+      );
+      return;
+    }
+
+    // Sprint-10 H5: screen the open payload for raw biometrics, oversized/blob
+    // shapes, and out-of-allowlist fields BEFORE it is copied verbatim into the
+    // emitted event. Biometrics must not cross the ingest door. Fail closed.
+    const payloadScreen = screenTelemetryIngestPayload(telemetry.eventType, telemetry.payload);
+    if (!payloadScreen.ok) {
+      const status = payloadScreen.errorType === 'payload_too_large' ? 413 : 400;
+      sendApiError(res, status, payloadScreen.errorType, payloadScreen.message);
+      return;
+    }
+
+    const occurredAtMs = Date.parse(telemetry.timestamp);
+    if (!Number.isFinite(occurredAtMs)) {
+      sendApiError(res, 400, 'invalid_request', 'timestamp must be a valid ISO-8601 string');
+      return;
+    }
+
+    const now = Date.now();
+    if (Math.abs(now - occurredAtMs) > TELEMETRY_MAX_SKEW_MS) {
+      sendApiError(
+        res,
+        400,
+        'stale_request',
+        `timestamp must be within ${TELEMETRY_MAX_SKEW_MS / 1000} seconds of server time`,
+      );
+      return;
+    }
+
+    this.pruneTelemetryNonces(now);
+    const nonceKey = `${telemetry.source}:${telemetry.nonce}`;
+    if (this.seenTelemetryNonces.has(nonceKey)) {
+      sendApiError(res, 409, 'replay_detected', 'Duplicate nonce detected');
+      return;
+    }
+    this.seenTelemetryNonces.set(nonceKey, now);
+
+    // Sprint-10 04-M1: stamp the authenticated origin so downstream
+    // consumers (perception bridge) can bind any payload-claimed satelliteId
+    // to the credential that actually authenticated this request.
+    const authContext: SatelliteTelemetryAuthContext = {
+      principalId: principal.id,
+      principalMode: principal.mode,
+      satelliteScoped: principal.scope === 'satellite',
+      ...(clientCert ? { clientCert } : {}),
+    };
+    const normalizedEvent: ExternalTelemetryEvent = {
+      id: `ext-${randomUUID()}`,
+      source: telemetry.source,
+      eventType: telemetry.eventType,
+      payload: telemetry.payload,
+      occurredAt: new Date(occurredAtMs).toISOString(),
+      receivedAt: new Date(now).toISOString(),
+      nonce: telemetry.nonce,
+      channelId: telemetry.channelId,
+      scope: telemetry.scope,
+      auth: authContext,
+    };
+
+    if (this.runtime) {
+      const result = await this.runtime.handleTelemetryIngest(normalizedEvent);
+      if (!result.ok) {
+        if (canWriteResponse(res)) {
+          sendApiError(
+            res,
+            result.error.status,
+            result.error.type,
+            result.error.message,
+            result.error.details,
+          );
+        }
+        return;
+      }
+      sendJson(res, 202, result.response);
+      return;
+    }
+
+    const receipt = await this.sensorIngest.ingestTelemetry(normalizedEvent);
+
+    const response: TelemetryIngestResponse = {
+      ok: true,
+      id: receipt.id,
+      acceptedEventType: receipt.acceptedEventType,
+    };
+    sendJson(res, 202, response);
+  }
+
+  private pruneTelemetryNonces(now: number): void {
+    for (const [nonceKey, seenAt] of this.seenTelemetryNonces.entries()) {
+      if (now - seenAt > TELEMETRY_NONCE_TTL_MS) {
+        this.seenTelemetryNonces.delete(nonceKey);
+      }
+    }
+  }
+}

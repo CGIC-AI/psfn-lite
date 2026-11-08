@@ -1,0 +1,273 @@
+import { describe, expect, it } from 'vitest';
+
+import { InMemoryBiographicalProfileStore } from './in-memory-store.js';
+import {
+  COMPANION_PUBLICATION_AUTHORITY_BASIS,
+  recordCompanionPublicationChoice,
+  revokeCompanionPublicationChoice,
+} from './publication.js';
+import { ingestSelfNicknameEvidence } from './ingest.js';
+import type {
+  BiographicalClaimSource,
+  BiographicalSubjectRef,
+} from './types.js';
+import type { BiographicalProfileStorePort } from './store-port.js';
+
+const SHA = 'a'.repeat(64);
+const NOW = new Date('2026-08-10T12:00:00.000Z');
+
+function companion(id = 'purrs'): BiographicalSubjectRef {
+  return { kind: 'companion', companionId: id, subjectVersion: 1 };
+}
+
+function source(ref: string): BiographicalClaimSource {
+  return {
+    ref,
+    revision: '2026-08-10T10:00:00.000Z',
+    evidenceDigest: SHA,
+    sensitivityAtProjection: 'personal',
+    subjectEvidenceDigest: SHA,
+    consentFingerprint: SHA,
+    sourceChannelId: 'dm:with-v',
+  };
+}
+
+function store() {
+  return new InMemoryBiographicalProfileStore(() => NOW);
+}
+
+async function seed(store: InMemoryBiographicalProfileStore, nickname: string) {
+  return ingestSelfNicknameEvidence({
+    store,
+    evidence: {
+      companionSubject: companion(),
+      nickname,
+      sources: [source('memory:m-1')],
+      confidence: 0.9,
+      now: NOW,
+    },
+  });
+}
+
+describe('recordCompanionPublicationChoice — exact digest-bound lowering', () => {
+  it('lowers exactly the chosen claim to public and stamps the companion basis', async () => {
+    const s = store();
+    const { claim: a } = await seed(s, 'Sunbeam loaf');
+    const { claim: b } = await seed(s, 'Sunny');
+
+    expect(a.effectiveSensitivity).toBe('personal');
+    expect(b.effectiveSensitivity).toBe('personal');
+
+    const grant = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: a.id, reason: 'I want to be called this in public', now: NOW },
+    });
+
+    expect(grant.authorizingActor).toBe('companion');
+    expect(grant.authorityBasis).toBe(COMPANION_PUBLICATION_AUTHORITY_BASIS);
+    expect(grant.grantedSensitivity).toBe('public');
+    expect(grant.claimDigest).toBe(a.claimDigest);
+    expect(grant.sourceSetDigest).toBe(a.sourceSetDigest);
+
+    const refreshedA = await s.getClaim(a.id);
+    const refreshedB = await s.getClaim(b.id);
+    expect(refreshedA?.effectiveSensitivity).toBe('public');
+    expect(refreshedA?.appliedGrantId).toBe(grant.id);
+    // Approval of one never authorizes another.
+    expect(refreshedB?.effectiveSensitivity).toBe('personal');
+    expect(refreshedB?.appliedGrantId).toBeUndefined();
+  });
+
+  it('records a distinct grant per nickname (independent approval)', async () => {
+    const s = store();
+    const { claim: a } = await seed(s, 'Sunbeam loaf');
+    const { claim: b } = await seed(s, 'Sunny');
+
+    const grantA = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: a.id, reason: 'publish A', now: NOW },
+    });
+    const grantB = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: b.id, reason: 'publish B', now: NOW },
+    });
+
+    expect(grantA.id).not.toBe(grantB.id);
+    expect(grantA.claimDigest).not.toBe(grantB.claimDigest);
+    expect((await s.getClaim(a.id))?.effectiveSensitivity).toBe('public');
+    expect((await s.getClaim(b.id))?.effectiveSensitivity).toBe('public');
+  });
+
+  it('fails closed on an unknown claim id', async () => {
+    const s = store();
+    await expect(
+      recordCompanionPublicationChoice({
+        store: s,
+        choice: { claimId: 'nope', reason: 'x', now: NOW },
+      }),
+    ).rejects.toThrow(/unknown biographical claim/u);
+  });
+
+  it('fails closed on a non-active claim', async () => {
+    const s = store();
+    const { claim: a } = await seed(s, 'Sunbeam loaf');
+    await s.transitionClaim({ claimId: a.id, to: 'contested', now: NOW });
+    await expect(
+      recordCompanionPublicationChoice({
+        store: s,
+        choice: { claimId: a.id, reason: 'x', now: NOW },
+      }),
+    ).rejects.toThrow(/not active/u);
+  });
+});
+
+describe('revokeCompanionPublicationChoice — immediate restriction', () => {
+  it('reverts the claim to its automatic sensitivity immediately', async () => {
+    const s = store();
+    const { claim: a } = await seed(s, 'Sunbeam loaf');
+    const grant = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: a.id, reason: 'publish', now: NOW },
+    });
+    expect((await s.getClaim(a.id))?.effectiveSensitivity).toBe('public');
+
+    const revoked = await revokeCompanionPublicationChoice({
+      store: s,
+      grantId: grant.id,
+      claimId: a.id,
+      revoke: { reason: 'I changed my mind', now: NOW },
+    });
+    expect(revoked.revokedAt).toBeDefined();
+
+    const refreshed = await s.getClaim(a.id);
+    expect(refreshed?.effectiveSensitivity).toBe('personal');
+    expect(refreshed?.appliedGrantId).toBeUndefined();
+  });
+
+  it('grants universal portability with the choice and withdraws it on revoke', async () => {
+    const s = store();
+    const { claim } = await seed(s, 'Sunbeam loaf');
+    // Before the companion chooses, her nickname is not portable at all.
+    expect((await s.getClaim(claim.id))?.portabilityScope).toBe('origin_only');
+
+    const grant = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: claim.id, reason: 'publish', now: NOW },
+    });
+    expect((await s.getClaim(claim.id))?.portabilityScope).toBe('universal');
+
+    await revokeCompanionPublicationChoice({
+      store: s,
+      grantId: grant.id,
+      claimId: claim.id,
+      revoke: { reason: 'no longer', now: NOW },
+    });
+    // Withdrawing the choice withdraws the reach it authorized.
+    expect((await s.getClaim(claim.id))?.portabilityScope).toBe('origin_only');
+    expect((await s.getClaim(claim.id))?.effectiveSensitivity).toBe('personal');
+  });
+
+  it('refuses to publish a claim that names a human', async () => {
+    const s = store();
+    const claim = await s.writeClaim({
+      subject: { kind: 'contact', contactId: 'v', subjectVersion: 1 },
+      relatedSubject: { kind: 'companion', companionId: 'purrs', subjectVersion: 1 },
+      kind: 'relationship',
+      value: { kind: 'relationship', relationshipType: 'partner' },
+      basis: 'explicit',
+      status: 'active',
+      confidence: 1,
+      sources: [source('memory:relationship')],
+      now: NOW,
+    });
+    await expect(recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: claim.id, reason: 'publish', now: NOW },
+    })).rejects.toThrow('only a companion-self claim may be published');
+    expect(await s.listGrantsForClaim(claim.id)).toEqual([]);
+    expect((await s.getClaim(claim.id))?.portabilityScope).toBe('origin_only');
+  });
+
+  // psfn-framework-a18qq — the two writes a revoke performs (grant revocation
+  // and portability tightening) are one transaction. A mid-write failure must
+  // leave the published state entirely intact, not a revoked grant beside a
+  // still-universally-portable claim.
+  it('rolls the whole revoke back when the portability write fails (a18qq)', async () => {
+    const s = store();
+    const { claim } = await seed(s, 'Sunbeam loaf');
+    const grant = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: claim.id, reason: 'publish', now: NOW },
+    });
+    expect((await s.getClaim(claim.id))?.portabilityScope).toBe('universal');
+
+    // The second write of the revoke fails; the first must not survive it.
+    const failing: BiographicalProfileStorePort = Object.assign(
+      Object.create(Object.getPrototypeOf(s) as object) as BiographicalProfileStorePort,
+      s,
+      {
+        setClaimPortability: async () => {
+          throw new Error('simulated mid-write failure');
+        },
+      },
+    );
+
+    await expect(revokeCompanionPublicationChoice({
+      store: failing,
+      grantId: grant.id,
+      claimId: claim.id,
+      revoke: { reason: 'I changed my mind', now: NOW },
+    })).rejects.toThrow('simulated mid-write failure');
+
+    // Nothing was half-applied: the grant is still live and the claim is still
+    // published at the reach the choice authorized.
+    expect((await s.getGrant(grant.id))?.revokedAt).toBeUndefined();
+    const refreshed = await s.getClaim(claim.id);
+    expect(refreshed?.effectiveSensitivity).toBe('public');
+    expect(refreshed?.portabilityScope).toBe('universal');
+  });
+
+  it('fails closed rather than revoking against an unknown claim (a18qq)', async () => {
+    const s = store();
+    const { claim } = await seed(s, 'Sunbeam loaf');
+    const grant = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: claim.id, reason: 'publish', now: NOW },
+    });
+
+    await expect(revokeCompanionPublicationChoice({
+      store: s,
+      grantId: grant.id,
+      claimId: 'claim-that-does-not-exist',
+      revoke: { reason: 'oops', now: NOW },
+    })).rejects.toThrow('cannot revoke a publication choice for an unknown claim');
+
+    // The real grant is untouched by the refused revoke.
+    expect((await s.getGrant(grant.id))?.revokedAt).toBeUndefined();
+    expect((await s.getClaim(claim.id))?.effectiveSensitivity).toBe('public');
+  });
+
+  it('revoking one nickname does not affect another', async () => {
+    const s = store();
+    const { claim: a } = await seed(s, 'Sunbeam loaf');
+    const { claim: b } = await seed(s, 'Sunny');
+    const grantA = await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: a.id, reason: 'publish A', now: NOW },
+    });
+    await recordCompanionPublicationChoice({
+      store: s,
+      choice: { claimId: b.id, reason: 'publish B', now: NOW },
+    });
+
+    await revokeCompanionPublicationChoice({
+      store: s,
+      grantId: grantA.id,
+      claimId: a.id,
+      revoke: { reason: 'revoke A only', now: NOW },
+    });
+
+    expect((await s.getClaim(a.id))?.effectiveSensitivity).toBe('personal');
+    expect((await s.getClaim(b.id))?.effectiveSensitivity).toBe('public');
+  });
+});

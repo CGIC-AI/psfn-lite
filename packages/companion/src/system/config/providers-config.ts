@@ -1,0 +1,318 @@
+import { join } from 'node:path';
+import type { CanonicalProviderRegistry, CanonicalProviderType, ProviderRegistryEntry } from '../../shared/contracts/runtime.js';
+import {
+  envCredential,
+  type CredentialReference,
+} from '../../shared/contracts/credential-contracts.js';
+import type { SubstrateConfig } from './runtime-config-contracts.js';
+import { loadRequiredJson } from './load-or-seed.js';
+import { writeJsonAtomic } from '../../shared/utils/fs.js';
+import { isRecord } from '../../shared/utils/types.js';
+
+export const PROVIDERS_FILE_NAME = 'providers.json';
+export const PROVIDERS_SEED_FILE_NAME = 'providers.seed.json';
+
+const PROVIDER_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
+const ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]*$/;
+const KNOWN_PROVIDER_TYPES = new Set<CanonicalProviderType>([
+  'openrouter',
+  'openai',
+  'anthropic',
+  'google',
+  'mistral',
+  'generic_openai',
+]);
+
+/**
+ * OpenRouter server-tools web backend selection (bead htm9.10).
+ * Sourced from the enabled openrouter provider's `metadata.webTools`. When
+ * `enabled` is true the gateway routes web search/fetch through OpenRouter's
+ * built-in server tools instead of the self-hosted crawler lane.
+ */
+export interface OpenRouterWebToolsConfig {
+  enabled: boolean;
+  /** OpenRouter model slug driving the server tools; required when enabled. */
+  model: string;
+}
+
+export interface ProvidersRuntimeConfig {
+  registry: CanonicalProviderRegistry;
+  openRouterApiBaseUrl?: string;
+  openRouterModelsApiUrl?: string;
+  openRouterApiKeyRef?: CredentialReference;
+  openRouterWebTools?: OpenRouterWebToolsConfig;
+}
+
+interface ProvidersConfigLoadOptions {
+  seedDir?: string;
+}
+
+export interface ProvidersLoadResult {
+  config: ProvidersRuntimeConfig;
+}
+
+function toNonEmptyString(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeHttpUrl(value: string | undefined, field: string): string | undefined {
+  if (!value) return undefined;
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`Invalid providers config: ${field} must be a valid http(s) URL`);
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`Invalid providers config: ${field} must use http or https`);
+  }
+  parsed.hash = '';
+  return parsed.toString();
+}
+
+function normalizeApiKeyEnv(value: unknown, field: string): string | undefined {
+  const normalized = toNonEmptyString(value);
+  if (!normalized) return undefined;
+  if (!ENV_NAME_PATTERN.test(normalized)) {
+    throw new Error(`Invalid providers config: ${field} must be an uppercase env var name`);
+  }
+  return normalized;
+}
+
+function normalizeCredentialReference(
+  value: unknown,
+  field: string,
+): CredentialReference | undefined {
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) {
+    throw new Error(`Invalid providers config: ${field} must be an object`);
+  }
+  if (value.kind !== 'env') {
+    throw new Error(`Invalid providers config: ${field}.kind must be "env"`);
+  }
+  const envName = normalizeApiKeyEnv(value.envName, `${field}.envName`);
+  if (!envName) {
+    throw new Error(`Invalid providers config: ${field}.envName must be an uppercase env var name`);
+  }
+  return envCredential(envName);
+}
+
+function normalizeProviderType(value: unknown, field: string): CanonicalProviderType {
+  const normalized = toNonEmptyString(value)?.toLowerCase() as CanonicalProviderType | undefined;
+  if (!normalized || !KNOWN_PROVIDER_TYPES.has(normalized)) {
+    throw new Error(
+      `Invalid providers config: ${field} must be one of ${[...KNOWN_PROVIDER_TYPES].join(', ')}`,
+    );
+  }
+  return normalized;
+}
+
+function normalizeProviderEntry(raw: unknown, field: string): ProviderRegistryEntry {
+  if (!isRecord(raw)) {
+    throw new Error(`Invalid providers config: ${field} must be an object`);
+  }
+
+  const id = toNonEmptyString(raw.id)?.toLowerCase();
+  if (!id || !PROVIDER_ID_PATTERN.test(id)) {
+    throw new Error(`Invalid providers config: ${field}.id must be a non-empty key-safe string`);
+  }
+  const enabled = raw.enabled === undefined ? true : raw.enabled;
+  if (typeof enabled !== 'boolean') {
+    throw new Error(`Invalid providers config: ${field}.enabled must be a boolean`);
+  }
+
+  const type = normalizeProviderType(raw.type, `${field}.type`);
+  const label = toNonEmptyString(raw.label);
+  const apiBaseUrl = normalizeHttpUrl(toNonEmptyString(raw.apiBaseUrl), `${field}.apiBaseUrl`);
+  const modelsApiUrl = normalizeHttpUrl(toNonEmptyString(raw.modelsApiUrl), `${field}.modelsApiUrl`);
+  if ('apiKeyEnv' in raw) {
+    throw new Error(`Invalid providers config: ${field}.apiKeyEnv is not supported; use ${field}.apiKeyRef`);
+  }
+  const apiKeyRef = normalizeCredentialReference(raw.apiKeyRef, `${field}.apiKeyRef`);
+  const capacity = normalizeProviderCapacity(raw.capacity, `${field}.capacity`);
+  const reservedForegroundSlots = normalizeProviderReservedForegroundSlots(
+    raw.reservedForegroundSlots,
+    capacity,
+    `${field}.reservedForegroundSlots`,
+  );
+
+  if (type === 'openrouter') {
+    if (!apiBaseUrl) {
+      throw new Error(`Invalid providers config: ${field}.apiBaseUrl is required for openrouter`);
+    }
+    if (!modelsApiUrl) {
+      throw new Error(`Invalid providers config: ${field}.modelsApiUrl is required for openrouter`);
+    }
+  }
+  if (
+    (type === 'openai' || type === 'anthropic' || type === 'google' || type === 'mistral' || type === 'generic_openai')
+    && !apiBaseUrl
+  ) {
+    throw new Error(`Invalid providers config: ${field}.apiBaseUrl is required for ${type}`);
+  }
+
+  return {
+    id,
+    type,
+    enabled,
+    ...(label ? { label } : {}),
+    ...(apiBaseUrl ? { apiBaseUrl } : {}),
+    ...(modelsApiUrl ? { modelsApiUrl } : {}),
+    ...(apiKeyRef ? { apiKeyRef } : {}),
+    ...(capacity !== undefined ? { capacity } : {}),
+    ...(reservedForegroundSlots !== undefined ? { reservedForegroundSlots } : {}),
+    ...(isRecord(raw.metadata) ? { metadata: { ...raw.metadata } } : {}),
+  };
+}
+
+function normalizeProviderCapacity(value: unknown, field: string): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`Invalid providers config: ${field} must be an integer >= 1`);
+  }
+  return value;
+}
+
+function normalizeProviderReservedForegroundSlots(
+  value: unknown,
+  capacity: number | undefined,
+  field: string,
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Invalid providers config: ${field} must be an integer >= 0`);
+  }
+  // Never reserve the entire endpoint away from background work: at least one
+  // slot must remain for non-foreground lanes.
+  const effectiveCapacity = capacity ?? 1;
+  if (value > Math.max(0, effectiveCapacity - 1)) {
+    throw new Error(
+      `Invalid providers config: ${field} (${value}) must be < capacity (${effectiveCapacity})`,
+    );
+  }
+  return value;
+}
+
+export function normalizeCanonicalProviderRegistry(
+  raw: unknown,
+  sourcePath = 'providers',
+): CanonicalProviderRegistry {
+  if (!isRecord(raw)) {
+    throw new Error(`Invalid providers config at ${sourcePath}: expected object`);
+  }
+  if (raw.schemaVersion !== 1) {
+    throw new Error(`Invalid providers config at ${sourcePath}.schemaVersion: expected 1`);
+  }
+  if (!Array.isArray(raw.providers) || raw.providers.length === 0) {
+    throw new Error(`Invalid providers config at ${sourcePath}.providers: expected non-empty array`);
+  }
+
+  const seenIds = new Set<string>();
+  const enabledTypeCounts = new Map<CanonicalProviderType, number>();
+  const providers = raw.providers.map((entry, index) => {
+    const normalized = normalizeProviderEntry(entry, `${sourcePath}.providers[${index}]`);
+    if (seenIds.has(normalized.id)) {
+      throw new Error(`Invalid providers config at ${sourcePath}.providers[${index}].id: duplicate "${normalized.id}"`);
+    }
+    seenIds.add(normalized.id);
+    if (normalized.enabled) {
+      enabledTypeCounts.set(normalized.type, (enabledTypeCounts.get(normalized.type) ?? 0) + 1);
+    }
+    return normalized;
+  });
+
+  for (const singletonType of ['openrouter'] as const) {
+    if ((enabledTypeCounts.get(singletonType) ?? 0) > 1) {
+      throw new Error(`Invalid providers config at ${sourcePath}: only one enabled ${singletonType} provider is supported`);
+    }
+  }
+
+  return {
+    schemaVersion: 1,
+    providers,
+  };
+}
+
+function projectOpenRouterWebTools(
+  openrouter: ProviderRegistryEntry | undefined,
+): OpenRouterWebToolsConfig | undefined {
+  const metadata = openrouter?.metadata;
+  const webTools = isRecord(metadata) ? metadata.webTools : undefined;
+  if (!isRecord(webTools)) {
+    return undefined;
+  }
+  if (webTools.enabled !== undefined && typeof webTools.enabled !== 'boolean') {
+    throw new Error('Invalid providers config: openrouter.metadata.webTools.enabled must be a boolean');
+  }
+  const enabled = webTools.enabled === true;
+  const model = toNonEmptyString(webTools.model);
+  if (enabled && !model) {
+    throw new Error(
+      'Invalid providers config: openrouter.metadata.webTools.model is required when webTools.enabled is true',
+    );
+  }
+  return { enabled, model: model ?? '' };
+}
+
+function projectProvidersRuntimeConfig(registry: CanonicalProviderRegistry): ProvidersRuntimeConfig {
+  const openrouter = registry.providers.find((entry) => entry.enabled && entry.type === 'openrouter');
+  const openRouterWebTools = projectOpenRouterWebTools(openrouter);
+  return {
+    registry,
+    ...(openrouter?.apiBaseUrl ? { openRouterApiBaseUrl: openrouter.apiBaseUrl } : {}),
+    ...(openrouter?.modelsApiUrl ? { openRouterModelsApiUrl: openrouter.modelsApiUrl } : {}),
+    ...(openrouter?.apiKeyRef ? { openRouterApiKeyRef: openrouter.apiKeyRef } : {}),
+    ...(openRouterWebTools ? { openRouterWebTools } : {}),
+  };
+}
+
+function writeProvidersRegistry(dataDir: string, registry: CanonicalProviderRegistry): void {
+  writeJsonAtomic(join(dataDir, PROVIDERS_FILE_NAME), registry);
+}
+
+export function loadProvidersConfig(
+  dataDir: string,
+  options: ProvidersConfigLoadOptions = {},
+): ProvidersRuntimeConfig {
+  const seedDir = options.seedDir ?? process.env.CONFIG_DIR ?? './config';
+  const registry = loadRequiredJson({
+    dataPath: join(dataDir, PROVIDERS_FILE_NAME),
+    examplePath: join(seedDir, PROVIDERS_SEED_FILE_NAME),
+    validate: normalizeCanonicalProviderRegistry,
+  });
+  return projectProvidersRuntimeConfig(registry);
+}
+
+export function loadStartupProvidersConfig(
+  dataDir: string,
+  options: ProvidersConfigLoadOptions = {},
+): ProvidersLoadResult {
+  const loaded = loadProvidersConfig(dataDir, options);
+  return {
+    config: loaded,
+  };
+}
+
+export function saveProvidersConfig(
+  dataDir: string,
+  nextConfig: unknown,
+): ProvidersRuntimeConfig {
+  const registry = normalizeCanonicalProviderRegistry(nextConfig, PROVIDERS_FILE_NAME);
+  writeProvidersRegistry(dataDir, registry);
+  return projectProvidersRuntimeConfig(registry);
+}
+
+export function applyProvidersRuntimeConfig(
+  config: SubstrateConfig,
+  providers: ProvidersRuntimeConfig,
+): void {
+  config.providerRegistry = providers.registry;
+  config.openRouterApiBaseUrl = providers.openRouterApiBaseUrl;
+  config.openRouterApiKeyRef = providers.openRouterApiKeyRef;
+  config.openRouterWebTools = providers.openRouterWebTools;
+  if (providers.openRouterModelsApiUrl) {
+    config.openRouterModelsApiUrl = providers.openRouterModelsApiUrl;
+  }
+}

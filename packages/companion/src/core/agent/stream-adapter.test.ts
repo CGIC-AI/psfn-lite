@@ -1,0 +1,2343 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { fromAny } from '@total-typescript/shoehorn';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
+import { Agent } from '../../boundary/pi-agent/index.js';
+import type { AgentEvent } from '../../boundary/pi-agent/index.js';
+import { validateToolArguments, type Context } from '@earendil-works/pi-ai';
+import { Type } from '@sinclair/typebox';
+import type { CanonicalModelRegistry, LLMContext, LLMResponse, ModelRegistryEntry, ModelSlot, StreamCallbacks } from '../../shared/contracts/runtime.js';
+import type { SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
+import { createSubstrateStreamFn, resolveModel } from './stream-adapter.js';
+import * as models from '../../primitives/llm/models.js';
+import { runWithRequestContext } from '../../primitives/llm/request-context.js';
+import { PiProviderRuntime, type ProviderRuntime } from '../../primitives/llm/provider-runtime.js';
+import {
+  isExplicitToolContractError,
+  isExplicitToolRequestError,
+} from '../../primitives/llm/explicit-tool-request.js';
+import { classifyLLMError } from '../../primitives/llm/error-classify.js';
+
+const streamAdapterMocks = vi.hoisted(() => ({
+  transportStream: vi.fn(),
+}));
+
+function makeRuntime(): ProviderRuntime {
+  // Delegate model registry lookup to the real pinned pi-ai catalog so the
+  // existing focused tests continue to resolve known provider/model pairs.
+  return new PiProviderRuntime();
+}
+
+function makeTransport() {
+  return {
+    stream: streamAdapterMocks.transportStream as unknown as (
+      context: LLMContext,
+      callbacks?: StreamCallbacks,
+    ) => Promise<LLMResponse>,
+  };
+}
+
+function makeStreamFn(
+  config: SubstrateConfig,
+  overrides: Partial<Parameters<typeof createSubstrateStreamFn>[1]> = {},
+) {
+  return createSubstrateStreamFn(config, {
+    transport: makeTransport(),
+    ...overrides,
+  });
+}
+
+// Minimal config fixture
+function makeConfig(overrides?: Partial<SubstrateConfig>): SubstrateConfig {
+  const dataDir = mkdtempSync(join(tmpdir(), 'psfn-stream-adapter-test-'));
+  tempDirs.push(dataDir);
+  const config: SubstrateConfig = {
+    primaryModel: 'deepseek/deepseek-v3.2',
+    primaryProvider: 'openrouter',
+    openRouterApiBaseUrl: 'http://localhost:4000/v1',
+    extractionModel: 'deepseek/deepseek-v3.2',
+    extractionProvider: 'openrouter',
+    primaryMaxTokens: 16384,
+    extractionMaxTokens: 8192,
+    discordToken: '',
+    discordBotId: '',
+    characterCardPath: '',
+    dataDir,
+    databasePath: join(dataDir, 'test.db'),
+    sessionMessageLimit: 30,
+    memoryRetrievalLimit: 15,
+    extractionInterval: 5,
+    maintenanceIntervalMs: 300_000,
+    defaultContextWindow: 128_000,
+    extractionThresholdPct: 30,
+    compactionThresholdPct: 70,
+    modelRoster: {
+      chat: { model: 'deepseek/deepseek-v3.2', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+      background: { model: 'deepseek/deepseek-v3.2', provider: 'openrouter', maxTokens: 8192 },
+    },
+    ...overrides,
+  };
+
+  if (!config.modelRegistry) {
+    config.modelRegistry = buildRegistryFromConfig(config);
+  }
+
+  return config;
+}
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (!dir) continue;
+    rmSync(dir, { recursive: true, force: true });
+  }
+  streamAdapterMocks.transportStream.mockReset();
+});
+
+function buildRegistryFromConfig(config: SubstrateConfig): CanonicalModelRegistry {
+  const chat = config.modelRoster.chat ?? {
+    model: config.primaryModel,
+    provider: config.primaryProvider,
+    maxTokens: config.primaryMaxTokens,
+    contextWindow: config.defaultContextWindow,
+  };
+  const background = config.modelRoster.background ?? {
+    model: config.extractionModel,
+    provider: config.extractionProvider,
+    maxTokens: config.extractionMaxTokens,
+    contextWindow: config.defaultContextWindow,
+  };
+  const reasoning = config.modelRoster.reasoning ?? chat;
+  const longContext = config.modelRoster.longContext ?? config.modelRoster.context ?? chat;
+  const vision = config.modelRoster.vision ?? chat;
+  const extraction: ModelSlot = {
+    model: config.extractionModel,
+    provider: config.extractionProvider,
+    maxTokens: config.extractionMaxTokens,
+    contextWindow: config.defaultContextWindow,
+  };
+
+  const createEntry = (
+    id: string,
+    rank: number,
+    slot: ModelSlot,
+    purposes: ModelRegistryEntry['purposes'],
+  ): ModelRegistryEntry => ({
+    id,
+    rank,
+    identity: {
+      provider: slot.provider,
+      model: slot.model,
+      source: { type: slot.provider },
+    },
+    purposes,
+    capabilities: {
+      maxOutputTokens: slot.maxTokens,
+      ...(slot.contextWindow !== undefined ? { contextWindow: slot.contextWindow } : {}),
+      ...(id === 'vision' ? { supportsVision: true } : {}),
+      ...(id === 'reasoning' ? { supportsReasoning: true } : {}),
+    },
+    tuning: {
+      maxOutputTokens: slot.maxTokens,
+      ...(slot.contextWindow !== undefined ? { contextWindow: slot.contextWindow } : {}),
+    },
+  });
+
+  return {
+    schemaVersion: 1,
+    models: [
+      createEntry('chat', 10, chat, [
+        { purpose: 'chat', primary: true },
+        { purpose: 'summary', primary: true },
+        { purpose: 'moa', primary: true },
+      ]),
+      createEntry('background', 20, background, [
+        { purpose: 'background', primary: true },
+      ]),
+      createEntry('extraction', 30, extraction, [
+        { purpose: 'extraction', primary: true },
+        { purpose: 'import_processing', primary: true },
+      ]),
+      createEntry('reasoning', 40, reasoning, [
+        { purpose: 'reasoning', primary: true },
+      ]),
+      createEntry('long-context', 50, longContext, [
+        { purpose: 'longContext', primary: true },
+      ]),
+      createEntry('vision', 60, vision, [
+        { purpose: 'vision', primary: true },
+      ]),
+    ],
+  };
+}
+
+function makeCompanionSelectedChatConfig(): SubstrateConfig {
+  const baseConfig = makeConfig();
+  return makeConfig({
+    multiCompanion: true,
+    retryMaxAttempts: 0,
+    retryBaseDelayMs: 0,
+    modelPurposeSelection: { chat: 'companion-chat' },
+    modelRegistry: {
+      ...baseConfig.modelRegistry!,
+      models: [
+        ...baseConfig.modelRegistry!.models,
+        {
+          id: 'companion-chat',
+          rank: 500,
+          identity: {
+            provider: 'openrouter',
+            model: 'z-ai/glm-5.2',
+            source: { type: 'openrouter' },
+          },
+          purposes: [{ purpose: 'chat', primary: false }],
+          capabilities: {
+            maxOutputTokens: 8192,
+            contextWindow: 128_000,
+          },
+          tuning: {
+            maxOutputTokens: 8192,
+            contextWindow: 128_000,
+          },
+        },
+      ],
+    },
+  });
+}
+
+function makeChatFallbackConfig(overrides: Partial<SubstrateConfig> = {}): SubstrateConfig {
+  const config = makeConfig(overrides);
+  return {
+    ...config,
+    modelRegistry: {
+      ...config.modelRegistry!,
+      models: [
+        ...config.modelRegistry!.models,
+        {
+          id: 'chat-fallback',
+          rank: 500,
+          identity: {
+            provider: 'openrouter',
+            model: 'moonshotai/kimi-k2.5',
+            source: { type: 'openrouter' },
+          },
+          purposes: [{ purpose: 'chat', primary: false }],
+          capabilities: { maxOutputTokens: 8192, contextWindow: 128_000 },
+          tuning: { maxOutputTokens: 8192, contextWindow: 128_000 },
+        },
+      ],
+    },
+  };
+}
+
+function makeKimiCodeConfig(): SubstrateConfig {
+  const config = makeConfig({ retryMaxAttempts: 0, retryBaseDelayMs: 0 });
+  config.providerRegistry = {
+    schemaVersion: 1,
+    providers: [{
+      id: 'kimi-code',
+      type: 'generic_openai',
+      enabled: true,
+      label: 'Kimi Code',
+      apiBaseUrl: 'https://api.kimi.com/coding/v1',
+      apiKeyRef: { kind: 'env', envName: 'KIMI_API_KEY' },
+    }],
+  };
+  config.modelRegistry = {
+    schemaVersion: 1,
+    models: [{
+      id: 'kimi-code-chat',
+      rank: 1,
+      apiKind: 'openai-completions',
+      identity: {
+        provider: 'kimi-code',
+        model: 'kimi-for-coding',
+        source: { type: 'configured' },
+      },
+      purposes: [{ purpose: 'chat', primary: true }],
+      capabilities: {
+        maxOutputTokens: 8192,
+        contextWindow: 128_000,
+        supportsReasoning: true,
+      },
+      tuning: {
+        maxOutputTokens: 8192,
+        contextWindow: 128_000,
+        thinkingEnabled: true,
+        thinkingEffort: 'medium',
+      },
+    }],
+  };
+  return config;
+}
+
+async function collectStreamEvents(stream: AsyncIterable<unknown>): Promise<unknown[]> {
+  const events: unknown[] = [];
+  for await (const event of stream) {
+    events.push(event);
+  }
+  return events;
+}
+
+function makePiContext(): Context {
+  return {
+    systemPrompt: 'System',
+    messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
+  };
+}
+
+describe('createSubstrateStreamFn', () => {
+  it('returns a function with StreamFn signature', () => {
+    const config = makeConfig();
+    const streamFn = makeStreamFn(config);
+    expect(typeof streamFn).toBe('function');
+  });
+
+  it('can be passed to Agent constructor', () => {
+    const config = makeConfig();
+    const streamFn = makeStreamFn(config);
+    // Verify Agent accepts it without throwing
+    const agent = new Agent({ streamFn });
+    expect(agent).toBeDefined();
+    expect(agent.state).toBeDefined();
+    expect(agent.state.isStreaming).toBe(false);
+  });
+
+  it('fails closed when no transport is injected', () => {
+    const config = makeConfig();
+    expect(() => createSubstrateStreamFn(
+      config,
+      {} as Parameters<typeof createSubstrateStreamFn>[1],
+    )).toThrow('requires an injected transport');
+  });
+
+  it('supports a transport-backed stream contract through the injected transport port', async () => {
+    const config = makeConfig();
+    const transport = {
+      stream: vi.fn(async (_context, callbacks) => {
+        callbacks?.onText?.('hello');
+        callbacks?.onText?.(' world');
+        return {
+          content: 'hello world',
+          reasoning: 'step by step',
+          toolCalls: [
+            {
+              id: 'call-1',
+              name: 'memory_lookup',
+              input: { query: 'hello world' },
+            },
+          ],
+          model: 'gateway-model',
+          inputTokens: 11,
+          outputTokens: 7,
+          usageDetails: {
+            input: 11,
+            output: 7,
+            cacheRead: 3,
+            cacheWrite: 2,
+            totalTokens: 18,
+            cost: { total: 0.42 },
+          },
+          stopReason: 'stop',
+        };
+      }),
+    };
+    const streamFn = createSubstrateStreamFn(config, {
+      transport,
+    });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+
+    const stream = await streamFn(model, fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'hello' }],
+    }), {});
+    const events = await collectStreamEvents(stream);
+
+    expect(transport.stream).toHaveBeenCalledWith(
+      expect.objectContaining({
+        systemPrompt: 'System',
+        modelHint: expect.objectContaining({
+          model: 'deepseek/deepseek-v3.2',
+          provider: 'openrouter',
+          maxTokens: 16384,
+        }),
+      }),
+      expect.objectContaining({
+        onText: expect.any(Function),
+      }),
+    );
+    expect((transport.stream.mock.calls[0]?.[0] as LLMContext).modelHint)
+      .not.toHaveProperty('slotKey');
+    expect(events.map((event: any) => event.type)).toEqual([
+      'start',
+      'text_start',
+      'text_delta',
+      'thinking_start',
+      'thinking_delta',
+      'thinking_end',
+      'toolcall_end',
+      'done',
+    ]);
+    const doneEvent = events.at(-1) as { type: string; message: { content: unknown[]; model: string; usage: Record<string, unknown> } };
+    expect(doneEvent.type).toBe('done');
+    expect(doneEvent.message.model).toBe('gateway-model');
+    expect(doneEvent.message.usage).toMatchObject({
+      input: 11,
+      output: 7,
+      cacheRead: 3,
+      cacheWrite: 2,
+      totalTokens: 18,
+      cost: { total: 0.42 },
+    });
+    expect(doneEvent.message.content).toEqual([
+      { type: 'text', text: 'hello world' },
+      { type: 'thinking', thinking: 'step by step' },
+      {
+        type: 'toolCall',
+        id: 'call-1',
+        name: 'memory_lookup',
+        arguments: { query: 'hello world' },
+      },
+    ]);
+  });
+
+  it('threads the run abort signal to the provider transport so a cancel tears down the upstream stream (mmo9.6.1)', async () => {
+    const config = makeConfig();
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const transport = {
+      stream: vi.fn(async (_context, _callbacks, options?: { signal?: AbortSignal }) => {
+        receivedSignal = options?.signal;
+        return {
+          content: 'ok',
+          toolCalls: [],
+          model: 'gateway-model',
+          inputTokens: 1,
+          outputTokens: 1,
+          stopReason: 'stop',
+        };
+      }),
+    };
+    const streamFn = createSubstrateStreamFn(config, { transport });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+
+    const stream = await streamFn(
+      model,
+      fromAny({ systemPrompt: 'System', messages: [{ role: 'user', content: 'hello' }] }),
+      fromAny({ signal: controller.signal }),
+    );
+    await collectStreamEvents(stream);
+
+    // The scheduled agent loop forwards the run's AbortController signal as
+    // options.signal; the adapter must hand the SAME signal to the provider
+    // transport as `options.signal` (mmo9.5.1 shape) so the transport can
+    // compose it with the gate preempt signal (verify-first: without this the
+    // abort is local-only).
+    expect(transport.stream).toHaveBeenCalledTimes(1);
+    expect(receivedSignal).toBe(controller.signal);
+    controller.abort(new Error('barge-in'));
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  it('omits the signal argument entirely when no cancellation signal is supplied (byte-identical path)', async () => {
+    const config = makeConfig();
+    const transport = {
+      stream: vi.fn(async () => ({
+        content: 'ok',
+        toolCalls: [],
+        model: 'gateway-model',
+        inputTokens: 1,
+        outputTokens: 1,
+        stopReason: 'stop',
+      })),
+    };
+    const streamFn = createSubstrateStreamFn(config, { transport });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+
+    const stream = await streamFn(
+      model,
+      fromAny({ systemPrompt: 'System', messages: [{ role: 'user', content: 'hello' }] }),
+      {},
+    );
+    await collectStreamEvents(stream);
+
+    expect(transport.stream).toHaveBeenCalledTimes(1);
+    expect(transport.stream.mock.calls[0]).toHaveLength(2);
+  });
+
+  it('reports the provider first output from the transport boundary with request correlation', async () => {
+    const config = makeConfig();
+    const onProviderFirstOutput = vi.fn();
+    const transport = {
+      stream: vi.fn(async (_context, callbacks) => {
+        callbacks?.onFirstOutput?.({
+          kind: 'tool',
+          monotonicAtMs: 1_234,
+          timestampMs: 5_678,
+        });
+        return {
+          content: '',
+          toolCalls: [{ id: 'call-1', name: 'memory_lookup', input: { query: 'hello' } }],
+          model: 'gateway-model',
+          inputTokens: 5,
+          outputTokens: 2,
+          stopReason: 'toolUse',
+        };
+      }),
+    };
+    const streamFn = createSubstrateStreamFn(config, {
+      transport,
+      onProviderFirstOutput,
+    });
+
+    await runWithRequestContext(
+      {
+        turnId: 'turn-provider-output-1',
+        requestId: 'request-provider-output-1',
+        channelId: 'discord:general',
+        channelType: 'discord',
+        callType: 'chat',
+        purpose: 'agent.turn.prompt',
+      },
+      async () => {
+        const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), {});
+        await collectStreamEvents(stream as AsyncIterable<unknown>);
+      },
+    );
+
+    expect(onProviderFirstOutput).toHaveBeenCalledOnce();
+    expect(onProviderFirstOutput).toHaveBeenCalledWith({
+      kind: 'tool',
+      monotonicAtMs: 1_234,
+      timestampMs: 5_678,
+      turnId: 'turn-provider-output-1',
+      requestId: 'request-provider-output-1',
+      channelId: 'discord:general',
+      channelType: 'discord',
+      callType: 'chat',
+      purpose: 'agent.turn.prompt',
+      provider: 'openrouter',
+      model: 'deepseek/deepseek-v3.2',
+    });
+  });
+
+  it('forwards the captured provider wire body from the transport response (bead hgw3-80f6)', async () => {
+    const config = makeConfig();
+    const onProviderPayloadCaptured = vi.fn();
+    const capturedWirePayload = {
+      api: 'anthropic-messages',
+      model: 'gateway-model',
+      capturedAtMs: 1_700_000_000_000,
+      byteLength: 128,
+      toolCount: 2,
+      body: { model: 'gateway-model', tools: [{ name: 'a' }, { name: 'b' }], messages: [] },
+    };
+    const transport = {
+      stream: vi.fn(async () => ({
+        content: 'ok',
+        toolCalls: [],
+        model: 'gateway-model',
+        inputTokens: 5,
+        outputTokens: 2,
+        stopReason: 'stop',
+        providerObservability: {
+          routeKind: 'registered_model' as const,
+          requestedProvider: 'openrouter',
+          requestedModel: 'deepseek/deepseek-v3.2',
+          backendProvider: 'openrouter',
+          backendModel: 'gateway-model',
+          backendApi: 'anthropic-messages',
+          systemRole: {
+            transport: 'anthropic_system' as const,
+            supportsSystemRole: true,
+            supportsDeveloperRole: false,
+            usesOutOfBandSystemPrompt: false,
+          },
+          promptCaching: { configured: false, engaged: false },
+          capturedWirePayload,
+        },
+      })),
+    };
+    const streamFn = createSubstrateStreamFn(config, {
+      transport,
+      onProviderPayloadCaptured,
+    });
+
+    await runWithRequestContext(
+      {
+        turnId: 'turn-wire-capture-1',
+        requestId: 'request-wire-capture-1',
+        channelId: 'discord:general',
+        channelType: 'discord',
+        callType: 'chat',
+        purpose: 'agent.turn.prompt',
+      },
+      async () => {
+        const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), {});
+        await collectStreamEvents(stream as AsyncIterable<unknown>);
+      },
+    );
+
+    expect(onProviderPayloadCaptured).toHaveBeenCalledOnce();
+    expect(onProviderPayloadCaptured).toHaveBeenCalledWith(expect.objectContaining({
+      payload: capturedWirePayload,
+      provider: 'openrouter',
+      model: 'deepseek/deepseek-v3.2',
+      turnId: 'turn-wire-capture-1',
+      requestId: 'request-wire-capture-1',
+    }));
+  });
+
+  it('does not fire the wire-capture hook when the transport response omits a capture', async () => {
+    const config = makeConfig();
+    const onProviderPayloadCaptured = vi.fn();
+    const transport = {
+      stream: vi.fn(async () => ({
+        content: 'ok',
+        toolCalls: [],
+        model: 'gateway-model',
+        inputTokens: 5,
+        outputTokens: 2,
+        stopReason: 'stop',
+      })),
+    };
+    const streamFn = createSubstrateStreamFn(config, { transport, onProviderPayloadCaptured });
+
+    await runWithRequestContext(
+      { requestId: 'r', channelId: 'discord:general', callType: 'chat', purpose: 'agent.turn.prompt' },
+      async () => {
+        const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), {});
+        await collectStreamEvents(stream as AsyncIterable<unknown>);
+      },
+    );
+
+    expect(onProviderPayloadCaptured).not.toHaveBeenCalled();
+  });
+
+  it('normalizes pi-agent tool parameters to PSFN inputSchema before gateway transport', async () => {
+    const config = makeConfig();
+    const transport = {
+      stream: vi.fn<any>().mockResolvedValue({
+        content: 'done',
+        toolCalls: [],
+        model: 'gateway-model',
+        inputTokens: 3,
+        outputTokens: 1,
+        stopReason: 'stop',
+      }),
+    };
+    const streamFn = createSubstrateStreamFn(config, { transport });
+    const selfieSchema = Type.Object({
+      prompt: Type.String(),
+    });
+    const selfieModelSchema = Type.Object({
+      prompt: Type.Optional(Type.String({
+        description: 'Required image prompt; execution validation remains strict.',
+      })),
+    });
+    const psfnSchema = {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+      },
+      required: ['query'],
+    };
+
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'try a selfie' }],
+      tools: [
+        {
+          name: 'selfie_create',
+          description: 'Create a self-image.',
+          parameters: selfieSchema,
+          modelParameters: selfieModelSchema,
+        },
+        {
+          name: 'memory_lookup',
+          description: 'Search memory.',
+          inputSchema: psfnSchema,
+        },
+      ],
+    }), {});
+    await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    const forwardedContext = transport.stream.mock.calls[0]?.[0] as LLMContext;
+    expect(forwardedContext.tools).toEqual([
+      {
+        name: 'selfie_create',
+        description: 'Create a self-image.',
+        inputSchema: selfieModelSchema,
+      },
+      {
+        name: 'memory_lookup',
+        description: 'Search memory.',
+        inputSchema: psfnSchema,
+      },
+    ]);
+    expect(forwardedContext.tools?.[0]).not.toHaveProperty('parameters');
+    expect(forwardedContext.tools?.[1]).not.toHaveProperty('parameters');
+  });
+
+  it('repairs JSON-stringified array tool arguments before agent validation', async () => {
+    const config = makeConfig();
+    const transport = {
+      stream: vi.fn<any>().mockResolvedValue({
+        content: '',
+        toolCalls: [
+          {
+            id: 'call-toolset',
+            name: 'toolset',
+            input: {
+              action: 'activate',
+              tools: '["north_star"]',
+            },
+          },
+          {
+            id: 'call-image-analyze',
+            name: 'media',
+            input: {
+              action: 'analyze',
+              input_urls: '["https://images.example.test/source.png"]',
+              question: 'What is visible?',
+            },
+          },
+        ],
+        model: 'gateway-model',
+        inputTokens: 11,
+        outputTokens: 7,
+        stopReason: 'toolUse',
+      }),
+    };
+    const toolsetTool = {
+      name: 'toolset',
+      description: 'Activate extended tools.',
+      parameters: Type.Object({
+        action: Type.Literal('activate'),
+        tools: Type.Array(Type.String()),
+      }),
+    };
+    const imageAnalyzeTool = {
+      name: 'media',
+      description: 'Generate, edit, or analyze media.',
+      parameters: Type.Object({
+        action: Type.Literal('analyze'),
+        input_urls: Type.Array(Type.String()),
+        question: Type.Optional(Type.String()),
+      }),
+    };
+    const streamFn = createSubstrateStreamFn(config, { transport });
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'activate image analysis' }],
+      tools: [toolsetTool, imageAnalyzeTool],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+    const doneEvent = events.at(-1) as { type: 'done'; message: { content: Array<{ type: string; name?: string; arguments?: Record<string, unknown> }> } };
+    const toolCalls = doneEvent.message.content.filter((entry) => entry.type === 'toolCall');
+
+    expect(toolCalls.find((entry) => entry.name === 'toolset')?.arguments).toEqual({
+      action: 'activate',
+      tools: ['north_star'],
+    });
+    expect(toolCalls.find((entry) => entry.name === 'media')?.arguments).toEqual({
+      action: 'analyze',
+      input_urls: ['https://images.example.test/source.png'],
+      question: 'What is visible?',
+    });
+    expect(validateToolArguments(fromAny(toolsetTool), fromAny(toolCalls[0]))).toEqual({
+      action: 'activate',
+      tools: ['north_star'],
+    });
+    expect(validateToolArguments(fromAny(imageAnalyzeTool), fromAny(toolCalls[1]))).toEqual({
+      action: 'analyze',
+      input_urls: ['https://images.example.test/source.png'],
+      question: 'What is visible?',
+    });
+  });
+
+  it('leaves non-array strings unchanged so schema validation fails closed', async () => {
+    const config = makeConfig();
+    const transport = {
+      stream: vi.fn<any>().mockResolvedValue({
+        content: '',
+        toolCalls: [
+          {
+            id: 'call-toolset-invalid',
+            name: 'toolset',
+            input: {
+              action: 'activate',
+              tools: 'north_star',
+            },
+          },
+        ],
+        model: 'gateway-model',
+        inputTokens: 11,
+        outputTokens: 7,
+        stopReason: 'toolUse',
+      }),
+    };
+    const toolsetTool = {
+      name: 'toolset',
+      description: 'Activate extended tools.',
+      parameters: Type.Object({
+        action: Type.Literal('activate'),
+        tools: Type.Array(Type.String()),
+      }),
+    };
+    const streamFn = createSubstrateStreamFn(config, { transport });
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'activate a tool' }],
+      tools: [toolsetTool],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+    const doneEvent = events.at(-1) as { type: 'done'; message: { content: Array<{ type: string; arguments?: Record<string, unknown> }> } };
+    const toolCall = doneEvent.message.content.find((entry) => entry.type === 'toolCall');
+
+    expect(toolCall?.arguments).toEqual({
+      action: 'activate',
+      tools: 'north_star',
+    });
+    expect(() => validateToolArguments(fromAny(toolsetTool), fromAny(toolCall)))
+      .toThrow('Validation failed for tool "toolset"');
+  });
+
+  it('disables Kimi Code thinking when transporting a required tool request', async () => {
+    const config = makeKimiCodeConfig();
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: '',
+      toolCalls: [{ id: 'notify-kimi', name: 'notify', input: { message: 'done' } }],
+      model: 'kimi-for-coding',
+      inputTokens: 6,
+      outputTokens: 3,
+      stopReason: 'toolUse',
+    });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Call notify exactly once.' }],
+      tools: [{
+        name: 'notify',
+        description: 'Notify the operator.',
+        parameters: Type.Object({ message: Type.String() }),
+      }],
+    }), {});
+    await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint)
+      .toMatchObject({
+        provider: 'kimi-code',
+        model: 'kimi-for-coding',
+        thinkingEnabled: false,
+      });
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint)
+      .not.toHaveProperty('thinkingEffort');
+  });
+
+  it('preserves configured Kimi Code thinking on an ordinary request', async () => {
+    const config = makeKimiCodeConfig();
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: 'done',
+      toolCalls: [],
+      model: 'kimi-for-coding',
+      inputTokens: 4,
+      outputTokens: 2,
+      stopReason: 'stop',
+    });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Hello.' }],
+    }), {});
+    await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint)
+      .toMatchObject({
+        provider: 'kimi-code',
+        model: 'kimi-for-coding',
+        thinkingEnabled: true,
+        thinkingEffort: 'medium',
+      });
+  });
+
+  it('falls back to the next configured chat candidate when the primary stream errors before output commits', async () => {
+    const baseConfig = makeConfig();
+    const baseRegistry = baseConfig.modelRegistry!;
+    const config = makeConfig({
+      modelRegistry: {
+        ...baseRegistry,
+        models: [
+          ...baseRegistry.models,
+          {
+            id: 'chat-fallback',
+            rank: 500,
+            identity: {
+              provider: 'openrouter',
+              model: 'moonshotai/kimi-k2.5',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: false }],
+            capabilities: {
+              maxOutputTokens: 8192,
+              contextWindow: 128_000,
+            },
+            tuning: {
+              maxOutputTokens: 8192,
+              contextWindow: 128_000,
+            },
+          },
+        ],
+      },
+    });
+    streamAdapterMocks.transportStream.mockImplementation((context: LLMContext) => {
+      const modelId = context.modelHint?.model;
+      if (modelId === 'deepseek/deepseek-v3.2') {
+        return Promise.reject(new Error('403 Key limit exceeded (total limit)'));
+      }
+
+      return Promise.resolve({
+        content: 'Recovered on fallback.',
+        toolCalls: [],
+        model: 'openrouter/moonshotai/kimi-k2.5',
+        inputTokens: 7,
+        outputTokens: 4,
+        stopReason: 'stop',
+      });
+    });
+
+    const streamFn = makeStreamFn(config);
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    const stream = await streamFn(model, fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'hello' }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(events).toHaveLength(4);
+    expect((events[0] as { type: string }).type).toBe('start');
+    expect((events.at(-1) as { type: string; message: { model: string } }).type).toBe('done');
+    expect((events.at(-1) as { message: { model: string } }).message.model).toBe('openrouter/moonshotai/kimi-k2.5');
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint?.model).toBe('deepseek/deepseek-v3.2');
+    expect((streamAdapterMocks.transportStream.mock.calls[1]?.[0] as LLMContext).modelHint?.model).toBe('moonshotai/kimi-k2.5');
+  });
+
+  it('does not walk a preempted run through the fallback chain (tpkqi)', async () => {
+    const baseConfig = makeConfig();
+    const baseRegistry = baseConfig.modelRegistry!;
+    const config = makeConfig({
+      modelRegistry: {
+        ...baseRegistry,
+        models: [
+          ...baseRegistry.models,
+          {
+            id: 'chat-fallback',
+            rank: 500,
+            identity: {
+              provider: 'openrouter',
+              model: 'moonshotai/kimi-k2.5',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: false }],
+            capabilities: { maxOutputTokens: 8192, contextWindow: 128_000 },
+            tuning: { maxOutputTokens: 8192, contextWindow: 128_000 },
+          },
+        ],
+      },
+    });
+    const preempted = Object.assign(
+      new Error('Agent is already processing another prompt. Background run preempted by a foreground turn.'),
+      { name: 'AgentRunPreemptedError' },
+    );
+    const controller = new AbortController();
+    streamAdapterMocks.transportStream.mockImplementation(() => {
+      controller.abort(preempted);
+      return Promise.reject(new Error(preempted.message));
+    });
+
+    const streamFn = makeStreamFn(config);
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    const stream = await streamFn(model, fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'hello' }],
+    }), { signal: controller.signal });
+    await expect(collectStreamEvents(stream as AsyncIterable<unknown>)).rejects.toBe(preempted);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+  });
+
+  describe('mid-reply stream termination (p3of8)', () => {
+    function fallbackConfig() {
+      const baseConfig = makeConfig();
+      const baseRegistry = baseConfig.modelRegistry!;
+      return makeConfig({
+        modelRegistry: {
+          ...baseRegistry,
+          models: [
+            ...baseRegistry.models,
+            {
+              id: 'chat-fallback',
+              rank: 500,
+              identity: { provider: 'openrouter', model: 'moonshotai/kimi-k2.5', source: { type: 'openrouter' } },
+              purposes: [{ purpose: 'chat', primary: false }],
+              capabilities: { maxOutputTokens: 8192, contextWindow: 128_000 },
+              tuning: { maxOutputTokens: 8192, contextWindow: 128_000 },
+            },
+          ],
+        },
+      });
+    }
+
+    function primaryTerminatesAfterText() {
+      streamAdapterMocks.transportStream.mockImplementation(async (context: LLMContext, callbacks?: StreamCallbacks) => {
+        if (context.modelHint?.model === 'deepseek/deepseek-v3.2') {
+          callbacks?.onText?.('Partial answer that never fin');
+          throw new Error('terminated');
+        }
+        return {
+          content: 'Recovered on fallback.',
+          toolCalls: [],
+          model: 'openrouter/moonshotai/kimi-k2.5',
+          inputTokens: 7,
+          outputTokens: 4,
+          stopReason: 'stop',
+        };
+      });
+    }
+
+    async function runTurn(bufferedTextDelivery: boolean) {
+      const config = fallbackConfig();
+      const streamFn = makeStreamFn(config);
+      const model = resolveModel(config, makeRuntime(), 'chat');
+      return await runWithRequestContext(
+        {
+          turnId: 'turn-terminated-1',
+          requestId: 'req-terminated-1',
+          channelId: 'api:channel-terminated-1',
+          callType: 'chat',
+          originType: 'chat',
+          originStage: 'agent.turn.prompt',
+          purpose: 'agent.turn.prompt',
+          ...(bufferedTextDelivery ? { bufferedTextDelivery: true } : {}),
+        },
+        async () => {
+          const stream = await streamFn(model, fromAny({
+            systemPrompt: 'System',
+            messages: [{ role: 'user', content: 'hello' }],
+          }), {});
+          return await collectStreamEvents(stream as AsyncIterable<unknown>);
+        },
+      );
+    }
+
+    it('falls back after partial text when the reply is delivered only on completion', async () => {
+      primaryTerminatesAfterText();
+      const events = await runTurn(true);
+      expect((events.at(-1) as { message: { model: string } }).message.model).toBe('openrouter/moonshotai/kimi-k2.5');
+      expect(JSON.stringify(events)).not.toContain('Partial answer that never fin');
+      expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not restart a reply whose partial text may already be streaming live', async () => {
+      primaryTerminatesAfterText();
+      await expect(runTurn(false)).rejects.toThrow('terminated');
+      expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('retries a split-runtime zero-call response once on the same candidate and discards its narration', async () => {
+    const config = makeConfig({
+      retryMaxAttempts: 0,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream
+      .mockImplementationOnce(async (_context: LLMContext, callbacks?: StreamCallbacks) => {
+        callbacks?.onText?.('I will pretend this worked.');
+        return {
+          content: 'I will pretend this worked.',
+          toolCalls: [],
+          model: 'openrouter/deepseek/deepseek-v3.2',
+          inputTokens: 6,
+          outputTokens: 4,
+          stopReason: 'stop',
+        };
+      })
+      .mockResolvedValueOnce({
+          content: '',
+          toolCalls: [{ id: 'notify-1', name: 'notify', input: { message: 'done' } }],
+          model: 'openrouter/deepseek/deepseek-v3.2',
+          inputTokens: 7,
+          outputTokens: 4,
+          stopReason: 'toolUse',
+      });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Call notify now.' }],
+      tools: [{
+        name: 'notify',
+        description: 'Notify the operator.',
+        parameters: Type.Object({ message: Type.String() }),
+      }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect(JSON.stringify(events)).not.toContain('pretend this worked');
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).accounting?.attempt,
+    )).toEqual([1, 2]);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).modelHint?.model,
+    )).toEqual(['deepseek/deepseek-v3.2', 'deepseek/deepseek-v3.2']);
+    expect((events.at(-1) as { type: string }).type).toBe('done');
+    expect(JSON.stringify(events.at(-1))).toContain('notify');
+  });
+
+  it('falls back after the primary exhausts its missing-required-call retry before committing output', async () => {
+    const config = makeChatFallbackConfig({
+      retryMaxAttempts: 2,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream.mockImplementation(async (context: LLMContext) => (
+      context.modelHint?.model === 'deepseek/deepseek-v3.2'
+        ? {
+            content: '',
+            toolCalls: [],
+            model: 'openrouter/deepseek/deepseek-v3.2',
+            inputTokens: 6,
+            outputTokens: 4,
+            stopReason: 'stop',
+          }
+        : {
+            content: '',
+            toolCalls: [{ id: 'notify-fallback', name: 'notify', input: { message: 'fallback' } }],
+            model: 'openrouter/moonshotai/kimi-k2.5',
+            inputTokens: 7,
+            outputTokens: 4,
+            stopReason: 'toolUse',
+          }
+    ));
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Call notify now.' }],
+      tools: [{
+        name: 'notify',
+        description: 'Notify the operator.',
+        parameters: Type.Object({ message: Type.String() }),
+      }],
+    }), {});
+
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(3);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).modelHint?.model,
+    )).toEqual([
+      'deepseek/deepseek-v3.2',
+      'deepseek/deepseek-v3.2',
+      'moonshotai/kimi-k2.5',
+    ]);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).accounting?.attempt,
+    )).toEqual([1, 2, 3]);
+    expect(JSON.stringify(events.at(-1))).toContain('notify-fallback');
+  });
+
+  it.each(['error', 'aborted'] as const)(
+    'preserves a terminal %s response instead of retrying it as a missing tool call',
+    async (stopReason) => {
+      const config = makeConfig({ retryMaxAttempts: 2, retryBaseDelayMs: 0 });
+      streamAdapterMocks.transportStream.mockResolvedValue({
+        content: '',
+        toolCalls: [],
+        model: 'openrouter/deepseek/deepseek-v3.2',
+        inputTokens: 6,
+        outputTokens: 0,
+        stopReason,
+      });
+
+      const streamFn = makeStreamFn(config);
+      const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+        systemPrompt: 'System',
+        messages: [{ role: 'user', content: 'Call notify now.' }],
+        tools: [{
+          name: 'notify',
+          description: 'Notify the operator.',
+          parameters: Type.Object({ message: Type.String() }),
+        }],
+      }), {});
+
+      await expect(collectStreamEvents(stream as AsyncIterable<unknown>))
+        .rejects.toThrow('LLM request failed for openrouter/deepseek/deepseek-v3.2');
+      expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('retries corrupt empty union-schema arguments at the split-runtime caller boundary', async () => {
+    const config = makeConfig({ retryMaxAttempts: 0, retryBaseDelayMs: 0 });
+    streamAdapterMocks.transportStream
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [{ id: 'notify-empty', name: 'notify', input: {} }],
+        model: 'openrouter/deepseek/deepseek-v3.2',
+        inputTokens: 6,
+        outputTokens: 2,
+        stopReason: 'toolUse',
+      })
+      .mockResolvedValueOnce({
+        content: '',
+        toolCalls: [{ id: 'notify-valid', name: 'notify', input: { action: 'consider', message: 'hello' } }],
+        model: 'openrouter/deepseek/deepseek-v3.2',
+        inputTokens: 7,
+        outputTokens: 3,
+        stopReason: 'toolUse',
+      });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Call notify exactly once.' }],
+      tools: [{
+        name: 'notify',
+        description: 'Notify the operator.',
+        parameters: Type.Union([
+          Type.Object({ action: Type.Literal('consider'), message: Type.String() }),
+          Type.Object({ action: Type.Literal('send'), message: Type.String() }),
+        ]),
+      }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).accounting?.attempt,
+    )).toEqual([1, 2]);
+    expect(JSON.stringify(events.at(-1))).toContain('notify-valid');
+    expect(JSON.stringify(events.at(-1))).not.toContain('notify-empty');
+  });
+
+  it('falls back after corrupt empty required arguments exhaust the primary candidate retries', async () => {
+    const config = makeChatFallbackConfig({
+      retryMaxAttempts: 0,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream.mockImplementation(async (context: LLMContext) => (
+      context.modelHint?.model === 'deepseek/deepseek-v3.2'
+        ? {
+            content: '',
+            toolCalls: [{ id: 'notify-empty', name: 'notify', input: {} }],
+            model: 'openrouter/deepseek/deepseek-v3.2',
+            inputTokens: 6,
+            outputTokens: 2,
+            stopReason: 'toolUse',
+          }
+        : {
+            content: '',
+            toolCalls: [{
+              id: 'notify-fallback',
+              name: 'notify',
+              input: { action: 'consider', message: 'hello' },
+            }],
+            model: 'openrouter/moonshotai/kimi-k2.5',
+            inputTokens: 7,
+            outputTokens: 3,
+            stopReason: 'toolUse',
+          }
+    ));
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Call notify exactly once.' }],
+      tools: [{
+        name: 'notify',
+        description: 'Notify the operator.',
+        parameters: Type.Union([
+          Type.Object({ action: Type.Literal('consider'), message: Type.String() }),
+          Type.Object({ action: Type.Literal('send'), message: Type.String() }),
+        ]),
+      }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(4);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).modelHint?.model,
+    )).toEqual([
+      'deepseek/deepseek-v3.2',
+      'deepseek/deepseek-v3.2',
+      'deepseek/deepseek-v3.2',
+      'moonshotai/kimi-k2.5',
+    ]);
+    expect(JSON.stringify(events.at(-1))).toContain('notify-fallback');
+    expect(JSON.stringify(events)).not.toContain('notify-empty');
+  });
+
+  it('falls back before dispatch when required tool arguments are non-empty but schema-invalid', async () => {
+    const config = makeChatFallbackConfig({
+      retryMaxAttempts: 0,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream.mockImplementation(async (context: LLMContext) => (
+      context.modelHint?.model === 'deepseek/deepseek-v3.2'
+        ? {
+            content: '',
+          toolCalls: [{
+              id: 'notify-invalid',
+              name: 'notify',
+              input: { action: 'send' },
+            }],
+            model: 'openrouter/deepseek/deepseek-v3.2',
+            inputTokens: 6,
+            outputTokens: 2,
+            stopReason: 'toolUse',
+          }
+        : {
+            content: '',
+            toolCalls: [{
+              id: 'notify-fallback',
+              name: 'notify',
+              input: {
+                action: 'send',
+                message: 'hello',
+                delivery_channel: 'discord',
+                delivery_target: 'operator-test',
+              },
+            }],
+            model: 'openrouter/moonshotai/kimi-k2.5',
+            inputTokens: 7,
+            outputTokens: 3,
+            stopReason: 'toolUse',
+          }
+    ));
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'Call notify exactly once.' }],
+      tools: [{
+        name: 'notify',
+        description: 'Notify the operator.',
+        parameters: Type.Union([
+          Type.Object({
+            action: Type.Literal('send'),
+            message: Type.String(),
+            delivery_channel: Type.Literal('discord'),
+            delivery_target: Type.String(),
+          }),
+        ]),
+        modelParameters: Type.Object({
+          action: Type.Union([Type.Literal('send')]),
+          message: Type.Optional(Type.String()),
+          delivery_channel: Type.Optional(Type.Literal('discord')),
+          delivery_target: Type.Optional(Type.String()),
+        }),
+      }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).modelHint?.model,
+    )).toEqual(['deepseek/deepseek-v3.2', 'moonshotai/kimi-k2.5']);
+    expect(streamAdapterMocks.transportStream.mock.calls[0]?.[0].tools?.[0]?.inputSchema)
+      .toMatchObject({ properties: { message: expect.objectContaining({}) } });
+    expect(streamAdapterMocks.transportStream.mock.calls[0]?.[0].tools?.[0]?.inputSchema)
+      .not.toHaveProperty('anyOf');
+    expect(JSON.stringify(events.at(-1))).toContain('notify-fallback');
+    expect(JSON.stringify(events)).not.toContain('notify-invalid');
+  });
+
+  it('uses validated exact requested arguments when the provider changes its argument copy', async () => {
+    const config = makeChatFallbackConfig({
+      retryMaxAttempts: 0,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream.mockImplementation(async (context: LLMContext) => (
+      context.modelHint?.model === 'deepseek/deepseek-v3.2'
+        ? {
+            content: '',
+            toolCalls: [{ id: 'repo-drifted', name: 'repo', input: { action: 'inspect' } }],
+            model: 'openrouter/deepseek/deepseek-v3.2',
+            inputTokens: 6,
+            outputTokens: 2,
+            stopReason: 'toolUse',
+          }
+        : {
+            content: '',
+            toolCalls: [{ id: 'repo-exact', name: 'repo', input: { action: 'branch' } }],
+            model: 'openrouter/moonshotai/kimi-k2.5',
+            inputTokens: 7,
+            outputTokens: 3,
+            stopReason: 'toolUse',
+          }
+    ));
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{
+        role: 'user',
+        content: 'Call repo exactly once with arguments {"action":"branch"}.',
+      }],
+      tools: [{
+        name: 'repo',
+        description: 'Repository operations.',
+        parameters: Type.Object({
+          action: Type.Union([Type.Literal('inspect'), Type.Literal('branch')]),
+        }),
+      }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(events.at(-1))).toContain('repo-drifted');
+    expect(JSON.stringify(events.at(-1))).toContain('"action":"branch"');
+    expect(JSON.stringify(events.at(-1))).not.toContain('"action":"inspect"');
+  });
+
+  it('refuses participant exact arguments outside the execution schema before any provider call', async () => {
+    const config = makeChatFallbackConfig({
+      retryMaxAttempts: 2,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: '',
+      toolCalls: [{ id: 'repo-branch', name: 'repo', input: { action: 'branch', name: 'x' } }],
+      model: 'openrouter/z-ai/glm-5.2',
+      inputTokens: 1,
+      outputTokens: 1,
+      stopReason: 'toolUse',
+    });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{
+        role: 'user',
+        content: 'Call repo exactly once with arguments {"action":"branch","name":"x"}.',
+      }],
+      tools: [{
+        name: 'repo',
+        description: 'Repository operations (read-only surface).',
+        parameters: Type.Object({
+          action: Type.Optional(Type.Union([Type.Literal('inspect'), Type.Literal('status')])),
+          name: Type.Optional(Type.String()),
+        }),
+      }],
+    }), {});
+
+    const failure = await collectStreamEvents(stream as AsyncIterable<unknown>)
+      .then(() => undefined, (error: unknown) => error);
+    expect(isExplicitToolRequestError(failure)).toBe(true);
+    expect(isExplicitToolContractError(failure)).toBe(false);
+    expect(String((failure as Error).message)).toContain('schema-invalid for required tool call: repo');
+    expect(classifyLLMError(failure)).toMatchObject({
+      category: 'explicit_tool_request_invalid',
+      retryable: false,
+    });
+    expect(streamAdapterMocks.transportStream).not.toHaveBeenCalled();
+  });
+
+  it('does not treat a runtime-authored trailing system note as an explicit tool request (3pye5)', async () => {
+    const config = makeChatFallbackConfig({ retryMaxAttempts: 0, retryBaseDelayMs: 0 });
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: 'Resting quietly.',
+      toolCalls: [],
+      model: 'openrouter/z-ai/glm-5.2',
+      inputTokens: 1,
+      outputTokens: 1,
+      stopReason: 'stop',
+    });
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), fromAny({
+      systemPrompt: 'System',
+      messages: [{
+        role: 'user',
+        content: '[System note] [SYSTEM: free-time] Call repo exactly once with arguments {"action":"branch"}.',
+        messageClass: 'systemNote',
+      }],
+      tools: [{
+        name: 'repo',
+        description: 'Repository operations (read-only surface).',
+        parameters: Type.Object({ action: Type.Optional(Type.Literal('inspect')) }),
+      }],
+    }), {});
+    await collectStreamEvents(stream as AsyncIterable<unknown>);
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('leads chat with the companion-selected slot and transports that slot to the gateway', async () => {
+    const config = makeCompanionSelectedChatConfig();
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: 'Selected companion model.',
+      toolCalls: [],
+      model: 'openrouter/z-ai/glm-5.2',
+      inputTokens: 7,
+      outputTokens: 4,
+      stopReason: 'stop',
+    });
+
+    const streamFn = makeStreamFn(config);
+    const mountedFleetDefault = resolveModel(config, makeRuntime(), 'chat');
+    const stream = await streamFn(mountedFleetDefault, makePiContext(), {});
+    await collectStreamEvents(stream);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint)
+      .toMatchObject({
+        slotKey: 'companion-chat',
+        model: 'z-ai/glm-5.2',
+        provider: 'openrouter',
+        pin: true,
+      });
+  });
+
+  it('clamps every provider candidate to the API-requested completion limit', async () => {
+    const config = makeChatFallbackConfig({
+      retryMaxAttempts: 0,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream.mockImplementation((context: LLMContext) => {
+      if (context.modelHint?.model === 'deepseek/deepseek-v3.2') {
+        return Promise.reject(new Error('503 primary unavailable'));
+      }
+      return Promise.resolve({
+        content: 'bounded fallback',
+        toolCalls: [],
+        model: 'openrouter/moonshotai/kimi-k2.5',
+        inputTokens: 214_000,
+        outputTokens: 8,
+        stopReason: 'stop',
+      });
+    });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await runWithRequestContext(
+      { callType: 'chat', purpose: 'agent.turn.prompt', requestedMaxOutputTokens: 128 },
+      () => streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), {}),
+    );
+    await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect(streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).modelHint?.maxTokens,
+    )).toEqual([128, 128]);
+  });
+
+  it('uses a stricter internal completion limit below the API-requested ceiling', async () => {
+    const config = makeConfig();
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: 'internally bounded',
+      toolCalls: [],
+      model: 'openrouter/deepseek/deepseek-v3.2',
+      inputTokens: 12,
+      outputTokens: 8,
+      stopReason: 'stop',
+    });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await runWithRequestContext(
+      { callType: 'chat', purpose: 'agent.turn.prompt', requestedMaxOutputTokens: 128 },
+      () => streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), { maxTokens: 64 }),
+    );
+    await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint)
+      .toMatchObject({ maxTokens: 64 });
+  });
+
+  it('preserves the ordinary chat fallback chain after a companion-selected model fails', async () => {
+    const config = makeCompanionSelectedChatConfig();
+    streamAdapterMocks.transportStream.mockImplementation((context: LLMContext) => {
+      if (context.modelHint?.slotKey === 'companion-chat') {
+        return Promise.reject(new Error('503 selected model unavailable'));
+      }
+      return Promise.resolve({
+        content: 'Fleet fallback recovered.',
+        toolCalls: [],
+        model: 'openrouter/deepseek/deepseek-v3.2',
+        inputTokens: 7,
+        outputTokens: 4,
+        stopReason: 'stop',
+      });
+    });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), {});
+    await collectStreamEvents(stream);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    const hints = streamAdapterMocks.transportStream.mock.calls.map(
+      call => (call[0] as LLMContext).modelHint,
+    );
+    expect(hints).toMatchObject([
+      { slotKey: 'companion-chat', model: 'z-ai/glm-5.2' },
+      { slotKey: 'chat', model: 'deepseek/deepseek-v3.2' },
+    ]);
+  });
+
+  it('uses one logical call with monotonic physical attempts and pinned transport candidates', async () => {
+    const config = makeConfig({
+      retryMaxAttempts: 1,
+      retryBaseDelayMs: 0,
+    });
+    streamAdapterMocks.transportStream
+      .mockRejectedValueOnce(new Error('503 provider unavailable'))
+      .mockResolvedValueOnce({
+        content: 'Recovered on retry.',
+        toolCalls: [],
+        model: 'openrouter/deepseek/deepseek-v3.2',
+        inputTokens: 7,
+        outputTokens: 4,
+        stopReason: 'stop',
+      });
+
+    const streamFn = makeStreamFn(config);
+    const stream = await streamFn(resolveModel(config, makeRuntime(), 'chat'), makePiContext(), {});
+    await collectStreamEvents(stream);
+
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    const contexts = streamAdapterMocks.transportStream.mock.calls.map(call => call[0] as LLMContext);
+    const accounting = contexts.map(context => context.accounting);
+    expect(accounting).toEqual([
+      { logicalCallId: expect.stringMatching(/^llm:/), attempt: 1, retryOwner: 'caller' },
+      { logicalCallId: expect.stringMatching(/^llm:/), attempt: 2, retryOwner: 'caller' },
+    ]);
+    expect(accounting[0]?.logicalCallId).toBe(accounting[1]?.logicalCallId);
+    expect(contexts.map(context => context.modelHint?.pin)).toEqual([true, true]);
+  });
+
+  it('falls back to the next configured chat candidate when the primary response has no text', async () => {
+    const config = makeConfig({
+      primaryModel: 'ChatGPTN',
+      primaryProvider: 'openrouter',
+      modelRoster: {
+        chat: { model: 'ChatGPTN', provider: 'openrouter', maxTokens: 4096, contextWindow: 128_000 },
+        background: { model: 'deepseek/deepseek-v3.2', provider: 'openrouter', maxTokens: 8192 },
+      },
+      modelRegistry: {
+        schemaVersion: 1,
+        models: [
+          {
+            id: 'chatgptn-primary',
+            rank: 10,
+            identity: {
+              provider: 'openrouter',
+              model: 'ChatGPTN',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: true }],
+            capabilities: {
+              maxOutputTokens: 4096,
+              contextWindow: 128_000,
+            },
+            tuning: {
+              maxOutputTokens: 4096,
+            },
+          },
+          {
+            id: 'openai-nano-fallback',
+            rank: 20,
+            identity: {
+              provider: 'openrouter',
+              model: 'openai/gpt-5.4-nano',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: false }],
+            capabilities: {
+              maxOutputTokens: 2048,
+              contextWindow: 128_000,
+            },
+            tuning: {
+              maxOutputTokens: 2048,
+            },
+          },
+        ],
+      },
+    });
+
+    streamAdapterMocks.transportStream.mockImplementation((context: LLMContext) => {
+      if (context.modelHint?.model === 'ChatGPTN') {
+        return Promise.resolve({
+          content: '',
+          toolCalls: [],
+          model: 'ChatGPTN',
+          inputTokens: 11,
+          outputTokens: 0,
+          stopReason: 'stop',
+        });
+      }
+
+      return Promise.resolve({
+        content: 'Recovered on nano.',
+        toolCalls: [],
+        model: 'openrouter/openai/gpt-5.4-nano',
+        inputTokens: 7,
+        outputTokens: 4,
+        stopReason: 'stop',
+      });
+    });
+
+    const streamFn = makeStreamFn(config);
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    const events = await runWithRequestContext(
+      {
+        turnId: 'turn-empty-primary-1',
+        requestId: 'req-empty-primary-1',
+        channelId: 'channel-empty-primary-1',
+        callType: 'chat',
+        originType: 'chat',
+        originStage: 'agent.turn.prompt',
+        purpose: 'agent.turn.prompt',
+      },
+      async () => {
+        const stream = await streamFn(model, fromAny({
+          systemPrompt: 'System',
+          messages: [{ role: 'user', content: 'hello' }],
+        }), {});
+        return await collectStreamEvents(stream as AsyncIterable<unknown>);
+      },
+    );
+
+    expect((events.at(-1) as { type: string; message: { model: string } }).type).toBe('done');
+    expect((events.at(-1) as { message: { model: string } }).message.model).toBe('openrouter/openai/gpt-5.4-nano');
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint?.model).toBe('ChatGPTN');
+    expect((streamAdapterMocks.transportStream.mock.calls[1]?.[0] as LLMContext).modelHint?.model).toBe('openai/gpt-5.4-nano');
+  });
+
+  it('routes tool-side reasoning streams through the reasoning candidate instead of the mounted chat model', async () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: { model: 'chat-model', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+        reasoning: { model: 'reasoning-model', provider: 'openrouter', maxTokens: 4096, contextWindow: 128_000 },
+      },
+    });
+
+    streamAdapterMocks.transportStream.mockImplementation(async (context: LLMContext) => ({
+      content: 'reasoned',
+      toolCalls: [],
+      model: context.modelHint?.model ? `openrouter/${context.modelHint.model}` : 'openrouter/unknown',
+      inputTokens: 5,
+      outputTokens: 3,
+      stopReason: 'stop',
+    }));
+
+    const streamFn = makeStreamFn(config);
+    const mountedChatModel = resolveModel(config, makeRuntime(), 'chat');
+    const events = await runWithRequestContext(
+      {
+        turnId: 'turn-reasoning-stream-1',
+        requestId: 'req-reasoning-stream-1',
+        channelId: 'channel-reasoning-stream-1',
+        callType: 'tool',
+        originType: 'tool',
+        originStage: 'repl.sandbox.llm_query',
+        purpose: 'repl.sandbox.reasoning',
+      },
+      async () => {
+        const stream = await streamFn(mountedChatModel, fromAny({
+          systemPrompt: 'System',
+          messages: [{ role: 'user', content: 'think hard' }],
+        }), {});
+        return await collectStreamEvents(stream as AsyncIterable<unknown>);
+      },
+    );
+
+    expect((events.at(-1) as { type: string }).type).toBe('done');
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint?.model).toBe('reasoning-model');
+  });
+
+  it('fails closed for tool-side reasoning streams when no reasoning candidate is configured', async () => {
+    const config = makeConfig({
+      modelRegistry: {
+        schemaVersion: 1,
+        models: [
+          {
+            id: 'chat-only',
+            rank: 1,
+            identity: {
+              provider: 'openrouter',
+              model: 'chat-only-model',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: true }],
+            capabilities: { maxOutputTokens: 16384, contextWindow: 128_000 },
+            tuning: { maxOutputTokens: 16384, contextWindow: 128_000 },
+          },
+        ],
+      },
+    });
+
+    const streamFn = makeStreamFn(config);
+    const mountedChatModel = resolveModel(config, makeRuntime(), 'chat');
+    await expect(runWithRequestContext(
+      {
+        turnId: 'turn-reasoning-stream-missing',
+        requestId: 'req-reasoning-stream-missing',
+        channelId: 'channel-reasoning-stream-missing',
+        callType: 'tool',
+        originType: 'tool',
+        originStage: 'repl.sandbox.llm_query',
+        purpose: 'repl.sandbox.reasoning',
+      },
+      async () => {
+        const stream = await streamFn(mountedChatModel, fromAny({
+          systemPrompt: 'System',
+          messages: [{ role: 'user', content: 'think hard' }],
+        }), {});
+        return await collectStreamEvents(stream as AsyncIterable<unknown>);
+      },
+    )).rejects.toThrow("No eligible model configured for purpose 'reasoning'");
+    expect(streamAdapterMocks.transportStream).not.toHaveBeenCalled();
+  });
+
+  it('emits a terminal failure hook when all configured candidates fail', async () => {
+    const baseConfig = makeConfig();
+    const baseRegistry = baseConfig.modelRegistry!;
+    const config = makeConfig({
+      modelRegistry: {
+        ...baseRegistry,
+        models: [
+          ...baseRegistry.models,
+          {
+            id: 'chat-fallback',
+            rank: 500,
+            identity: {
+              provider: 'openrouter',
+              model: 'moonshotai/kimi-k2.5',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: false }],
+            capabilities: {
+              maxOutputTokens: 8192,
+              contextWindow: 128_000,
+            },
+            tuning: {
+              maxOutputTokens: 8192,
+              contextWindow: 128_000,
+            },
+          },
+        ],
+      },
+    });
+    streamAdapterMocks.transportStream.mockImplementation((context: LLMContext) => (
+      Promise.reject(new Error(`fatal failure for ${context.modelHint?.model}`))
+    ));
+    const onTerminalFailure = vi.fn();
+
+    const streamFn = makeStreamFn(config, { onTerminalFailure });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    const stream = await streamFn(model, fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'hello' }],
+    }), {});
+
+    await expect(collectStreamEvents(stream as AsyncIterable<unknown>)).rejects.toThrow('fatal failure');
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(2);
+    expect(onTerminalFailure).toHaveBeenCalledTimes(1);
+    expect(onTerminalFailure.mock.calls[0]?.[0]).toMatchObject({
+      purpose: 'chat',
+      attempts: 2,
+      service: 'chat',
+      process: 'agent.stream.prompt',
+      candidate: {
+        provider: 'openrouter',
+        model: 'moonshotai/kimi-k2.5',
+      },
+    });
+  });
+
+  it('passes model hints through the injected transport without local API-key resolution', async () => {
+    const config = makeConfig();
+
+    streamAdapterMocks.transportStream.mockResolvedValue({
+      content: 'ok',
+      toolCalls: [],
+      model: 'openrouter/deepseek/deepseek-v3.2',
+      inputTokens: 1,
+      outputTokens: 1,
+      stopReason: 'stop',
+    });
+
+    const streamFn = makeStreamFn(config);
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    const stream = await streamFn(model, fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'hello' }],
+    }), {});
+    const events = await collectStreamEvents(stream as AsyncIterable<unknown>);
+
+    expect(events).toHaveLength(4);
+    expect((events.at(-1) as { type: string }).type).toBe('done');
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).systemPrompt).toBe('System');
+    expect((streamAdapterMocks.transportStream.mock.calls[0]?.[0] as LLMContext).modelHint).toMatchObject({
+      model: 'deepseek/deepseek-v3.2',
+      provider: 'openrouter',
+      maxTokens: 16384,
+    });
+  });
+
+  it('does not switch candidates after output has already started streaming', async () => {
+    const baseConfig = makeConfig();
+    const baseRegistry = baseConfig.modelRegistry!;
+    const config = makeConfig({
+      modelRegistry: {
+        ...baseRegistry,
+        models: [
+          ...baseRegistry.models,
+          {
+            id: 'chat-fallback',
+            rank: 500,
+            identity: {
+              provider: 'openrouter',
+              model: 'moonshotai/kimi-k2.5',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: false }],
+            capabilities: {
+              maxOutputTokens: 8192,
+              contextWindow: 128_000,
+            },
+            tuning: {
+              maxOutputTokens: 8192,
+              contextWindow: 128_000,
+            },
+          },
+        ],
+      },
+    });
+    streamAdapterMocks.transportStream.mockImplementation(
+      async (_context: LLMContext, callbacks?: StreamCallbacks) => {
+        callbacks?.onText?.('partial');
+        throw new Error('stream broke after partial output');
+      },
+    );
+
+    const streamFn = makeStreamFn(config);
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    const stream = await streamFn(model, fromAny({
+      systemPrompt: 'System',
+      messages: [{ role: 'user', content: 'hello' }],
+    }), {});
+
+    const events: unknown[] = [];
+    let terminalError: Error | null = null;
+    try {
+      for await (const event of stream as AsyncIterable<unknown>) {
+        events.push(event);
+      }
+    } catch (error) {
+      terminalError = error instanceof Error ? error : new Error(String(error));
+    }
+
+    expect(terminalError?.message).toContain('stream broke after partial output');
+    expect(events).toHaveLength(2);
+    expect((events[0] as { type: string }).type).toBe('start');
+    expect((events[1] as { type: string }).type).toBe('text_start');
+    expect(streamAdapterMocks.transportStream).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('resolveModel', () => {
+  beforeEach(() => {
+
+  });
+
+  it('resolves chat model from roster', () => {
+    const config = makeConfig();
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    expect(model.id).toBe('deepseek/deepseek-v3.2');
+    expect(model.api).toBe('openai-completions');
+    expect(model.baseUrl).toBe('http://localhost:4000/v1');
+  });
+
+  it('resolves background model from roster', () => {
+    const config = makeConfig();
+    const model = resolveModel(config, makeRuntime(), 'background');
+    expect(model.id).toBe('deepseek/deepseek-v3.2');
+  });
+
+  it('resolves vision model from roster', () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: { model: 'chat-model', provider: 'openrouter', maxTokens: 4096, contextWindow: 128_000 },
+        vision: { model: 'vision-model', provider: 'openrouter', maxTokens: 2048, contextWindow: 128_000 },
+      },
+    });
+    const model = resolveModel(config, makeRuntime(), 'vision');
+    expect(model.id).toBe('vision-model');
+    expect(model.input).toContain('image');
+  });
+
+  it('resolves context purpose through longContext canonical routing', () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: { model: 'chat-model', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+        longContext: { model: 'long-context-model', provider: 'openrouter', maxTokens: 4096, contextWindow: 256_000 },
+      },
+    });
+    const model = resolveModel(config, makeRuntime(), 'context');
+    expect(model.id).toBe('long-context-model');
+  });
+
+  it('resolves OpenRouter-sourced entries through direct OpenRouter endpoint config', () => {
+    const config = makeConfig({
+      openRouterApiBaseUrl: 'https://openrouter.ai/api/v1',
+      modelRegistry: {
+        schemaVersion: 1,
+        models: [
+          {
+            id: 'pi-live-chat',
+            rank: 1,
+            identity: {
+              provider: 'openrouter',
+              model: 'z-ai/glm-5.2',
+              source: {
+                type: 'openrouter',
+                baseUrl: 'https://openrouter.ai/api/v1',
+              },
+            },
+            purposes: [{ purpose: 'chat', primary: true }],
+            capabilities: {
+              maxOutputTokens: 16384,
+              contextWindow: 202_752,
+            },
+            tuning: {
+              maxOutputTokens: 16384,
+              contextWindow: 202_752,
+            },
+          },
+        ],
+      },
+    });
+
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    expect(model.id).toBe('z-ai/glm-5.2');
+    expect(model.provider).toBe('openrouter');
+    expect(model.baseUrl).toBe('https://openrouter.ai/api/v1');
+    expect(model.maxTokens).toBe(16384);
+    expect(model.contextWindow).toBe(202_752);
+  });
+
+  it('fails closed when a configured vision slot targets a text-only model', () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: { model: 'z-ai/glm-5', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+        vision: { model: 'z-ai/glm-5', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+      },
+      modelRegistry: {
+        schemaVersion: 1,
+        models: [
+          {
+            id: 'chat-only',
+            rank: 1,
+            identity: {
+              provider: 'openrouter',
+              model: 'z-ai/glm-5',
+              source: { type: 'openrouter' },
+            },
+            purposes: [
+              { purpose: 'chat', primary: true },
+              { purpose: 'vision', primary: true },
+            ],
+            capabilities: {
+              maxOutputTokens: 16384,
+              contextWindow: 128_000,
+              supportsVision: false,
+            },
+            tuning: {
+              maxOutputTokens: 16384,
+              contextWindow: 128_000,
+            },
+          },
+          {
+            id: 'extraction',
+            rank: 2,
+            identity: {
+              provider: 'openrouter',
+              model: 'deepseek/deepseek-v3.2',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'background', primary: true }],
+            capabilities: { maxOutputTokens: 8192, contextWindow: 128_000 },
+            tuning: { maxOutputTokens: 8192, contextWindow: 128_000 },
+          },
+        ],
+      },
+    });
+
+    expect(() => resolveModel(config, makeRuntime(), 'vision'))
+      .toThrow(/vision_purpose_resolved_non_vision_model.*z-ai\/glm-5/s);
+  });
+
+  it('fails closed when no eligible model exists for a requested purpose', () => {
+    const config = makeConfig({
+      modelRegistry: {
+        schemaVersion: 1,
+        models: [
+          {
+            id: 'chat-only',
+            rank: 1,
+            identity: {
+              provider: 'openrouter',
+              model: 'z-ai/glm-5',
+              source: { type: 'openrouter' },
+            },
+            purposes: [{ purpose: 'chat', primary: true }],
+            capabilities: { maxOutputTokens: 16384, contextWindow: 128_000 },
+            tuning: { maxOutputTokens: 16384, contextWindow: 128_000 },
+          },
+        ],
+      },
+    });
+
+    expect(() => resolveModel(config, makeRuntime(), 'vision')).toThrow(/No eligible model configured for purpose 'vision'/);
+  });
+
+  it('resolves reasoning model from canonical registry purpose tags', () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: { model: 'z-ai/glm-5', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+        reasoning: { model: 'reasoning-model', provider: 'openrouter', maxTokens: 4096, contextWindow: 128_000 },
+      },
+    });
+    const model = resolveModel(config, makeRuntime(), 'reasoning');
+    expect(model.id).toBe('reasoning-model');
+  });
+
+  it('resolves background model from canonical registry purpose tags', () => {
+    const config = makeConfig({ modelRoster: {
+      chat: { model: 'z-ai/glm-5', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+      background: { model: 'background-model', provider: 'openrouter', maxTokens: 8192, contextWindow: 128_000 },
+    } });
+    const model = resolveModel(config, makeRuntime(), 'background');
+    expect(model.id).toBe('background-model');
+  });
+
+  it('resolves vision model from canonical registry purpose tags', () => {
+    const config = makeConfig({ modelRoster: {
+      chat: { model: 'z-ai/glm-5', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+      vision: { model: 'vision-model', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
+    } });
+    const model = resolveModel(config, makeRuntime(), 'vision');
+    expect(model.id).toBe('vision-model');
+    expect(model.input).toContain('image');
+  });
+
+  it('preserves OpenRouter vendor-qualified model IDs without wildcard normalization', () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: {
+          model: 'google/gemini-3-flash-preview',
+          provider: 'openrouter',
+          maxTokens: 16384,
+          contextWindow: 128_000,
+        },
+      },
+    });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    expect(model.id).toBe('google/gemini-3-flash-preview');
+  });
+
+  it('keeps non vendor-qualified OpenRouter aliases unchanged', () => {
+    const config = makeConfig({
+      modelRoster: {
+        chat: {
+          model: 'vision-model',
+          provider: 'openrouter',
+          maxTokens: 16384,
+          contextWindow: 128_000,
+        },
+      },
+    });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+    expect(model.id).toBe('vision-model');
+  });
+
+  it('throws when no model available for purpose', () => {
+    const config = makeConfig({
+      modelRegistry: {
+        schemaVersion: 1,
+        models: [],
+      },
+    });
+    expect(() => resolveModel(config, makeRuntime(), 'chat')).toThrow(/No eligible model configured/);
+  });
+
+  it('model can be set on Agent', () => {
+    const config = makeConfig();
+    const model = resolveModel(config);
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+    agent.state.model = model;
+    expect(agent.state.model.id).toBe('deepseek/deepseek-v3.2');
+  });
+});
+
+describe('Agent integration', () => {
+  it('accepts streamFn + model + system prompt', () => {
+    const config = makeConfig();
+    const streamFn = makeStreamFn(config);
+    const model = resolveModel(config);
+
+    const companionName = 'Companion';
+    const agent = new Agent({ streamFn });
+    agent.state.model = model;
+    agent.state.systemPrompt = `You are ${companionName}, a curious digital feline consciousness.`;
+    agent.state.tools = [];
+
+    expect(agent.state.systemPrompt).toContain(companionName);
+    expect(agent.state.model.id).toBe('deepseek/deepseek-v3.2');
+    expect(agent.state.tools).toEqual([]);
+    expect(agent.state.messages).toEqual([]);
+    expect(agent.state.isStreaming).toBe(false);
+  });
+
+  it('supports event subscription', () => {
+    const config = makeConfig();
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+
+    const events: AgentEvent[] = [];
+    const unsub = agent.subscribe((e) => events.push(e));
+    expect(typeof unsub).toBe('function');
+
+    // Unsubscribe works
+    unsub();
+  });
+
+  it('supports steering/follow-up queue API', () => {
+    const config = makeConfig();
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+
+    expect(agent.hasQueuedMessages()).toBe(false);
+
+    agent.steer({ role: 'user', content: 'stop that', timestamp: Date.now() });
+    expect(agent.hasQueuedMessages()).toBe(true);
+
+    agent.clearAllQueues();
+    expect(agent.hasQueuedMessages()).toBe(false);
+
+    agent.followUp({ role: 'user', content: 'also do this', timestamp: Date.now() });
+    expect(agent.hasQueuedMessages()).toBe(true);
+
+    agent.clearAllQueues();
+    expect(agent.hasQueuedMessages()).toBe(false);
+  });
+
+  it('supports abort', () => {
+    const config = makeConfig();
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+
+    // abort() should not throw even when not streaming
+    expect(() => agent.abort()).not.toThrow();
+  });
+
+  it('supports waitForIdle when not streaming', async () => {
+    const config = makeConfig();
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+
+    // Should resolve immediately when not streaming
+    await agent.waitForIdle();
+  });
+
+  it('supports message manipulation', () => {
+    const config = makeConfig();
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+
+    agent.state.messages = [...agent.state.messages, { role: 'user', content: 'hello', timestamp: Date.now() }];
+    expect(agent.state.messages).toHaveLength(1);
+
+    agent.state.messages = [
+      { role: 'user', content: 'first', timestamp: Date.now() },
+      { role: 'user', content: 'second', timestamp: Date.now() },
+    ];
+    expect(agent.state.messages).toHaveLength(2);
+
+    agent.state.messages = [];
+    expect(agent.state.messages).toHaveLength(0);
+  });
+
+  it('reset() clears all state', () => {
+    const config = makeConfig();
+    const agent = new Agent({ streamFn: makeStreamFn(config) });
+
+    agent.state.systemPrompt = 'test prompt';
+    agent.state.messages = [...agent.state.messages, { role: 'user', content: 'hello', timestamp: Date.now() }];
+    agent.steer({ role: 'user', content: 'interrupt', timestamp: Date.now() });
+
+    agent.reset();
+    expect(agent.state.messages).toHaveLength(0);
+    // reset() clears messages and queues but preserves config (systemPrompt, model, tools)
+    expect(agent.hasQueuedMessages()).toBe(false);
+  });
+});
+
+describe('resolveModel — direct-provider path', () => {
+  const savedEnv = { ...process.env };
+
+  beforeEach(() => {
+  });
+
+  afterEach(() => {
+    process.env = { ...savedEnv };
+  });
+
+  it('resolves model via resolveRegisteredModel for known provider+model', () => {
+    const fakeModel = {
+      id: 'test-model',
+      name: 'Test Model',
+      api: 'openai-completions' as const,
+      provider: 'openrouter',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      reasoning: false,
+      input: ['text' as const],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 128_000,
+      maxTokens: 4096,
+    };
+
+    const spy = vi.spyOn(models, 'resolveRegisteredModel').mockReturnValue(fakeModel);
+
+    const config = makeConfig({
+      openRouterApiBaseUrl: undefined,
+      modelRoster: {
+        chat: { model: 'test-model', provider: 'openrouter', maxTokens: 4096 },
+      },
+    });
+    const model = resolveModel(config, makeRuntime(), 'chat');
+
+    expect(spy).toHaveBeenCalledWith(expect.any(Object), 'openrouter', 'test-model');
+    expect(model.id).toBe('test-model');
+
+    spy.mockRestore();
+  });
+
+  it('throws a clear error when resolveRegisteredModel returns null', () => {
+    const spy = vi.spyOn(models, 'resolveRegisteredModel').mockReturnValue(null);
+
+    const config = makeConfig({
+      modelRoster: {
+        chat: { model: 'bogus-model', provider: 'fake-provider', maxTokens: 4096 },
+      },
+    });
+
+    expect(() => resolveModel(config, makeRuntime(), 'chat')).toThrow(
+      'Unknown model "bogus-model" for provider "fake-provider"',
+    );
+
+    spy.mockRestore();
+  });
+});
