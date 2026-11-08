@@ -70,6 +70,11 @@ in-memory fallback.
   instance may settle a turn; handover goes through an explicit abort. An
   idempotency key replays a settled turn instead of re-executing, and reuse with a
   different request is a conflict.
+- **Worker scopes** (`deriveWorkerScope`) narrow a participant or internal scope
+  for a bounded worker. The grant names its actions, a positive turn budget and a
+  `maxSensitivity`; the worker is admitted only up to that ceiling, never the
+  parent's full ceiling. Unknown or worker-closed actions, actions above the
+  ceiling and ceilings the parent lacks are refused, not trimmed.
 - **Dispatch** (`createToolDispatcher`) resolves `tool.action` against the
   inventory, enforces admission, `foreground_only`, `self_audience_only` and
   worker grants, then calls the owning domain handler. A missing handler is

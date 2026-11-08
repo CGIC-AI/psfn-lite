@@ -1,14 +1,19 @@
-import type { Result, SessionId, TurnId, WorkerRunId } from '../shared/index.ts';
+import type { Result, Sensitivity, SessionId, TurnId, WorkerRunId } from '../shared/index.ts';
 
 export type WorkerRunStatus = 'queued' | 'running' | 'completed' | 'failed' | 'cancelled';
 
 /** Terminal runs carry lineage, outcome and accounting only, never transcripts or reasoning. */
 export type WorkerOutcome = 'completed' | 'blocked' | 'cancelled' | 'budget_limited' | 'failed';
 
-/** Tool actions a worker may call, already intersected with the parent's grant. */
+/**
+ * What a worker may do. `deriveWorkerScope` validates it against the inventory
+ * and the parent scope: every action must exist and be open to workers, and
+ * `maxSensitivity` caps the parent's admission. It can never widen it.
+ */
 export interface WorkerGrant {
   readonly actions: readonly { readonly tool: string; readonly action: string }[];
   readonly maxTurns: number;
+  readonly maxSensitivity: Sensitivity;
 }
 
 export interface WorkerRun {
