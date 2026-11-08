@@ -19,7 +19,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | Step | State |
 |---|---|
 | A0 baseline | Recorded (below). |
-| A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding; typechecks with the donor compiler options; the extracted tests reproduce the baseline. |
+| A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding; typechecks with the donor compiler options; the extracted tests reproduce the baseline in a clean full run (Equivalence, below). |
 | B1-B7 seam cuts | Not started. No donor behaviour has been changed yet. |
 
 ## Closure (Step A0)
@@ -123,17 +123,33 @@ Evidence about stability:
 - Under load, cold harness containers made `beforeAll` exceed the donor's
   default 10 s hook timeout in some runs (2 to 4 files); warm containers did
   not.
-- On this machine the test processes were repeatedly killed by an external
-  `SIGKILL` (exit 137), sometimes the vitest main process (no report) and
-  sometimes a worker ("Worker exited unexpectedly", its remaining tests left
-  `pending`). It was not a test: a run with every JS-level `process.kill` and
-  `ChildProcess.kill` logged showed none aimed at vitest; no OOM or
-  systemd-oomd record; a same-process-group `sleep` and an idle or CPU-busy
-  look-alike process survived; a 12 GB process tree survived. The cause was
-  not found. Killed runs and killed workers are not test outcomes and are not
-  counted; `baseline.json` lists the completed runs and their non-passed tests
-  (all `pending` or hook timeouts, never an assertion failure, apart from the
-  `TMPDIR` case above).
+- Lost test forks. In the baseline runs and the first Lite runs, a vitest
+  fork sometimes died mid-file ("Worker exited unexpectedly"; the rest of
+  that file left `pending`; once the main process then failed with `write
+  EPIPE`, which is it sending to the already dead fork). It hit a different
+  file each time (memory and biographical Postgres stores, fleet
+  observability, background-work drain, `retrieval/budget.test.ts`), in the
+  donor clone and in Lite alike. Separately, a vitest main process was killed
+  with exit 137 several times. The last of those, at 21:33Z, was the host
+  terminal daemon restarting every terminal. The others were not explained.
+  **Every one of those runs used vitest's default fork count**: none set
+  `maxWorkers`, and vitest 4.1.12's default for `run` is
+  `availableParallelism() - 1`, which is 31 on the 32-core workstation. That
+  is above the workstation's 16-fork budget. With `maxWorkers: 16` (now in
+  both vitest configs, below), seven runs in a row lost nothing: one
+  `companion` project run, five full runs with exit instrumentation, and the
+  plain final run. The instrumentation was a `--import` preload that logged
+  every `process.exit`/`reallyExit`/`abort`, every catchable fatal signal, and
+  the exit code and signal of every `fork()` child. In 5,378
+  forks, vitest stopped each one with its normal `SIGTERM` or it exited 0.
+  The exact way forks died at 31 was not isolated. These causes were ruled
+  out: kernel OOM (`/proc/vmstat` `oom_kill 0` since boot, `oom_kill 0` in
+  `memory.events` at every cgroup level), systemd-oomd (no journal entries),
+  native crashes (no node core dumps), and JS-level exits and kills (the
+  earlier kill-logging run and the preload above). Lost forks and killed runs
+  are not test outcomes and are not counted. `baseline.json` lists the
+  completed baseline runs and their non-passed tests: all `pending` or hook
+  timeouts, never an assertion failure, apart from the `TMPDIR` case above.
 
 ## Extracted tree (Step A)
 
@@ -208,16 +224,26 @@ environment and 10 s `testTimeout`. Differences:
 - `hookTimeout` is 120 s (Lite's harness start budget) instead of vitest's
   default 10 s, because each run starts fresh containers. No assertion
   changes.
+- `maxWorkers` is 16 (also in the root `vitest.config.ts`; the two projects
+  share one pool, so the values must match). The donor baseline used vitest's
+  default (31 forks here). Fork count does not change any expected status,
+  because every baseline test passed. It only removes the lost forks
+  described in the baseline section.
 
 ### Equivalence
 
 `node packages/companion/extraction/compare-baseline.mjs <vitest json report>`
 compares a run with `baseline.json` minus `extraction/deleted-tests.tsv`.
 
-Step A result: every one of the 9,478 remaining baseline tests (9,485 minus the
-7 card-importer tests) passed with its baseline status in the Lite run of the
-`companion` project; the runs that did not match differed only by tests left
-`pending` by an externally killed worker (see the baseline section).
+Step A result: the plain validation command `mise exec node@24.22.1
+npm@11.17.0 -- npx vitest run` (both projects, with a JSON reporter added),
+2026-11-08 22:05Z, finished with exit 0: **786 files and 9,915 tests, all
+passed**. `lite` had 52 files and 437 tests; `companion` had 734 files and
+9,478 tests. Comparison: `matched: 9478`, `equivalent: every remaining
+baseline test has its baseline status`. That is the baseline's 9,485 tests
+minus the 7 deleted card-importer tests. The five instrumented full runs
+before it gave the same totals. Afterwards, no `lite-companion-*` harness
+containers and no `/tmp/lc-*` directories were left.
 
 ## Deleted and modified tests
 
