@@ -74,6 +74,7 @@ class FakeBridge:
     def __init__(self):
         self.requests = []
         self.handlers = {}
+        self._closed = False
         self._turns = 0
         bridge = self
 
@@ -128,7 +129,10 @@ class FakeBridge:
         return [r["body"] for r in self.requests if r["route"] == route]
 
     def close(self):
-        self._server.shutdown()
+        if not self._closed:
+            self._closed = True
+            self._server.shutdown()
+            self._server.server_close()
 
 
 @pytest.fixture

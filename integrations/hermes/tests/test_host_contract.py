@@ -66,7 +66,7 @@ def test_lifecycle_hooks_are_valid_and_registered_once_however_often_hermes_load
         load_provider()
     hooks, valid = our_hooks()
     registered = {name for name, callbacks in hooks.items() if callbacks}
-    assert registered == {"pre_llm_call", "post_llm_call", "post_tool_call", "on_session_end", "subagent_start"}
+    assert registered == {"pre_llm_call", "pre_tool_call", "post_llm_call", "post_tool_call", "on_session_end", "on_session_finalize", "subagent_start"}
     assert registered <= valid
     assert all(len(hooks[name]) == 1 for name in registered)
 
@@ -154,7 +154,7 @@ def test_an_undeliverable_settlement_is_kept_surfaced_and_retried_before_the_nex
     fire("on_session_end", **end(turn_id="t-1"))
     assert any("settle did not reach Lite" in w for w in warnings)
     ledger = plugin_module("runtime").driver().ledger
-    assert len(ledger.pending_settlements()) == 1
+    assert [e["kind"] for e in ledger.pending()] == ["settle"]
     assert stat.S_IMODE(os.stat(ledger.path).st_mode) == 0o600
 
     # Lite is back: the next turn first delivers the kept outcome, then prepares.
@@ -162,7 +162,7 @@ def test_an_undeliverable_settlement_is_kept_surfaced_and_retried_before_the_nex
     [result] = fire("pre_llm_call", **turn(turn_id="t-2"))
     assert [r["route"] for r in bridge.requests][-2:] == ["settle", "prepare"]
     assert bridge.bodies("settle")[-1]["outcome"] == {"kind": "completed", "reply": "a reply", "delivery": "unknown"}
-    assert ledger.pending_settlements() == []
+    assert ledger.pending() == []
     # The model is told what happened on the earlier turn.
     assert "settle did not reach Lite" in result["context"]
 
@@ -175,7 +175,9 @@ def test_an_unreachable_bridge_is_named_in_the_turn_and_recorded(profile, bridge
     [result] = fire("pre_llm_call", **turn())
     assert "continuity is unavailable for this turn" in result["context"]
     assert any("prepare did not reach Lite" in w for w in warnings)
-    assert [e["kind"] for e in plugin_module("runtime").driver().ledger.pending()] == ["prepare"]
+    # The turn is kept with its key, so settling it later finds or records it in Lite.
+    [row] = plugin_module("runtime").driver().ledger.turns()
+    assert row["turn_id"] is None and row["payload"]["prepare"]["message"] == "what have you been up to?"
 
 
 def test_compaction_is_refused_unless_lite_proves_the_sessions_turns(profile, bridge):
