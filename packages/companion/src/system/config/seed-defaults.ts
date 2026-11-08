@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import type { ShardToolsetConfig, WyomingShardRoutingConfig } from './runtime-config-contracts.js';
+import type { ShardToolsetConfig, WyomingShardRoutingConfig } from './scaffolding-config-fields.js';
 import { assertPositiveInteger } from './validators.js';
 
 export const MODELS_SEED_FILE_NAME = 'models.seed.json';

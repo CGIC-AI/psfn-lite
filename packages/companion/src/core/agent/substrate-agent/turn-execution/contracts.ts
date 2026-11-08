@@ -16,8 +16,8 @@ import type { TurnToolResultCustodyRecord } from '../turn-tool-result-custody.js
 import type { DisclosureLineage } from '../../../cogsec/disclosure/contracts.js';
 import type { MetacognitiveFlag } from '../../../self-model/metacognition.js';
 import type { InternalState } from '../../../self-model/state.js';
-import type { SkillsRuntime } from '../../../../faculties/skills/runtime.js';
-import type { TurnToolSummary } from '../../../../faculties/skills/reflection-nudge.js';
+import type { SkillsRuntime } from '../../../../shared/contracts/skills-runtime-port.js';
+import type { TurnToolSummary } from '../../../../shared/contracts/skills-runtime-port.js';
 import type { ChannelMeta } from '../../../../system/trust/policy.js';
 import type { TrustLevel } from '../../../../system/trust/types.js';
 import type { SatellitePresencePort } from '../../satellite-adapter-port.js';

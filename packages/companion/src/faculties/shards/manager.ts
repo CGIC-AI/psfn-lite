@@ -5,7 +5,8 @@ import { captureViewerCeilingFromRequest, type ViewerCeiling } from '../../core/
 
 import { randomUUID } from 'node:crypto';
 import type { AgentTool } from '../../boundary/pi-agent/index.js';
-import type { CapabilityTier, ShardToolsetConfig, SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
+import type { CapabilityTier, SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
+import type { ShardToolsetConfig } from '../../system/config/scaffolding-config-fields.js';
 import type { SubstrateMessage } from '../../shared/contracts/runtime.js';
 import type { IntakeEnvelopeSnapshot } from '../../shared/contracts/intake-envelope.js';
 import { cloneIntakeSnapshots } from '../../core/cogsec/intake/derived-content.js';

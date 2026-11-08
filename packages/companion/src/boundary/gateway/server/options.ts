@@ -5,7 +5,8 @@ import type { EmbeddingProviderPort } from '../../../shared/contracts/embedding-
 import type { ChannelOutboundDock } from '../../../channels/backplane/types.js';
 import type { GatewayRoomReplyOutbound } from '../room-reply-outbound.js';
 import type { ModelBudgetController } from '../../../primitives/llm/model-budget.js';
-import type { CapabilityTier, WyomingShardRoutingConfig } from '../../../system/config/runtime-config-contracts.js';
+import type { CapabilityTier } from '../../../system/config/runtime-config-contracts.js';
+import type { WyomingShardRoutingConfig } from '../../../system/config/scaffolding-config-fields.js';
 import type { GatewayRpcEndpoint } from '../transport.js';
 import type {
   GatewayCredentialPresenceResult,

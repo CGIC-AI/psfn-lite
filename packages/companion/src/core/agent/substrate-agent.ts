@@ -70,9 +70,7 @@ import { TurnQueueIngressCoordinator } from './substrate-agent/turn-queue-ingres
 import { convertToLlm } from './messages.js';
 import { createEventBridge, type EventBridge } from './event-bridge.js';
 import { createComponentLogger } from '../../shared/logger.js';
-import type { SkillsRuntime } from '../../faculties/skills/runtime.js';
-import { ReflectionNudgeTracker } from '../../faculties/skills/reflection-nudge.js';
-import { DEFAULT_SKILL_REUSE_CONFIG } from '../../system/config/skills-config.js';
+import type { SkillsRuntime } from '../../shared/contracts/skills-runtime-port.js';
 import type { IntrospectionTurnSensitivityDecisions } from '../../faculties/introspection/turn-sensitivity.js';
 import type { ToolCategory } from './tool-registrar.js';
 import {
@@ -364,25 +362,6 @@ export class SubstrateAgent {
    */
   private preToolHookGate: PreToolHookGate | null = null;
   private readonly appCache: AppCache;
-  /**
-   * The quiet reuse-and-revision loop (psfn-framework-lpxg3.3). Its candidates
-   * come from the CogSec-admitted skill cache the prompt was already built
-   * from, so reuse never bypasses admission and costs no extra scan; its
-   * bounds come from the skills owner file.
-   */
-  private reflectionNudge = new ReflectionNudgeTracker({
-    resolveAdmittedSkills: () => this.skillsRuntime?.getCachedAdmittedSkills() ?? [],
-    resolveConfig: () => (
-      this.skillsRuntime?.getCachedReuseConfig() ?? { ...DEFAULT_SKILL_REUSE_CONFIG }
-    ),
-    // psfn-framework-sap72: how the turns that USED a skill actually went is
-    // durable evidence, so the ordering survives a restart instead of starting
-    // from scratch each process.
-    resolveOutcomeEvidence: () => this.skillsRuntime?.getSkillOutcomeEvidence() ?? new Map(),
-    recordPostUseOutcome: (input) => {
-      this.skillsRuntime?.recordSkillPostUseOutcome(input);
-    },
-  });
   private readonly promptCacheRuntime = new PromptCacheTurnRuntime();
   private readonly turnRunReservation = new TurnRunReservation();
   /**
@@ -1810,7 +1789,9 @@ export class SubstrateAgent {
       resolveSituatedFallbackPlaceId: (message) => this.resolveSituatedFallbackPlaceIdForTurn(message),
       followVirtualRoomActivity: (message, author) => this.virtualRoomFollower.maybeFollow(message, author),
       skillsRuntime: this.skillsRuntime,
-      evaluateReflectionNudge: (toolSummary) => this.reflectionNudge.evaluate(toolSummary),
+      // Skills cut (seam 3.17): the reflection nudge is the skills faculty's
+      // reuse loop, so the core never offers one.
+      evaluateReflectionNudge: () => null,
       emotionSelfModelRuntime: this.emotionSelfModelRuntime,
       observerEvalSidecar: this.observerEvalSidecar,
       turnSupportRuntime: this.turnSupportRuntime,

@@ -1,6 +1,4 @@
-import type {
-  LifecycleKubernetesSettings,
-} from '../config/runtime-config-contracts.js';
+import type { LifecycleKubernetesSettings } from '../config/scaffolding-config-fields.js';
 
 export interface LifecycleKubernetesSettingsSource {
   lifecycleKubernetes?: LifecycleKubernetesSettings;
