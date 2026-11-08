@@ -681,3 +681,91 @@ Known limits:
   returns `not_found`. That differs from a fresh create, so it reveals that
   the path is taken.
 - Letter ids are one namespace shared by the companion and the Partner.
+
+## Pi harness and standalone composition
+
+This section supersedes the "planned" status above for `packages/pi` and
+`apps/standalone`; `packages/mcp` and `integrations/hermes` remain planned.
+
+`packages/pi` (package `lite-pi`) is the native harness. It runs on the
+public API of `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai`
+(both pinned at 0.84.1, the donor's versions): `runAgentLoop` with its
+`shouldStopAfterTurn` and steering hooks, and pi-ai's model collection. It
+does not use the `Agent` class, does not patch Pi internals and keeps no Pi
+session between turns. `src/pi.ts` is the only module that imports Pi, and
+`src/core.ts` is the only one that reaches core (through its public entry).
+The model, the provider key and the output ceiling are host-supplied as a
+`PiModelRuntime`.
+
+Every turn follows core's lifecycle:
+
+1. **Prepare.** Ingress admits the host's evidence. The session's current
+   revision is read. The context is assembled only from core reads under the
+   turn's scope: enabled prompt layers, the conversation's orientation blocks
+   (none for self turns), the labelled self-state context, and canonical
+   history through `contextFromHistory`. Then `prepareTurn` opens the turn.
+   A stale revision retries once. A turn left open by another owner is
+   recovered through `recoverTurn` only after its lease, so the recovery is
+   attributed to the host. A replayed key returns the recorded settlement
+   without calling the model.
+2. **Execute.** The model loop sees one Pi tool per domain tool of
+   `TOOL_INVENTORY`. Each takes `{action, args}` with the actions as an enum.
+   Every call goes through core's dispatcher under the turn's scope. A
+   refused call becomes a labelled error result for the model. The loop has
+   a model-call budget per turn and a bounded tool-result size.
+3. **Record.** A completed reply is delivered (participant turns only) and
+   then committed with its delivery status. An aborted, failed or stopped
+   loop is aborted with who interrupted (`participant`, `shutdown`, `host`)
+   or the failure code. Any partial reply is kept, so the system note in
+   history says what happened.
+4. **Post-turn.** The settled turn is observed for emotion
+   (`emotion.observeTurn`). In participant turns the conversation's requeued
+   workers are resumed (`workers.resume`).
+
+Only companion speech is rendered in the assistant position. Participant
+speech, system notes, tool results and machine inference are rendered in the
+user position with their labels.
+
+Host ports implemented over Pi:
+
+- `InternalTurnPort`: free time, scheduled prompts and reflection templates
+  run as companion-internal turns of the same harness, keyed by the
+  reference and the prompt.
+- `WorkerHostPort`: a worker runs inline with only its granted actions. Each
+  model turn starts through `WorkerSession.beginTurn`, so core enforces the
+  turn budget and delivers new guidance (injected as labelled steering).
+  Effects are keyed per attempt and tool call. Cancellation aborts the loop.
+- `ModelPort` and `AffectEstimatorPort`: machine tasks over the same model.
+  A provider error or a non-JSON estimate is `unavailable`, never an empty
+  success, and core re-validates every estimate.
+- `EmbeddingPort`: pi-ai has no embeddings API. It is either explicitly
+  disabled (writes stay pending for the backfill) or an OpenAI-compatible
+  endpoint with strict dimension checks.
+
+`apps/standalone` (package `lite-standalone`) is the thin composition root.
+It takes one explicit configuration document: every setting is required,
+unknown keys are refused, and policies are the core baseline only when named
+`"baseline"`. Secrets are read from the environment variables the document
+names, and a missing one is reported by name only. It opens the storage
+layout, the JSONL archive and one migrated Postgres pool. It builds every core
+stack, wires the Pi harness, and runs the scheduler tick loop with memory
+maintenance every Nth tick. The CLI has `init`, `once`, `chat`, `tick` and
+`maintain` (`npm run standalone -- <command> --config <file>`, run through
+tsx because core uses TypeScript parameter properties). `createLiteRuntime`
+is the composition entry, and it exposes the governed dispatcher and ingress
+for a later tool transport. The local host vouches for exactly two callers:
+the configured operator in their direct conversation and the companion's own
+internal turns. Its evidence is an opaque object minted in-process. `close`
+stops the scheduler, interrupts running turns as `shutdown`, waits for them to
+settle and then closes storage.
+
+Known gaps:
+
+- No approval queue: protected changes that need approval are refused with
+  `unavailable (approval_queue)`.
+- Workers run inline within the turn that drives them. There is no separate
+  worker process.
+- Rooms with several speakers get no per-speaker labels yet. Standalone has
+  only the direct operator conversation.
+- Only pi-ai's builtin providers can be configured. A provider is chosen by
+  id and model id from pi-ai's catalogue.
