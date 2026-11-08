@@ -15,7 +15,7 @@ export const episodeTool = defineTool({
       admission: 'public',
       restrictions: ['visibility_gated'],
       workers: 'allowed',
-      inference: 'none',
+      inference: 'may_call_model',
       donor: {
         kind: 'donor',
         paths: ['src/faculties/memory/tools.ts', 'src/faculties/memory/retrieval/episode-search.ts', EPISODIC_RETRIEVAL],
