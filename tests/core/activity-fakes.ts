@@ -5,6 +5,7 @@
  */
 import {
   conflict,
+  invalid,
   notFound,
   ok,
   unavailable,
@@ -35,6 +36,8 @@ import {
 
 const done = <T>(value: T): Promise<T> => Promise.resolve(value);
 const stale = (what: string) => conflict('stale_revision', `${what} moved`);
+/** As the Postgres stores do: an update advances exactly one revision. */
+const skips = (next: { revision: number }, expected: number) => next.revision !== expected + 1;
 
 export class FakeWorkerRuns implements WorkerRunPort {
   readonly runs = new Map<WorkerRunId, WorkerRun>();
@@ -67,6 +70,7 @@ export class FakeWorkerRuns implements WorkerRunPort {
       this.failNextUpdate = false;
       return done(unavailable('worker_runs', 'store unavailable'));
     }
+    if (skips(next, expectedRevision)) return done(invalid('a worker run update must advance one revision'));
     if (this.runs.get(next.id)?.revision !== expectedRevision) return done(stale(`run ${next.id}`));
     this.runs.set(next.id, next);
     return done(ok(next));
@@ -127,6 +131,7 @@ export class FakeFreeTimeBlocks implements FreeTimeBlockPort {
     return done(ok(rows.slice(0, limit)));
   }
   update(next: FreeTimeBlock, expectedRevision: number) {
+    if (skips(next, expectedRevision)) return done(invalid('a free-time block update must advance one revision'));
     if (this.blocks.get(next.id)?.revision !== expectedRevision) return done(stale(`block ${next.id}`));
     this.blocks.set(next.id, next);
     return done(ok(next));
@@ -155,6 +160,7 @@ export class FakeScheduledPrompts implements ScheduledPromptPort {
     return done(ok(rows.slice(0, query.limit)));
   }
   update(next: ScheduledPrompt, expectedRevision: number) {
+    if (skips(next, expectedRevision)) return done(invalid('a scheduled prompt update must advance one revision'));
     if (this.prompts.get(next.id)?.revision !== expectedRevision) return done(stale(`prompt ${next.id}`));
     this.prompts.set(next.id, next);
     return done(ok(next));
@@ -172,6 +178,7 @@ export class FakeTemplates implements ReflectionTemplatePort {
   }
   put(next: ReflectionTemplate, expectedRevision: number) {
     const actual = this.templates.get(next.id)?.revision ?? 0;
+    if (skips(next, expectedRevision)) return done(invalid('a reflection template write must advance one revision'));
     if (actual !== expectedRevision) return done(stale(`template ${next.id}`));
     this.templates.set(next.id, next);
     return done(ok(next));
@@ -200,6 +207,7 @@ export class FakeCareReminders implements CareReminderPort {
     return done(ok(rows.slice(0, query.limit)));
   }
   update(next: CareReminder, expectedRevision: number) {
+    if (skips(next, expectedRevision)) return done(invalid('a care reminder update must advance one revision'));
     if (this.reminders.get(next.id)?.revision !== expectedRevision) return done(stale(`reminder ${next.id}`));
     this.reminders.set(next.id, next);
     return done(ok(next));
