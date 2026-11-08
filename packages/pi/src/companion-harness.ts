@@ -9,18 +9,25 @@
  *   -> post-turn: emotion.observeTurn, and workers.resume for participants.
  *
  * A retried request replays its settled turn instead of executing again. A
- * turn a crashed predecessor left open is recovered (recorded as
- * interrupted by the host) once its lease expires, then the new turn is
- * prepared. Every ending is recorded: interruption and failure are settled
- * with their cause and any partial reply, never dropped.
+ * turn is never executed twice: when the outcome could not be recorded, the
+ * harness holds it and a retry of the request, or the session's next turn,
+ * records it (see turn-settler.ts). An open turn of this harness that is not
+ * running here is recorded as interrupted by the host. A turn a crashed
+ * predecessor left open is recovered the same way once its lease expires,
+ * then the new turn is prepared. Every ending is recorded: interruption and
+ * failure are settled with their cause and any partial reply, never dropped.
+ * After `shutdown` no turn starts, and one already preparing is recorded as
+ * interrupted by shutdown without calling the model.
  */
 import { createHash } from 'node:crypto';
 import {
   TOOL_INVENTORY,
+  conflict,
   internalContext,
   invalid,
   ok,
   parseId,
+  unavailable,
   type DeliveryStatus,
   type EmotionService,
   type InternalTurnPort,
@@ -34,7 +41,9 @@ import {
   type TrustedIngress,
   type TrustedTurnScope,
   type TurnLedgerPort,
+  type TurnId,
   type TurnLifecycle,
+  type TurnOutcome,
   type TurnOwner,
   type TurnRecord,
   type WorkerRun,
@@ -45,8 +54,9 @@ import { runModelLoop, type LoopUsage } from './loop.ts';
 import type { PiModelRuntime } from './model-runtime.ts';
 import type { Message } from './pi.ts';
 import { labelledText, toModelMessages } from './render.ts';
-import { TurnInterruption, deliveryStatusOf, settledView, unfinishedOutcome, type InterruptedBy, type SettledStatus } from './settlement.ts';
+import { TurnInterruption, deliveryStatusOf, interruptedBeforeStart, settledView, unfinishedOutcome, type InterruptedBy, type SettledStatus } from './settlement.ts';
 import { piTools } from './tools.ts';
+import { createTurnSettler, type SettledTurn } from './turn-settler.ts';
 
 /** The channel a participant turn's reply goes out on, owned by the host. */
 export interface ReplyDeliveryPort {
@@ -64,7 +74,7 @@ export interface CompanionHarnessDeps {
   readonly ingress: TrustedIngress;
   readonly lifecycle: TurnLifecycle;
   readonly sessions: Pick<SessionService, 'current'>;
-  readonly ledger: Pick<TurnLedgerPort, 'head'>;
+  readonly ledger: Pick<TurnLedgerPort, 'head' | 'get'>;
   readonly context: TurnContextSources;
   readonly dispatcher: ToolDispatcher;
   readonly emotion: Pick<EmotionService, 'observeTurn'>;
@@ -105,9 +115,13 @@ export interface CompanionHarness {
   converse(request: ConversationRequest): Promise<Result<TurnReport>>;
   /** Core's `InternalTurnPort`: free time, scheduled prompts. */
   readonly internalTurns: InternalTurnPort;
-  /** Aborts every running turn; each settles as interrupted by `by`. Returns how many were running. */
+  /** Aborts every turn in progress, including one still preparing; each settles as interrupted by `by`. Returns how many there were. */
   interruptAll(by: InterruptedBy): number;
+  /** Refuses new turns from now on and interrupts every turn in progress as `shutdown`. */
+  shutdown(): number;
   activeTurns(): number;
+  /** Turns whose outcome is known but could not be recorded yet; a retry or the session's next turn records them. */
+  unsettledTurns(): readonly TurnId[];
 }
 
 export function createCompanionHarness(deps: CompanionHarnessDeps): Result<CompanionHarness> {
@@ -119,17 +133,39 @@ export function createCompanionHarness(deps: CompanionHarnessDeps): Result<Compa
   if (!positive(limits.historyEntries)) issues.push('historyEntries must be a positive integer');
   if (!positive(limits.selfStateItems)) issues.push('selfStateItems must be a positive integer');
   if (issues.length > 0) return invalid(...issues);
-  const active = new Set<AbortController>();
+  /** Every turn in progress, from before prepare until it settled; interruptAll reaches all of them. */
+  const controllers = new Set<AbortController>();
+  /** Turns of this owner that are executing in this process; any other open turn of this owner was abandoned. */
+  const running = new Set<TurnId>();
+  const settler = createTurnSettler({ lifecycle: deps.lifecycle, owner: deps.owner });
+  let closing = false;
 
-  const prepare = async (
-    scope: TrustedTurnScope,
-    sessionId: SessionId,
-    trigger: TriggerInput,
-    key: string,
-  ): Promise<Result<{ readonly kind: 'prepared'; readonly turn: PreparedTurn; readonly context: TurnContext } | { readonly kind: 'replayed'; readonly record: TurnRecord }>> => {
+  /**
+   * Clears the session's open turn so a new one can be prepared. A turn of this
+   * owner that is not running here is settled (its held outcome, or abandoned);
+   * one a predecessor left is recovered once its lease expired.
+   */
+  const clearOpenTurn = async (scope: TrustedTurnScope, sessionId: SessionId): Promise<Result<void>> => {
+    const head = await deps.ledger.head(sessionId);
+    if (!head.ok) return head;
+    if (head.value.openTurnId === null) return ok(undefined);
+    const open = await deps.ledger.get(head.value.openTurnId);
+    if (!open.ok) return open;
+    if (sameOwner(open.value.owner, deps.owner)) {
+      if (running.has(open.value.turnId)) return conflict('turn_already_open', 'another turn of this session is running in this harness');
+      const settled = await settler.settleAbandoned({ scope, record: open.value });
+      return settled.ok ? ok(undefined) : settled;
+    }
+    const recovered = await deps.lifecycle.recoverTurn(scope, { sessionId, owner: deps.owner });
+    if (!recovered.ok && recovered.error.kind !== 'not_found') return recovered;
+    return ok(undefined);
+  };
+
+  const prepare = async (scope: TrustedTurnScope, sessionId: SessionId, trigger: TriggerInput, key: string): Promise<Result<Prepared>> => {
     const idempotencyKey = parseId('idempotency_key', key);
     if (!idempotencyKey.ok) return idempotencyKey;
-    for (let attempt = 0; ; attempt += 1) {
+    let refused: Result<never> = conflict('stale_revision', 'the session kept changing while the turn was prepared');
+    for (let attempt = 0; attempt < PREPARE_ATTEMPTS; attempt += 1) {
       const head = await deps.ledger.head(sessionId);
       if (!head.ok) return head;
       // Context is assembled against this revision; prepareTurn refuses it if the session moved since.
@@ -143,17 +179,64 @@ export function createCompanionHarness(deps: CompanionHarnessDeps): Result<Compa
         trigger,
       });
       if (prepared.ok) {
-        return prepared.value.kind === 'replayed'
-          ? ok({ kind: 'replayed', record: prepared.value.record })
-          : ok({ kind: 'prepared', turn: prepared.value.turn, context: context.value });
+        if (prepared.value.kind === 'replayed') return ok({ kind: 'replayed', record: prepared.value.record });
+        const { turn } = prepared.value;
+        // Core hands back the open turn of an earlier attempt with this key; that attempt already ran.
+        if (head.value.openTurnId === turn.record.turnId) return ok({ kind: 'reopened', turn });
+        return ok({ kind: 'prepared', turn, context: context.value });
       }
       const error = prepared.error;
-      if (attempt > 0 || error.kind !== 'conflict') return prepared;
-      if (error.reason === 'stale_revision') continue;
+      if (error.kind !== 'conflict') return prepared;
+      if (error.reason === 'stale_revision') {
+        refused = prepared;
+        continue;
+      }
       if (error.reason !== 'turn_already_open') return prepared;
-      // A predecessor left this session's turn open. Once its lease ran out it is recorded as interrupted by the host.
-      const recovered = await deps.lifecycle.recoverTurn(scope, { sessionId, owner: deps.owner });
-      if (!recovered.ok) return recovered.error.kind === 'conflict' ? recovered : prepared;
+      const cleared = await clearOpenTurn(scope, sessionId);
+      if (!cleared.ok) return cleared;
+      refused = prepared;
+    }
+    return refused;
+  };
+
+  /** Post-turn work for a turn that settled now: the emotion observation, then the conversation's requeued workers. */
+  const afterSettled = async (scope: TrustedTurnScope, settled: SettledTurn, usage: LoopUsage | null): Promise<Result<TurnReport>> => {
+    const view = settledView(settled.record);
+    if (view === null) return invalid('a settled turn has an outcome');
+    const emotion = await deps.emotion.observeTurn(scope, { turnId: settled.record.turnId, toolCallCount: settled.toolCalls });
+    const workers = scope.caller.kind === 'participant' ? await deps.workers.resume(scope) : null;
+    return ok({ status: view.status, record: settled.record, reply: view.reply, delivery: view.delivery, usage, postTurn: { emotion, workers } });
+  };
+
+  /** Runs the model loop and delivers a completed reply. Never throws: anything unexpected is a recorded failure. */
+  const execute = async (turn: PreparedTurn, context: TurnContext, prompt: string, signal: AbortSignal, channel: boolean): Promise<{ readonly outcome: TurnOutcome; readonly usage: LoopUsage | null }> => {
+    if (signal.aborted) return { outcome: interruptedBeforeStart(signal.reason), usage: null };
+    try {
+      const now = Date.now();
+      const loop = await runModelLoop({
+        runtime: deps.runtime,
+        systemPrompt: context.systemPrompt,
+        history: toModelMessages(context.history, deps.runtime.model, now),
+        prompt: { role: 'user', content: prompt, timestamp: now } satisfies Message,
+        tools: piTools(TOOL_INVENTORY, (_id, call) => deps.dispatcher.dispatch(turn.scope, call), () => true, { maxResultChars: limits.maxToolResultChars }),
+        signal,
+        maxModelCalls: limits.maxModelCalls,
+      });
+      if (loop.kind !== 'completed') return { outcome: unfinishedOutcome(loop), usage: loop.usage };
+      const delivery: DeliveryStatus = channel && loop.reply !== null ? await deliver(turn.scope, loop.reply) : 'not_attempted';
+      return { outcome: { kind: 'completed', reply: loop.reply, delivery }, usage: loop.usage };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { outcome: { kind: 'failed', error: { code: 'harness_error', message }, partialReply: null, delivery: 'not_attempted' }, usage: null };
+    }
+  };
+
+  /** A throwing delivery port may or may not have sent the reply. */
+  const deliver = async (scope: TrustedTurnScope, reply: string): Promise<DeliveryStatus> => {
+    try {
+      return deliveryStatusOf(await deps.delivery.deliver(scope, reply));
+    } catch {
+      return 'unknown';
     }
   };
 
@@ -164,63 +247,49 @@ export function createCompanionHarness(deps: CompanionHarnessDeps): Result<Compa
     signal: AbortSignal | undefined,
     channel: boolean,
   ): Promise<Result<TurnReport>> => {
-    const session = await deps.sessions.current(scope);
-    if (!session.ok) return session;
-    const prepared = await prepare(scope, session.value.sessionId, trigger, key);
-    if (!prepared.ok) return prepared;
-    if (prepared.value.kind === 'replayed') {
-      const record = prepared.value.record;
-      const view = settledView(record);
-      if (view === null) return invalid('a replayed turn is settled');
-      return ok({ record, reply: view.reply, delivery: view.delivery, status: 'replayed', usage: null, postTurn: null });
-    }
-    const { turn, context } = prepared.value;
-
+    if (closing) return unavailable('companion_harness', 'the harness is shutting down');
     const prompt = triggerMessage(trigger);
     if (!prompt.ok) return prompt;
+    const session = await deps.sessions.current(scope);
+    if (!session.ok) return session;
+    // Registered before prepare, so an interruption during prepare is recorded instead of missed.
     const controller = new AbortController();
     const onAbort = () => controller.abort(signal?.reason);
     if (signal?.aborted === true) onAbort();
     signal?.addEventListener('abort', onAbort, { once: true });
-    active.add(controller);
-    let settled: Result<TurnRecord>;
-    let reply: string | null = null;
-    let delivery: DeliveryStatus = 'not_attempted';
-    let usage: LoopUsage;
+    controllers.add(controller);
     try {
-      const now = Date.now();
-      const outcome = await runModelLoop({
-        runtime: deps.runtime,
-        systemPrompt: context.systemPrompt,
-        history: toModelMessages(context.history, deps.runtime.model, now),
-        prompt: { role: 'user', content: prompt.value, timestamp: now } satisfies Message,
-        tools: piTools(TOOL_INVENTORY, (_id, call) => deps.dispatcher.dispatch(turn.scope, call), () => true, { maxResultChars: limits.maxToolResultChars }),
-        signal: controller.signal,
-        maxModelCalls: limits.maxModelCalls,
-      });
-      usage = outcome.usage;
-      if (outcome.kind === 'completed') {
-        reply = outcome.reply;
-        if (channel && reply !== null) delivery = deliveryStatusOf(await deps.delivery.deliver(turn.scope, reply));
-        settled = await deps.lifecycle.commitTurn(turn, deps.owner, { kind: 'completed', reply, delivery });
-      } else {
-        const unfinished = unfinishedOutcome(outcome);
-        reply = unfinished.partialReply;
-        delivery = unfinished.delivery;
-        settled = await deps.lifecycle.abortTurn(turn, deps.owner, unfinished);
+      const prepared = await prepare(scope, session.value.sessionId, trigger, key);
+      if (!prepared.ok) return prepared;
+      if (prepared.value.kind === 'replayed') {
+        const record = prepared.value.record;
+        const view = settledView(record);
+        if (view === null) return invalid('a replayed turn is settled');
+        return ok({ record, reply: view.reply, delivery: view.delivery, status: 'replayed', usage: null, postTurn: null });
       }
+      const { turn } = prepared.value;
+      const turnId = turn.record.turnId;
+      if (running.has(turnId)) return conflict('turn_already_open', 'this request is still running in this harness');
+      if (prepared.value.kind === 'reopened') {
+        // Re-issue the outcome this harness already knows, or record the turn as abandoned; never run it twice.
+        const settled = await settler.settleAbandoned(turn);
+        return settled.ok ? afterSettled(turn.scope, settled.value, null) : settled;
+      }
+      running.add(turnId);
+      let executed: { readonly outcome: TurnOutcome; readonly usage: LoopUsage | null };
+      try {
+        executed = await execute(turn, prepared.value.context, prompt.value, controller.signal, channel);
+      } finally {
+        running.delete(turnId);
+      }
+      // A write that still fails is held; a retry of this request, or the session's next turn, records it.
+      const settled = await settler.settle(turn, executed.outcome, executed.usage?.toolCalls ?? 0);
+      if (!settled.ok) return settled;
+      return afterSettled(turn.scope, settled.value, executed.usage);
     } finally {
       signal?.removeEventListener('abort', onAbort);
-      active.delete(controller);
+      controllers.delete(controller);
     }
-    // A failed settlement leaves the turn open; the next prepare repairs history or recovers the turn.
-    if (!settled.ok) return settled;
-    const view = settledView(settled.value);
-    if (view === null) return invalid('a settled turn has an outcome');
-
-    const emotion = await deps.emotion.observeTurn(turn.scope, { turnId: settled.value.turnId, toolCallCount: usage.toolCalls });
-    const workers = turn.scope.caller.kind === 'participant' ? await deps.workers.resume(turn.scope) : null;
-    return ok({ status: view.status, record: settled.value, reply, delivery, usage, postTurn: { emotion, workers } });
   };
 
   const internalTurns: InternalTurnPort = {
@@ -240,6 +309,12 @@ export function createCompanionHarness(deps: CompanionHarnessDeps): Result<Compa
     },
   };
 
+  const interruptAll = (by: InterruptedBy): number => {
+    const current = [...controllers];
+    for (const controller of current) controller.abort(new TurnInterruption(by));
+    return current.length;
+  };
+
   return ok({
     async converse(request) {
       const scope = await deps.ingress.admit(request.evidence);
@@ -248,18 +323,30 @@ export function createCompanionHarness(deps: CompanionHarnessDeps): Result<Compa
       return runTurn(scope.value, { kind: 'participant_message', text: request.text }, request.idempotencyKey, request.signal, true);
     },
     internalTurns,
-    interruptAll(by) {
-      const running = [...active];
-      for (const controller of running) controller.abort(new TurnInterruption(by));
-      return running.length;
+    interruptAll,
+    shutdown() {
+      closing = true;
+      return interruptAll('shutdown');
     },
-    activeTurns: () => active.size,
+    activeTurns: () => controllers.size,
+    unsettledTurns: () => settler.held(),
   });
 }
 
-/** The trigger as the model sees it: participant speech plainly, an internal trigger with its system-note label. */
+const PREPARE_ATTEMPTS = 3;
+
+type Prepared =
+  | { readonly kind: 'prepared'; readonly turn: PreparedTurn; readonly context: TurnContext }
+  | { readonly kind: 'reopened'; readonly turn: PreparedTurn }
+  | { readonly kind: 'replayed'; readonly record: TurnRecord };
+
+function sameOwner(a: TurnOwner, b: TurnOwner): boolean {
+  return a.surface === b.surface && a.instance === b.instance;
+}
+
+/** The trigger as the model sees it, rendered exactly as history renders it: participant speech or a system note, each with its label. */
 function triggerMessage(trigger: TriggerInput): Result<string> {
-  if (trigger.kind === 'participant_message') return ok(trigger.text);
+  if (trigger.kind === 'participant_message') return ok(labelledText({ role: 'participant', label: null, text: trigger.text }));
   const entry = internalContext(trigger.origin, trigger.text);
   return entry.ok ? ok(labelledText(entry.value)) : entry;
 }

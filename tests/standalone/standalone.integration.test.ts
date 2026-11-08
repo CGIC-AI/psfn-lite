@@ -68,7 +68,7 @@ describe.skipIf(dockerTestsOptedOut('standalone'))('the standalone runtime over 
     expect(host.replies).toEqual(['ok (1 in view)']);
     // Prepare ran under the operator's scope: the companion saw its system prompt and only the trigger.
     const turn = host.model.calls.find((c) => c.kind === 'companion');
-    expect(turn?.lastUser).toBe('hello there');
+    expect(turn?.lastUser).toBe('[participant speech]\nhello there');
     expect(turn?.systemPrompt).toContain('You are the companion');
     // Post-turn emotion observation went through the estimator and the appraisal model.
     expect(host.model.calls.map((c) => c.kind)).toEqual(expect.arrayContaining(['estimator']));
@@ -141,7 +141,8 @@ describe.skipIf(dockerTestsOptedOut('standalone'))('the standalone runtime over 
     expect(entries[4]?.text).toBe('turn interrupted by participant');
     // The turn after the interruption saw the partial reply and the note as context.
     const after = host.model.calls.find((c) => c.kind === 'companion' && c.lastUser.includes('are you there?'));
-    expect(after?.lastUser).toBe('[system note: turn_lifecycle]\nturn interrupted by participant\n\nare you there?');
+    // The participant's next words follow the lifecycle note as their own labelled block, never as part of the note.
+    expect(after?.lastUser).toBe('[system note: turn_lifecycle]\nturn interrupted by participant\n\n[participant speech]\nare you there?');
     expect(after?.context.messages.at(-2)).toMatchObject({ role: 'assistant', content: [{ type: 'text', text: entries[3]?.text }] });
   });
 

@@ -5,12 +5,16 @@
  * held in memory only and never appears in an error or a record.
  */
 import { invalid, ok, type Result } from './core.ts';
-import { builtinProviders, createModels, type Api, type Model, type Models, type SimpleStreamOptions, type StreamFn } from './pi.ts';
+import { builtinProviders, createModels, type Api, type AuthContext, type Model, type Models, type SimpleStreamOptions, type StreamFn } from './pi.ts';
 
 export interface PiModelRuntime {
   readonly models: Models;
   readonly model: Model<Api>;
-  /** Null when the provider authenticates without a key the host passes (for example a local server). */
+  /**
+   * The only credential a request carries. Null sends none: a runtime from
+   * `createCatalogModelRuntime` then discovers nothing either, so only a
+   * keyless provider can serve it.
+   */
   readonly apiKey: string | null;
   /** Output ceiling for one model call. */
   readonly maxOutputTokens: number;
@@ -26,8 +30,20 @@ export function createPiModelRuntime(input: PiModelRuntime): Result<PiModelRunti
 }
 
 /**
+ * pi-ai's default auth context reads provider variables from `process.env`
+ * and probes credential files (AWS profiles, Google ADC) whenever a request
+ * carries no key. This context answers neither, so a credential reaches the
+ * provider only as the explicit `apiKey`.
+ */
+export const NO_AMBIENT_CREDENTIALS: AuthContext = Object.freeze({
+  env: () => Promise.resolve(undefined),
+  fileExists: () => Promise.resolve(false),
+});
+
+/**
  * A runtime over one built-in pi-ai provider and model. Only that provider is
- * registered, so no other provider's ambient credentials are ever consulted.
+ * registered, and no ambient credential of any provider is consulted: not the
+ * environment, not credential files.
  */
 export function createCatalogModelRuntime(input: {
   readonly provider: string;
@@ -39,7 +55,7 @@ export function createCatalogModelRuntime(input: {
   if (provider === undefined) return invalid(`unknown model provider ${input.provider}`);
   const model = provider.getModels().find((candidate) => candidate.id === input.modelId);
   if (model === undefined) return invalid(`provider ${input.provider} has no model ${input.modelId}`);
-  const models = createModels();
+  const models = createModels({ authContext: NO_AMBIENT_CREDENTIALS });
   models.setProvider(provider);
   return createPiModelRuntime({ models, model, apiKey: input.apiKey, maxOutputTokens: input.maxOutputTokens });
 }

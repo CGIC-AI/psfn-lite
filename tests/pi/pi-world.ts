@@ -32,7 +32,10 @@ import { fauxRuntime, type Brain } from './faux-brain.ts';
 export const TURN_LEASE_MS = 60_000;
 export const LIMITS: HarnessLimits = { historyEntries: 50, selfStateItems: 10, maxModelCalls: 4, maxToolResultChars: 4_000 };
 
-export async function piWorld(brain: Brain, options: { readonly tokensPerSecond?: number; readonly instance?: string } = {}) {
+export async function piWorld(
+  brain: Brain,
+  options: { readonly tokensPerSecond?: number; readonly instance?: string; readonly deliver?: (reply: string) => Promise<Result<void>> } = {},
+) {
   const base = await memoryWorld(fakeMemoryPorts());
   base.clock.advance(12 * 3_600_000); // Midday: outside the default quiet hours.
   const selfState = wireSelfState(base, fakeSelfStatePorts());
@@ -97,7 +100,7 @@ export async function piWorld(brain: Brain, options: { readonly tokensPerSecond?
     delivery: {
       deliver(scope, reply) {
         delivered.push({ scope, reply });
-        return Promise.resolve({ ok: true, value: undefined } as Result<void>);
+        return options.deliver === undefined ? Promise.resolve({ ok: true, value: undefined } as Result<void>) : options.deliver(reply);
       },
     },
     limits: LIMITS,
@@ -109,7 +112,7 @@ export async function piWorld(brain: Brain, options: { readonly tokensPerSecond?
     if (!result.ok) throw new Error(`${tool}.${action} failed: ${JSON.stringify(result.error)}`);
     return result.value.content as T;
   };
-  return { ...base, selfState, stack: stack.value, activity, harness: built.value, lifecycle: lifecycle.value, owner, model, delivered, diagnostics, must };
+  return { ...base, selfState, stack: stack.value, activity, harness: built.value, workerHost, lifecycle: lifecycle.value, owner, model, delivered, diagnostics, must };
 }
 
 /** All archived entries of a session, oldest first. */

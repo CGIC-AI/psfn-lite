@@ -30,12 +30,22 @@ function definiteRefusal(error: CoreError): boolean {
   return error.kind === 'denied' || error.kind === 'invalid' || error.kind === 'not_found';
 }
 
+/** Who interrupted, read from an abort reason; an unattributed abort is the host's. */
+export function interrupterOf(reason: unknown): InterruptedBy {
+  return reason instanceof TurnInterruption ? reason.by : 'host';
+}
+
+/** A turn interrupted before its model loop started: nothing was said or sent. */
+export function interruptedBeforeStart(reason: unknown): Extract<TurnOutcome, { kind: 'interrupted' }> {
+  return { kind: 'interrupted', by: interrupterOf(reason), partialReply: null, delivery: 'not_attempted' };
+}
+
 /** The outcome of a loop that did not complete; the partial reply never reached the channel. */
 export function unfinishedOutcome(outcome: Exclude<LoopOutcome, { kind: 'completed' }>): Exclude<TurnOutcome, { kind: 'completed' }> {
   const delivery: DeliveryStatus = outcome.partialReply === null ? 'not_attempted' : 'not_delivered';
   switch (outcome.kind) {
     case 'aborted':
-      return { kind: 'interrupted', by: outcome.reason instanceof TurnInterruption ? outcome.reason.by : 'host', partialReply: outcome.partialReply, delivery };
+      return { kind: 'interrupted', by: interrupterOf(outcome.reason), partialReply: outcome.partialReply, delivery };
     case 'failed':
       return { kind: 'failed', error: { code: outcome.code, message: outcome.message }, partialReply: outcome.partialReply, delivery };
     case 'stopped':

@@ -78,7 +78,7 @@ describe('the Pi companion harness', () => {
     const controller = new AbortController();
     const w = await piWorld(
       withDefaults((call) => {
-        if (call.lastUser === 'tell me a long story') {
+        if (call.lastUser.endsWith('tell me a long story')) {
           setTimeout(() => controller.abort(new TurnInterruption('participant')), 30);
           return say('Once upon a time '.repeat(200));
         }

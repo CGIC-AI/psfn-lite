@@ -28,6 +28,7 @@ import {
   createPiWorkerHost,
   type CompanionHarness,
   type PiModelRuntime,
+  type PiWorkerHost,
   type TurnReport,
   type WorkerDiagnostic,
 } from './harness.ts';
@@ -84,7 +85,11 @@ export interface LiteRuntime {
   maintain(): Promise<Result<MaintenanceReport>>;
   /** Runs `tick` every `tickIntervalMs` until `close`. */
   startScheduler(): void;
-  /** Stops the scheduler, interrupts running turns (recorded as shutdown), waits for them to settle and closes storage. */
+  /**
+   * Refuses new work, interrupts every turn (recorded as shutdown) and every
+   * running worker attempt (cancelled, host_shutdown), stops the scheduler,
+   * waits for all of it to settle and closes storage.
+   */
   close(): Promise<void>;
 }
 
@@ -154,7 +159,7 @@ export async function createLiteRuntime(input: {
     return built;
   }
   harness = built.value;
-  return ok(assemble({ config, host, local: local.value, storage: storage.value, stacks: stacks.value, harness: built.value, owner }));
+  return ok(assemble({ config, host, local: local.value, storage: storage.value, stacks: stacks.value, harness: built.value, workerHost, owner }));
 }
 
 function assemble(parts: {
@@ -164,9 +169,10 @@ function assemble(parts: {
   readonly storage: LiteStorage;
   readonly stacks: LiteStacks;
   readonly harness: CompanionHarness;
+  readonly workerHost: PiWorkerHost;
   readonly owner: TurnOwner;
 }): LiteRuntime {
-  const { config, host, local, storage, stacks, harness } = parts;
+  const { config, host, local, storage, stacks, harness, workerHost } = parts;
   const inFlight = new Set<Promise<unknown>>();
   let closed = false;
   let ticks = 0;
@@ -247,9 +253,11 @@ function assemble(parts: {
     },
     async close() {
       if (closed) return;
-      await loop?.stop();
+      // Interrupt first: a tick in progress waits on its turn, which waits on the model.
       closed = true;
-      harness.interruptAll('shutdown');
+      harness.shutdown();
+      workerHost.shutdown();
+      await loop?.stop();
       await Promise.allSettled([...inFlight]);
       await storage.close();
     },

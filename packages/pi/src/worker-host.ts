@@ -9,16 +9,23 @@
  *   or cancel gate stops the loop, and the attempt is reported as
  *   `budget_limited` or `cancelled`.
  * - Tools are only the granted actions, and every call goes through
- *   `session.call` with an effect key derived from the attempt and the
- *   model's tool call id, so a retried call replays instead of repeating.
+ *   `session.call` with an effect key derived from the attempt and a digest
+ *   of the model's tool call id, so a retried call replays instead of
+ *   repeating. Providers' raw ids may hold characters core refuses in a key
+ *   (openai-responses ids contain `|`), so the raw id is never the key.
  * - The final text is the machine-produced summary; core records it as the
  *   worker's output, never as companion speech.
  * - The loop runs inside `start`, so a spawn or a resume returns once the
  *   attempt has settled. `cancel` aborts a running loop at once.
+ * - `shutdown` refuses new attempts (core returns a refused attempt to the
+ *   queue unrun) and aborts every running one; each is reported as cancelled
+ *   with reason `host_shutdown`.
  */
+import { createHash } from 'node:crypto';
 import {
   TOOL_INVENTORY,
   ok,
+  unavailable,
   type WorkerGuidance,
   type WorkerHostPort,
   type WorkerReport,
@@ -46,10 +53,31 @@ export interface WorkerDiagnostic {
   readonly detail: string;
 }
 
-export function createPiWorkerHost(options: WorkerHostOptions): WorkerHostPort & { running(): readonly WorkerRunId[] } {
+export interface PiWorkerHost extends WorkerHostPort {
+  running(): readonly WorkerRunId[];
+  /** Refuses new attempts and aborts the running ones. Returns how many were running. */
+  shutdown(): number;
+}
+
+/** The abort reason of an attempt stopped because the host is shutting down. */
+class HostShutdown extends Error {
+  constructor() {
+    super('the worker host is shutting down');
+    this.name = 'HostShutdown';
+  }
+}
+
+/** The effect key of one tool call of one attempt: stable for the call, and always within core's key alphabet. */
+export function effectKey(attempt: number, toolCallId: string): string {
+  return `attempt-${attempt}:${createHash('sha256').update(toolCallId).digest('hex').slice(0, 40)}`;
+}
+
+export function createPiWorkerHost(options: WorkerHostOptions): PiWorkerHost {
   const running = new Map<WorkerRunId, AbortController>();
+  let closing = false;
   return {
     async start(session) {
+      if (closing) return unavailable('worker_host', 'the worker host is shutting down');
       const controller = new AbortController();
       running.set(session.run.id, controller);
       try {
@@ -64,6 +92,12 @@ export function createPiWorkerHost(options: WorkerHostOptions): WorkerHostPort &
       return Promise.resolve(ok(undefined));
     },
     running: () => [...running.keys()],
+    shutdown() {
+      closing = true;
+      const current = [...running.values()];
+      for (const controller of current) controller.abort(new HostShutdown());
+      return current.length;
+    },
   };
 }
 
@@ -93,7 +127,7 @@ async function runAttempt(session: WorkerSession, signal: AbortSignal, options: 
     ].join('\n'),
     history: [],
     prompt: { role: 'user', content: [labelledText({ role: 'labelled_context', label: 'system note: worker task', text: run.task }), ...guidanceTexts(first.value.guidance)].join('\n\n'), timestamp: Date.now() },
-    tools: piTools(TOOL_INVENTORY, (toolCallId, call) => session.call(`attempt-${run.attempts}:${toolCallId}`, call), granted, { maxResultChars: options.maxToolResultChars }),
+    tools: piTools(TOOL_INVENTORY, (toolCallId, call) => session.call(effectKey(run.attempts, toolCallId), call), granted, { maxResultChars: options.maxToolResultChars }),
     signal,
     maxModelCalls: run.grant.maxTurns,
     gate: async () => {
@@ -141,7 +175,9 @@ function outcomeReport(outcome: LoopOutcome, usage: WorkerReport['usage']): Work
     case 'completed':
       return { outcome: 'completed', summary: summary(outcome.reply, 'The worker finished without writing a summary.'), artifacts: [], reason: null, usage };
     case 'aborted':
-      return { outcome: 'cancelled', summary: summary(outcome.partialReply, 'The worker was stopped while running.'), artifacts: [], reason: 'aborted', usage };
+      return outcome.reason instanceof HostShutdown
+        ? { outcome: 'cancelled', summary: summary(outcome.partialReply, 'The worker was stopped because the host shut down.'), artifacts: [], reason: 'host_shutdown', usage }
+        : { outcome: 'cancelled', summary: summary(outcome.partialReply, 'The worker was stopped while running.'), artifacts: [], reason: 'aborted', usage };
     case 'stopped':
       return { outcome: 'budget_limited', summary: summary(outcome.partialReply, `The worker stopped: ${outcome.reason}.`), artifacts: [], reason: outcome.reason, usage };
     case 'failed':
