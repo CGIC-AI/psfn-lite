@@ -292,6 +292,7 @@ export function checkTurn(step: TurnStep, observed: TurnObservation, at: string)
 export function participantBlocks(rendered: string): string[] {
   const blocks: string[] = [];
   const pattern = /(?:^|\n\n)\[participant speech\]\n([\s\S]*?)(?=\n\n\[[^\]\n]+\]\n|$)/g;
-  for (const match of rendered.matchAll(pattern)) if (match[1] !== undefined) blocks.push(match[1]);
+  // The Pi harness quotes a label-like line inside a block as `\[`; the speech it carries is the unquoted text.
+  for (const match of rendered.matchAll(pattern)) if (match[1] !== undefined) blocks.push(match[1].replace(/^([ \t]*)\\\[/gm, '$1['));
   return blocks;
 }
