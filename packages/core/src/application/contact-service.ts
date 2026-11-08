@@ -41,6 +41,7 @@ export interface ContactView {
   readonly relationship: HumanRelationship;
   readonly machineIntelligence: boolean;
   readonly status: ContactRecord['status']['kind'];
+  readonly consent: ContactRecord['consent'];
   readonly mergedInto: ContactId | null;
   readonly identities: readonly { readonly channelKind: string; readonly externalId: string; readonly privacy: ChannelPrivacy | null }[];
   readonly revision: number;
@@ -87,7 +88,13 @@ export interface ContactService {
 
 /**
  * Contact reads and companion writes. Every write is visibility-gated: a
- * contact the caller may not read is treated as missing. Agents never write
+ * contact the caller may not read is treated as missing. Tracking consent
+ * gates the dossier, not only ingress: a contact whose consent is pending,
+ * denied or revoked gets no notes, links, trust, relationship, channel
+ * privacy or classification written, and lookup withholds its notes, so
+ * withdrawing consent also stops the companion profiling them (donor
+ * `src/core/contacts/tracking-gate.ts`). Blocking stays available because it
+ * protects rather than profiles. Agents never write
  * high-tier trust or gated relationships; those become operator proposals, as
  * does linking an identity to a high-tier contact, since that would grant the
  * linked account high-tier authority.
@@ -110,6 +117,16 @@ export function createContactService(deps: {
     const found = await readVisible(scope, contactId);
     if (!found.ok) return found;
     if (!isWritable(found.value)) return invalid(`contact ${contactId} is ${found.value.status.kind} and is kept as history`);
+    return found;
+  };
+
+  /** A writable contact that has granted tracking: the only kind the companion may build a dossier on. */
+  const trackable = async (scope: TrustedTurnScope, contactId: ContactId): Promise<Result<ContactRecord>> => {
+    const found = await writable(scope, contactId);
+    if (!found.ok) return found;
+    if (found.value.consent !== 'granted') {
+      return denied('untracked_contact', `contact ${contactId} has ${found.value.consent} tracking consent; nothing is recorded about them`);
+    }
     return found;
   };
 
@@ -189,6 +206,7 @@ export function createContactService(deps: {
       }
       const found = await readVisible(scope, contactId);
       if (!found.ok) return found;
+      if (found.value.consent !== 'granted') return ok({ contact: view(found.value), notes: [] });
       const notes = await deps.store.notes(contactId, NOTES_IN_LOOKUP);
       if (!notes.ok) return notes;
       const viewer = viewerOf(scope);
@@ -198,7 +216,7 @@ export function createContactService(deps: {
     async note(scope, input) {
       const text = input.text.trim();
       if (text.length === 0 || text.length > NOTE_MAX_CHARS) return invalid(`note text must be 1-${NOTE_MAX_CHARS} characters`);
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       return deps.store.appendNote({
         noteId: deps.ids.next('contact_note'),
@@ -212,7 +230,7 @@ export function createContactService(deps: {
 
     async setTrust(scope, input) {
       if (!isLowTierTrust(input.trust)) return denied('approval_required', 'high-tier trust is never written directly; use propose_trust');
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       if (!isLowTierTrust(record.trust)) {
@@ -224,7 +242,7 @@ export function createContactService(deps: {
 
     async proposeTrust(scope, input) {
       if (!isNonEmptyString(input.rationale)) return invalid('propose_trust needs a rationale');
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       if (!isLowTierTrust(record.trust)) return invalid(`contact already holds ${record.trust} trust`);
@@ -238,7 +256,7 @@ export function createContactService(deps: {
     },
 
     async setRelationship(scope, input) {
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       if (record.machineIntelligence?.value === true) {
@@ -260,7 +278,7 @@ export function createContactService(deps: {
 
     async proposeRelationship(scope, input) {
       if (!isNonEmptyString(input.rationale)) return invalid('propose_relationship needs a rationale');
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       const valid = validateRelationshipProposal(record.relationship, input.relationship);
@@ -277,7 +295,7 @@ export function createContactService(deps: {
     async linkIdentity(scope, input) {
       const identity = parseIdentity(input.identity);
       if (!identity.ok) return identity;
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       if (record.identities.some((link) => sameIdentity(link, identity.value))) return ok({ status: 'unchanged', contact: view(record) });
@@ -297,7 +315,7 @@ export function createContactService(deps: {
     },
 
     async setChannelPrivacy(scope, input) {
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       const index = record.identities.findIndex((link) => sameIdentity(link, input.identity));
@@ -307,7 +325,7 @@ export function createContactService(deps: {
     },
 
     async setMachineIntelligence(scope, input) {
-      const found = await writable(scope, input.contactId);
+      const found = await trackable(scope, input.contactId);
       if (!found.ok) return found;
       const record = found.value;
       if (record.machineIntelligence?.setBy === 'operator' && record.machineIntelligence.value !== input.value) {
@@ -347,6 +365,7 @@ function view(record: ContactRecord): ContactView {
     relationship: record.relationship,
     machineIntelligence: record.machineIntelligence?.value ?? false,
     status: record.status.kind,
+    consent: record.consent,
     mergedInto: record.status.kind === 'merged' ? record.status.into : null,
     identities: record.identities.map((link) => ({ channelKind: link.channelKind, externalId: link.externalId, privacy: link.privacy })),
     revision: record.revision,
