@@ -54,9 +54,71 @@ Preserve applicable notices. Prefer reusing cohesive domain implementations and
 tests over copying composition roots or introducing a dependency on the framework.
 
 Hermes integration reference: https://github.com/NousResearch/hermes-agent.
-No Hermes revision is selected or implementation copied yet. Pin the revision
-used for the compatibility proof and record the actual plugin/MCP capabilities
-tested before claiming support.
+The tested upstream revision is `f0187332d13679e2ace74d1f0eb399eb91a90571`. It
+is recorded as `HERMES_REVISION` in `integrations/hermes/psfn_lite/config.py`,
+and the host contract tests refuse any other revision. No Hermes code is
+copied into Lite.
+
+The tested capabilities are:
+
+- the memory-slot loader for a user plugin directory (`plugins/memory`
+  `load_memory_provider`, exclusive classification), and `register(ctx)`
+  forwarding `register_hook` to a real `PluginContext`;
+- hooks delivered through `hermes_cli.lifecycle.invoke_hook` with the
+  payloads at that revision: `pre_llm_call` (context returned as
+  `{"context": ...}` is injected into the user message; the spill threshold is
+  `hooks.output_spill.max_chars`), `post_llm_call` (only on a completed,
+  uninterrupted reply), `pre_tool_call` (a `{"action": "block", "message":
+  ...}` result vetoes the call; a callback that raises does not, so the
+  plugin never raises there), `post_tool_call`, `on_session_end` (with
+  `completed`, `failed`, `interrupted` and `turn_exit_reason`, fired only
+  from `finalize_turn`; several failure paths of
+  `agent/conversation_loop.py` return without it, which
+  `tests/test_turn_integrity.py` reproduces with a real
+  `AIAgent.run_conversation`), `on_session_finalize` and `subagent_start`;
+- the turn id minted once per turn in `agent/turn_context.py`, unchanged when
+  a compression rotates `agent.session_id` mid-turn
+  (`agent/conversation_compression.py`), and `MemoryProvider.on_session_switch`
+  for that rotation;
+- `MemoryProvider` checkpoint API v2 with `MemoryManager.on_pre_compress(...,
+  require_checkpoint=True)` propagating the refusal;
+- MCP servers from `config.yaml` `mcp_servers` with `${VAR}` header
+  interpolation, through `tools.mcp_tool.discover_mcp_tools` and the tool
+  registry against Lite's stateless streamable HTTP endpoint.
+
+Hermes integration donor audit (psfn-lite-vvn.10). The donor's
+`integrations/hermes-memory` (`psfn_memory/provider.py`, `outbox.py`,
+`config.py`, `plugin.yaml`, `tests/test_host_contract.py`,
+`tests/test_provider.py` at the donor revision above) was audited. It was a
+recall-plus-ingest memory provider over the PSFN gateway's MCP tools, which
+delivered only completed user/assistant pairs. These patterns were kept and
+rewritten for Lite:
+
+- strict dataclass config parsing, with every field validated and unknown
+  fields refused (`psfn_lite/config.py`);
+- the durable SQLite outbox storage pattern (WAL, `synchronous = FULL`, an
+  owner-only file in a 0700 directory, a binding row that refuses a profile
+  shared with another target). It became `psfn_lite/ledger.py`, which keeps
+  every Lite turn from before its prepare until Lite accepts its settlement,
+  and every undelivered lifecycle event, not only completed pairs;
+- classifying server failures into adapter-owned diagnostics that never echo
+  server text (`psfn_lite/bridge.py`);
+- host contract testing by installing the plugin into a throwaway profile
+  and loading it through Hermes's real loader.
+
+These were dropped:
+
+- MCP recall through `prefetch`: Lite's context arrives with each prepared
+  turn.
+- `sync_turn` ingestion of completed pairs. It skips interrupted turns, so
+  Lite settles every outcome through the lifecycle instead.
+- Gateway body and companion receipt assertions: the bridge binds the caller
+  from the credential.
+- Telegram DM identity parsing: senders are an explicit `(platform,
+  sender_id)` allowlist bound to one credential.
+
+The plugin pins the newer Hermes revision above instead of the donor's
+`5bd439d3ed4ae5f099857813383389dcd0ab4369`.
 
 Emotion, self-model, concerns and reflection continuity (psfn-lite-vvn.6).
 Written new for Lite from the donor's algorithms and tests at the donor

@@ -87,6 +87,35 @@ export interface LiteConfig {
     readonly maintenanceMaxEntries: number;
   };
   readonly memory: { readonly endedAfterMs: number };
+  /**
+   * The governed tool transport over MCP streamable HTTP, or null for none.
+   * `bindings` is the operator binding document's list (see packages/mcp):
+   * each names where its credential lives, never the credential. Internal
+   * turns hold a credential minted per turn for at most `internalTurnTtlMs`.
+   */
+  readonly mcp: {
+    readonly host: string;
+    readonly port: number;
+    /** Null binds loopback only; a list opts in to a wider address and names the Host values served. */
+    readonly allowedHosts: readonly string[] | null;
+    readonly bindings: readonly unknown[];
+    readonly internalTurnTtlMs: number;
+    readonly maxOpenInternalTurns: number;
+  } | null;
+  /**
+   * The lifecycle bridge an external companion host drives its turns
+   * through, or null for none. It shares the MCP bindings, so it needs `mcp`.
+   * Internal turns run in this process's Pi harness, or are delegated to the
+   * one bound principal named as their host.
+   */
+  readonly lifecycle: {
+    readonly host: string;
+    readonly port: number;
+    readonly allowedHosts: readonly string[] | null;
+    readonly internalTurns:
+      | { readonly kind: 'harness' }
+      | { readonly kind: 'delegated'; readonly host: string; readonly claimTimeoutMs: number; readonly runTimeoutMs: number };
+  } | null;
 }
 
 class Reader {
@@ -157,7 +186,7 @@ const DAY_MS = 24 * HOUR_MS;
 export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   if (!isRecord(raw)) return invalid('config must be a JSON object');
   const issues: string[] = [];
-  const root = new Reader(raw, '', ['companionId', 'surface', 'operator', 'storage', 'postgres', 'model', 'embedding', 'policies', 'approvals', 'harness', 'workers', 'scheduler', 'memory'], issues);
+  const root = new Reader(raw, '', ['companionId', 'surface', 'operator', 'storage', 'postgres', 'model', 'embedding', 'policies', 'approvals', 'harness', 'workers', 'scheduler', 'memory', 'mcp', 'lifecycle'], issues);
 
   const companionId = parseId('companion', root.value('companionId'));
   if (!companionId.ok && Object.hasOwn(raw, 'companionId')) issues.push('companionId must be an id of [A-Za-z0-9:._-]');
@@ -234,6 +263,13 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   };
   const memory = { endedAfterMs: root.child('memory', ['endedAfterMs']).integer('endedAfterMs', 60_000, 7 * DAY_MS) };
 
+  const mcp = parseMcp(root, issues);
+  const lifecycle = parseLifecycle(root, issues);
+  if (lifecycle !== null && mcp === null) issues.push('lifecycle needs mcp: the bridge shares its bindings');
+  if (lifecycle?.internalTurns.kind === 'delegated' && mcp !== null && lifecycle.internalTurns.runTimeoutMs > mcp.internalTurnTtlMs) {
+    issues.push('lifecycle.internalTurns.runTimeoutMs must not exceed mcp.internalTurnTtlMs, the life of the credential the host runs the turn with');
+  }
+
   if (issues.length > 0 || !companionId.ok || !surface.ok) return invalid(...issues);
   return ok({
     companionId: companionId.value,
@@ -249,7 +285,52 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
     workers,
     scheduler,
     memory,
+    mcp,
+    lifecycle,
   });
+}
+
+function listen(reader: Reader, issues: string[], at: string): { host: string; port: number; allowedHosts: readonly string[] | null } {
+  const host = reader.string('host');
+  const port = reader.integer('port', 0, 65_535);
+  const raw = reader.value('allowedHosts');
+  let allowedHosts: string[] | null = null;
+  if (Array.isArray(raw) && raw.length > 0 && raw.every((h) => typeof h === 'string' && h.trim().length > 0)) allowedHosts = raw as string[];
+  else if (raw !== null && raw !== undefined) issues.push(`${at}.allowedHosts must be null or a non-empty list of Host names`);
+  return { host, port, allowedHosts };
+}
+
+function parseMcp(root: Reader, issues: string[]): LiteConfig['mcp'] {
+  if (root.value('mcp') === null) return null;
+  const r = root.child('mcp', ['host', 'port', 'allowedHosts', 'bindings', 'internalTurnTtlMs', 'maxOpenInternalTurns']);
+  const bindings = r.value('bindings');
+  if (!Array.isArray(bindings) || bindings.length === 0) {
+    if (bindings !== undefined) issues.push('mcp.bindings must be a non-empty list of principal bindings');
+  }
+  return {
+    ...listen(r, issues, 'mcp'),
+    bindings: Array.isArray(bindings) ? bindings : [],
+    internalTurnTtlMs: r.integer('internalTurnTtlMs', 1_000, DAY_MS),
+    maxOpenInternalTurns: r.integer('maxOpenInternalTurns', 1, 100),
+  };
+}
+
+function parseLifecycle(root: Reader, issues: string[]): LiteConfig['lifecycle'] {
+  if (root.value('lifecycle') === null) return null;
+  const r = root.child('lifecycle', ['host', 'port', 'allowedHosts', 'internalTurns']);
+  const raw = r.value('internalTurns');
+  let internalTurns: NonNullable<LiteConfig['lifecycle']>['internalTurns'] = { kind: 'harness' };
+  if (isRecord(raw) && raw['kind'] === 'harness') {
+    r.child('internalTurns', ['kind']);
+  } else if (isRecord(raw) && raw['kind'] === 'delegated') {
+    const d = r.child('internalTurns', ['kind', 'host', 'claimTimeoutMs', 'runTimeoutMs']);
+    const host = d.string('host');
+    if (host !== '' && !/^[a-z0-9][a-z0-9._-]{0,63}$/.test(host)) issues.push('lifecycle.internalTurns.host must name a bound principal');
+    internalTurns = { kind: 'delegated', host, claimTimeoutMs: d.integer('claimTimeoutMs', 1_000, HOUR_MS), runTimeoutMs: d.integer('runTimeoutMs', 1_000, DAY_MS) };
+  } else if (raw !== undefined) {
+    issues.push('lifecycle.internalTurns.kind must be "harness" or "delegated"');
+  }
+  return { ...listen(r, issues, 'lifecycle'), internalTurns };
 }
 
 /** The secrets the config names, read from the environment. A missing one is named, its value never shown. */

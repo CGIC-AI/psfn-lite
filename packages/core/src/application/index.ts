@@ -83,6 +83,25 @@ export {
   type SessionSummary,
 } from './session-service.ts';
 export { syncTranscriptProjection } from './transcript-projection.ts';
+export {
+  createHostedTurns,
+  type HostedCheckpoint,
+  type HostedCheckpointInput,
+  type HostedPrepareInput,
+  type HostedPrepared,
+  type HostedSettleInput,
+  type HostedSettled,
+  type HostedTurns,
+  type HostedTurnsDeps,
+} from './hosted-turns.ts';
+export {
+  createTurnContextAssembler,
+  type HistoryContextEntry,
+  type TurnContextAssembler,
+  type TurnContextDeps,
+  type TurnContextLimits,
+  type TurnContextParts,
+} from './turn-context.ts';
 export { createValuesService, type ValuesService } from './values-service.ts';
 export * from './self-state.ts';
 export * from './memory-index.ts';

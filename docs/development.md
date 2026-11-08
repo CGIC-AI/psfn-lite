@@ -63,3 +63,44 @@ run the complete local gate once, and publish through its wrapper. A coherent
 out-of-budget change gets an explicit variance rather than filler. Return the PR
 URL without polling unless asked. Merge with exact-head protection after required
 checks pass. Close delivered implementation beads; track later live testing separately.
+
+## Hermes plugin tests
+
+`integrations/hermes` is Python. Its tests run in a project-local virtualenv
+(`integrations/hermes/.venv`, gitignored) with [uv](https://docs.astral.sh/uv/).
+Hermes itself is installed editable from a throwaway clone at the tested
+revision, `f0187332d13679e2ace74d1f0eb399eb91a90571`. Never install into an
+operator's Hermes checkout, `~/.hermes` profile or `hermes` binary. The suite
+sets `HERMES_HOME` to a temporary directory before importing Hermes, and it
+refuses to run unless the imported Hermes is a git checkout at that revision.
+Every test dependency is pinned exactly in `requirements-test.txt`.
+
+```bash
+HERMES_CLONE=/tmp/hermes-agent-f0187332   # any disposable path
+git clone --no-checkout https://github.com/NousResearch/hermes-agent.git "$HERMES_CLONE"
+git -C "$HERMES_CLONE" checkout --detach f0187332d13679e2ace74d1f0eb399eb91a90571
+cd integrations/hermes
+uv venv --no-config --python 3.13 .venv
+uv pip install --no-config --python .venv/bin/python -r requirements-test.txt
+uv pip install --no-config --python .venv/bin/python --no-deps -e "$HERMES_CLONE"
+mise exec node@24.22.1 npm@11.17.0 -- .venv/bin/python -I -m pytest -q
+```
+
+Hermes's `setup.py` refuses to build a wheel, so it cannot be a locked uv git
+dependency; hence the editable install with `--no-deps`. `--no-config` keeps
+user-level uv indexes out of resolution. The pins were compiled from Hermes's
+own `pyproject.toml` at the tested revision, with its `mcp` extra plus
+pytest. To refresh them after moving the tested revision:
+
+```bash
+echo 'pytest==8.4.2' > /tmp/psfn-test-extra.in
+uv pip compile --no-config "$HERMES_CLONE/pyproject.toml" /tmp/psfn-test-extra.in \
+  --extra mcp --python-version 3.13 --no-header --no-annotate -o requirements-test.txt
+```
+
+`tests/test_e2e_lite.py` starts `tests/hermes/fixtures/lite-host.ts` (the
+standalone runtime over a throwaway pgvector container, with the MCP
+transport and the lifecycle bridge on loopback), so it needs Docker, Node on
+`PATH` (hence `mise exec`) and the repository's `node_modules`. As with the
+TypeScript integration suites, `LITE_SKIP_DOCKER_TESTS=1` skips it explicitly.
+

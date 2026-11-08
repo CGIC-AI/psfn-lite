@@ -1,0 +1,14 @@
+[project]
+name = "psfn-lite-hermes"
+version = "0.1.0"
+description = "Native Hermes plugin that drives the PSFN Lite lifecycle bridge"
+readme = "README.md"
+license = "AGPL-3.0-only"
+# Hermes at the tested revision requires >=3.11,<3.14; the plugin runs inside Hermes.
+requires-python = ">=3.11,<3.14"
+# The plugin uses only the standard library and the Hermes host it is loaded into.
+dependencies = []
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"
