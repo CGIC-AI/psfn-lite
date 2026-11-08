@@ -39,6 +39,7 @@ const TASK_MAX = 4_000;
 const SUMMARY_MAX = 8_000;
 const ARTIFACTS_MAX = 50;
 const SWEEP_BATCH = 50;
+const ACTIVITY_SYNC_ATTEMPTS = 3;
 
 export interface SpawnInput {
   /** Caller-chosen key; a retried spawn with the same key and request replays the same run. */
@@ -55,8 +56,6 @@ export interface SweepReport {
   readonly blocked: readonly WorkerRunId[];
   readonly failed: readonly WorkerRunId[];
   readonly cancelled: readonly WorkerRunId[];
-  /** Queued runs nothing drove within the resume grace window, settled as failed (`not_resumed`). */
-  readonly notResumed: readonly WorkerRunId[];
   /** Runs another pass moved first; left to it. */
   readonly contended: readonly WorkerRunId[];
 }
@@ -77,11 +76,17 @@ export interface WorkerRunner {
    * Recovers attempts whose lease expired. A started effect without an outcome
    * becomes `outcome_unknown` and blocks its run; a run with no ambiguous
    * effect returns to the queue until `maxAttempts`, then fails as
-   * `lease_expired`. A queued run that nothing drove within `resumeGraceMs`
-   * settles as failed (`not_resumed`), so no run waits forever for a
-   * conversation that never comes back. Nothing is re-executed here.
+   * `lease_expired`. Nothing is re-executed here.
    */
   sweep(): Promise<Result<SweepReport>>;
+  /**
+   * Settles as failed (`not_resumed`) every queued run nothing drove within
+   * `resumeGraceMs`, so no run waits forever for a conversation that never
+   * comes back. The scheduler runs it after `resume`, so its own runs get
+   * their chance first. Returns the runs it settled; one another pass moved
+   * first is left alone.
+   */
+  settleUnresumed(): Promise<Result<readonly WorkerRunId[]>>;
   /**
    * Cancels a visible run. A queued run settles at once; a running one gets a
    * durable request the next turn gate honours, and the host is told.
@@ -131,27 +136,37 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
     return canViewWorkerRun(viewerOf(scope), found.value) ? found : notFound(`worker run ${runId}`);
   };
 
-  /** Mirrors a settled run into its activity record once; a retry after a partial failure completes it. */
+  /**
+   * Mirrors a settled run into its activity record once; a retry after a
+   * partial failure completes it. A note landing between the read and the
+   * write is re-read and the outcome applied over it, so a settled run never
+   * leaves its activity in progress because of a lost race.
+   */
   const syncActivity = async (run: WorkerRun): Promise<Result<WorkerRun>> => {
-    if (run.outcome === null) return ok(run);
-    const activity = await deps.activities.get(run.activityId);
-    if (!activity.ok) return activity;
-    if (activity.value.status !== 'in_progress') return ok(run);
+    const outcome = run.outcome;
+    if (outcome === null) return ok(run);
     const author = { kind: 'machine', producer: `worker:${run.id}` } as const;
-    const next = applyActivityUpdate(
-      activity.value,
-      {
-        expectedRevision: activity.value.revision,
-        status: activityStatusForOutcome(run.outcome),
-        outcome: run.result?.summary ?? `worker ${run.outcome}${run.reason === null ? '' : `: ${run.reason}`}`,
-        artifacts: run.result?.artifacts ?? [],
-      },
-      author,
-      now(),
-    );
-    if (!next.ok) return next;
-    const updated = await deps.activities.update(next.value, activity.value.revision);
-    return updated.ok ? ok(run) : updated;
+    for (let attempt = 1; ; attempt += 1) {
+      const activity = await deps.activities.get(run.activityId);
+      if (!activity.ok) return activity;
+      if (activity.value.status !== 'in_progress') return ok(run);
+      const next = applyActivityUpdate(
+        activity.value,
+        {
+          expectedRevision: activity.value.revision,
+          status: activityStatusForOutcome(outcome),
+          outcome: run.result?.summary ?? `worker ${outcome}${run.reason === null ? '' : `: ${run.reason}`}`,
+          artifacts: run.result?.artifacts ?? [],
+        },
+        author,
+        now(),
+      );
+      if (!next.ok) return next;
+      const updated = await deps.activities.update(next.value, activity.value.revision);
+      if (updated.ok) return ok(run);
+      const raced = updated.error.kind === 'conflict' && updated.error.reason === 'stale_revision';
+      if (!raced || attempt >= ACTIVITY_SYNC_ATTEMPTS) return updated;
+    }
   };
 
   const settle = async (
@@ -383,7 +398,6 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
         blocked: [] as WorkerRunId[],
         failed: [] as WorkerRunId[],
         cancelled: [] as WorkerRunId[],
-        notResumed: [] as WorkerRunId[],
         contended: [] as WorkerRunId[],
       };
       /** Settles or requeues one run; a lost race leaves it to the pass that moved it. */
@@ -422,7 +436,10 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
                 );
         if (!outcome.ok) return outcome;
       }
+      return ok(report);
+    },
 
+    async settleUnresumed() {
       // Queued work nothing drove: its conversation never resumed it within the grace window.
       const cutoff = deps.clock.now().getTime() - deps.resumeGraceMs;
       const abandoned = await collectPaged({
@@ -432,11 +449,14 @@ export function createWorkerRunner(deps: WorkerRunnerDeps): Result<WorkerRunner>
         limit: SWEEP_BATCH,
       });
       if (!abandoned.ok) return abandoned;
+      const settled: WorkerRunId[] = [];
       for (const run of abandoned.value) {
-        const outcome = record(await settle(run, { outcome: 'failed', reason: 'not_resumed', result: null }), run, report.notResumed);
-        if (!outcome.ok) return outcome;
+        const result = await settle(run, { outcome: 'failed', reason: 'not_resumed', result: null });
+        if (lostRace(result)) continue;
+        if (!result.ok) return result;
+        settled.push(run.id);
       }
-      return ok(report);
+      return ok(settled);
     },
 
     async cancel(scope, runId) {

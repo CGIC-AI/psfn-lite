@@ -511,8 +511,10 @@ and builds the one dispatcher that the companion and every worker use):
   `delivery_unknown`; a daily one counts it in `unknownDeliveries` and
   moves to its next day, as a delivered one does.
 - **Scheduler tick** (`scheduler-tick.ts`). One pass in a companion-internal
-  turn: worker sweep and resume, reminder delivery, due prompts and
-  templates, then free time per lane. Each part reports its own result.
+  turn: worker sweep, resume, then settling queued runs past their grace
+  window (after resume, so scheduled runs queued through an outage are
+  driven first), reminder delivery, due prompts and templates, then free
+  time per lane. Each part reports its own result.
   There is no tick-wide lock: each step is exclusive on its own (the
   one-open-block index, compare-and-set on every in-flight marker, age-gated
   stranded markers), so overlapping ticks, on one host or several, neither
