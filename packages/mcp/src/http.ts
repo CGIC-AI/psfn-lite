@@ -7,14 +7,15 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createMcpHandler } from '@modelcontextprotocol/server';
-import type { McpPrincipalBindings } from './bindings.ts';
+import type { McpCallers } from './callers.ts';
 import { invalid, ok, unavailable, type Result } from './core.ts';
 import { bearerCredential } from './credentials.ts';
 import type { McpErrorReport, McpSurface } from './surface.ts';
 
 export interface McpHttpOptions {
   readonly surface: McpSurface;
-  readonly bindings: Pick<McpPrincipalBindings, 'identify'>;
+  /** The operator bindings, or `combineCallers(bindings, internalTurns)` when the host runs internal turns over this transport. */
+  readonly bindings: Pick<McpCallers, 'identify'>;
   /** Port to listen on; 0 picks a free one. */
   readonly port: number;
   /** Default 127.0.0.1. Anything that is not loopback needs `exposeBeyondLoopback`. */

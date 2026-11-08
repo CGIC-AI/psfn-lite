@@ -4,6 +4,7 @@
  * actions, and every action is called through the SDK client, reaching its
  * core handler under the caller bound from the credential.
  */
+import type { Client } from '@modelcontextprotocol/client';
 import { describe, expect, it } from 'vitest';
 import { TOOL_INVENTORY, ok, type TrustedTurnScope } from '../../packages/core/src/index.ts';
 import { ACTIONS_META_KEY, type ActionCatalogEntry } from '../../packages/mcp/src/index.ts';
@@ -36,17 +37,17 @@ describe('MCP tool listing', () => {
   });
 });
 
-/** Records every action called and checks it reached its handler. */
+/** Records every action called and checks it reached its handler. A caller is a bound principal or a client inside an internal turn. */
 function harness(w: World) {
   const covered = new Set<string>();
-  const call = async (principal: Principal, tool: string, action: string, args: Record<string, unknown> = {}): Promise<ToolOutcome> => {
-    const outcome = await invoke(await w.as(principal), tool, { action, ...args });
+  const call = async (principal: Principal | Client, tool: string, action: string, args: Record<string, unknown> = {}): Promise<ToolOutcome> => {
+    const outcome = await invoke(typeof principal === 'string' ? await w.as(principal) : principal, tool, { action, ...args });
     covered.add(`${tool}.${action}`);
     return outcome;
   };
-  const must = async <T = Record<string, unknown>>(principal: Principal, tool: string, action: string, args: Record<string, unknown> = {}): Promise<T> => {
+  const must = async <T = Record<string, unknown>>(principal: Principal | Client, tool: string, action: string, args: Record<string, unknown> = {}): Promise<T> => {
     const outcome = await call(principal, tool, action, args);
-    if (outcome.isError) throw new Error(`${tool}.${action} as ${principal} failed: ${outcome.text}`);
+    if (outcome.isError) throw new Error(`${tool}.${action} as ${typeof principal === 'string' ? principal : 'the companion'} failed: ${outcome.text}`);
     expect(outcome.payload['origin']).toEqual({ kind: 'tool_result', tool, action });
     return outcome.payload['content'] as T;
   };
@@ -203,13 +204,16 @@ describe('MCP inventory parity', () => {
       text: 'The garden talk felt like care.',
     });
     expect(reflection.ok).toBe(true);
-    expect(await must<unknown[]>('self', 'journal', 'reflections_list')).toHaveLength(1);
-    await must('self', 'journal', 'reflections_read', { reflectionId: 'r-1' });
-    await must('self', 'journal', 'letter_compose', { letterId: 'l-1', subject: 'Spring', body: 'The hives are waking up.', draft: true });
-    await must('self', 'journal', 'letter_list');
-    await must('self', 'journal', 'letter_read', { letterId: 'l-1' });
-    await must('self', 'journal', 'letter_place', { letterId: 'l-1' });
-    await must('self', 'journal', 'letter_archive', { letterId: 'l-1' });
+    // The companion's own journal is reached only inside an internal turn, with the credential minted for it.
+    await w.inSelfTurn(async (self) => {
+      expect(await must<unknown[]>(self, 'journal', 'reflections_list')).toHaveLength(1);
+      await must(self, 'journal', 'reflections_read', { reflectionId: 'r-1' });
+      await must(self, 'journal', 'letter_compose', { letterId: 'l-1', subject: 'Spring', body: 'The hives are waking up.', draft: true });
+      await must(self, 'journal', 'letter_list');
+      await must(self, 'journal', 'letter_read', { letterId: 'l-1' });
+      await must(self, 'journal', 'letter_place', { letterId: 'l-1' });
+      await must(self, 'journal', 'letter_archive', { letterId: 'l-1' });
+    });
 
     // episodes, formed by maintenance from the ended conversation
     w.clock.advance(2 * 60 * 60_000);
@@ -220,25 +224,27 @@ describe('MCP inventory parity', () => {
     expect(episodeId).not.toBe('');
     await must('primary', 'episode', 'search', { query: 'tomatoes' });
     const episode = await must<{ revision?: number }>('primary', 'episode', 'get', { episodeId });
-    await must('self', 'episode', 'author_meaning', { episodeId, text: 'The day the garden began.', expectedRevision: episode.revision ?? 0 });
+    await w.inSelfTurn((self) => must(self, 'episode', 'author_meaning', { episodeId, text: 'The day the garden began.', expectedRevision: episode.revision ?? 0 }));
 
     // free time: the invitation runs in a companion-internal turn whose harness answers over MCP
     const selfScope: TrustedTurnScope = await w.admit('free-time');
-    w.internalTurns.script = async (request) => {
-      if (request.prompt.startsWith('Free time is open')) await must('self', 'free_time', 'choose', { blockId: request.reference.id, optionId: 'reflect' });
+    w.companion.turn = async (request, self) => {
+      if (request.prompt.startsWith('Free time is open')) await must(self, 'free_time', 'choose', { blockId: request.reference.id, optionId: 'reflect' });
       return ok({ status: 'completed', reply: 'Tending the beds felt steadying.' });
     };
     const ticked = await w.scheduler.tick(selfScope);
     expect(ticked.ok).toBe(true);
     expect(covered.has('free_time.choose')).toBe(true);
-    await must('self', 'free_time', 'status');
-    await must('self', 'free_time', 'rest', { minutes: 30 });
-    await must('self', 'free_time', 'defer', { minutes: 60 });
-    await must('self', 'free_time', 'schedule_prompt', { scheduleId: 'garden-1', name: 'garden', prompt: 'Look at the garden notes', at: '2030-02-01T09:30', timeZone: 'UTC' });
-    await must('self', 'free_time', 'update_template', { templateId: 'evening', expectedRevision: 0, name: 'evening', prompt: 'What mattered today?', schedule: { kind: 'manual' } });
-    await must('self', 'free_time', 'scheduled_list');
     w.templateModel.reply = 'The small things carried the day.';
-    await must('self', 'free_time', 'run_template', { templateId: 'evening', runId: 'run-1' });
+    await w.inSelfTurn(async (self) => {
+      await must(self, 'free_time', 'status');
+      await must(self, 'free_time', 'rest', { minutes: 30 });
+      await must(self, 'free_time', 'defer', { minutes: 60 });
+      await must(self, 'free_time', 'schedule_prompt', { scheduleId: 'garden-1', name: 'garden', prompt: 'Look at the garden notes', at: '2030-02-01T09:30', timeZone: 'UTC' });
+      await must(self, 'free_time', 'update_template', { templateId: 'evening', expectedRevision: 0, name: 'evening', prompt: 'What mattered today?', schedule: { kind: 'manual' } });
+      await must(self, 'free_time', 'scheduled_list');
+      await must(self, 'free_time', 'run_template', { templateId: 'evening', runId: 'run-1' });
+    });
 
     expect([...covered].sort()).toEqual([...ALL_ACTIONS].sort());
     expect(w.errors).toEqual([]);

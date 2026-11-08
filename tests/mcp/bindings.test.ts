@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildToolCatalog, bearerCredential, loadPrincipalBindings, startMcpHttpServer, ACTION_ARGUMENTS, type McpSurface } from '../../packages/mcp/src/index.ts';
 import { TOOL_INVENTORY } from '../../packages/core/src/index.ts';
+import { STANDING_INTERNAL } from './bindings-fixture.ts';
 import { BINDINGS } from './mcp-world.ts';
 
 const STRONG = 'k'.repeat(24) + 'Q7-x_9.Z';
@@ -58,6 +59,7 @@ describe('principal bindings', () => {
     ['a credential bound twice', { bindings: [binding('robin', { env: 'ROBIN_TOKEN' }), binding('sam', { env: 'COPY_TOKEN' })] }, 'already bound'],
     ['an unknown binding key', { bindings: [binding('robin', { env: 'ROBIN_TOKEN' }, { trust: 'primary' })] }, 'must have only'],
     ['a malformed attestation', { bindings: [{ principal: 'robin', credential: { env: 'ROBIN_TOKEN' }, attestation: { surface: 'mcp', principal: { kind: 'root' } } }] }, 'principal.kind'],
+    ['a standing companion-internal principal', { bindings: [binding('wren', { env: 'ROBIN_TOKEN' }, { attestation: STANDING_INTERNAL })] }, 'cannot be bound to a standing credential'],
     ['a missing turn kind', { bindings: [binding('robin', { env: 'ROBIN_TOKEN' }, { attestation: { ...attestation, turnKind: undefined } })] }, 'turnKind'],
     ['no bindings', { bindings: [] }, 'at least one binding'],
     ['another top-level key', { bindings: [], tokens: [] }, 'must be { "bindings"'],

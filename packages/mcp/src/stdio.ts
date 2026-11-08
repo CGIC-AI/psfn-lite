@@ -6,14 +6,19 @@
  */
 import type { Transport } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
-import type { McpPrincipalBindings } from './bindings.ts';
+import type { McpCallers } from './callers.ts';
 import { denied, ok, type Result } from './core.ts';
 import { readCredential, type CredentialEnvironment, type CredentialSource } from './credentials.ts';
 import type { McpErrorReport, McpSurface } from './surface.ts';
 
 export interface McpStdioOptions {
   readonly surface: McpSurface;
-  readonly bindings: Pick<McpPrincipalBindings, 'identify'>;
+  /**
+   * The operator bindings. stdio carries participant callers only: the
+   * harness launches the server process, so no host there mints internal
+   * turn credentials, and a static binding never reaches a self scope.
+   */
+  readonly bindings: Pick<McpCallers, 'identify'>;
   /** Where this process's credential lives, for example `{ env: 'LITE_MCP_CREDENTIAL' }`. */
   readonly credential: CredentialSource;
   readonly env: CredentialEnvironment;
