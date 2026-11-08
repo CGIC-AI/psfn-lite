@@ -122,6 +122,8 @@ export interface CompanionHarness {
   activeTurns(): number;
   /** Turns whose outcome is known but could not be recorded yet; a retry or the session's next turn records them. */
   unsettledTurns(): readonly TurnId[];
+  /** Tries once more to record every held outcome (a host does this before it closes storage); returns the turn ids still unrecorded. */
+  settleHeld(): Promise<readonly TurnId[]>;
 }
 
 export function createCompanionHarness(deps: CompanionHarnessDeps): Result<CompanionHarness> {
@@ -330,6 +332,7 @@ export function createCompanionHarness(deps: CompanionHarnessDeps): Result<Compa
     },
     activeTurns: () => controllers.size,
     unsettledTurns: () => settler.held(),
+    settleHeld: () => settler.flush(),
   });
 }
 

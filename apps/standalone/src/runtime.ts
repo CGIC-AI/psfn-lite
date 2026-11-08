@@ -56,7 +56,9 @@ export interface LiteHostCapabilities {
 export type LiteDiagnostic =
   | { readonly kind: 'pool_idle_error'; readonly message: string }
   | ({ readonly kind: 'worker_host' } & WorkerDiagnostic)
-  | { readonly kind: 'tick'; readonly report: Result<LiteTickReport> };
+  | { readonly kind: 'tick'; readonly report: Result<LiteTickReport> }
+  /** Turn outcomes known at close that storage still refused; each turn stays open until a successor recovers it as interrupted by the host. */
+  | { readonly kind: 'unsettled_turns'; readonly turnIds: readonly string[] };
 
 export interface LiteTickReport {
   readonly scheduler: Result<SchedulerTickReport>;
@@ -259,6 +261,8 @@ function assemble(parts: {
       workerHost.shutdown();
       await loop?.stop();
       await Promise.allSettled([...inFlight]);
+      const unsettled = await harness.settleHeld();
+      if (unsettled.length > 0) host.onDiagnostic({ kind: 'unsettled_turns', turnIds: unsettled });
       await storage.close();
     },
   };
