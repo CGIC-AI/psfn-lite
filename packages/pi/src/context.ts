@@ -52,7 +52,8 @@ export async function assembleTurnContext(
 ): Promise<Result<TurnContext>> {
   const layers = await sources.orientation.listLayers(scope);
   if (!layers.ok) return layers;
-  const blocks = await sources.orientation.view(scope);
+  // Orientation blocks belong to a conversation; a self turn has none, by core's design.
+  const blocks = scope.audience.kind === 'self' ? ok([]) : await sources.orientation.view(scope);
   if (!blocks.ok) return blocks;
   const selfState = await sources.selfState.build(scope, { limit: limits.selfStateItems });
   if (!selfState.ok) return selfState;
