@@ -30,11 +30,6 @@ import {
   saveSchedulerConfig,
 } from './scheduler-config.js';
 import {
-  SKILLS_FILE_NAME,
-  loadSkillsConfig,
-  saveSkillsConfig,
-} from './skills-config.js';
-import {
   TRUST_POLICY_FILE_NAME,
   loadTrustPolicyConfig,
   saveTrustPolicyConfig,
@@ -512,58 +507,6 @@ describe('subsystem config round-trip', () => {
     expect(saveSchedulerConfig(dataDir, expected)).toEqual(expected);
     expect(readJsonFile(join(dataDir, SCHEDULER_FILE_NAME))).toEqual(expected);
     expect(loadSchedulerConfig(dataDir)).toEqual(expected);
-  });
-
-  it('round-trips skills.json without drift', () => {
-    const dataDir = makeDataDir('psfn-skills-config-');
-    const expected = {
-      enabled: true,
-      directories: ['skills'],
-      extraDirectories: ['history/skills'],
-      maxLoadedSkills: 16,
-      maxSkillChars: 12_000,
-      disabledSkills: ['git-ops'],
-      // lpxg3.3: the reuse block is optional in the owner file and fills in
-      // from the contract defaults, so the round-trip must state it.
-      reuse: {
-        maxCandidates: 3,
-        minRelevanceScore: 0.25,
-        minToolCalls: 3,
-        nudgeEveryNthTurn: 3,
-        // sap72: post-use outcome evidence weight, contract default.
-        outcomeEvidenceWeight: 0.25,
-      },
-      // 7wggj: the eligibility block is optional in the owner file and fills in
-      // from the contract defaults, so the round-trip must state it too.
-      eligibility: {
-        maxTotalBinaryChecks: 4096,
-      },
-    };
-
-    expect(saveSkillsConfig(dataDir, expected)).toEqual(expected);
-    expect(readJsonFile(join(dataDir, SKILLS_FILE_NAME))).toEqual(expected);
-    expect(loadSkillsConfig(dataDir)).toEqual(expected);
-  });
-
-  it('preserves skills positive integer validation wording', () => {
-    const dataDir = makeDataDir('psfn-skills-config-invalid-');
-    const expected = {
-      enabled: true,
-      directories: ['skills'],
-      extraDirectories: ['history/skills'],
-      maxLoadedSkills: 16,
-      maxSkillChars: 12_000,
-      disabledSkills: ['git-ops'],
-    };
-
-    expect(() => saveSkillsConfig(dataDir, {
-      ...expected,
-      maxLoadedSkills: 1.5,
-    })).toThrow('Invalid skills config: maxLoadedSkills must be an integer');
-    expect(() => saveSkillsConfig(dataDir, {
-      ...expected,
-      maxLoadedSkills: 0,
-    })).toThrow('Invalid skills config: maxLoadedSkills must be between 1 and 512');
   });
 
   it('round-trips trust-policy.json without drift', () => {

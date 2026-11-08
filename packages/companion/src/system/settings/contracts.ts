@@ -7,7 +7,8 @@ import type { MemoryPresentationProfile } from '../config/memory-presentation-pr
 import type { MemoryDeletionPolicy } from '../config/memory-deletion-policy.js';
 import type { BiographicalDepthPolicy } from '../config/biographical-depth-policy.js';
 import type { BiographicalCandidatePolicy } from '../config/biographical-candidate-policy.js';
-import type { ActiveMemoryRetrievalMode, CapabilityTier, CompositionalPolicyConfig, LifecycleKubernetesSettings, SessionRestartBehavior, SessionTailCacheSettings, SubstrateConfig, VoiceReplySegmenterSettings, WikiStartupHydrationSettings } from '../config/runtime-config-contracts.js';
+import type { ActiveMemoryRetrievalMode, CapabilityTier, CompositionalPolicyConfig, SessionRestartBehavior, SessionTailCacheSettings, SubstrateConfig } from '../config/runtime-config-contracts.js';
+import type { LifecycleKubernetesSettings, VoiceReplySegmenterSettings, WikiStartupHydrationSettings } from '../config/scaffolding-config-fields.js';
 import type { ShellExecSettings } from '../config/shell-exec-config.js';
 import type { DecisionBackendSettings } from '../config/decision-backend-config.js';
 import type {

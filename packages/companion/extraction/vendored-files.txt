@@ -1,5 +1,6 @@
 # Donor files carried TEMPORARILY (scaffolding the closure or its tests import, test-support, fixtures). Each leaves when its seam is cut (plan Step B); the build must end with none of the scaffolding ones.
 # Kind `promoted`: a donor file outside the Step A0 closure that a seam cut kept as core (it is self-contained and serves a kept path); it stays at its donor path and is no longer scaffolding. Unchanged unless a cut in extraction/cuts.tsv edits it (B2: core/cogsec/intake/derived-content.ts imports redirected to the ports; core/cogsec/memory-candidacy.ts split, seam 3.5).
+# Kind `cut`: a file of the Step A0 closure that a B5 cut moved out of the core (an operator ruling made it scaffolding, or a cut left it with no core importer). It is unchanged at its donor path (unless cuts.tsv says otherwise), no longer core, and leaves with the vendored scaffolding in B7.
 # kind	file
 scaffolding	src/app/agent/control-plane.ts
 scaffolding	src/app/agent/icp-autonomy-candidate-dispatcher.ts
@@ -434,22 +435,22 @@ scaffolding	src/faculties/file-ingest/office-document.ts
 scaffolding	src/faculties/file-ingest/quarantine.ts
 scaffolding	src/faculties/file-ingest/zip-container.ts
 scaffolding	src/faculties/shards/agent-runtime.ts
-scaffolding	src/faculties/shards/artifact-policy.ts
-scaffolding	src/faculties/shards/artifact-return-port.ts
+promoted	src/faculties/shards/artifact-policy.ts
+promoted	src/faculties/shards/artifact-return-port.ts
 scaffolding	src/faculties/shards/configuration-snapshot.ts
 scaffolding	src/faculties/shards/context-pack.ts
 scaffolding	src/faculties/shards/directory.ts
 scaffolding	src/faculties/shards/launch-capabilities.ts
-scaffolding	src/faculties/shards/lineage-contracts.ts
+promoted	src/faculties/shards/lineage-contracts.ts
 scaffolding	src/faculties/shards/manager.ts
-scaffolding	src/faculties/shards/output-review.ts
+promoted	src/faculties/shards/output-review.ts
 scaffolding	src/faculties/shards/parent-icp-runtime.ts
 scaffolding	src/faculties/shards/parent-icp-tool.ts
 scaffolding	src/faculties/shards/port.ts
 scaffolding	src/faculties/shards/request-scoped-capability-transport.ts
 scaffolding	src/faculties/shards/tool-governance.ts
 scaffolding	src/faculties/shards/tool-sync.ts
-scaffolding	src/faculties/shards/types.ts
+promoted	src/faculties/shards/types.ts
 scaffolding	src/faculties/shards/workload-registry.ts
 scaffolding	src/faculties/skills/filter.ts
 scaffolding	src/faculties/skills/format.ts
@@ -861,3 +862,8 @@ source-text	src/app/agent/scheduler-runtime.ts
 source-text	src/app/agent/startup/free-time-lane.ts
 source-text	src/app/gateway/main.ts
 source-text	src/app/operator/main.ts
+cut	src/system/config/fleet-auth-config.ts
+cut	src/system/config/fleet-auth-garden-projection.ts
+cut	src/system/config/fleet-auth-key-boundary.ts
+scaffolding	src/system/config/scaffolding-config-fields.ts
+cut	src/system/config/skills-config.ts

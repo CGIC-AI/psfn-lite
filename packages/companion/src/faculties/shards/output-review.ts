@@ -14,7 +14,7 @@ import type {
   ShardTaggedOutputSource,
   ShardWorkLogEntry,
 } from './types.js';
-import { truncateShardContextText } from './context-pack.js';
+import { truncateShardContextText } from './context-text.js';
 
 export interface StagedShardMemoryCandidate {
   text: string;

@@ -54,7 +54,7 @@ import type { MemoryWriteOptions, MemoryWriter, WriteResult } from './writer.js'
 import type { SleepCycleEpisodeConsolidator } from './episodic/sleep-consolidation.js';
 import type { EpisodeArcWeaver } from './episodic/arc-formation.js';
 import type { DreamMeaningPass } from './episodic/dream-meaning-pass.js';
-import type { SleeptimeWikiPass } from '../wiki/sleeptime-wiki-pass.js';
+import type { SleeptimeWikiPass } from './sleeptime-wiki-stage.js';
 import type {
   EpisodicMaintenanceDiagnostics,
   EpisodicStorePort,

@@ -1,21 +1,9 @@
-import type {
-  FalCreateModel,
-  FalEditModel,
-  ImageProvider,
-  ImageWorkflowSettings,
-} from '../../primitives/images/types.js';
 import type { CredentialReference, CredentialVaultPort } from '../../shared/contracts/credential-contracts.js';
-import type { StreamingSttProvider } from '../../primitives/voice/connectors/stt/index.js';
-import type { StreamingTtsProvider } from '../../primitives/voice/connectors/tts/index.js';
 import type { CapabilityTier } from '../capabilities/tier-types.js';
 import type { ChargePolicyConfig } from './charge-policy-config.js';
 import type { SubagentRoleRegistryConfig } from '../../faculties/subagents/role-registry.js';
 import type { AutomataOwnerPolicy } from '../../faculties/automata/registry-contract.js';
-import type {
-  CompanionRuntimeIdentity,
-  ResolvedCompanionsFleetConfig,
-} from './companions-config.js';
-import type { SatelliteRegistryConfig } from '../../shared/contracts/satellite-registry.js';
+import type { ResolvedCompanionsFleetConfig } from './companions-config.js';
 import type { GroupMemorySettings } from './group-memory-config.js';
 import type { EmotionScopingSettings } from './emotion-scoping-config.js';
 import type { NarrativeEmotionAppraisalSettings } from './narrative-emotion-appraisal-config.js';
@@ -27,10 +15,6 @@ import type { BiographicalCandidatePolicy } from './biographical-candidate-polic
 import type { ShellExecSettings } from './shell-exec-config.js';
 import type { DecisionBackendSettings } from './decision-backend-config.js';
 import type { RuntimeCompanionId } from '../../shared/routing/companion-id.js';
-import type {
-  FleetAuthConfig,
-  FleetAuthVerifierConfig,
-} from './fleet-auth-config.js';
 import type {
   CanonicalModelRegistry,
   CanonicalProviderRegistry,
@@ -53,10 +37,8 @@ import {
   EMOSIM_PROACTIVITY_SOURCE_VERSION,
   EMOSIM_WOULD_MESSAGE_V1,
 } from '../../shared/contracts/runtime.js';
-import type { CogSecPersonaConformanceSettings } from '../../shared/contracts/cogsec-persona-conformance.js';
 
 export type { CapabilityTier } from '../capabilities/tier-types.js';
-export type ShardToolsetConfig = Partial<Record<CapabilityTier, string[]>>;
 export type SessionRestartBehavior = 'reuse_latest_session' | 'new_session';
 export type ActiveMemoryRetrievalMode = 'background' | 'inline';
 export type PersistenceBackend = 'postgres';
@@ -189,12 +171,6 @@ export function createDefaultEmoSimProactivitySettings(): EmoSimProactivitySetti
   };
 }
 
-export interface WyomingShardRoutingConfig {
-  enabled: boolean;
-  siteAllowlist?: string[];
-  satelliteAllowlist?: string[];
-}
-
 /**
  * Optional Redis-backed hot session tail (psfn-framework-hgw3.5). Owned by
  * settings.json. Enablement and the per-channel bound live here; the Redis
@@ -242,12 +218,6 @@ export interface SubstrateConfig {
    * Fleet Auth/multi-companion gateway and agent processes.
    */
   companionFleet?: ResolvedCompanionsFleetConfig;
-  /** Fleet-bound process identity for an agent/gateway using fleet routing. */
-  companionRuntimeIdentity?: CompanionRuntimeIdentity;
-  /** Per-companion proof used only during gateway connection authentication. */
-  gatewayCompanionAuthToken?: string;
-  /** Role-bound proof delegated only to the session-integrity worker. */
-  gatewaySessionIntegrityAuthToken?: string;
   systemDataDir?: string;
   companionDataDir?: string;
   workspacePath?: string;
@@ -257,10 +227,6 @@ export interface SubstrateConfig {
   databasePath: string;
   persistenceBackend?: PersistenceBackend;
   postgresDatabaseUrl?: string;
-  /** Gateway-only full owner-file projection; never present in agent/operator config. */
-  fleetAuth?: FleetAuthConfig;
-  /** Public-key-only projection supplied to operator/agent verifier processes. */
-  fleetAuthVerifier?: FleetAuthVerifierConfig;
   /**
    * Optional per-companion Postgres schema (sprint 10, W2 multi-companion
    * tenancy). When set, the agent's runtime persistence pools pin their
@@ -290,12 +256,6 @@ export interface SubstrateConfig {
   wikiRetrievalFocusTokenCap?: number;
   wikiRetrievalSimilarityThreshold?: number;
   wikiRetrievalGroupSimilarityThreshold?: number;
-  /** settings.json-owned startup wiki cache hydration volume. */
-  wikiStartupHydration?: WikiStartupHydrationSettings;
-  /** settings.json-owned lifecycle and Kubernetes operational policy. */
-  lifecycleKubernetes?: LifecycleKubernetesSettings;
-  /** Per-companion JSON-owned baseline for CogSec persona drift detection. */
-  cogSecPersonaConformance?: CogSecPersonaConformanceSettings;
   extractionInterval: number;
   maintenanceIntervalMs: number;
   defaultContextWindow: number;
@@ -392,11 +352,6 @@ export interface SubstrateConfig {
    * regularly fall back to the last-good context. Owned by settings.json.
    */
   activeMemoryInlineBudgetMs?: number;
-  /**
-   * Fail-closed intake screening events per stage/source class before one
-   * deduplicated operator alert is raised. Owned by settings.json.
-   */
-  intakeScreeningFailureAlertThreshold?: number;
   groupMemory?: GroupMemorySettings;
   emotionScoping?: EmotionScopingSettings;
   /** settings.json-owned gate for expensive narrative emotion appraisal. */
@@ -443,7 +398,6 @@ export interface SubstrateConfig {
   observerEvalSidecar?: ObserverEvalSidecarSettings;
   emosimProactivity?: EmoSimProactivitySettings;
   sessionTailCache?: SessionTailCacheSettings;
-  shardToolsets?: ShardToolsetConfig;
   /**
    * bead 7ym.2.1 — schema-owned subagent role registry (subagent-roles.json).
    * Named role profiles layered over inherited companion identity; each role may
@@ -455,39 +409,10 @@ export interface SubstrateConfig {
   automataPolicy?: AutomataOwnerPolicy;
   /** Concurrency cap on simultaneously active subagent tasks (zet.7). */
   subagentMaxConcurrent?: number;
-  /** Concurrency cap on simultaneously active shards (zet.7). */
-  shardMaxConcurrent?: number;
-  /** Shard heartbeat silence (ms) before a shard is marked degraded/stale (zet.7). */
-  shardHeartbeatStaleAfterMs?: number;
-  /** Shard heartbeat silence (ms) before a shard is marked offline (zet.7). */
-  shardHeartbeatDisconnectAfterMs?: number;
-  /** Satellite heartbeat silence (ms) before a hub device reads degraded (s7wq3). */
-  satelliteHeartbeatStaleAfterMs?: number;
-  /** Max document attachment size accepted by file ingest (bytes, zet.7). */
-  documentIngestMaxBytes?: number;
-  /** Max plain-text attachment size accepted by file ingest (bytes, zet.7). */
-  documentIngestTextMaxBytes?: number;
-  /** Char cap on parsed attachment text injected into the prompt (zet.7). */
-  documentIngestPromptChars?: number;
-  /** Char cap on parsed attachment text written to the sidecar file (zet.7). */
-  documentIngestSidecarChars?: number;
   ledgerReadChunkBytes?: number;
   ledgerReadMaxRowBytes?: number;
   ledgerReadYieldRows?: number;
   sessionTombstoneAuthorityOwners?: number;
-  /** Overall wait cap (ms) for FAL image queue results (zet.7). */
-  imageFalTimeoutMs?: number;
-  /** Poll cadence (ms) for FAL image queue status (zet.7). */
-  imageFalPollIntervalMs?: number;
-  /** Overall wait cap (ms) for ComfyUI workflow completion (zet.7). */
-  imageComfyTimeoutMs?: number;
-  /** Poll cadence (ms) for ComfyUI workflow history (zet.7). */
-  imageComfyPollIntervalMs?: number;
-  voiceEnabled?: boolean;
-  discordBackfillOnStartup?: boolean;
-  discordTriggerWords?: string[];
-  discordTriggerReactions?: string[];
-  discordTriggerListenWindowMs?: number;
   characterName?: string;
   /**
    * Companion's active IANA timezone (settings.json-owned). Precedence, fail-closed:
@@ -496,52 +421,6 @@ export interface SubstrateConfig {
    * settings load; consumed live by every formatter, the scheduler, and rest windows.
    */
   activeTimezone?: string;
-  uiThemeId?: string;
-  voiceTargetGuildId?: string;
-  voiceTargetUserId?: string;
-  voiceReadyCueText?: string;
-  voiceDaveEncryption?: boolean;
-  voiceDecryptionFailureTolerance?: number;
-  /** Idle-connection timeout for the voice websocket session before force-close. */
-  voiceSessionTimeoutMs?: number;
-  /** Maximum inbound voice websocket frame size (bytes) before rejection. */
-  voiceMaxFrameBytes?: number;
-  /** Backpressure cap on queued inbound voice frames before overflow close. */
-  voiceMaxPendingFrames?: number;
-  /** settings.json-owned committed voice reply segmentation thresholds. */
-  voiceReplySegmenter?: VoiceReplySegmenterSettings;
-  sttProvider?: StreamingSttProvider | 'disabled';
-  ttsProvider?: StreamingTtsProvider | 'disabled';
-  deepgramApiKey?: string;
-  deepgramModel?: string;
-  deepgramSttEndpoint?: string;
-  deepgramListenEndpoint?: string;
-  elevenLabsApiKey?: string;
-  elevenLabsVoiceId?: string;
-  elevenLabsModelId?: string;
-  elevenLabsEndpointBase?: string;
-  falApiKey?: string;
-  comfyUiBaseUrl?: string;
-  imageProvider?: ImageProvider;
-  imageFalCreateModel?: FalCreateModel;
-  imageFalEditModel?: FalEditModel;
-  imageSelfieEditModel?: FalEditModel;
-  imageWorkflows?: ImageWorkflowSettings;
-  echoTtsUrl?: string;
-  echoTtsVoice?: string;
-  echoTtsPreset?: string;
-  echoTtsModel?: string;
-  analysisWorkbenchMaxTokens?: number;
-  analysisWorkbenchMaxWallTimeMs?: number;
-  /** Shared response-wait window for direct-parent Workbench execution. */
-  analysisWorkbenchDirectResponseTimeoutMs?: number;
-  analysisWorkbenchMaxSubQueries?: number;
-  /** Operator override for the analysis workbench iteration cap (turns). */
-  analysisWorkbenchMaxIterations?: number;
-  /** Per-code-block sandbox execution timeout (ms) for the analysis workbench. */
-  analysisWorkbenchExecutionTimeoutMs?: number;
-  /** Character cap on a single analysis-workbench code execution's output. */
-  analysisWorkbenchOutputTruncation?: number;
   /** Default byte page size for the unified filesystem read tool. */
   fsReadMaxBytes?: number;
   retryMaxAttempts?: number;
@@ -564,35 +443,9 @@ export interface SubstrateConfig {
   embeddingApiUrl?: string;
   embeddingApiModel?: string;
   embeddingApiDims?: number;
-  webFetchAllowHttp?: boolean;
-  webFetchDomainAllowlist?: string[];
-  webFetchAllowInternalNetwork?: boolean;
-  homeAssistantEnabled?: boolean;
-  webFetchTlsCaCertPaths?: string[];
-  /** Path to a CA certificate file (PEM) to trust for all outbound TLS connections (LLM, embeddings, etc.). Sets NODE_EXTRA_CA_CERTS at startup. */
-  gatewayTlsCaPath?: string;
-  /** Dev/test-only request for endpoint-scoped TLS verification exceptions. Rejected in production; never maps to NODE_TLS_REJECT_UNAUTHORIZED. */
-  gatewayTlsRejectUnauthorized?: boolean;
-  wyomingShardRouting?: WyomingShardRoutingConfig;
-  wyomingEnabled?: boolean;
-  wyomingHost?: string;
-  wyomingPort?: number;
-
-  // ── Telegram ──
-  telegramEnabled?: boolean;
-  telegramAuthorizedUsers?: string[];
-
-  // ── Obsidian vault ──
-  obsidianVaultName?: string;
-  obsidianCliPath?: string;
-  obsidianAutoPublish?: boolean;
-  obsidianTimeoutMs?: number;
 
   // ── Charge policy ──
   chargePolicy?: ChargePolicyConfig;
-
-  // ── Satellite claim registry ──
-  satelliteRegistry?: SatelliteRegistryConfig;
 
   // ── MoA (Mixture of Agents) ──
   moaEnabled?: boolean;
@@ -603,37 +456,6 @@ export interface SubstrateConfig {
   moaTimeoutMs?: number;
 }
 
-export interface WikiStartupHydrationSettings {
-  recentSessionLimit: number;
-  recentMessageLimit: number;
-  maxContextChars: number;
-}
-
-export interface VoiceReplySegmenterSettings {
-  minSegmentLength: number;
-  maxBufferLength: number;
-}
-
-/**
- * Mutable operational limits for lifecycle commands and the Kubernetes
- * self-management surfaces. Network coordinates and credentials remain
- * environment-owned; immutable protocol and response-size guards remain code-owned.
- */
-export interface LifecycleKubernetesSettings {
-  lifecycleCommandTimeoutMs: number;
-  operatorCommandTimeoutMs: number;
-  operatorHttpTimeoutMs: number;
-  operatorConfirmationRequestTimeoutMs: number;
-  kubernetesReadRequestTimeoutMs: number;
-  kubernetesRolloutRequestTimeoutMs: number;
-  rolloutWaitTimeoutMs: number;
-  rolloutPollIntervalMs: number;
-  rollbackWaitTimeoutMs: number;
-  rollbackPollIntervalMs: number;
-  postRolloutMaxLogRecords: number;
-  postRolloutValidationHistoryLimit: number;
-  rollbackHistoryLimit: number;
-}
 export const DEFAULT_MOOD_CONGRUENCE_WEIGHT = 0.15;
 export const DEFAULT_UI_THEME_ID = 'garden';
 
@@ -681,7 +503,7 @@ export function sanitizeCoreSubstrateConfig(config: SubstrateConfig): CoreSubstr
     elevenLabsApiKey: _elevenLabsApiKey,
     falApiKey: _falApiKey,
     ...coreConfig
-  } = config;
+  } = config as SubstrateConfig & Partial<Record<CoreSecretBearingConfigKey, unknown>>;
 
   return coreConfig as CoreSubstrateConfig;
 }

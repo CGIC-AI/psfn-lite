@@ -5,10 +5,11 @@
  *
  *   node packages/companion/extraction/remaining-seams.mjs [--summary]
  *
- * Core = the Step A0 closure (closure-files.txt), plus donor files promoted to
- * core (kind `promoted` in vendored-files.txt), plus Lite files added by seam
- * cuts (any non-test .ts under src/ that is in neither list). Scaffolding =
- * kind `scaffolding` in vendored-files.txt. Only non-test .ts core files are
+ * Core = the Step A0 closure (closure-files.txt) minus the closure files a cut
+ * moved out of the core (kind `cut` in vendored-files.txt, B5), plus donor
+ * files promoted to core (kind `promoted`), plus Lite files added by seam cuts
+ * (any non-test .ts under src/ that is in neither list). Scaffolding = kind
+ * `scaffolding` or `cut` in vendored-files.txt. Only non-test .ts core files are
  * scanned; every relative import kind counts (value, type, re-export,
  * dynamic). Step B7 ends with this list empty.
  */
@@ -21,7 +22,7 @@ const lines = (f) => readFileSync(join(pkg, 'extraction', f), 'utf8').split('\n'
   .filter((l) => l.trim() !== '' && !l.startsWith('#'));
 const closure = new Set(lines('closure-files.txt'));
 const vendored = new Map(lines('vendored-files.txt').map((l) => l.split('\t')).map(([k, f]) => [f, k]));
-const scaffolding = new Set([...vendored].filter(([, k]) => k === 'scaffolding').map(([f]) => f));
+const scaffolding = new Set([...vendored].filter(([, k]) => k === 'scaffolding' || k === 'cut').map(([f]) => f));
 
 function walk(dir) {
   return readdirSync(join(pkg, dir), { withFileTypes: true }).flatMap((e) =>
@@ -29,7 +30,7 @@ function walk(dir) {
 }
 const isTestish = (f) => /\.test\.ts$|\.test-fixtures\.ts$|\.test-support\.ts$|(^|\/)test-support\//.test(f);
 const core = walk('src').filter((f) => f.endsWith('.ts') && !isTestish(f))
-  .filter((f) => closure.has(f) || vendored.get(f) === 'promoted' || !vendored.has(f));
+  .filter((f) => (closure.has(f) && vendored.get(f) !== 'cut') || vendored.get(f) === 'promoted' || !vendored.has(f));
 
 const rx = /(?:import|export)\s+(type\s+)?(?:[\s\S]*?)\s+from\s+'([^']+)'|import\(\s*'([^']+)'\s*\)/g;
 const rows = [];

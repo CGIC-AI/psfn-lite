@@ -1,6 +1,8 @@
 import { statSync } from 'node:fs';
 import { join } from 'node:path';
-import { FLEET_AUTH_FILE_NAME } from './fleet-auth-config.js';
+// Lite extraction (seam 3.10): the fleet-auth owner file name, inlined from
+// the donor's fleet-auth-config.ts:47 (fleet auth is not part of the core).
+const FLEET_AUTH_FILE_NAME = 'fleet-auth.json';
 
 /**
  * Canonical POSIX mode authority for startup owner files.

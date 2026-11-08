@@ -9,7 +9,8 @@ import {
   JSONRPCServerAndClient,
 } from 'json-rpc-2.0';
 import { DEFAULT_COMPANION_ID } from '../../core/identity/companion-naming.js';
-import type { CapabilityTier, WyomingShardRoutingConfig } from '../../system/config/runtime-config-contracts.js';
+import type { CapabilityTier } from '../../system/config/runtime-config-contracts.js';
+import type { WyomingShardRoutingConfig } from '../../system/config/scaffolding-config-fields.js';
 import type { SubstrateMessage } from '../../shared/contracts/runtime.js';
 import type { GatewayRpcConnection } from './transport.js';
 import { GatewayInlineImageRetention } from './inline-image-retention.js';

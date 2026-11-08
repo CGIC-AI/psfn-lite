@@ -17,7 +17,7 @@ import type { ContactStorePort } from '../../contacts/contact-store-port.js';
 import type { ContactTrackingGate } from '../../contacts/tracking-gate.js';
 import type { CapabilityGrantSnapshot } from '../../../system/capabilities/access.js';
 import type { PlacesRegistryConfig } from '../../../shared/contracts/places-registry.js';
-import type { SkillsRuntime } from '../../../faculties/skills/runtime.js';
+import type { SkillsRuntime } from '../../../shared/contracts/skills-runtime-port.js';
 import type { InternalStateContinuityGap } from '../../self-model/internal-state-persistence.js';
 import type { ActiveConcernContextProvider } from '../../intention/concern-store-port.js';
 import type { ActiveConcernRuntimeData } from '../../intention/concerns.js';

@@ -23,7 +23,7 @@ import type { EpisodicSynthesizer } from '../../faculties/memory/episodic/synthe
 import type { SleepCycleEpisodeConsolidator } from '../../faculties/memory/episodic/sleep-consolidation.js';
 import type { EpisodeArcWeaver } from '../../faculties/memory/episodic/arc-formation.js';
 import type { DreamMeaningPass } from '../../faculties/memory/episodic/dream-meaning-pass.js';
-import type { SleeptimeWikiPass } from '../../faculties/wiki/sleeptime-wiki-pass.js';
+import type { SleeptimeWikiPass } from '../../faculties/memory/sleeptime-wiki-stage.js';
 import type { AutomataClassLifecycleRuntime } from '../../faculties/automata/bus/class-lifecycle.js';
 import type { NearTurnMemoryScopeClassifierPort } from '../../faculties/memory/near-turn-memory-lane.js';
 import type { ConversationalActivityWorksetPort } from '../session/conversational-activity-workset.js';

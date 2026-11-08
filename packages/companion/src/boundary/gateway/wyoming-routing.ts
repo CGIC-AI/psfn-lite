@@ -1,5 +1,5 @@
 import type { SubstrateMessage, WyomingRoutingMetadata } from '../../shared/contracts/runtime.js';
-import type { WyomingShardRoutingConfig } from '../../system/config/runtime-config-contracts.js';
+import type { WyomingShardRoutingConfig } from '../../system/config/scaffolding-config-fields.js';
 import type { VoiceStreamMetadata } from './protocol.js';
 import type { CompanionId } from '../../shared/routing/companion-id.js';
 import { createGatewayRoutingEnvelope } from '../../shared/routing/envelope.js';

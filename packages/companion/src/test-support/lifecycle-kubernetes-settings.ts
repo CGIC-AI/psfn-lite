@@ -1,6 +1,4 @@
-import type {
-  LifecycleKubernetesSettings,
-} from '../system/config/runtime-config-contracts.js';
+import type { LifecycleKubernetesSettings } from '../system/config/scaffolding-config-fields.js';
 
 export function lifecycleKubernetesSettingsFixture(
   overrides: Partial<LifecycleKubernetesSettings> = {},
