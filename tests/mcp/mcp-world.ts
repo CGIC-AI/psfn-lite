@@ -9,12 +9,7 @@
 import { randomBytes } from 'node:crypto';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { afterEach } from 'vitest';
-import {
-  BASELINE_DISCLOSURE_POLICY,
-  createContactAuthority,
-  createTrustedIngress,
-  type HostAttestation,
-} from '../../packages/core/src/index.ts';
+import { BASELINE_DISCLOSURE_POLICY, createContactAuthority, createTrustedIngress } from '../../packages/core/src/index.ts';
 import {
   createMcpSurface,
   loadPrincipalBindings,
@@ -27,36 +22,9 @@ import {
 import { activityWorld, fakeActivityPorts, type ActivityPorts } from '../core/activity-world.ts';
 import { COMPANION } from '../core/fakes.ts';
 import { fakeMemoryPorts, type MemoryPorts } from '../core/memory-world.ts';
+import { BINDINGS } from './bindings-fixture.ts';
 
-const SURFACE = 'mcp';
-
-const direct = (externalId: string, channel: string, turnKind: 'foreground' | 'background' = 'foreground'): HostAttestation =>
-  ({
-    surface: SURFACE,
-    principal: { kind: 'channel_account', identity: { channelKind: 'chat', externalId } },
-    room: { kind: 'direct', channelId: channel },
-    turnKind,
-  }) as unknown as HostAttestation;
-
-/** Operator bindings for the standard cast, plus deliberately bad ones. */
-export const BINDINGS = {
-  primary: direct('primary-handle', 'dm-primary'),
-  friend: direct('friend-handle', 'dm-friend'),
-  'friend-background': direct('friend-handle', 'dm-friend', 'background'),
-  acquaintance: direct('acq-handle', 'dm-acq'),
-  stranger: direct('stranger-handle', 'dm-stranger'),
-  'friend-group': {
-    surface: SURFACE,
-    principal: { kind: 'channel_account', identity: { channelKind: 'chat', externalId: 'friend-handle' } },
-    room: { kind: 'group', channelId: 'room-a', room: 'small_group' },
-    turnKind: 'foreground',
-  },
-  self: { surface: SURFACE, principal: { kind: 'companion_internal', purpose: 'free_time' }, room: { kind: 'self' }, turnKind: 'background' },
-  // Bound, but to nobody core knows.
-  nobody: direct('nobody-handle', 'dm-nobody'),
-  // A participant claiming the companion's own room.
-  'self-claim': { surface: SURFACE, principal: { kind: 'channel_account', identity: { channelKind: 'chat', externalId: 'primary-handle' } }, room: { kind: 'self' }, turnKind: 'foreground' },
-} as const;
+export { BINDINGS };
 
 export type Principal = keyof typeof BINDINGS;
 
