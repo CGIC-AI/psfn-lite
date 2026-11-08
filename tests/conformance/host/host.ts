@@ -25,7 +25,7 @@ import {
   type LiteTickReport,
 } from '../../../apps/standalone/src/index.ts';
 import { openLiteStorage } from '../../../apps/standalone/src/storage.ts';
-import { createContinuityBackup, type ContactId, type Result, type SessionId, type TrustedTurnScope } from '../../../packages/core/src/index.ts';
+import { TOOL_INVENTORY, createContinuityBackup, type ContactId, type Result, type SessionId, type TrustedTurnScope } from '../../../packages/core/src/index.ts';
 import { createDisabledEmbeddings } from '../../../packages/pi/src/index.ts';
 import { FixedClock } from '../../core/fakes.ts';
 import { liteConfigDocument } from '../../standalone/lite-config.ts';
@@ -222,9 +222,19 @@ export class ConformanceHost {
     return unwrap(await this.live().stacks.contactAdmin.setConsent('conformance:operator', input.contact as ContactId, input.consent));
   }
 
-  workerPlan(plan: { readonly calls?: readonly PlannedCall[]; readonly reply?: string; readonly hang?: boolean }): { readonly set: true } {
-    this.model.worker = { calls: plan.calls ?? [], reply: plan.reply ?? 'Worker finished.', hang: plan.hang ?? false };
+  workerPlan(plan: { readonly calls?: readonly PlannedCall[]; readonly reply?: string; readonly hang?: 'first' | 'after_calls' | 'never' }): { readonly set: true } {
+    this.model.worker = { calls: plan.calls ?? [], reply: plan.reply ?? 'Worker finished.', hang: plan.hang ?? 'never' };
     return { set: true };
+  }
+
+  /** What the last worker model request was shown as tool results. */
+  workerResults(): readonly CallResult[] {
+    return this.model.workerResults;
+  }
+
+  /** The governed inventory: every tool and its actions, as core declares them. */
+  inventory(): readonly { readonly name: string; readonly actions: readonly string[] }[] {
+    return TOOL_INVENTORY.map((t) => ({ name: t.name, actions: t.actions.map((a) => a.name) }));
   }
 
   /** A governed call as the operator (in their direct conversation) or as the companion's own internal turn: inspection through the same dispatcher. */

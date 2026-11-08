@@ -11,7 +11,6 @@ import type { HostState, Principal } from './host/host.ts';
 import type { Vars } from './scenario.ts';
 
 const REPO = join(import.meta.dirname, '..', '..');
-const TSX = join(REPO, 'node_modules', '.bin', 'tsx');
 const ENTRY = join(import.meta.dirname, 'fixtures', 'host-process.ts');
 const READY_TIMEOUT_MS = 60_000;
 
@@ -49,7 +48,8 @@ export class HostProcess {
   }
 
   static async start(state: HostState): Promise<HostProcess> {
-    const child = spawn(TSX, [ENTRY], { cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env['PATH'] ?? '' } });
+    // node with tsx's loader in one process (not the tsx CLI, which runs a child): SIGKILL then reaches the runtime itself.
+    const child = spawn(process.execPath, ['--import', 'tsx', ENTRY], { cwd: REPO, stdio: ['pipe', 'pipe', 'pipe'], env: { PATH: process.env['PATH'] ?? '' } });
     const log = { stderr: '' };
     child.stderr.on('data', (chunk: Buffer) => {
       log.stderr = `${log.stderr}${chunk.toString()}`.slice(-20_000);

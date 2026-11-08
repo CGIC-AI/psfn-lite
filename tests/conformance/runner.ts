@@ -99,7 +99,7 @@ async function runTurn(
   const key = `${step.id}-${surface}`;
   if (step.crash === 'worker') {
     // The worker the turn spawns is mid model call when the Lite host dies; whatever the turn returns is lost with it.
-    const started = host.nextEvent('worker_model_call');
+    const started = host.nextEvent('worker_hang');
     const turn =
       surface === 'hermes'
         ? hermes.turn({ key, as: 'hermes-operator', say, calls, reply, abandon: false, vars }).catch(() => null)
@@ -114,7 +114,7 @@ async function runTurn(
   }
   if (step.abandon === true) {
     // The Pi host dies while the companion's model call is in flight: kill the process, start a successor.
-    const started = host.nextEvent('companion_model_call');
+    const started = host.nextEvent('companion_hang');
     const turn = host.request('pi_turn', { say, calls, reply, hang: true, vars, key }).catch(() => null);
     await started;
     await crash();
