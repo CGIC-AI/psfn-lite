@@ -124,3 +124,16 @@ counterpart in a server that binds its caller from the transport credential.
 `invocation-authority.ts` contributed only its permit pattern, above; its
 argument normalization and outbound-sensitivity binding belong to outbound
 calls.
+
+Pi harness and standalone composition (psfn-lite-vvn.8). Written new for Lite
+against the public API of `@earendil-works/pi-agent-core` and
+`@earendil-works/pi-ai` 0.84.1, the versions the donor pins. No donor code was
+copied. The donor's `SubstrateAgent` and its loop patch were deliberately not
+ported.
+
+| Lite path | Donor path | Retained behavior | Deliberate change |
+| --- | --- | --- | --- |
+| `packages/pi/src/companion-harness.ts`, `loop.ts`, `context.ts`, `settlement.ts` | `src/core/agent/substrate-agent.ts`, `src/boundary/pi-agent/agent-loop-patch.ts` | Pi runs the model loop with the companion's tools; interrupted and failed turns are recorded | Public `runAgentLoop` only, no patch of Pi internals; a fresh context per turn from canonical history instead of a long-lived agent; every turn goes through core's prepare/commit/abort/recover; post-turn emotion observation and worker resumption |
+| `packages/pi/src/tools.ts` | `src/boundary/pi-agent/substrate-agent-tool.ts` | Tools are Pi `AgentTool`s whose arguments Pi validates against the tool's schema before `execute` | Plain `AgentTool` with no repo-owned mirror type; one Pi tool per inventory tool with an action enum; every call through core's dispatcher under the turn scope; refusals surface as labelled tool errors |
+| `packages/pi/src/worker-host.ts`, `inference.ts`, `embeddings.ts` | none | none | Lite-new implementations of core's worker, model, affect-estimator and embedding ports |
+| `apps/standalone/src/*` | none (the donor's composition root was excluded) | none | Explicit validated configuration, a local host authenticator and a CLI over one composition function |
