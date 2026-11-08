@@ -36,7 +36,8 @@ export interface PostgresHarness {
 /** True when the operator explicitly opted out of docker-backed tests. Prints the opt-out. */
 export function dockerTestsOptedOut(suite: string): boolean {
   if (process.env[OPT_OUT_ENV] !== '1') return false;
-  console.warn(`[lite] ${OPT_OUT_ENV}=1: skipping docker-backed integration suite "${suite}"`);
+  // Written to stderr directly: the runner discards console output of files whose tests all skip.
+  process.stderr.write(`[lite] ${OPT_OUT_ENV}=1: skipping docker-backed integration suite "${suite}"\n`);
   return true;
 }
 
