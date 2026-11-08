@@ -162,4 +162,16 @@ describe('JSONL session archive', () => {
     await writeFile(join(roots.history, 'archive.lock'), `${String(dead)}\n`);
     expect((await openArchive(layout)).sessionIds()).toEqual([]);
   });
+
+  it('takes over a stale lock carrying its own pid, as a restarted pid-1 container leaves it', async () => {
+    const roots = await tempRoots();
+    const layout = await layoutFor(roots);
+    await writeFile(join(roots.history, 'archive.lock'), `${String(process.pid)}\n`);
+    const archive = await openArchive(layout);
+    expect(archive.sessionIds()).toEqual([]);
+    // The lock this process does hold is still exclusive.
+    expect(errorOf(await openFileSessionArchive(layout))).toMatchObject({ kind: 'conflict', reason: 'already_exists' });
+    await archive.close();
+    expect((await openArchive(layout)).sessionIds()).toEqual([]);
+  });
 });

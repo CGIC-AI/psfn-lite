@@ -5,13 +5,14 @@
  * on the real store, and a full backup restored into a fresh history root and
  * a fresh database.
  */
-import { join } from 'node:path';
+import pg from 'pg';
 import { describe, expect, it } from 'vitest';
 import {
   createHistoryBackupComponent,
   openFileBackupStore,
   type FileSessionArchive,
   type PostgresState,
+  type StorageLayout,
 } from '../../packages/adapters/src/index.ts';
 import { createContinuityBackup, type BackupStorePort, type RenderedEntry, type SessionId } from '../../packages/core/src/index.ts';
 import { FakeApprovals, FakeModel } from '../core/continuity-fakes.ts';
@@ -58,8 +59,8 @@ function realPorts(h: Host, archive: FileSessionArchive, state: PostgresState): 
   };
 }
 
-async function backupStore(dir: string): Promise<BackupStorePort> {
-  const opened = await openFileBackupStore(dir);
+async function backupStore(layout: StorageLayout, setName: string): Promise<BackupStorePort> {
+  const opened = await openFileBackupStore(layout, setName);
   if (!opened.ok) throw new Error(JSON.stringify(opened.error));
   return opened.value;
 }
@@ -138,6 +139,11 @@ describe.skipIf(dockerTestsOptedOut('continuity recovery'))('continuity over the
     expect(errorOf(await world.ingress.admit('nobody-dm'))).toMatchObject({ kind: 'denied', reason: 'unknown_authority' });
     await world.admin.setConsent(OPERATOR, people.acquaintance, 'revoked');
     expect(errorOf(await world.ingress.admit('acq-dm'))).toMatchObject({ kind: 'denied', reason: 'untracked_contact' });
+    // Withdrawn consent also stops the dossier: nothing new is recorded about them.
+    const primaryScope = await world.admit('primary-dm');
+    const note = await world.call(primaryScope, 'contact', 'note', { contactId: people.acquaintance, text: 'seen at the market' });
+    expect(errorOf(note)).toMatchObject({ kind: 'denied', reason: 'untracked_contact' });
+    expect(await state.contacts.notes(people.acquaintance, 10)).toEqual({ ok: true, value: [] });
 
     // Merging the revoked contact into a trusted one must not resurrect it, and drags the survivor down.
     expect((await world.admin.merge(OPERATOR, people.acquaintance, people.friend)).ok).toBe(true);
@@ -156,8 +162,9 @@ describe.skipIf(dockerTestsOptedOut('continuity recovery'))('continuity over the
 
   it('restores a full backup into a fresh history root and database with identity and lineage intact', async () => {
     const sourceRoots = await tempRoots();
+    const sourceLayout = await layoutFor(sourceRoots);
     const h = host();
-    const archive = await openArchive(await layoutFor(sourceRoots));
+    const archive = await openArchive(sourceLayout);
     const state = await pgdb.fresh();
     const world = wireWorld(realPorts(h, archive, state));
     const people = await registerPeople(world.admin);
@@ -176,16 +183,36 @@ describe.skipIf(dockerTestsOptedOut('continuity recovery'))('continuity over the
     await world.call(primary, 'values', 'north_star_create', { title: 'care', content: 'care matters' });
     await world.identityAdmin.defineLayer(OPERATOR, { id: 'base', name: 'Base', type: 'base', content: 'Be kind.' });
 
-    const setDir = join(sourceRoots.backups, 'set-1');
-    const made = await continuityBackup(archive, state).backup(await backupStore(setDir));
+    const made = await continuityBackup(archive, state).backup(await backupStore(sourceLayout, 'set-1'));
     expect(made.ok && made.value.components.map((c) => c.name)).toEqual(['history', 'state']);
+    if (!made.ok) return;
+
+    // An import that would not reproduce the fingerprint leaves both targets empty and retryable.
+    const set = await backupStore(sourceLayout, 'set-1');
+    const [historyPart, statePart] = made.value.components;
+    const scratchState = await pgdb.fresh();
+    expect(errorOf(await scratchState.backup.importFrom(set, statePart?.files ?? [], 'f'.repeat(64)))).toMatchObject({ kind: 'unavailable' });
+    expect(await scratchState.backup.isEmpty()).toEqual({ ok: true, value: true });
+    const scratchArchive = await openArchive(await layoutFor(await tempRoots()));
+    const scratchHistory = createHistoryBackupComponent(scratchArchive);
+    expect(errorOf(await scratchHistory.importFrom(set, historyPart?.files ?? [], 'f'.repeat(64)))).toMatchObject({ kind: 'unavailable' });
+    expect(scratchArchive.sessionIds()).toEqual([]);
 
     const targetRoots = await tempRoots();
     const restoredArchive = await openArchive(await layoutFor(targetRoots));
-    const restoredState = await pgdb.fresh();
-    const restore = await continuityBackup(restoredArchive, restoredState).restore(await backupStore(setDir));
+    // The target database renders timestamps in another zone; the fingerprint must not care.
+    const targetUrl = `${await pgdb.database()}?options=${encodeURIComponent('-c TimeZone=America/New_York')}`;
+    const restoredState = await pgdb.open(targetUrl);
+    const probe = new pg.Client({ connectionString: targetUrl });
+    await probe.connect();
+    try {
+      expect((await probe.query<{ zone: string }>("SELECT current_setting('TimeZone') AS zone")).rows[0]?.zone).toBe('America/New_York');
+    } finally {
+      await probe.end();
+    }
+    const restore = await continuityBackup(restoredArchive, restoredState).restore(await backupStore(sourceLayout, 'set-1'));
     expect(errorOf(restore)).toBe('ok');
-    expect(errorOf(await continuityBackup(restoredArchive, restoredState).restore(await backupStore(setDir)))).toMatchObject({
+    expect(errorOf(await continuityBackup(restoredArchive, restoredState).restore(await backupStore(sourceLayout, 'set-1')))).toMatchObject({
       kind: 'conflict',
       reason: 'already_exists',
     });

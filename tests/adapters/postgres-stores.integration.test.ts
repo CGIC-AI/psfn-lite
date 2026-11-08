@@ -98,6 +98,7 @@ describe.skipIf(dockerTestsOptedOut('postgres stores'))('postgres stores', () =>
     const winnerId = winner?.ok === true ? winner.value.turnId : ('none' as TurnId);
     expect(errorOf(await ledger.open(turn('s-1', 3, 0)))).toMatchObject({ kind: 'conflict', reason: 'turn_already_open' });
 
+    expect(await ledger.lastSettled(id('s-1'))).toEqual({ ok: true, value: null });
     const settle = { turnId: winnerId, settledBy: { surface: PI, instance: 'pi-1' }, settledAt: AT };
     const outcome = { kind: 'completed', reply: 'hi', delivery: 'delivered' } as const;
     expect(errorOf(await ledger.settle({ ...settle, outcome, expectedRevision: 5 }))).toMatchObject({ kind: 'conflict', reason: 'stale_revision' });
@@ -109,6 +110,18 @@ describe.skipIf(dockerTestsOptedOut('postgres stores'))('postgres stores', () =>
     expect(byKey.ok && byKey.value?.settlement?.outcome).toEqual(outcome);
     expect(errorOf(await ledger.open(turn('s-1', 1, 1)))).toMatchObject({ kind: 'conflict' });
     expect(errorOf(await ledger.get(id('turn-404')))).toMatchObject({ kind: 'not_found' });
+
+    // lastSettled names the turn whose settlement produced the current revision, ignoring open turns.
+    const lastOf = async () => {
+      const last = await ledger.lastSettled(id('s-1'));
+      return last.ok ? last.value?.turnId : last.error;
+    };
+    expect(await lastOf()).toBe(winnerId);
+    expect((await ledger.open(turn('s-1', 4, 1))).ok).toBe(true);
+    expect(await lastOf()).toBe(winnerId);
+    expect((await ledger.settle({ ...settle, turnId: id('turn-4'), outcome, expectedRevision: 1 })).ok).toBe(true);
+    expect(await lastOf()).toBe('turn-4');
+    expect(await ledger.lastSettled(id('s-404'))).toEqual({ ok: true, value: null });
   });
 
   it('keeps the session catalog ordered, never lowers activity and moves conversation heads by CAS', async () => {

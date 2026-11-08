@@ -54,6 +54,17 @@ export function createPostgresTurnLedger(pool: pg.Pool): TurnLedgerPort {
         return ok(records<TurnRecord>(found.rows)[0] ?? null);
       }),
 
+    lastSettled: (sessionId) =>
+      guarded(async () => {
+        const found = await pool.query(
+          `SELECT t.record FROM turns t JOIN session_heads h ON h.session_id = t.session_id
+            WHERE t.session_id = $1 AND jsonb_typeof(t.record->'settlement') = 'object'
+              AND (t.record->'settlement'->>'revision')::integer = h.revision`,
+          [sessionId],
+        );
+        return ok(records<TurnRecord>(found.rows)[0] ?? null);
+      }),
+
     open: (record) =>
       transaction(
         pool,

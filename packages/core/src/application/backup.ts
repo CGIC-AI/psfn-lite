@@ -33,7 +33,13 @@ export interface BackupComponentPort {
   fingerprint(): Promise<Result<string>>;
   isEmpty(): Promise<Result<boolean>>;
   exportTo(store: BackupStorePort, prefix: string): Promise<Result<readonly BackupFile[]>>;
-  importFrom(store: BackupStorePort, files: readonly BackupFile[]): Promise<Result<void>>;
+  /**
+   * Imports into an empty target. The component proves the imported content
+   * reproduces `expectedFingerprint` before making it durable where it can
+   * (inside its transaction, or from the backup files before installing them),
+   * so a mismatch leaves the target empty and the restore retryable.
+   */
+  importFrom(store: BackupStorePort, files: readonly BackupFile[], expectedFingerprint: string): Promise<Result<void>>;
 }
 
 export const BACKUP_FORMAT = 'psfn-lite-continuity-backup';
@@ -49,7 +55,12 @@ export interface BackupManifest {
 }
 
 export interface ContinuityBackup {
-  /** Writes a complete set. Fails if any component changed while it was exported. */
+  /**
+   * Writes a complete set. Every component is fingerprinted before the first
+   * export and again after the last one, so a write landing between two
+   * components' exports (a turn in the ledger but not yet in history) fails
+   * the backup instead of producing a skewed set.
+   */
   backup(store: BackupStorePort): Promise<Result<BackupManifest>>;
   /** Checks the manifest digest, the manifest and every file digest without writing anything. */
   verify(store: BackupStorePort): Promise<Result<BackupManifest>>;
@@ -103,16 +114,25 @@ export function createContinuityBackup(deps: {
 
   return ok({
     async backup(store) {
-      const components: BackupManifest['components'][number][] = [];
+      const before: string[] = [];
       for (const component of deps.components) {
-        const before = await component.fingerprint();
-        if (!before.ok) return before;
+        const fingerprint = await component.fingerprint();
+        if (!fingerprint.ok) return fingerprint;
+        before.push(fingerprint.value);
+      }
+      const exported: (readonly BackupFile[])[] = [];
+      for (const component of deps.components) {
         const files = await component.exportTo(store, `${component.name}/`);
         if (!files.ok) return files;
+        exported.push(files.value);
+      }
+      const components: BackupManifest['components'][number][] = [];
+      for (const [index, component] of deps.components.entries()) {
         const after = await component.fingerprint();
         if (!after.ok) return after;
-        if (after.value !== before.value) return conflict('stale_revision', `${component.name} changed during backup; quiesce writers and retry`);
-        components.push({ name: component.name, fingerprint: before.value, files: files.value });
+        const fingerprint = before[index] as string;
+        if (after.value !== fingerprint) return conflict('stale_revision', `${component.name} changed during backup; quiesce writers and retry`);
+        components.push({ name: component.name, fingerprint, files: exported[index] as readonly BackupFile[] });
       }
       const manifest: BackupManifest = {
         format: BACKUP_FORMAT,
@@ -140,7 +160,7 @@ export function createContinuityBackup(deps: {
       for (const component of deps.components) {
         const entry = manifest.value.components.find((c) => c.name === component.name);
         if (entry === undefined) return corrupt(`manifest lost component ${component.name}`);
-        const imported = await component.importFrom(store, entry.files);
+        const imported = await component.importFrom(store, entry.files, entry.fingerprint);
         if (!imported.ok) return imported;
         const fingerprint = await component.fingerprint();
         if (!fingerprint.ok) return fingerprint;
