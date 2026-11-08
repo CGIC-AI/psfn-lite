@@ -156,8 +156,13 @@ export interface AppraisalLogPort {
   /** Idempotent by id: identical content returns the stored entry, different content is an `entry_mismatch` conflict. */
   append(entry: AppraisalEntry): Promise<Result<AppraisalEntry>>;
   get(id: string): Promise<Result<AppraisalEntry | null>>;
-  /** Newest first across every scope; callers filter by audience. */
-  recent(limit: number): Promise<Result<readonly AppraisalEntry[]>>;
+  /**
+   * One page, newest first across every scope, strictly older than the entry
+   * `before` names (null starts at the newest; an unknown id is `not_found`).
+   * A page shorter than `limit` means the log is exhausted. Callers filter by
+   * audience and page on.
+   */
+  recent(query: { readonly limit: number; readonly before: string | null }): Promise<Result<readonly AppraisalEntry[]>>;
 }
 
 /** What the companion says about its own state, stored apart from every estimate. */

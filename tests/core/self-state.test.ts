@@ -322,6 +322,66 @@ describe('follow-ups', () => {
   });
 });
 
+describe('lists page past any fixed window', () => {
+  const MANY = 600;
+
+  it('finds a due follow-up behind hundreds of earlier ones in any state', async () => {
+    const w = await selfStateWorld();
+    const robin = await w.admit('primary-dm');
+    const now = w.clock.now().getTime();
+    for (let i = 0; i < MANY; i += 1) {
+      const dueAt = new Date(now - 86_400_000 - i * 1000).toISOString();
+      const made = contentOf<{ followUp: PendingFollowUp }>(await w.call(robin, 'concern', 'follow_up_create', { content: `old ${String(i)}`, dueAt }));
+      if (i % 2 === 0) await w.call(robin, 'concern', 'follow_up_activate', { followUpId: made.followUp.id, expectedRevision: 1 });
+    }
+    const fresh = contentOf<{ followUp: PendingFollowUp; created: boolean }>(
+      await w.call(robin, 'concern', 'follow_up_create', { content: 'ask how the interview went', dueAt: new Date(now - 1000).toISOString() }),
+    );
+    expect(fresh.created).toBe(true);
+    const due = await w.followUps.due(robin, { limit: MANY });
+    expect(due.ok && due.value).toHaveLength(MANY / 2 + 1);
+    expect(due.ok && due.value.at(-1)?.content).toBe('ask how the interview went');
+    const pending = await w.followUps.list(robin, { includeDone: false, limit: MANY });
+    expect(pending.ok && pending.value.map((f) => f.content)).toContain('ask how the interview went');
+    expect(pending.ok && pending.value.every((f) => f.state === 'pending')).toBe(true);
+    const all = await w.followUps.list(robin, { includeDone: true, limit: 2 * MANY });
+    expect(all.ok && all.value).toHaveLength(MANY + 1);
+  });
+
+  it('keeps an old open concern listed, counted and blocking duplicates behind hundreds of newer ones', async () => {
+    const w = await selfStateWorld();
+    const robin = await w.admit('primary-dm');
+    const sam = await w.admit('friend-dm');
+    const samsConcern = contentOf<ActiveConcern>(await w.call(sam, 'concern', 'create', { text: 'Sam worries about the exam' }));
+    const later = (i: number) => new Date(w.clock.now().getTime() + 1000 + i * 1000).toISOString();
+    for (let i = 0; i < MANY; i += 1) {
+      // Newer concerns Sam may not see (formed in Robin's DM), and newer closed ones Sam may see.
+      const hidden: ActiveConcern = { ...samsConcern, id: `concern-hidden-${String(i)}`, text: `hidden ${String(i)}`, formedIn: robin.audience, contactId: null, sensitivity: 'confidential', updatedAt: later(i) };
+      const closed: ActiveConcern = { ...samsConcern, id: `concern-closed-${String(i)}`, text: `closed ${String(i)}`, status: 'resolved', updatedAt: later(i) };
+      w.ports.concerns.concerns.set(hidden.id, hidden);
+      w.ports.concerns.concerns.set(closed.id, closed);
+    }
+    expect(contentOf<ActiveConcern[]>(await w.call(sam, 'concern', 'list')).map((c) => c.id)).toEqual([samsConcern.id]);
+    expect(contentOf<ActiveConcern[]>(await w.call(sam, 'concern', 'list', { includeClosed: true, limit: 50 }))).toHaveLength(50);
+    expect(errorOf(await w.call(sam, 'concern', 'create', { text: 'Sam worries about the exam!' }))).toMatchObject({ kind: 'conflict', reason: 'already_exists' });
+    await w.talk(sam, 'exam tomorrow', 'you will do well', 'k1', steady());
+    const state = w.ports.emotionStates.states.get(`direct:${w.people.friend}`);
+    expect(state?.selfModel?.openConcernCount).toBe(1);
+  });
+
+  it('shows a readable appraisal behind hundreds of newer ones it may not read', async () => {
+    const w = await selfStateWorld();
+    const robin = await w.admit('primary-dm');
+    await w.talk(robin, 'hello', 'hi', 'k1', steady());
+    const moved = await w.talk(robin, 'terrible news', 'I am here', 'k2', reading(-0.9, 0.4, 0));
+    const robins = (moved.observed.appraisal as { entry: AppraisalEntry }).entry;
+    for (let i = 0; i < MANY; i += 1) {
+      w.ports.appraisals.entries.push({ ...robins, id: `appraisal:internal-${String(i)}`, scopeKey: 'self', source: { kind: 'self' } });
+    }
+    expect(await w.emotion.appraisals(robin, { limit: 5 })).toEqual({ ok: true, value: [robins] });
+  });
+});
+
 describe('self-state context', () => {
   it('keeps inference, authored reflection and signals distinct, never as participant speech, and filtered by audience', async () => {
     const w = await selfStateWorld();

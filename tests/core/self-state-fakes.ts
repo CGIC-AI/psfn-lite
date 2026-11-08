@@ -9,6 +9,7 @@ import {
   invalid,
   notFound,
   ok,
+  OPEN_CONCERN_STATUSES,
   type ActiveConcern,
   type AffectEstimatorPort,
   type AffectObservation,
@@ -17,11 +18,13 @@ import {
   type AuthoredReflection,
   type AuthoredReflectionPort,
   type ConcernEvent,
+  type ConcernListQuery,
   type ConcernPort,
   type EmotionObservationRecord,
   type EmotionSelfReport,
   type EmotionStatePort,
   type EmotionStateRecord,
+  type FollowUpListQuery,
   type FollowUpPort,
   type PendingFollowUp,
   type Result,
@@ -62,8 +65,11 @@ export class FakeAppraisals implements AppraisalLogPort {
   get(id: string) {
     return done(ok(this.entries.find((e) => e.id === id) ?? null));
   }
-  recent(limit: number) {
-    return done(ok([...this.entries].reverse().slice(0, limit)));
+  recent(query: { limit: number; before: string | null }): Promise<Result<readonly AppraisalEntry[]>> {
+    const newest = [...this.entries].reverse();
+    if (query.before === null) return done(ok(newest.slice(0, query.limit)));
+    const at = newest.findIndex((e) => e.id === query.before);
+    return done(at < 0 ? notFound(`appraisal ${query.before}`) : ok(newest.slice(at + 1, at + 1 + query.limit)));
   }
 }
 
@@ -90,9 +96,16 @@ export class FakeConcerns implements ConcernPort {
     const found = this.concerns.get(id);
     return done(found === undefined ? notFound(`concern ${id}`) : ok(found));
   }
-  list(limit: number) {
-    const sorted = [...this.concerns.values()].sort((a, b) => (a.updatedAt === b.updatedAt ? b.id.localeCompare(a.id) : b.updatedAt.localeCompare(a.updatedAt)));
-    return done(ok(sorted.slice(0, limit)));
+  list(query: ConcernListQuery) {
+    // Most recent first: (updatedAt, id) descending, strictly after the cursor.
+    const order = (a: { updatedAt: string; id: string }, b: { updatedAt: string; id: string }) =>
+      a.updatedAt === b.updatedAt ? b.id.localeCompare(a.id) : b.updatedAt.localeCompare(a.updatedAt);
+    const after = query.after;
+    const rows = [...this.concerns.values()]
+      .filter((c) => !query.openOnly || OPEN_CONCERN_STATUSES.includes(c.status))
+      .filter((c) => after === null || order(after, c) < 0)
+      .sort(order);
+    return done(ok(rows.slice(0, query.limit)));
   }
   create(concern: ActiveConcern, event: ConcernEvent): Promise<Result<ActiveConcern>> {
     if (this.concerns.has(concern.id)) return done(conflict('already_exists', 'concern exists'));
@@ -125,8 +138,16 @@ export class FakeFollowUps implements FollowUpPort {
     const found = this.followUps.get(id);
     return done(found === undefined ? notFound(`follow-up ${id}`) : ok(found));
   }
-  list(limit: number) {
-    return done(ok([...this.followUps.values()].sort((a, b) => a.dueAt.localeCompare(b.dueAt) || a.id.localeCompare(b.id)).slice(0, limit)));
+  list(query: FollowUpListQuery) {
+    // Earliest due first: (dueAt, id) ascending, strictly after the cursor.
+    const order = (a: { dueAt: string; id: string }, b: { dueAt: string; id: string }) => a.dueAt.localeCompare(b.dueAt) || a.id.localeCompare(b.id);
+    const { after, dueAtOrBefore } = query;
+    const rows = [...this.followUps.values()]
+      .filter((f) => query.state === null || f.state === query.state)
+      .filter((f) => dueAtOrBefore === null || Date.parse(f.dueAt) <= Date.parse(dueAtOrBefore))
+      .filter((f) => after === null || order(after, f) < 0)
+      .sort(order);
+    return done(ok(rows.slice(0, query.limit)));
   }
   update(next: PendingFollowUp, expectedRevision: number): Promise<Result<PendingFollowUp>> {
     const actual = this.followUps.get(next.id)?.revision;

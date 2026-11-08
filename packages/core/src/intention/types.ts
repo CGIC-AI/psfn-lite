@@ -80,10 +80,27 @@ export interface ConcernEvent {
   readonly at: string;
 }
 
+/** Position in the concern order (most recently updated first, then id descending). */
+export interface ConcernCursor {
+  readonly updatedAt: string;
+  readonly id: string;
+}
+
+export interface ConcernListQuery {
+  /** Only concerns in an open status (`OPEN_CONCERN_STATUSES`). */
+  readonly openOnly: boolean;
+  readonly limit: number;
+  /** Continue strictly after this concern; null starts at the most recent. */
+  readonly after: ConcernCursor | null;
+}
+
 export interface ConcernPort {
   get(id: string): Promise<Result<ActiveConcern>>;
-  /** Most recently updated first. Callers filter by audience. */
-  list(limit: number): Promise<Result<readonly ActiveConcern[]>>;
+  /**
+   * One page, most recently updated first. A page shorter than `limit` means
+   * the store is exhausted. Callers filter by audience and page on.
+   */
+  list(query: ConcernListQuery): Promise<Result<readonly ActiveConcern[]>>;
   /** Writes revision 1 and its event; an existing id is an `already_exists` conflict. */
   create(concern: ActiveConcern, event: ConcernEvent): Promise<Result<ActiveConcern>>;
   /** Compare-and-set on the revision; the event is appended in the same transaction. */
@@ -110,12 +127,31 @@ export interface PendingFollowUp {
   readonly revision: number;
 }
 
+/** Position in the follow-up order (earliest due first, then id). */
+export interface FollowUpCursor {
+  readonly dueAt: string;
+  readonly id: string;
+}
+
+export interface FollowUpListQuery {
+  /** Only follow-ups in this state; null for every state. */
+  readonly state: FollowUpState | null;
+  /** Only follow-ups due at or before this instant; null for any due time. */
+  readonly dueAtOrBefore: string | null;
+  readonly limit: number;
+  /** Continue strictly after this follow-up; null starts at the earliest due. */
+  readonly after: FollowUpCursor | null;
+}
+
 export interface FollowUpPort {
   /** Idempotent by id: an existing id returns the stored follow-up with `created: false`. */
   create(followUp: PendingFollowUp): Promise<Result<{ readonly followUp: PendingFollowUp; readonly created: boolean }>>;
   get(id: string): Promise<Result<PendingFollowUp>>;
-  /** Earliest due first. Callers filter by audience. */
-  list(limit: number): Promise<Result<readonly PendingFollowUp[]>>;
+  /**
+   * One page, earliest due first. A page shorter than `limit` means the store
+   * is exhausted. Callers filter by audience and page on.
+   */
+  list(query: FollowUpListQuery): Promise<Result<readonly PendingFollowUp[]>>;
   /** Compare-and-set on the revision. */
   update(next: PendingFollowUp, expectedRevision: number): Promise<Result<PendingFollowUp>>;
 }

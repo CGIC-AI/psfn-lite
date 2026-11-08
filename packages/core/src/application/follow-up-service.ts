@@ -5,6 +5,7 @@ import {
   normalizeFollowUpContent,
   type ConcernPort,
   type FollowUpPort,
+  type FollowUpState,
   type PendingFollowUp,
 } from '../intention/index.ts';
 import type { SessionCatalogPort } from '../sessions/index.ts';
@@ -21,9 +22,8 @@ import {
   type Clock,
   type Result,
 } from '../shared/index.ts';
+import { collectPaged } from './paging.ts';
 import { authorOf, isTrustedTurnScope, viewerOf, type TrustedTurnScope } from './trusted-scope.ts';
-
-const RECENT_SCAN = 500;
 
 export interface FollowUpService {
   list(scope: TrustedTurnScope, input: { readonly includeDone: boolean; readonly limit: number }): Promise<Result<readonly PendingFollowUp[]>>;
@@ -48,11 +48,18 @@ export function createFollowUpService(deps: {
   readonly concerns: ConcernPort;
   readonly clock: Clock;
 }): FollowUpService {
-  const visible = async (scope: TrustedTurnScope): Promise<Result<readonly PendingFollowUp[]>> => {
-    const listed = await deps.followUps.list(RECENT_SCAN);
-    if (!listed.ok) return listed;
+  /** Up to `limit` follow-ups this scope may read, earliest due first. */
+  const visible = (
+    scope: TrustedTurnScope,
+    input: { readonly state: FollowUpState | null; readonly dueAtOrBefore: string | null; readonly limit: number; readonly match?: (f: PendingFollowUp) => boolean },
+  ) => {
     const viewer = viewerOf(scope);
-    return ok(listed.value.filter((f) => canViewerRead(viewer, f.target)));
+    return collectPaged({
+      fetch: (after, pageSize) => deps.followUps.list({ state: input.state, dueAtOrBefore: input.dueAtOrBefore, limit: pageSize, after }),
+      cursorOf: (f: PendingFollowUp) => ({ dueAt: f.dueAt, id: f.id }),
+      keep: (f) => canViewerRead(viewer, f.target) && (input.match?.(f) ?? true),
+      limit: input.limit,
+    });
   };
 
   const targetFor = async (scope: TrustedTurnScope, channelId: ChannelId | null): Promise<Result<Audience>> => {
@@ -70,21 +77,17 @@ export function createFollowUpService(deps: {
   return {
     async list(scope, input) {
       if (!isTrustedTurnScope(scope)) return untrusted();
-      const followUps = await visible(scope);
-      if (!followUps.ok) return followUps;
-      return ok(followUps.value.filter((f) => input.includeDone || f.state === 'pending').slice(0, input.limit));
+      return visible(scope, { state: input.includeDone ? null : 'pending', dueAtOrBefore: null, limit: input.limit });
     },
 
     async due(scope, input) {
       if (!isTrustedTurnScope(scope)) return untrusted();
-      const followUps = await visible(scope);
-      if (!followUps.ok) return followUps;
-      const now = deps.clock.now().getTime();
-      return ok(
-        followUps.value
-          .filter((f) => f.state === 'pending' && sameConversation(f.target, scope.audience) && Date.parse(f.dueAt) <= now)
-          .slice(0, input.limit),
-      );
+      return visible(scope, {
+        state: 'pending',
+        dueAtOrBefore: deps.clock.now().toISOString(),
+        limit: input.limit,
+        match: (f) => sameConversation(f.target, scope.audience),
+      });
     },
 
     async create(scope, input) {
