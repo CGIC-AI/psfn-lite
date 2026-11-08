@@ -207,7 +207,8 @@ export class ConformanceHost {
     this.model.freeTime = { choice: plan.choice ?? 'rest', reflection: plan.reflection ?? 'A quiet thought.' };
     const before = this.model.calls.length;
     const report = unwrap(await this.live().tick());
-    return { modelCalls: this.model.calls.length - before, ...summarizeTick(report) };
+    const made = this.model.calls.slice(before);
+    return { modelCalls: made.length, companionCalls: made.filter((c) => c.kind === 'companion').length, ...summarizeTick(report) };
   }
 
   async maintain(extract: readonly ExtractionItem[]): Promise<Record<string, unknown>> {
@@ -245,10 +246,10 @@ export class ConformanceHost {
     return result.ok ? { ok: true, content: result.value.content } : { ok: false, error: { kind: result.error.kind, ...reasonOf(result.error) } };
   }
 
-  /** The operator conversation's canonical history, read from the JSONL archive. */
-  async history(): Promise<readonly { readonly origin: string; readonly text: string; readonly turnId: string }[]> {
+  /** The canonical history of the operator conversation (or the companion's own-time session), read from the JSONL archive. */
+  async history(of: 'operator' | 'self'): Promise<readonly { readonly origin: string; readonly text: string; readonly turnId: string }[]> {
     const runtime = this.live();
-    const scope = unwrap(await runtime.ingress.admit(runtime.host.operatorEvidence()));
+    const scope = unwrap(of === 'operator' ? await runtime.ingress.admit(runtime.host.operatorEvidence()) : await runtime.internalScope('reflection'));
     const session = unwrap(await runtime.stacks.sessions.current(scope));
     const tail = unwrap(await runtime.storage.archive.readTail(session.sessionId as SessionId, 1_000));
     return tail.map((e) => ({ origin: e.origin.kind, text: e.text, turnId: e.turnId }));

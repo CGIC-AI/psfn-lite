@@ -1,0 +1,45 @@
+{
+  "name": "worker-recovery",
+  "invariant": "A worker whose Lite host dies mid-run is recovered rather than lost or duplicated: its expired lease returns it to the queue, the conversation's next turn on either surface drives it to completion, and the effect it had already made is not made twice.",
+  "orders": "both",
+  "internalTurns": "harness",
+  "steps": [
+    {
+      "do": "host", "id": "hang-plan", "op": "worker_plan",
+      "args": {
+        "calls": [ { "tool": "memory", "action": "write", "args": { "writeId": "frost-1", "kind": "fact", "content": "The first frost is expected in late October", "sensitivity": "public" } } ],
+        "hang": "after_calls"
+      }
+    },
+    {
+      "do": "turn", "id": "spawn", "on": "a", "say": "could a helper note when the first frost comes?", "crash": "worker",
+      "calls": [
+        { "tool": "automata", "action": "spawn", "args": { "spawnId": "frost", "label": "frost helper", "task": "Note the first frost date", "actions": ["memory.write", "memory.search"], "maxTurns": 4, "maxSensitivity": "public" } }
+      ],
+      "reply": "A helper is on it."
+    },
+    {
+      "do": "host", "id": "steady-plan", "op": "worker_plan",
+      "args": {
+        "calls": [ { "tool": "memory", "action": "write", "args": { "writeId": "frost-1", "kind": "fact", "content": "The first frost is expected in late October", "sensitivity": "public" } } ],
+        "reply": "Noted the first frost."
+      }
+    },
+    { "do": "host", "id": "lapse", "op": "advance", "args": { "minutes": 2 } },
+    { "do": "host", "id": "sweep", "op": "tick", "expect": { "has": ["\"modelCalls\":0", "\"requeued\":[\"worker_run:"], "count": { "\"blocked\":[]": 1, "\"failed\":[]": 1 } } },
+    {
+      "do": "turn", "id": "next", "on": "b", "say": "is the helper done?",
+      "calls": [ { "tool": "automata", "action": "status", "args": { "limit": 5 }, "expect": { "has": ["lease_expired_requeued", "Note the first frost date"], "lacks": ["Noted the first frost."] } } ],
+      "reply": "Let me look."
+    },
+    {
+      "do": "turn", "id": "check", "on": "a", "say": "and now?",
+      "calls": [
+        { "tool": "automata", "action": "status", "args": { "limit": 5 }, "expect": { "has": ["\"active\":[]", "Noted the first frost."], "count": { "\"task\":\"Note the first frost date\"": 1 } } },
+        { "tool": "memory", "action": "search", "args": { "query": "first frost" }, "expect": { "count": { "\"content\":\"The first frost is expected in late October\"": 1 }, "has": ["\"producer\":\"worker:worker_run:"] } }
+      ],
+      "reply": "It is done."
+    },
+    { "do": "host", "id": "worker-saw", "op": "worker_results", "expect": { "has": ["\"replayed\":true"], "count": { "\"ok\":true": 1 } } }
+  ]
+}

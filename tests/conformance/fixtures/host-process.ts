@@ -79,7 +79,7 @@ async function serve(host: ConformanceHost, op: string, args: Record<string, unk
     case 'dispatch':
       return host.dispatch(args as { as: 'operator' | 'self'; tool: string; action: string; args?: Record<string, unknown> });
     case 'history':
-      return host.history();
+      return host.history(args['of'] === 'self' ? 'self' : 'operator');
     case 'backup_restore':
       return host.backupRestore();
     case 'restart':
