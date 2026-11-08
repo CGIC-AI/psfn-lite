@@ -1008,16 +1008,27 @@ stay on the runtime's Pi worker host.
 
 `integrations/hermes/psfn_lite` is a Hermes memory-slot plugin, tested
 against Hermes `f0187332d13679e2ace74d1f0eb399eb91a90571`. It registers
-`pre_llm_call`, `post_llm_call`, `post_tool_call`, `on_session_end` and
-`subagent_start` once per process, plus a memory provider with no tools and
-no recall:
+`pre_llm_call`, `pre_tool_call`, `post_llm_call`, `post_tool_call`,
+`on_session_end`, `on_session_finalize` and `subagent_start` once per
+process, plus a memory provider with no tools and no recall:
 
 1. **Prepare.** Each root turn of a bound sender is prepared under
-   `hermes:<sha256(session, turn)>`. Lite's context is injected into the user
-   message as labelled blocks with the same label escaping as the Pi harness.
-2. **Settle.** `on_session_end`, which Hermes fires on every exit, settles
-   the turn as completed with the reply, interrupted, or failed.
-3. **Checkpoint.** Before compaction the provider calls `checkpoint`
+   `hermes:<sha256(session, turn)>`. A prepare whose answer was lost is sent
+   once more under the same key, which Lite resumes. Lite's context is
+   injected into the user message as labelled blocks with the same label
+   escaping as the Pi harness.
+2. **Settle.** `on_session_end` settles the turn as completed with the reply,
+   interrupted, or failed. Open turns are keyed by Hermes's turn id, which
+   survives a compression's mid-turn session rotation. Hermes fires
+   `on_session_end` only from `finalize_turn`, and several failure paths in
+   `agent/conversation_loop.py` return before it. A turn left open that way
+   is settled as failed (`hermes_turn_unfinished`) before the next turn of
+   the same conversation is prepared, or when Hermes finalizes the session.
+3. **Gate.** Hermes's MCP client sends the profile's standing credential on
+   every call, so `pre_tool_call` blocks the Lite tools outside an open Lite
+   turn of the process. That covers unbound senders, subagents, the review
+   fork, cron and flush agents, and a profile where the plugin is not usable.
+4. **Checkpoint.** Before compaction the provider calls `checkpoint`
    (checkpoint API v2) and raises when Lite cannot prove the session's turns.
    With `compression.checkpoint_required`, Hermes then keeps the
    uncompressed transcript.
@@ -1030,13 +1041,18 @@ Subagent sessions (seen through `subagent_start` or their `subagent` platform), 
 
 Every event Lite did not accept is logged, kept in an owner-only SQLite
 ledger in the profile, reported through the warning callback, and named in
-the next turn's context. A kept settlement is retried before the next turn
-and blocks compaction until Lite has it.
+the next turn's context. Each Lite turn has a ledger row from before its
+prepare until Lite accepts its settlement. A kept settlement is retried
+before the next turn and blocks compaction until Lite has it. When the turn's
+id was never learned, the retry prepares the kept key again first. The next
+standing process of the profile settles the turns of an exited process as
+failed (`hermes_process_ended`) under that process's host instance.
 
 In delegated mode the process started with `PSFN_LITE_INTERNAL_HOST=1`
 claims internal turns. It runs each one as its own Hermes process with the
 minted credential, so that turn's MCP tools act in the companion's self
-audience.
+audience. Inside that process the root-turn guard still applies, so a
+subagent or the review fork never prepares or settles the job's turn.
 
 Known gaps: Hermes reports no partial reply for an interrupted or failed
 turn, and it delivers the reply after the hook, so delivery is recorded as

@@ -68,9 +68,18 @@ The tested capabilities are:
   payloads at that revision: `pre_llm_call` (context returned as
   `{"context": ...}` is injected into the user message; the spill threshold is
   `hooks.output_spill.max_chars`), `post_llm_call` (only on a completed,
-  uninterrupted reply), `post_tool_call`, `on_session_end` (on every exit,
-  with `completed`, `failed`, `interrupted` and `turn_exit_reason`) and
-  `subagent_start`;
+  uninterrupted reply), `pre_tool_call` (a `{"action": "block", "message":
+  ...}` result vetoes the call; a callback that raises does not, so the
+  plugin never raises there), `post_tool_call`, `on_session_end` (with
+  `completed`, `failed`, `interrupted` and `turn_exit_reason`, fired only
+  from `finalize_turn`; several failure paths of
+  `agent/conversation_loop.py` return without it, which
+  `tests/test_turn_integrity.py` reproduces with a real
+  `AIAgent.run_conversation`), `on_session_finalize` and `subagent_start`;
+- the turn id minted once per turn in `agent/turn_context.py`, unchanged when
+  a compression rotates `agent.session_id` mid-turn
+  (`agent/conversation_compression.py`), and `MemoryProvider.on_session_switch`
+  for that rotation;
 - `MemoryProvider` checkpoint API v2 with `MemoryManager.on_pre_compress(...,
   require_checkpoint=True)` propagating the refusal;
 - MCP servers from `config.yaml` `mcp_servers` with `${VAR}` header
@@ -90,7 +99,8 @@ rewritten for Lite:
 - the durable SQLite outbox storage pattern (WAL, `synchronous = FULL`, an
   owner-only file in a 0700 directory, a binding row that refuses a profile
   shared with another target). It became `psfn_lite/ledger.py`, which keeps
-  every undelivered lifecycle event, not only completed pairs;
+  every Lite turn from before its prepare until Lite accepts its settlement,
+  and every undelivered lifecycle event, not only completed pairs;
 - classifying server failures into adapter-owned diagnostics that never echo
   server text (`psfn_lite/bridge.py`);
 - host contract testing by installing the plugin into a throwaway profile
