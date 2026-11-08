@@ -19,7 +19,9 @@ export type ConflictReason =
   | 'turn_ownership'
   | 'turn_already_open'
   | 'turn_already_settled'
-  | 'idempotency_mismatch';
+  | 'turn_lease_active'
+  | 'idempotency_mismatch'
+  | 'entry_mismatch';
 
 /** A caller lacks the authority for this operation. */
 export interface DeniedError {

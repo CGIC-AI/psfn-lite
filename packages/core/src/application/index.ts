@@ -32,7 +32,9 @@ export {
   type PrepareTurnInput,
   type PrepareTurnResult,
   type PreparedTurn,
+  type RecoverTurnInput,
   type ReplayedTurn,
   type TriggerInput,
   type TurnLifecycle,
+  type TurnLifecycleDeps,
 } from './turn-lifecycle.ts';

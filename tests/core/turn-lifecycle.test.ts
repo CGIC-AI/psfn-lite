@@ -5,6 +5,7 @@ import {
   type PreparedTurn,
   type PrepareTurnInput,
   type TrustedTurnScope,
+  type TurnLifecycle,
   type TurnOwner,
 } from '../../packages/core/src/index.ts';
 import { FakeArchive, FakeTurnLedger, FixedClock, PI, PRIMARY, SequentialIds, TOOL_TRANSPORT, id, standardWorld } from './fakes.ts';
@@ -13,11 +14,15 @@ const PI_OWNER: TurnOwner = { surface: PI, instance: 'pi-1' };
 const OTHER_OWNER: TurnOwner = { surface: TOOL_TRANSPORT, instance: 'hermes-1' };
 const SESSION = id<'session'>('session-1');
 
+const LEASE_MS = 60_000;
+
 function setup() {
   const ledger = new FakeTurnLedger();
   const archive = new FakeArchive();
-  const lifecycle = createTurnLifecycle({ ledger, archive, clock: new FixedClock(), ids: new SequentialIds() });
-  return { ledger, archive, lifecycle, ...standardWorld() };
+  const clock = new FixedClock();
+  const created = createTurnLifecycle({ ledger, archive, clock, ids: new SequentialIds(), turnLeaseMs: LEASE_MS });
+  if (!created.ok) throw new Error(JSON.stringify(created.error));
+  return { ledger, archive, clock, lifecycle: created.value, ...standardWorld() };
 }
 
 function input(overrides: Partial<PrepareTurnInput> = {}): PrepareTurnInput {
@@ -32,7 +37,7 @@ function input(overrides: Partial<PrepareTurnInput> = {}): PrepareTurnInput {
 }
 
 async function prepared(
-  lifecycle: ReturnType<typeof setup>['lifecycle'],
+  lifecycle: TurnLifecycle,
   scope: TrustedTurnScope,
   overrides: Partial<PrepareTurnInput> = {},
 ): Promise<PreparedTurn> {
@@ -133,7 +138,7 @@ describe('turn lifecycle', () => {
     });
   });
 
-  it('lets only the owning harness settle a turn; handover goes through an explicit abort', async () => {
+  it('lets only the owning harness settle a live turn; a live owner hands over through abort', async () => {
     const { lifecycle, admit } = setup();
     const turn = await prepared(lifecycle, await admit('primary-dm'));
     const stolen = await lifecycle.commitTurn(turn, OTHER_OWNER, { kind: 'completed', reply: 'hijack', delivery: 'delivered' });
@@ -157,15 +162,106 @@ describe('turn lifecycle', () => {
     expect(changed.ok || changed.error).toMatchObject({ kind: 'conflict', reason: 'turn_already_settled' });
   });
 
-  it('does not settle when history cannot be archived, and succeeds on retry', async () => {
+  it('settles the ledger before history, reports a failed append and repairs it on retry', async () => {
     const { lifecycle, archive, ledger, admit } = setup();
     const turn = await prepared(lifecycle, await admit('primary-dm'));
     archive.failNext = true;
     const outcome = { kind: 'completed', reply: 'hi', delivery: 'delivered' } as const;
     const failed = await lifecycle.commitTurn(turn, PI_OWNER, outcome);
     expect(failed.ok || failed.error).toMatchObject({ kind: 'unavailable', capability: 'session_archive' });
-    expect(ledger.turns.get(turn.record.turnId)?.settlement).toBeNull();
+    expect(ledger.turns.get(turn.record.turnId)?.settlement?.outcome).toEqual(outcome);
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning']);
+
+    const changed = await lifecycle.abortTurn(turn, PI_OWNER, { kind: 'failed', error: { code: 'x', message: 'y' }, partialReply: 'h', delivery: 'unknown' });
+    expect(changed.ok || changed.error).toMatchObject({ kind: 'conflict', reason: 'turn_already_settled' });
     expect((await lifecycle.commitTurn(turn, PI_OWNER, outcome)).ok).toBe(true);
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'hi']);
+  });
+
+  it('repairs missing history when a settled request is replayed', async () => {
+    const { lifecycle, archive, admit } = setup();
+    const scope = await admit('primary-dm');
+    const turn = await prepared(lifecycle, scope);
+    archive.failNext = true;
+    await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'hi', delivery: 'delivered' });
+    const replay = await lifecycle.prepareTurn(scope, input());
+    expect(replay.ok && replay.value.kind).toBe('replayed');
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning', 'hi']);
+  });
+
+  it('never archives a reply the ledger did not record when the ledger write fails', async () => {
+    const { lifecycle, archive, ledger, admit } = setup();
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    ledger.failNextSettle = true;
+    const completed = await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'full answer A', delivery: 'delivered' });
+    expect(completed.ok || completed.error).toMatchObject({ kind: 'unavailable', capability: 'turn_ledger' });
+    expect(archive.entries.map((e) => e.text)).toEqual(['good morning']);
+
+    const aborted = await lifecycle.abortTurn(turn, PI_OWNER, {
+      kind: 'failed',
+      error: { code: 'delivery_failed', message: 'channel closed' },
+      partialReply: 'partial B',
+      delivery: 'not_delivered',
+    });
+    expect(aborted.ok && aborted.value.settlement?.outcome.kind).toBe('failed');
+    expect(archive.entries.map((e) => [e.origin.kind, e.text])).toEqual([
+      ['participant_speech', 'good morning'],
+      ['companion_speech', 'partial B'],
+      ['system_note', 'turn failed: delivery_failed: channel closed'],
+    ]);
+  });
+
+  it('lets a successor recover a turn whose owner disappeared, once the lease expires', async () => {
+    const { lifecycle, archive, ledger, clock, admit } = setup();
+    const turn = await prepared(lifecycle, await admit('primary-dm'));
+    // The owning harness dies here without settling. A successor arrives on another surface.
+    const successorScope = await admit('primary-dm-mcp');
+    const blocked = await lifecycle.prepareTurn(successorScope, input({ owner: OTHER_OWNER, idempotencyKey: id('key-2') }));
+    expect(blocked.ok || blocked.error).toMatchObject({ kind: 'conflict', reason: 'turn_already_open' });
+
+    const early = await lifecycle.recoverTurn(successorScope, { sessionId: SESSION, owner: OTHER_OWNER });
+    expect(early.ok || early.error).toMatchObject({ kind: 'conflict', reason: 'turn_lease_active' });
+
+    clock.advance(LEASE_MS);
+    const recovered = await lifecycle.recoverTurn(successorScope, { sessionId: SESSION, owner: OTHER_OWNER });
+    expect(recovered.ok && recovered.value.settlement).toMatchObject({
+      outcome: { kind: 'interrupted', by: 'host', partialReply: null, delivery: 'unknown' },
+      settledBy: OTHER_OWNER,
+      revision: 1,
+    });
+    expect(archive.entries.at(-1)).toMatchObject({ origin: { kind: 'system_note' }, text: 'turn interrupted by host; recovered by mcp' });
+
+    const next = await lifecycle.prepareTurn(successorScope, input({ owner: OTHER_OWNER, idempotencyKey: id('key-2'), expectedRevision: 1 }));
+    expect(next.ok && next.value.kind).toBe('prepared');
+
+    const lateOwner = await lifecycle.commitTurn(turn, PI_OWNER, { kind: 'completed', reply: 'too late', delivery: 'delivered' });
+    expect(lateOwner.ok || lateOwner.error).toMatchObject({ kind: 'conflict', reason: 'turn_already_settled' });
+    expect(archive.entries.some((e) => e.text === 'too late')).toBe(false);
+    expect(ledger.turns.get(turn.record.turnId)?.settlement?.outcome.kind).toBe('interrupted');
+  });
+
+  it('refuses recovery by the owner, another audience, a worker, or with no open turn', async () => {
+    const { lifecycle, clock, admit } = setup();
+    const scope = await admit('primary-dm');
+    const none = await lifecycle.recoverTurn(scope, { sessionId: SESSION, owner: OTHER_OWNER });
+    expect(none.ok || none.error.kind).toBe('not_found');
+
+    await prepared(lifecycle, scope);
+    clock.advance(LEASE_MS);
+    const self = await lifecycle.recoverTurn(scope, { sessionId: SESSION, owner: PI_OWNER });
+    expect(self.ok || self.error.kind).toBe('invalid');
+    const otherAudience = await lifecycle.recoverTurn(await admit('friend-dm'), { sessionId: SESSION, owner: OTHER_OWNER });
+    expect(otherAudience.ok || otherAudience.error).toMatchObject({ kind: 'denied', reason: 'audience_not_admitted' });
+    const worker = deriveWorkerScope(scope, id('run-1'), { actions: [], maxTurns: 1, maxSensitivity: 'public' });
+    if (!worker.ok) throw new Error('worker scope');
+    const byWorker = await lifecycle.recoverTurn(worker.value, { sessionId: SESSION, owner: OTHER_OWNER });
+    expect(byWorker.ok || byWorker.error).toMatchObject({ kind: 'denied', reason: 'worker_not_permitted' });
+  });
+
+  it('requires an explicit positive turn lease', () => {
+    const deps = { ledger: new FakeTurnLedger(), archive: new FakeArchive(), clock: new FixedClock(), ids: new SequentialIds() };
+    expect(createTurnLifecycle({ ...deps, turnLeaseMs: 0 }).ok).toBe(false);
+    expect(createTurnLifecycle({ ...deps, turnLeaseMs: 1.5 }).ok).toBe(false);
   });
 
   it('binds speech attribution to the scope: no participant speech from internal turns, and vice versa', async () => {
