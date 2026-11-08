@@ -11,6 +11,7 @@ import {
   notFound,
   ok,
   unavailable,
+  type ActivityCursor,
   type ActivityId,
   type ActivityLogPort,
   type ActivityRecord,
@@ -167,6 +168,7 @@ export class FakeActivityLog implements ActivityLogPort {
   readonly records = new Map<ActivityId, ActivityRecord>();
 
   insert(record: ActivityRecord): Promise<Result<ActivityRecord>> {
+    if (this.records.has(record.id)) return Promise.resolve(fail({ kind: 'conflict', reason: 'already_exists', detail: `activity ${record.id} exists` }));
     this.records.set(record.id, record);
     return Promise.resolve(ok(record));
   }
@@ -174,6 +176,13 @@ export class FakeActivityLog implements ActivityLogPort {
   get(activityId: ActivityId): Promise<Result<ActivityRecord>> {
     const record = this.records.get(activityId);
     return Promise.resolve(record === undefined ? notFound(`activity ${activityId}`) : ok(record));
+  }
+
+  list(limit: number, after: ActivityCursor | null): Promise<Result<readonly ActivityRecord[]>> {
+    const key = (r: { startedAt: string; id: string }) => `${r.startedAt}|${r.id}`;
+    const sorted = [...this.records.values()].sort((a, b) => (key(a) < key(b) ? 1 : -1));
+    const from = after === null ? sorted : sorted.filter((r) => key(r) < key(after));
+    return Promise.resolve(ok(from.slice(0, limit)));
   }
 
   update(record: ActivityRecord, expectedRevision: number): Promise<Result<ActivityRecord>> {
