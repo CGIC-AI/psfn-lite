@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@types/node": "24.13.3",
+    "@types/pg": "8.20.0",
     "@typescript-eslint/eslint-plugin": "8.56.0",
     "@typescript-eslint/parser": "8.56.0",
     "eslint": "10.0.0",
@@ -24,5 +25,8 @@
     "tsx": "4.23.1",
     "typescript": "5.9.3",
     "vitest": "4.1.12"
+  },
+  "dependencies": {
+    "pg": "8.20.0"
   }
 }
