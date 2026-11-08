@@ -303,6 +303,9 @@ describe.skipIf(dockerTestsOptedOut('postgres memory stores'))('postgres memory 
     expect(merged.ok && merged.value.segments.length).toBe(2);
     const gone = await stores.episodes.get(b.id);
     expect(gone.ok && [gone.value.lifecycle, gone.value.mergedInto, gone.value.revision]).toEqual(['merged', a.id, 2]);
+    expect(kindOf(await stores.episodes.setMeaning(b.id, meaning, 0))).toBe('conflict');
+    const meaningsOfB = await stores.episodes.meaningHistory(b.id);
+    expect(meaningsOfB.ok && meaningsOfB.value).toEqual([]);
     expect(kindOf(await stores.episodes.merge({ ...survivor, revision: 3 }, 2, [{ id: b.id, expectedRevision: 2 }], AT))).toBe('conflict');
 
     const withMeaning = await stores.episodes.get(c.id);

@@ -293,6 +293,7 @@ export class FakeEpisodes implements EpisodeStorePort {
   setMeaning(episodeId: string, meaning: EpisodeMeaning, expectedMeaningRevision: number): Promise<Result<Episode>> {
     const current = this.episodes.get(episodeId);
     if (current === undefined) return Promise.resolve(notFound(`episode ${episodeId}`));
+    if (current.lifecycle === 'merged') return Promise.resolve(conflict('stale_revision', `episode ${episodeId} was merged`));
     if ((current.meaning?.revision ?? 0) !== expectedMeaningRevision) return Promise.resolve(conflict('stale_revision', 'meaning moved'));
     const saved = { ...current, meaning, revision: current.revision + 1 };
     this.episodes.set(episodeId, saved);

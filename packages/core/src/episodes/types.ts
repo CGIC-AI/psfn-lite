@@ -81,9 +81,10 @@ export interface EpisodeAbsorption {
  * stored meaning is kept whatever the record passed in says, and an episode
  * that carries meaning may only be promoted, never merged, absorbed or
  * re-summarized (`frozenEpisodeChange`). `setMeaning` is the sole meaning
- * writer, compare-and-set on the meaning revision; it keeps every version and
- * bumps the episode revision, so a machine change planned before the meaning
- * was written fails its compare-and-set and is re-planned.
+ * writer, compare-and-set on the meaning revision and refused on a merged
+ * episode; it keeps every version and bumps the episode revision, so a
+ * machine change planned before the meaning was written fails its
+ * compare-and-set and is re-planned.
  */
 export interface EpisodeStorePort {
   get(id: string): Promise<Result<Episode>>;
