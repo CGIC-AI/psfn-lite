@@ -682,6 +682,117 @@ Known limits:
   the path is taken.
 - Letter ids are one namespace shared by the companion and the Partner.
 
+## MCP transport
+
+`packages/mcp` (package `lite-mcp`, public entry `src/index.ts`) exposes the
+inventory to external harnesses over the MCP SDK (`@modelcontextprotocol/server`
+2.3.0). It is a transport, not a host: it adds no handlers, authorization or
+argument validation, and it opens no turns. `tests/boundary/mcp-imports.test.ts`
+enforces that it reaches core only through `core/src/index.ts` (via its own
+`src/core.ts`) and the adapters only through `adapters/src/index.ts`, imports
+only `node:` builtins and its exact-pinned SDK, and that neither core nor the
+adapters reference it.
+
+- **Tool surface** (`createMcpSurface`, `buildToolCatalog`). One MCP tool per
+  inventory tool, named as the inventory names it, with an `action`
+  discriminator whose values are the inventory's actions. Descriptions,
+  read-only hints and the per-action `_meta` (`psfn-lite/actions`: access,
+  privacy, admission, restrictions, worker access, inference) come from
+  `TOOL_INVENTORY`. Argument properties come from `ACTION_ARGUMENTS`, because
+  the inventory carries no argument shapes; `tests/mcp/argument-drift.test.ts`
+  reads the `withArgs` key lists from `application/handlers-*.ts` and fails if
+  any action's described keys differ. The schema requires only `action` and
+  leaves the property set open, so an unknown or authority-shaped argument
+  reaches core and is refused there (`unknown arguments`, `authority cannot be
+  passed as arguments`), not filtered in transport. A catalog that misses an
+  inventory action, or describes one the inventory lacks, refuses to build.
+- **Caller binding.** Transport credential, then operator binding, then core
+  ingress. `loadPrincipalBindings(config, env)` reads a configuration of
+  `{ principal, credential: { env } | { file }, attestation }` entries; the
+  configuration names where a credential lives and never holds one. A file
+  must be a regular file readable only by its owner. A credential must be
+  32-4096 printable characters and is kept only as a SHA-256 digest; startup
+  fails on a weak, missing or reused credential or a principal bound twice.
+  The attestation fixes surface, principal (a channel identity), room and
+  turn kind. A `companion_internal` principal is refused at startup: a
+  self-audience scope admits every sensitivity and every conversation's
+  sources, so no standing credential may reach it (see internal turns below).
+  The returned `authenticator` is the `CallerAuthenticatorPort` the host
+  builds MCP's `createTrustedIngress` with; it accepts only
+  `{ kind: 'mcp_credential', credential }` and answers with the bound
+  attestation. Every tool call is admitted again (`ingress.admit`), so a
+  contact that is blocked, unblocked or loses consent changes what its next
+  call may do on the same connection. A binding to an identity core does not
+  know is unknown authority, and a channel account bound to a self room is
+  refused by ingress. Credentials are matched by hashing the candidate and
+  comparing it with every digest in constant time, without early exit.
+- **Internal turns** (`createMcpInternalTurns`, `combineCallers`). The
+  companion's own tools (reflections, letters, episode meaning, free time) are
+  reached only inside a companion-internal turn core asked for. The host
+  implements core's `InternalTurnPort` with `createTurnPort(launch)`: each
+  `run(request)` mints a random credential, calls `launch(request,
+  credential)` so the host's harness connects its MCP client with it (as its
+  bearer, never in the prompt or arguments), and revokes it when the run
+  settles, whether it completed, failed or threw. The credential's
+  attestation is derived from the request (the turn's purpose, the surface of
+  the scope core admitted, self room, background); the purpose is the
+  request's, because core runs some turns under a scope admitted for another
+  purpose (a scheduler tick's scope runs scheduled prompts). A request whose
+  scope is not an ingress-admitted companion-internal self scope mints
+  nothing. A credential also expires after `ttlMs` while its turn is
+  still running, and at most `maxOpen` turns hold one; another turn is then
+  refused as `unavailable` rather than evicting a live one. The host builds
+  ingress and the HTTP transport with `combineCallers(bindings,
+  internalTurns)`, so both the pre-body 401 check and ingress recognize a
+  live turn credential. The credential is bound to the turn by lifetime:
+  ingress admits each call and mints a fresh scope from the attestation,
+  not the scope object in the request. stdio carries participants only,
+  since the harness launches the stdio server process and no host there
+  mints turn credentials.
+- **Results.** A success returns `{ origin: tool_result, content }` as
+  structured content and JSON text, so a harness labels it tool output. A
+  failure returns `isError` with core's error: `denied` (reason and detail),
+  `not_found` (subject), `conflict`, `invalid` (issues). An `unavailable`
+  detail can carry driver text, so the client receives only the capability
+  and a fixed message; the operator's `onError` receives the original. A
+  thrown failure becomes a generic `unavailable` the same way. An unknown tool
+  is a protocol error (`Tool <name> not found`).
+- **Streamable HTTP** (`startMcpHttpServer`). Binds `127.0.0.1` unless the
+  operator passes `exposeBeyondLoopback` with the Host values to serve; a
+  loopback endpoint answers only loopback Host headers (DNS rebinding). Each
+  POST is authenticated before its body is read (401 with
+  `WWW-Authenticate: Bearer`, the same text for every refusal), and is served
+  by a fresh protocol server through the SDK's stateless `createMcpHandler`,
+  so no transport session carries authority between requests. Requests with
+  an `Origin` (browsers) or `Mcp-Session-Id` are refused, other methods get
+  405, bodies over `maxBodyBytes` (1 MiB) get 413, and `Authorization`,
+  `Cookie` and `Proxy-Authorization` are stripped before the SDK sees the
+  request. Both 2026-era and 2025-era (`initialize`) clients are served.
+- **stdio** (`startMcpStdioServer`). The launching operator supplies the
+  process's credential from the environment or a private file; an unbound
+  one stops startup with `unknown_authority` and is never echoed. Calls on the
+  connection are still admitted one by one.
+
+Tests: `tests/mcp/inventory-parity.test.ts` lists the tools through the SDK
+client and calls every inventory action over a real HTTP connection (every
+companion-only action from inside an internal turn under its minted
+credential, free-time choice from the scheduler's own turn);
+`internal-turns.test.ts` covers standing credentials reaching no private
+state, revocation on settle, TTL expiry, the open-turn bound, refusal to
+mint for any other scope, and a scheduled prompt served in the tick's turn;
+`authority.test.ts` and `leakage.test.ts` cover unknown, untracked, blocked and
+background authority, identity in arguments, cross-audience reads and counts,
+companion-private state, credential non-disclosure and error redaction;
+`stdio.test.ts` drives a real child process; `postgres.integration.test.ts`
+runs the surface over the Postgres stores.
+
+Host duties MCP does not take on: it is not lifecycle integration. It does not
+call `prepareTurn`/`commitTurn`, observe turns for emotion, or call
+`workers.resume(scope)`; the harness that admits participant turns keeps that
+duty (an `automata.wait` over MCP still drives the caller's own queued run).
+Actions that bind to the current turn (`activity.start`) use the session and
+open turn the durable state records for the caller's audience.
+
 ## Pi harness and standalone composition
 
 This section supersedes the "planned" status above for `packages/pi` and

@@ -105,6 +105,26 @@ scheduler and the findings bus were not ported.
 | `packages/core/src/application/reflection-reader.ts` | none (vvn.6 left the port unwired) | Authored reflections in the self-model context | The journals' reflection store implements `AuthoredReflectionPort` |
 | `packages/adapters/src/postgres/automata-stores.ts`, `scheduler-stores.ts`, `record-rows.ts`, `migrations/0004_activity_automata.sql` | `src/core/agent/background-work/store-port.ts` | Durable runs, receipts and rest | JSONB records with constraint-only columns and compare-and-set; extend-only rest enforced by the upsert; one open free-time block enforced by a partial unique index; included in the state backup |
 
+Governed tool transport over MCP (psfn-lite-vvn.9). Written new for Lite
+against `@modelcontextprotocol/server` 2.3.0, the donor's pinned SDK version,
+from the donor's external-memory MCP route and its tests at the donor
+revision above. No donor code was copied.
+
+| Lite path | Donor path | Retained behavior | Deliberate change |
+| --- | --- | --- | --- |
+| `packages/mcp/src/http.ts`, `surface.ts` | `src/channels/api/server/external-memory-mcp.ts`, `external-memory-mcp.test.ts` | Stateless per-request `createMcpHandler`; bearer credential bound to fixed operator identity; browser `Origin` and `Mcp-Session-Id` refused; `Authorization` and `Cookie` stripped before the SDK; 2025-era clients served | The whole inventory instead of five memory operations, one tool per domain with an action discriminator; every call admitted through core ingress and contact authority instead of a fixed binding body; loopback bind and Host check by default; `unavailable` details redacted |
+| `packages/mcp/src/bindings.ts`, `credentials.ts` | `src/channels/api/server/external-memory-mcp.ts` (binding uniqueness), `src/channels/backplane/http/auth.ts` (`isExpectedApiToken`) | Unique, non-empty credentials per binding; constant-time comparison | Credentials only from environment variables or owner-only files, never configuration; digests of equal length compared against every binding without early exit (the donor's length check returned early); bindings attest surface, principal, room and turn kind for core ingress instead of naming a contact directly |
+| `packages/mcp/src/catalog.ts`, `arguments/*.ts` | `src/core/agent/tool-surface/registry.ts` | One semantic tool per domain | Tool names, actions and restrictions from `TOOL_INVENTORY`; argument descriptions checked against core's handler key lists; the transport never validates or filters arguments |
+| `packages/mcp/src/stdio.ts` | none (the donor served MCP only over HTTP) | | One bound credential per process, every call still admitted |
+| `packages/mcp/src/internal-turns.ts`, `callers.ts` | `src/boundary/gateway/mcp/invocation-authority.ts` | Opaque random authority minted by the host for one use, with a TTL and a bound on how many are outstanding | One credential per companion-internal turn instead of per model-emitted call, revoked when the turn settles; its attestation comes from core's `InternalTurnRequest`; at the bound a new turn is refused (`unavailable`) instead of evicting the oldest permit; matched by digest in constant time |
+
+`src/boundary/gateway/mcp/authentication.ts` was assessed and not ported: it
+authenticates the donor as a client of outbound MCP servers, which has no
+counterpart in a server that binds its caller from the transport credential.
+`invocation-authority.ts` contributed only its permit pattern, above; its
+argument normalization and outbound-sensitivity binding belong to outbound
+calls.
+
 Pi harness and standalone composition (psfn-lite-vvn.8). Written new for Lite
 against the public API of `@earendil-works/pi-agent-core` and
 `@earendil-works/pi-ai` 0.84.1, the versions the donor pins. No donor code was
