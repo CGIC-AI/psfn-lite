@@ -314,7 +314,10 @@ never references the adapters.
     on run and effect key: the idempotency fence; a receipt moves out of
     `started` once and is never rewritten), `rest_states` (one row per lane;
     the upsert only ever moves `until` later), `free_time_blocks`,
-    `scheduled_prompts`, `reflection_templates` and `care_reminders`. Every
+    `scheduled_prompts`, `reflection_templates` and `care_reminders`. A
+    partial unique index (`free_time_blocks_one_open`) admits at most one
+    block in `invited`, `chosen` or `executing` across every lane; a second
+    is a `turn_already_open` conflict. Every
     update is compare-and-set and must advance exactly one revision. Status
     and state columns are checked against the record. Runs and blocks
     reference their activity by foreign key; nothing refers to earlier
@@ -413,9 +416,15 @@ and builds the one dispatcher that the companion and every worker use):
   outcome, artifact refs, attributed notes, the source session, turn and
   worker run, and a visibility audience. `activity.recent` and `get` show a
   record only when `canViewerRead` admits its visibility; a worker sees only
-  its own run's activity. Workers and free time write their status as they
-  go, so "what have you been doing?" is answered without waiting for
-  extraction.
+  its own run's activity. `activity.update` additionally requires the
+  writer to be in the record's own conversation (the same audience), so a
+  turn that can read another conversation's activity still cannot write
+  into it; a mismatch reads as `not_found`. The activity that mirrors a
+  worker run takes notes and artifacts from the worker or its parent, but
+  its status and outcome are set only by the runner from the run's outcome
+  (`worker_not_permitted` otherwise), so a worker cannot certify itself.
+  Workers and free time write their status as they go, so "what have you
+  been doing?" is answered without waiting for extraction.
 - **Workers** (`worker-runner.ts`, `worker-session.ts`, `worker-effects.ts`).
   - Authority: `automata.spawn` validates the grant through
     `deriveWorkerScope`. It names the actions and a sensitivity ceiling no
@@ -433,7 +442,12 @@ and builds the one dispatcher that the companion and every worker use):
   - One runner: a per-turn spawn drives the run at once, and a run queued
     for a schedule is resumed by the scheduler tick, through the same
     `drive`. Driving again requires a freshly admitted scope for the same
-    audience and principal.
+    audience and principal. A participant run that recovery requeued is
+    driven again when its conversation calls `automata.wait` on it, or when
+    the host calls `workers.resume(scope)` after admitting a turn there (a
+    host obligation). One that nothing drives within `workerResumeGraceMs`
+    settles as `failed` with reason `not_resumed`, mirrored into its
+    activity, so no run stays queued forever.
   - Effect fences: every non-read call carries a host-supplied effect key. A
     `started` receipt is written before dispatch. An `applied` or `rejected`
     receipt replays its result, and a different request under the key is a
@@ -444,9 +458,10 @@ and builds the one dispatcher that the companion and every worker use):
     run as `effect_outcome_unknown`. A cancel request settles it cancelled.
     Otherwise it is requeued until `maxAttempts`, then fails as
     `lease_expired`. A run that finishes with an unsettled effect is reported
-    `blocked`, never `completed`.
+    `blocked`, never `completed`. A run another pass moved first is
+    reported `contended` and left alone.
   - `automata.wait` is non-blocking: it returns the run and whether it has
-    settled. `message` appends bounded guidance; `inspect` shows the run and
+    settled (driving the caller's own queued run first, as above). `message` appends bounded guidance; `inspect` shows the run and
     its effect phases, never a transcript.
 - **Free time** (`free-time-service.ts`, `scheduler/free-time-gate.ts`,
   `scheduler/policy.ts`). Free time runs in the companion's own
@@ -459,8 +474,10 @@ and builds the one dispatcher that the companion and every worker use):
     shared across lanes.
   - Invitation: a block with the fixed option menu (rest, reflect, wander,
     up to three interrupted activities to resume, begin new) is recorded
-    before the companion is asked, so a crash or a second scheduler never
-    invites twice. The companion answers with `free_time.choose`, `rest` or
+    before the companion is asked. The store holds at most one open block
+    across all lanes, so when two scheduler passes overlap, the one whose
+    write loses reports `invitation_open` and asks nothing; a crash leaves
+    the block for the next pass to lapse or interrupt. The companion answers with `free_time.choose`, `rest` or
     `defer` inside that turn; an invented option is `invalid`.
   - Decisions: rest and defer extend rest durably through the extend-only
     `RestStatePort`, on every lane unless the companion names one. An
@@ -475,19 +492,31 @@ and builds the one dispatcher that the companion and every worker use):
 - **Self-scheduled time** (`schedule-service.ts`). Prompts carry an explicit
   IANA zone and local time; a time skipped by DST or in the past is
   `invalid`. Prompts and reflection templates are fenced the same way: marked
-  running before the work, so a crash leaves them `interrupted` and they are
-  never repeated. A template run requested outside a self turn, or while one
+  running, with its start time, before the work, so a crash leaves them
+  `interrupted` and they are never repeated. A marker is read as a crash
+  only once it is older than `schedulerInFlightMs`, so a run an overlapping
+  pass still has in flight is left alone, and a lost compare-and-set skips
+  the item (`contended`) instead of running it again. A template run requested outside a self turn, or while one
   is in flight, is deferred to the next tick. Templates call the model with
   companion-turn attribution and record a companion reflection; a run id
   replays its result.
 - **Care reminders** (`care-reminder-service.ts`). A delivery is marked
-  `delivering` before the host is asked. A refused delivery returns to
-  `pending`; a delivering reminder found by a later tick is
-  `delivery_unknown` and is not sent again. Daily reminders re-arm for the
-  next day after now.
+  `delivering`, with its start time, before the host is asked. Only a
+  definite refusal (`denied`, `invalid`, `not_found`) returns it to
+  `pending`. Any other host result, `unavailable` in particular, may mean
+  the message went out, so the occurrence is recorded as unknown and not
+  sent again. A `delivering` marker older than `schedulerInFlightMs` is
+  read as a crash and treated the same way; a younger one belongs to an
+  overlapping pass and is left alone. An unknown one-off reminder ends as
+  `delivery_unknown`; a daily one counts it in `unknownDeliveries` and
+  moves to its next day, as a delivered one does.
 - **Scheduler tick** (`scheduler-tick.ts`). One pass in a companion-internal
   turn: worker sweep and resume, reminder delivery, due prompts and
-  templates, then free time per lane. Each part reports its own result. With
+  templates, then free time per lane. Each part reports its own result.
+  There is no tick-wide lock: each step is exclusive on its own (the
+  one-open-block index, compare-and-set on every in-flight marker, age-gated
+  stranded markers), so overlapping ticks, on one host or several, neither
+  invite, deliver nor run anything twice. With
   nothing due and rest in force, a tick makes no model call and opens no
   turn; the tests count inference across ticks
   (`tests/core/free-time.test.ts`).
