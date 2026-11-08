@@ -183,12 +183,73 @@ describe('memory writes are idempotent and evolve by authority', () => {
 
   it('never deduplicates into, supersedes or reveals a memory the writer cannot read', async () => {
     const world = await fakeMemoryWorld();
-    const selfWrite = await mustWrite(world, await world.admit('reflection'), 'w1', 'Robin keeps three beehives on the roof garden');
-    // The self note is companion_internal; Robin's write is about Robin and cannot see it.
-    const robin = await mustWrite(world, await world.admit('primary-dm'), 'w1', 'Robin keeps three beehives on the roof garden');
-    expect(robin.memoryId).not.toBe(selfWrite.memoryId);
-    expect(robin.outcome).toBe('created');
-    expect(world.memories.records.get(selfWrite.memoryId)?.state).toBe('current');
+    const sam = await world.admit('friend-dm');
+    const own = await mustWrite(world, sam, 'w1', 'Sam keeps three beehives on the roof garden');
+    const hidden = world.memories.records.get(own.memoryId);
+    if (hidden === undefined) throw new Error('memory');
+    // Same subject and kind, but recorded in a self turn: Sam's conversation cannot read it.
+    world.memories.records.set(own.memoryId, { ...hidden, provenance: { ...hidden.provenance, source: { kind: 'self' } } });
+    const again = await mustWrite(world, sam, 'w2', 'Sam keeps three beehives on the roof garden');
+    expect(again).toMatchObject({ outcome: 'created', replayed: false });
+    expect(again.memoryId).not.toBe(own.memoryId);
+    const changed = await mustWrite(world, sam, 'w3', 'Sam now keeps five beehives on the roof garden');
+    expect(world.memories.records.get(own.memoryId)?.state).toBe('current');
+    expect(changed.outcome).toBe('superseded');
+    expect(world.memories.records.get(again.memoryId)?.state).toBe('superseded');
+  });
+});
+
+describe('memory import', () => {
+  const records = (...items: { kind?: string; sensitivity?: string; content: string }[]) =>
+    items.map((r) => ({ kind: r.kind ?? 'fact', sensitivity: r.sensitivity ?? 'personal', content: r.content, occurredAt: '2029-06-01' }));
+
+  it('imports with validated occurrence times, idempotently by batch, and refuses unadmitted or malformed batches', async () => {
+    const world = await fakeMemoryWorld();
+    const sam = await world.admit('friend-dm');
+    const imported = await world.must<{ staged: boolean; results: Written[] }>(sam, 'memory', 'import', {
+      batchId: 'b1',
+      records: records({ content: 'Sam ran a marathon' }, { content: 'Sam learned the cello' }),
+    });
+    expect(imported.staged).toBe(false);
+    expect(imported.results.map((r) => r.outcome)).toEqual(['created', 'created']);
+    const stored = world.memories.records.get(imported.results[0]?.memoryId ?? '');
+    expect(stored).toMatchObject({ occurredAt: '2029-06-01T00:00:00.000Z', provenance: { via: 'import', sourceConversationAt: null } });
+    const retried = await world.must<{ results: Written[] }>(sam, 'memory', 'import', {
+      batchId: 'b1',
+      records: records({ content: 'Sam ran a marathon' }, { content: 'Sam learned the cello' }),
+    });
+    expect(retried.results.map((r) => r.replayed)).toEqual([true, true]);
+
+    const unadmitted = await world.call(sam, 'memory', 'import', {
+      batchId: 'b2',
+      records: records({ content: 'Sam is fine' }, { content: 'Sam has a diagnosis', sensitivity: 'confidential' }),
+    });
+    expect(unadmitted.ok || unadmitted.error).toMatchObject({ kind: 'denied', reason: 'audience_not_admitted' });
+    expect(kindOf(await world.call(sam, 'memory', 'import', { batchId: 'b3', records: [] }))).toBe('invalid');
+    const tooMany = records(...Array.from({ length: 101 }, (_, i) => ({ content: `item ${String(i)}` })));
+    expect(kindOf(await world.call(sam, 'memory', 'import', { batchId: 'b4', records: tooMany }))).toBe('invalid');
+    const future = [{ kind: 'fact', sensitivity: 'personal', content: 'later', occurredAt: '2031-01-01' }];
+    expect(kindOf(await world.call(sam, 'memory', 'import', { batchId: 'b5', records: future }))).toBe('invalid');
+    expect(world.memories.records.size).toBe(2);
+  });
+
+  it('stages a whole worker batch when any record is restricted, hidden until an operator approves', async () => {
+    const world = await fakeMemoryWorld();
+    const parent = await world.admit('primary-dm');
+    const worker = deriveWorkerScope(parent, id('run-1'), { actions: [{ tool: 'memory', action: 'import' }], maxTurns: 2, maxSensitivity: 'personal' });
+    if (!worker.ok) throw new Error('worker');
+    const batch = await world.must<{ staged: boolean; results: Written[] }>(worker.value, 'memory', 'import', {
+      batchId: 'b1',
+      records: records({ content: 'Robin likes quiet mornings' }, { kind: 'boundary', content: 'Robin asked not to be called after ten' }),
+    });
+    expect(batch.staged).toBe(true);
+    expect(batch.results.map((r) => r.outcome)).toEqual(['staged', 'staged']);
+    expect((await world.must<{ memories: View[] }>(parent, 'memory', 'search', { query: 'quiet mornings' })).memories).toEqual([]);
+    expect((await world.must<{ total: number }>(parent, 'memory', 'census')).total).toBe(0);
+    await world.administration.reviewStaged(OPERATOR, { memoryId: batch.results[0]?.memoryId ?? '', approve: true });
+    await world.administration.reviewStaged(OPERATOR, { memoryId: batch.results[1]?.memoryId ?? '', approve: false });
+    const visible = await world.must<{ memories: View[] }>(parent, 'memory', 'search', { query: 'quiet mornings called after ten' });
+    expect(visible.memories.map((m) => m.content)).toEqual(['Robin likes quiet mornings']);
   });
 });
 
