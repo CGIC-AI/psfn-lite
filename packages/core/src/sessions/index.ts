@@ -1,8 +1,22 @@
 export type {
+  ArchiveHead,
+  ArchivedEntry,
+  ContinuityArtifact,
+  ContinuityKind,
+  ContinuityOccasion,
+  ContinuityPort,
+  ConversationHead,
   DeliveryStatus,
+  FocusPort,
+  FocusRecord,
   SessionArchivePort,
+  SessionCatalogPort,
+  SessionCursor,
   SessionEntry,
   SessionHead,
+  SessionRecord,
+  TranscriptHit,
+  TranscriptProjectionPort,
   TurnLedgerPort,
   TurnOutcome,
   TurnOwner,
@@ -10,4 +24,5 @@ export type {
   TurnSettlement,
   TurnTrigger,
 } from './types.ts';
+export { CONTINUITY_KINDS, CONTINUITY_OCCASIONS } from './types.ts';
 export { sessionTool } from './tool.ts';

@@ -11,8 +11,10 @@ Hermes is the only alternate integration target in the initial scope.
 
 Module layout. `packages/core` exists (package `lite-core`, public entry
 `src/index.ts`) with each domain's types, core-owned ports and tool descriptor,
-plus the application boundary described below. Domain behavior, storage and
-every other package are planned, not implemented.
+plus the application boundary described below. The identity, sessions and
+contacts actions have domain services wired into dispatch; other domains have
+contracts only. `packages/adapters` (package `lite-adapters`) implements the
+storage ports for them (see Persistence). Every other package is planned.
 
 - `packages/core/src/identity`: persona, constitution, values, North Star, orientation.
 - `packages/core/src/sessions` and `contacts`: archive lifecycle, trusted identity,
@@ -27,8 +29,9 @@ every other package are planned, not implemented.
   free-time choice, rest and maintenance.
 - `packages/core/src/shared` and `application`: shared primitives and the
   cross-domain use cases (ingress, turn lifecycle, dispatch, activity).
-- Planned: `packages/adapters` (persistence, model/embedding access and host
-  capabilities), `packages/pi` (the native conversation/activity harness),
+- `packages/adapters`: filesystem JSONL history and Postgres structured state.
+  Model/embedding access and host capabilities are planned.
+- Planned: `packages/pi` (the native conversation/activity harness),
   `packages/mcp` (governed domain tool transport), `integrations/hermes` (native
   Python plugin and lifecycle bridge) and `apps/standalone` (thin composition for
   the Pi edition and local core service).
@@ -52,8 +55,9 @@ Each domain exposes narrow ports for the state it owns (for example
 `TurnLedgerPort` and `SessionArchivePort` in sessions, `ContactAuthorityPort` in
 contacts, `MemoryReadPort` in memory). `application/host-ports.ts` declares what
 the host supplies: caller authentication, model, embedding and approval queue.
-Adapters implement these interfaces later; core contains no storage and no
-in-memory fallback.
+Storage adapters implement the domain ports outside core. Core contains no
+storage and no in-memory fallback, and no core interface names a concrete
+adapter.
 
 - **Trusted ingress** (`createTrustedIngress`) turns host-verified evidence into a
   `TrustedTurnScope`: caller, contact, trust, audience and admitted sensitivities
@@ -71,7 +75,14 @@ in-memory fallback.
   never shows a reply the ledger did not record. A failed append is returned as a
   failure and repaired by retrying the same outcome or replaying the request; a
   different outcome after settlement is a conflict. The archive rejects an entry
-  id that already exists with different content.
+  id that already exists with different content. A replayed request re-appends
+  its turn's entries before the ownership check, so a successor that is refused
+  as `turn_ownership` still repairs the history. Before opening a new turn,
+  `prepareTurn` re-appends the entries of the session's last settled turn
+  (`TurnLedgerPort.lastSettled`) and opens nothing if that fails. A crash
+  between ledger settlement and the history append is therefore repaired by
+  whichever harness opens the next turn, and only the latest settlement can lag
+  history.
   Each open turn carries a lease (`turnLeaseMs`, required). While the lease runs
   only the owning harness instance may settle the turn, and a live owner hands
   over through `abortTurn`. After it expires, a successor with a scope for the
@@ -91,12 +102,54 @@ in-memory fallback.
 - **Activity** (`createActivityService`) records purpose, status, outcome,
   artifacts and attributed notes bound to the source turn and audience. Another
   audience's activity reads as missing.
+- **Sessions** (`createSessionService`). A session is bound to one audience
+  when it is created. `prepareTurn` refuses a turn whose scope has another
+  audience, so a session id never mixes rooms. Reads follow `canViewerRead`.
+  A room's disclosure class is confidential for direct and self rooms,
+  personal for small groups and public for large rooms and broadcasts.
+  Self-audience history is readable only from self turns. A non-worker always
+  reads its own conversation. Anything else needs the class admitted, and a
+  worker also stays under its grant's ceiling. `new` records lineage
+  (`previousSessionId`). `resume` of another audience's session starts a
+  continuation (`continuesFrom`) instead of moving the caller into that room.
+  Search is served from the Postgres projection only after it is proven level
+  with the canon: same entry count and chain hash. A projection that is ahead
+  or diverged is reset and rebuilt from the JSONL. Model summaries are
+  attributed as machine inference, never as companion speech.
+- **Contacts** (`createContactService`, `createContactAdministration`,
+  `createContactAuthority`). Ingress resolves a verified identity through the
+  store and follows merges for at most eight hops. A missing target or a cycle
+  is unknown authority. An archived contact is unknown, and so is a merged
+  contact that has no survivor. A blocked contact is blocked, and any consent
+  other than `granted` is untracked. A merge never widens authority. The
+  survivor takes the lower trust, the more restrictive consent and the higher
+  sensitivity, and it is blocked if either side was. Identities move to the
+  survivor in one transaction. Raising trust to trusted or above, family and
+  partner relationships, and linking an identity onto a high-tier contact
+  become approval proposals. Every write is audited with its author.
+  Tracking consent also gates the dossier, not only ingress. For a contact
+  whose consent is pending, denied or revoked, `note`, `link_identity`,
+  `set_trust`, `propose_trust`, `set_relationship`, `propose_relationship`,
+  `set_channel_privacy` and `set_machine_intelligence` are denied as
+  `untracked_contact`, and `lookup` withholds its notes. Block and unblock stay
+  available, because blocking protects and does not profile.
+- **Identity** (`createOrientationService`, `createIdentityAdministration`,
+  `createValuesService`). Orientation blocks are kept per conversation with
+  compare-and-set revisions, and limits reject instead of truncating. Prompt
+  layers and the persona card are append-only versions. A worker reads a
+  conversation's blocks only when its grant admits that conversation's
+  disclosure class (`canViewerRead`), the same rule as for its history. Protected layers
+  (base, operator) and protected persona fields become proposals, which apply
+  only if the version and checksum have not moved. Values append revisions.
+  The North Star holds at most three active items, and every item version is
+  kept.
 
 Failure semantics are types (`shared/result.ts`): every operation returns a
 `Result` whose failures are `denied`, `not_found` (also used for items the
 audience may not see), `conflict` (stale revision, turn ownership, open or
-settled turn, active lease, idempotency mismatch, archive entry mismatch, with
-expected/actual revisions), `invalid`
+settled turn, active lease, idempotency mismatch, archive entry mismatch,
+existing record, identity owned by another contact, with expected/actual
+revisions), `invalid`
 or `unavailable`. Internal context carries one of seven origins (participant
 speech, companion speech, tool result, system note, internal signal, machine
 inference, authored reflection). Only participant speech renders in the
@@ -110,6 +163,95 @@ for a turn its predecessor left open. A tool transport such as MCP maps calls to
 native plugin maps its lifecycle hooks to prepare/commit/abort. Each use case
 takes only the ports it needs, and both surfaces share one inventory and one set
 of handlers.
+
+## Persistence
+
+`packages/adapters` implements core-owned ports. It contains no policy.
+`tests/boundary/adapter-imports.test.ts` enforces that an adapter reaches core
+only through `packages/core/src/index.ts`, and imports only `node:` builtins
+and its declared, exact-pinned dependencies (`pg`). It also checks that core
+never references the adapters.
+
+- **Storage layout** (`resolveStorageLayout`). The roots are canonical
+  history, the agent workspace, and optionally credentials and backups. Each
+  root is resolved through symlinks, and the layout is rejected if any two
+  roots are equal or nested. Only a resolved layout opens the archive or a
+  backup store, and backup sets live only directly under `backupRoot`. As a
+  result, a workspace cleanup or a harness reset cannot reach lived history,
+  and history never sits beside credentials. Database connection strings are
+  passed in by the host. They are never stored in a root and never appear in
+  an error.
+- **Canonical history** (`openFileSessionArchive`). History is one JSONL file
+  per session under `<historyRoot>/sessions/`. Each line carries
+  `seq`, `prev` and `hash = sha256(prev + canonical(entry))`.
+  - Appends: each append is one write followed by fsync, serialized per
+    session. Re-appending an entry id with identical content is a no-op. With
+    different content it is an `entry_mismatch` conflict, and nothing is
+    written.
+  - Opening: an unterminated trailing fragment (a torn append) is quarantined
+    to a `.torn-*` file and the verified prefix is kept. A session that fails
+    verification for any other reason is refused as `unavailable`, and the
+    other sessions keep working.
+  - Locking: an exclusive lock file guards the root. A lock left by a dead
+    process is taken over. So is a lock carrying this process's own pid that
+    this process does not hold, which is what a restarted container leaves
+    when the app is pid 1 again. A second open in the same process is still
+    refused.
+- **Structured state** (`openPostgresState`) uses Postgres with pgvector.
+  - Migrations: versioned `NNNN_name.sql` files run under an advisory lock,
+    one transaction each. Checksums are recorded in `schema_migrations` and
+    re-verified on every start. An edited, missing or unknown applied
+    migration stops startup.
+  - Stores: the stores implement the turn ledger, session catalog, continuity
+    notes, focus records, transcript projection, contacts (with identity
+    index, audit log and notes), orientation blocks, prompt layers, persona,
+    values and North Star. Records are JSONB documents in core's shape.
+    Columns exist only for keys, ordering and the constraints the database
+    must enforce: compare-and-set under row locks, version primary keys, and
+    one contact per channel identity.
+  - Projection: the transcript projection (`tsvector`, `simple`
+    configuration) is derived from the canon and records the archive head it
+    reflects.
+- **Backup** (`createContinuityBackup` in core).
+  - Components: the set of components is fixed when the backup is created.
+    Lite has two. The history component copies verified chains, and its
+    fingerprint is the session heads. The state component exports every
+    durable table from one repeatable-read snapshot, in primary-key order,
+    together with the schema version. It leaves out the projection, which is
+    rebuilt after restore.
+  - Writing: each file in a set is written atomically and exclusively, so a
+    set is never partially overwritten. `openFileBackupStore(layout, setName)`
+    requires a resolved layout with a `backupRoot` and a single-segment set
+    name, and it refuses a set directory that resolves anywhere else (for
+    example through a planted symlink). A full copy of private state can
+    therefore never land in the workspace or beside history.
+  - Consistency: every component is fingerprinted before the first export and
+    again after the last one. A write that lands between two components'
+    exports fails the backup as `stale_revision`. Without this, a set could
+    hold a ledger turn whose history is missing.
+  - Time zones: the state component pins `TimeZone` to UTC in every snapshot
+    and import transaction, so its fingerprint does not depend on the
+    server's, database's or role's zone.
+  - Restore: every digest is verified before anything is written. Restore
+    targets only an empty history root and an empty database at the same
+    schema version. Each component proves the backup fingerprint before its
+    content becomes durable. The state component recomputes it inside the
+    import transaction and rolls back on a mismatch. The history component
+    verifies every backed-up chain and the fingerprint before it installs the
+    first session. A fingerprint mismatch in either component leaves that
+    target empty and the restore retryable. An I/O failure partway through
+    installing history sessions does not. Core then recomputes each fingerprint once more. The two
+    components are still separate stores, so an I/O failure in the second
+    after the first committed leaves the first restored.
+  - A component that changes during the backup fails it, and the writers must
+    be quiesced before retrying.
+
+Integration tests (`*.integration.test.ts`, part of `npx vitest run`) run
+against a throwaway pgvector container. The container uses a pinned image
+digest, a random name and port, a tmpfs data directory and a label, and it is
+always removed (`tests/support/postgres-harness.ts`). The tests fail when
+Docker is unavailable. `LITE_SKIP_DOCKER_TESTS=1` is the explicit, printed
+opt-out.
 
 ## Shared companion state and tool surface
 

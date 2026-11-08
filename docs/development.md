@@ -54,6 +54,10 @@ state ownership, harness handover and module isolation. Exercise real entrypoint
 and adapters where appropriate; no production in-memory fallback disguised as
 durability. Scope expensive validation to actual risk and changed behavior.
 
+Adapter integration tests (`*.integration.test.ts`) run inside `npx vitest run`
+against a throwaway pinned pgvector container, so Docker is required. Without it
+they fail. `LITE_SKIP_DOCKER_TESTS=1` skips them explicitly and prints that it did.
+
 Run focused checks during implementation. Fetch the base, commit a clean head,
 run the complete local gate once, and publish through its wrapper. A coherent
 out-of-budget change gets an explicit variance rather than filler. Return the PR

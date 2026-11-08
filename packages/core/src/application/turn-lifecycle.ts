@@ -1,5 +1,6 @@
 import type {
   SessionArchivePort,
+  SessionCatalogPort,
   TurnLedgerPort,
   TurnOutcome,
   TurnOwner,
@@ -7,14 +8,15 @@ import type {
   TurnTrigger,
 } from '../sessions/index.ts';
 import {
+  conflict,
   denied,
   fail,
   invalid,
   isNonEmptyString,
   notFound,
   ok,
+  sameAudience,
   type Clock,
-  type ConflictReason,
   type IdSource,
   type IdempotencyKey,
   type InternalOrigin,
@@ -80,6 +82,8 @@ export interface TurnLifecycle {
 export interface TurnLifecycleDeps {
   readonly ledger: TurnLedgerPort;
   readonly archive: SessionArchivePort;
+  /** Sessions are bound to one audience; a turn from any other audience is refused. */
+  readonly sessions: SessionCatalogPort;
   readonly clock: Clock;
   readonly ids: IdSource;
   /** How long an open turn belongs exclusively to its owner before a successor may recover it. */
@@ -113,6 +117,11 @@ async function prepareTurn(
   const trigger = bindTrigger(scope, input.trigger);
   if (!trigger.ok) return trigger;
   const fingerprint = fingerprintRequest(input.sessionId, scope, trigger.value);
+  const session = await deps.sessions.get(input.sessionId);
+  if (!session.ok) return session;
+  if (!sameAudience(session.value.audience, scope.audience)) {
+    return denied('audience_not_admitted', 'the session belongs to another audience');
+  }
 
   const existing = await deps.ledger.findByIdempotencyKey(input.sessionId, input.idempotencyKey);
   if (!existing.ok) return existing;
@@ -121,10 +130,12 @@ async function prepareTurn(
     if (record.requestFingerprint !== fingerprint) {
       return conflict('idempotency_mismatch', 'idempotency key was reused for a different request');
     }
-    if (!sameOwner(record.owner, input.owner)) return conflict('turn_ownership', 'turn is owned by another harness');
     // Re-appending repairs history a failed append left incomplete; identical entries are no-ops.
+    // The entries derive only from the ledger record, so any admitted caller may repair them,
+    // including a successor that is not the owner and is refused below.
     const archived = await deps.archive.append(turnEntries(record));
     if (!archived.ok) return archived;
+    if (!sameOwner(record.owner, input.owner)) return conflict('turn_ownership', 'turn is owned by another harness');
     if (record.settlement !== null) return ok({ kind: 'replayed', record });
     return ok({ kind: 'prepared', turn: { scope, record } });
   }
@@ -140,6 +151,11 @@ async function prepareTurn(
         'the owner settles it, or a successor recovers it after the lease',
     );
   }
+  // A crash between ledger settlement and the history append leaves the last
+  // settled turn's entries missing. Every new turn first restores them, so at
+  // most the latest settlement can ever lag history, and never past a new turn.
+  const repaired = await repairLastSettled(deps, input.sessionId);
+  if (!repaired.ok) return repaired;
   if (head.value.revision !== input.expectedRevision) {
     return fail({
       kind: 'conflict',
@@ -164,6 +180,8 @@ async function prepareTurn(
     settlement: null,
   });
   if (!opened.ok) return opened;
+  const touched = await deps.sessions.touch(input.sessionId, opened.value.openedAt);
+  if (!touched.ok) return touched;
   // Archive the trigger at open so lived history is complete even if the turn never settles.
   const archived = await deps.archive.append([triggerEntry(opened.value)]);
   if (!archived.ok) return archived;
@@ -236,6 +254,13 @@ async function recoverTurn(
   return archiveSettled(deps, settled.value);
 }
 
+async function repairLastSettled(deps: TurnLifecycleDeps, sessionId: SessionId): Promise<Result<void>> {
+  const last = await deps.ledger.lastSettled(sessionId);
+  if (!last.ok) return last;
+  if (last.value === null) return ok(undefined);
+  return deps.archive.append(turnEntries(last.value));
+}
+
 async function archiveSettled(deps: TurnLifecycleDeps, record: TurnRecord): Promise<Result<TurnRecord>> {
   const archived = await deps.archive.append(turnEntries(record));
   if (!archived.ok) return archived;
@@ -262,8 +287,4 @@ function bindTrigger(scope: TrustedTurnScope, input: TriggerInput): Result<TurnT
 
 function fingerprintRequest(sessionId: SessionId, scope: TrustedTurnScope, trigger: TurnTrigger): string {
   return digest({ sessionId, caller: scope.caller, audience: scope.audience, trigger });
-}
-
-function conflict(reason: ConflictReason, detail: string) {
-  return fail({ kind: 'conflict', reason, detail } as const);
 }

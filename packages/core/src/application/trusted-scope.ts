@@ -11,7 +11,9 @@ import {
   type Result,
   type Sensitivity,
   type SurfaceId,
+  type Author,
   type TrustLevel,
+  type Viewer,
   type WorkerRunId,
 } from '../shared/index.ts';
 import type { WorkerGrant } from '../automata/index.ts';
@@ -105,4 +107,18 @@ export function deriveWorkerScope(
       turnKind: 'background',
     }),
   );
+}
+
+/** The read authority of a scope, in the form domain visibility rules take. */
+export function viewerOf(scope: TrustedTurnScope): Viewer {
+  return { audience: scope.audience, admitted: scope.admitted, worker: scope.caller.kind === 'worker' };
+}
+
+/**
+ * Who a write made under this scope is attributed to. The companion acts in
+ * its own turns and in participant conversations; a worker's output is
+ * machine-produced, never companion-authored.
+ */
+export function authorOf(scope: TrustedTurnScope): Author {
+  return scope.caller.kind === 'worker' ? { kind: 'machine', producer: `worker:${scope.caller.runId}` } : { kind: 'companion' };
 }

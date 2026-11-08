@@ -21,7 +21,9 @@ export type ConflictReason =
   | 'turn_already_settled'
   | 'turn_lease_active'
   | 'idempotency_mismatch'
-  | 'entry_mismatch';
+  | 'entry_mismatch'
+  | 'already_exists'
+  | 'identity_conflict';
 
 /** A caller lacks the authority for this operation. */
 export interface DeniedError {
@@ -94,4 +96,12 @@ export function unavailable(capability: string, detail: string): { readonly ok: 
 
 export function notFound(subject: string): { readonly ok: false; readonly error: NotFoundError } {
   return fail({ kind: 'not_found', subject });
+}
+
+export function conflict(
+  reason: ConflictReason,
+  detail: string,
+  revisions: { readonly expectedRevision?: number; readonly actualRevision?: number } = {},
+): { readonly ok: false; readonly error: ConflictError } {
+  return fail({ kind: 'conflict', reason, detail, ...revisions });
 }
