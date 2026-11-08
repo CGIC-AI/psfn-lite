@@ -18,7 +18,7 @@ async function dirWith(files: readonly string[]): Promise<URL> {
 }
 
 describe('migration numbering', () => {
-  it('accepts a reserved gap left by a parallel lane, in version order', async () => {
+  it('accepts a reserved gap left by a parallel lane, in version order (applied rows match by version)', async () => {
     const loaded = loadMigrations(await dirWith(['0003_c.sql', '0001_a.sql']));
     expect(loaded.map((m) => m.version)).toEqual([1, 3]);
   });
