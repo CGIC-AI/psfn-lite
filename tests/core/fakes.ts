@@ -85,7 +85,13 @@ export class FakeTurnLedger implements TurnLedgerPort {
     return Promise.resolve(ok(record));
   }
 
+  failNextSettle = false;
+
   settle(input: Parameters<TurnLedgerPort['settle']>[0]): Promise<Result<TurnRecord>> {
+    if (this.failNextSettle) {
+      this.failNextSettle = false;
+      return Promise.resolve(unavailable('turn_ledger', 'ledger unavailable'));
+    }
     const record = this.turns.get(input.turnId);
     if (record === undefined) return Promise.resolve(notFound(`turn ${input.turnId}`));
     const head = this.headOf(record.sessionId);
@@ -93,7 +99,8 @@ export class FakeTurnLedger implements TurnLedgerPort {
       return Promise.resolve(fail({ kind: 'conflict', reason: 'stale_revision', detail: 'head moved' }));
     }
     const revision = head.revision + 1;
-    const settled: TurnRecord = { ...record, settlement: { outcome: input.outcome, settledAt: input.settledAt, revision } };
+    const settlement = { outcome: input.outcome, settledBy: input.settledBy, settledAt: input.settledAt, revision };
+    const settled: TurnRecord = { ...record, settlement };
     this.turns.set(record.turnId, settled);
     this.heads.set(record.sessionId, { sessionId: record.sessionId, revision, openTurnId: null });
     return Promise.resolve(ok(settled));
@@ -113,9 +120,16 @@ export class FakeArchive implements SessionArchivePort {
       this.failNext = false;
       return Promise.resolve(unavailable('session_archive', 'disk unavailable'));
     }
+    const fresh: SessionEntry[] = [];
     for (const entry of entries) {
-      if (!this.entries.some((e) => e.entryId === entry.entryId)) this.entries.push(entry);
+      const existing = this.entries.find((e) => e.entryId === entry.entryId);
+      if (existing === undefined) {
+        fresh.push(entry);
+      } else if (JSON.stringify(existing) !== JSON.stringify(entry)) {
+        return Promise.resolve(fail({ kind: 'conflict', reason: 'entry_mismatch', detail: `entry ${entry.entryId} differs` }));
+      }
     }
+    this.entries.push(...fresh);
     return Promise.resolve(ok(undefined));
   }
 

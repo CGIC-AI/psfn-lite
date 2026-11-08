@@ -66,10 +66,19 @@ in-memory fallback.
   revision the harness assembled context against, allows one open turn per
   session, binds the trigger's attribution from the scope and archives it at once.
   `commitTurn` records completed turns; `abortTurn` records interrupted and failed
-  ones with delivery status and any partial reply. Only the owning harness
-  instance may settle a turn; handover goes through an explicit abort. An
-  idempotency key replays a settled turn instead of re-executing, and reuse with a
-  different request is a conflict.
+  ones with delivery status and any partial reply. The ledger write fixes the
+  outcome first and history is derived from the settled record, so the archive
+  never shows a reply the ledger did not record. A failed append is returned as a
+  failure and repaired by retrying the same outcome or replaying the request; a
+  different outcome after settlement is a conflict. The archive rejects an entry
+  id that already exists with different content.
+  Each open turn carries a lease (`turnLeaseMs`, required). While the lease runs
+  only the owning harness instance may settle the turn, and a live owner hands
+  over through `abortTurn`. After it expires, a successor with a scope for the
+  same audience calls `recoverTurn`. That records the turn as interrupted by the
+  host, together with who recovered it, and the original owner's late settlement
+  becomes a conflict. An idempotency key replays a settled turn instead of
+  re-executing, and reuse with a different request is a conflict.
 - **Worker scopes** (`deriveWorkerScope`) narrow a participant or internal scope
   for a bounded worker. The grant names its actions, a positive turn budget and a
   `maxSensitivity`; the worker is admitted only up to that ceiling, never the
@@ -86,7 +95,8 @@ in-memory fallback.
 Failure semantics are types (`shared/result.ts`): every operation returns a
 `Result` whose failures are `denied`, `not_found` (also used for items the
 audience may not see), `conflict` (stale revision, turn ownership, open or
-settled turn, idempotency mismatch, with expected/actual revisions), `invalid`
+settled turn, active lease, idempotency mismatch, archive entry mismatch, with
+expected/actual revisions), `invalid`
 or `unavailable`. Internal context carries one of seven origins (participant
 speech, companion speech, tool result, system note, internal signal, machine
 inference, authored reflection). Only participant speech renders in the
@@ -95,7 +105,8 @@ participant role, and only an admitted participant scope can produce it.
 Pi and Hermes enter the same way with no service locator or universal options
 object. Each host authenticates its caller, then calls `ingress.admit`, then
 `prepareTurn`, `dispatcher.dispatch` for every tool call, and finally `commitTurn`
-or `abortTurn`. A tool transport such as MCP maps calls to `dispatch`; the Hermes
+or `abortTurn`. A host that restarts or takes over a session calls `recoverTurn`
+for a turn its predecessor left open. A tool transport such as MCP maps calls to `dispatch`; the Hermes
 native plugin maps its lifecycle hooks to prepare/commit/abort. Each use case
 takes only the ports it needs, and both surfaces share one inventory and one set
 of handlers.

@@ -10,7 +10,12 @@ import type {
   TurnId,
 } from '../shared/index.ts';
 
-/** The harness instance executing a turn. Only the owner may settle it. */
+/**
+ * The harness instance executing a turn. Only the owner may settle it while its
+ * lease runs. `instance` names one harness process lifetime: a harness that
+ * keeps it stable across restarts can resume its own open turn with the same
+ * idempotency key; any other successor recovers the turn after the lease ends.
+ */
 export interface TurnOwner {
   readonly surface: SurfaceId;
   readonly instance: string;
@@ -44,6 +49,8 @@ export type TurnOutcome =
 
 export interface TurnSettlement {
   readonly outcome: TurnOutcome;
+  /** The owner, or the successor harness that recovered an abandoned turn. */
+  readonly settledBy: TurnOwner;
   readonly settledAt: string;
   /** Session revision after this settlement. */
   readonly revision: number;
@@ -61,6 +68,8 @@ export interface TurnRecord {
   readonly audience: Audience;
   readonly trigger: TurnTrigger;
   readonly openedAt: string;
+  /** Until this instant only the owner may settle the turn; afterwards a successor may recover it. */
+  readonly leaseUntil: string;
   readonly settlement: TurnSettlement | null;
 }
 
@@ -82,7 +91,7 @@ export interface TurnLedgerPort {
   open(record: TurnRecord): Promise<Result<TurnRecord>>;
   settle(input: {
     readonly turnId: TurnId;
-    readonly owner: TurnOwner;
+    readonly settledBy: TurnOwner;
     readonly outcome: TurnOutcome;
     readonly settledAt: string;
     readonly expectedRevision: number;
@@ -91,7 +100,11 @@ export interface TurnLedgerPort {
 
 /** One attributed entry of canonical lived history. */
 export interface SessionEntry {
-  /** Stable id; appending the same entry id twice is a no-op. */
+  /**
+   * Stable id. Appending an entry whose id already exists with identical
+   * content is a no-op; with different content it is an `entry_mismatch`
+   * conflict and nothing is written.
+   */
   readonly entryId: string;
   readonly sessionId: SessionId;
   readonly turnId: TurnId;
@@ -100,7 +113,11 @@ export interface SessionEntry {
   readonly at: string;
 }
 
-/** Append-only canonical history (filesystem JSONL in the storage adapter). */
+/**
+ * Append-only canonical history (filesystem JSONL in the storage adapter).
+ * Turn entries are derived from the ledger record after it is written, so a
+ * retry re-appends identical entries and repairs a missed append.
+ */
 export interface SessionArchivePort {
   append(entries: readonly SessionEntry[]): Promise<Result<void>>;
   readTail(sessionId: SessionId, limit: number): Promise<Result<readonly SessionEntry[]>>;
