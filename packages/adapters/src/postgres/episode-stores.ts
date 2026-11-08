@@ -137,6 +137,8 @@ export function createPostgresEpisodeStore(pool: pg.Pool): EpisodeStorePort {
       transaction(pool, async (client) => {
         const current = await lockedEpisode(client, episodeId);
         if (current === undefined) return notFound(`episode ${episodeId}`);
+        // A merge that committed after the caller's read would leave the meaning on a record no read returns.
+        if (current.lifecycle === 'merged') return conflict('stale_revision', `episode ${episodeId} was merged`);
         const actual = current.meaning?.revision ?? 0;
         if (actual !== expectedMeaningRevision) {
           return conflict('stale_revision', `meaning of episode ${episodeId} moved`, { expectedRevision: expectedMeaningRevision, actualRevision: actual });

@@ -210,6 +210,22 @@ describe('consolidation races and retries', () => {
     expect(world.episodes.episodes.get('ep-b')?.machineSignals.summary).toBe('fence planning talk');
   });
 
+  it('refuses meaning on an episode a merge absorbed after the companion read it', async () => {
+    const world = await fakeMemoryWorld();
+    await sitting(world);
+    const self = await world.admit('reflection');
+    // The merge commits between the companion's read of ep-c and its meaning write.
+    const setMeaning = world.episodes.setMeaning.bind(world.episodes);
+    world.episodes.setMeaning = async (episodeId, meaning, expected) => {
+      await formation(world);
+      return setMeaning(episodeId, meaning, expected);
+    };
+    const late = await world.call(self, 'episode', 'author_meaning', { episodeId: 'ep-c', text: 'too late', expectedRevision: 0 });
+    expect(late.ok || late.error).toMatchObject({ kind: 'conflict', reason: 'stale_revision' });
+    expect(world.episodes.episodes.get('ep-c')).toMatchObject({ lifecycle: 'merged', meaning: null });
+    expect(world.episodes.meanings.get('ep-c')).toBeUndefined();
+  });
+
   it('refuses any machine change but promotion to an episode that carries meaning', async () => {
     const world = await fakeMemoryWorld();
     await sitting(world);
