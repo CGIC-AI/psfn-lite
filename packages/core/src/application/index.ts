@@ -80,3 +80,4 @@ export {
 } from './session-service.ts';
 export { syncTranscriptProjection } from './transcript-projection.ts';
 export { createValuesService, type ValuesService } from './values-service.ts';
+export * from './memory-index.ts';
