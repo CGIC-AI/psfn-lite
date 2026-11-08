@@ -734,10 +734,12 @@ adapters reference it.
   credential)` so the host's harness connects its MCP client with it (as its
   bearer, never in the prompt or arguments), and revokes it when the run
   settles, whether it completed, failed or threw. The credential's
-  attestation is derived from the request (its purpose and the surface of the
-  scope core admitted, self room, background), and a request whose scope is
-  not an ingress-admitted companion-internal self scope of the same purpose
-  mints nothing. A credential also expires after `ttlMs` while its turn is
+  attestation is derived from the request (the turn's purpose, the surface of
+  the scope core admitted, self room, background); the purpose is the
+  request's, because core runs some turns under a scope admitted for another
+  purpose (a scheduler tick's scope runs scheduled prompts). A request whose
+  scope is not an ingress-admitted companion-internal self scope mints
+  nothing. A credential also expires after `ttlMs` while its turn is
   still running, and at most `maxOpen` turns hold one; another turn is then
   refused as `unavailable` rather than evicting a live one. The host builds
   ingress and the HTTP transport with `combineCallers(bindings,
@@ -776,8 +778,8 @@ client and calls every inventory action over a real HTTP connection (every
 companion-only action from inside an internal turn under its minted
 credential, free-time choice from the scheduler's own turn);
 `internal-turns.test.ts` covers standing credentials reaching no private
-state, revocation on settle, TTL expiry, the open-turn bound and refusal to
-mint for any other scope;
+state, revocation on settle, TTL expiry, the open-turn bound, refusal to
+mint for any other scope, and a scheduled prompt served in the tick's turn;
 `authority.test.ts` and `leakage.test.ts` cover unknown, untracked, blocked and
 background authority, identity in arguments, cross-audience reads and counts,
 companion-private state, credential non-disclosure and error redaction;

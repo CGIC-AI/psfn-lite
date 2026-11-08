@@ -9,8 +9,8 @@
  * expires after `ttlMs` even if its turn never settles, and at most
  * `maxOpen` turns hold one at a time; a further turn is refused rather than
  * evicting a live one. The attestation comes from core's own request
- * (purpose and surface of the scope core admitted), never from the host or
- * the harness. Core ingress still admits every call made with it.
+ * (the turn's purpose and the surface of the scope core admitted), never
+ * from the host or the harness. Core ingress still admits every call made with it.
  *
  * Reuses the donor gateway's permit pattern (opaque, minted per use, TTL,
  * bounded) from src/boundary/gateway/mcp/invocation-authority.ts.
@@ -90,13 +90,10 @@ export function createMcpInternalTurns(options: McpInternalTurnOptions): Result<
 
   const run = async (launch: InternalTurnLauncher, request: InternalTurnRequest): Promise<Result<InternalTurnResult>> => {
     const scope = request.scope;
-    if (
-      !isTrustedTurnScope(scope) ||
-      scope.caller.kind !== 'companion_internal' ||
-      scope.audience.kind !== 'self' ||
-      scope.caller.purpose !== request.purpose
-    ) {
-      return denied('unknown_authority', 'a turn credential is minted only for an admitted companion-internal turn of the same purpose');
+    // Core may run a turn of one purpose under a scope admitted for another (a scheduler tick's
+    // scope runs scheduled prompts); the credential carries the purpose of the turn itself.
+    if (!isTrustedTurnScope(scope) || scope.caller.kind !== 'companion_internal' || scope.audience.kind !== 'self') {
+      return denied('unknown_authority', 'a turn credential is minted only for an ingress-admitted companion-internal self scope');
     }
     prune();
     if (open.size >= options.maxOpen) return unavailable('internal_turn_credentials', 'too many internal turns hold a credential');
