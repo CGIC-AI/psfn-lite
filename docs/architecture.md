@@ -14,7 +14,9 @@ Module layout. `packages/core` exists (package `lite-core`, public entry
 plus the application boundary described below. The identity, sessions and
 contacts actions have domain services wired into dispatch; other domains have
 contracts only. `packages/adapters` (package `lite-adapters`) implements the
-storage ports for them (see Persistence). Every other package is planned.
+storage ports for them (see Persistence). The harness, transport, bridge,
+composition and Hermes packages listed below exist too; each has its own
+section.
 
 - `packages/core/src/identity`: persona, constitution, values, North Star, orientation.
 - `packages/core/src/sessions` and `contacts`: archive lifecycle, trusted identity,
@@ -32,10 +34,13 @@ storage ports for them (see Persistence). Every other package is planned.
   cross-domain use cases (ingress, turn lifecycle, dispatch, activity).
 - `packages/adapters`: filesystem JSONL history and Postgres structured state.
   Model/embedding access and host capabilities are planned.
-- Planned: `packages/pi` (the native conversation/activity harness),
-  `packages/mcp` (governed domain tool transport), `integrations/hermes` (native
-  Python plugin and lifecycle bridge) and `apps/standalone` (thin composition for
-  the Pi edition and local core service).
+- `packages/pi`: the native conversation/activity harness.
+- `packages/mcp`: the governed domain tool transport.
+- `packages/lifecycle`: the lifecycle bridge an external host drives its turns
+  through.
+- `apps/standalone`: the thin composition for the Pi edition and the local
+  core service.
+- `integrations/hermes`: the native Python Hermes plugin.
 
 These are module seams, not a requirement for separate processes or a package
 per noun. Keep internal modules private behind deliberately small interfaces.
@@ -531,7 +536,8 @@ authorization, memory disclosure, continuity and authorship. Module separation
 alone is not a sandbox for host shell execution.
 
 Use Hermes native integration for lifecycle, identity, context and activity
-execution; use MCP for the tool transport where appropriate. Verify available
+execution; use MCP for the tool transport where appropriate. The section
+Lifecycle bridge and Hermes integration describes how this is built. Verify available
 hooks and version-pin the tested integration. A memory provider alone cannot
 establish the required lifecycle guarantees. Do not run competing personal
 memory/identity authorities, disguise internal context as user speech, or rely
@@ -795,8 +801,8 @@ open turn the durable state records for the caller's audience.
 
 ## Pi harness and standalone composition
 
-This section supersedes the "planned" status above for `packages/pi` and
-`apps/standalone`; `packages/mcp` and `integrations/hermes` remain planned.
+This section covers `packages/pi` and `apps/standalone`. The MCP transport,
+the lifecycle bridge and the Hermes plugin have their own sections.
 
 `packages/pi` (package `lite-pi`) is the native harness. It runs on the
 public API of `@earendil-works/pi-agent-core` and `@earendil-works/pi-ai`
@@ -815,10 +821,16 @@ can serve it.
 Every turn follows core's lifecycle:
 
 1. **Prepare.** Ingress admits the host's evidence. The session's current
-   revision is read. The context is assembled only from core reads under the
-   turn's scope: enabled prompt layers, the conversation's orientation blocks
-   (none for self turns), the labelled self-state context, and canonical
-   history through `contextFromHistory`. Then `prepareTurn` opens the turn.
+   revision is read. Core's turn context assembler (`createTurnContextAssembler`,
+   shared with external hosts) builds the context only from core reads under
+   the turn's scope: enabled prompt layers, the conversation's orientation
+   blocks (none for self turns), the labelled self-state context, recent
+   activity, and canonical history through `contextFromHistory`. Recent
+   activity is shown only when `activity.recent` itself would be permitted,
+   and only the records `canSeeActivity` admits for this audience. It is one
+   labelled `internal_signal` entry that says whether each activity happened
+   in this conversation, in another one or in the companion's own time. Then
+   `prepareTurn` opens the turn.
    A stale revision is retried. An open turn of this harness that is not
    running in this process is settled first: with the outcome the harness
    holds for it, or else as interrupted by the host with delivery `unknown`.
@@ -880,9 +892,11 @@ layout, the JSONL archive and one migrated Postgres pool. It builds every core
 stack, wires the Pi harness, and runs the scheduler tick loop with memory
 maintenance every Nth tick. The CLI has `init`, `once`, `chat`, `tick` and
 `maintain` (`npm run standalone -- <command> --config <file>`, run through
-tsx because core uses TypeScript parameter properties). `createLiteRuntime`
-is the composition entry, and it exposes the governed dispatcher and ingress
-for a later tool transport. The local host vouches for exactly two callers:
+tsx because core uses TypeScript parameter properties). `serve` runs the
+scheduler and the configured transports until Ctrl-C. `createLiteRuntime` is
+the composition entry. It exposes the governed dispatcher and ingress, and it
+mounts the MCP transport and the lifecycle bridge when the config names them
+(see Lifecycle bridge and Hermes integration). The local host vouches for exactly two callers:
 the configured operator in their direct conversation and the companion's own
 internal turns. Its evidence is an opaque object minted in-process. `close`
 first refuses new work and interrupts every turn as `shutdown`, including
@@ -900,3 +914,159 @@ Known gaps:
   only the direct operator conversation.
 - Only pi-ai's builtin providers can be configured. A provider is chosen by
   id and model id from pi-ai's catalogue.
+
+## Lifecycle bridge and Hermes integration
+
+An external companion host (Hermes, `integrations/hermes`) runs its own model
+loop. It reaches Lite through two loopback surfaces that the standalone
+runtime mounts when its config names them. Both are bound from the same
+operator credentials:
+
+- the MCP transport, for the governed tools;
+- the lifecycle bridge (`packages/lifecycle`, package `lite-lifecycle`), for
+  the turn lifecycle.
+
+The config has two required-nullable blocks:
+
+- `mcp`: `host`, `port`, `allowedHosts`, `bindings` (the binding document
+  `loadPrincipalBindings` reads, naming credential variables or files, never
+  values), `internalTurnTtlMs` and `maxOpenInternalTurns`.
+- `lifecycle`: `host`, `port`, `allowedHosts` and `internalTurns`. The
+  bridge needs `mcp`.
+
+Callers are recognised in this order: the CLI's in-process evidence first,
+then the bindings, then the credential minted for one internal turn
+(`combineCallers`). One core ingress admits all of them.
+`tests/boundary/harness-imports.test.ts` enforces that the bridge reaches core
+and MCP only through their public entries (via `src/core.ts` and `src/mcp.ts`),
+that it has no third-party dependency, and that core references neither MCP
+nor the bridge.
+
+### Bridge
+
+The bridge serves `POST /lifecycle/v1/<route>` with JSON bodies. The bearer
+credential is identified before the body is read. Browser origins and
+unexpected Host headers are refused, and bodies are parsed strictly: unknown
+fields are refused, and no field names a caller, contact, audience or
+speaker. Each route calls one core use case in `application/hosted-turns.ts`
+and holds no logic of its own:
+
+- `prepare {hostInstance, idempotencyKey, message}` calls
+  `HostedTurns.prepare`. It opens a turn in the caller's current session for
+  the admitted participant. The context is assembled against the session
+  revision, and a stale revision is retried. A repeated key whose turn is
+  open resumes it (`resumed: true`), with the history before its trigger; a
+  settled key replays its outcome. The turn owner is the bound principal,
+  narrowed by the host's process instance. Another owner's open turn is
+  recovered only after its lease. This owner's own open turn is refused as
+  `turn_already_open`, because it may still be running. The response is
+  core's context with each entry's role, label, origin and (for history)
+  turn id, so the host renders attribution exactly.
+- `settle {hostInstance, turnId, outcome, toolCallCount}` calls
+  `HostedTurns.settle`. It handles `completed`, `interrupted` and `failed`
+  outcomes, with the actual reply or partial reply and delivery. Only a turn
+  of the admitted audience is visible, and only its owner settles it. Then
+  the post-turn work runs: `emotion.observeTurn`, and `workers.resume` for
+  participant turns. Each part reports its own failure. Settling again with
+  the same outcome repairs history and does not run post-turn work twice.
+- `checkpoint {turnIds}` calls `HostedTurns.checkpoint`. The host calls it
+  before it compacts its own transcript. For each named turn of the audience
+  it re-appends the ledger-derived entries (identical entries are no-ops),
+  which both proves and repairs canonical history. It answers which turns are
+  settled and which are open. A missing turn, or one of another audience,
+  refuses the whole checkpoint. Compaction never touches the Lite archive,
+  which stays the source of evidence.
+- `internal/claim {waitMs}` and `internal/release {jobId, error}` serve
+  delegated internal turns (below).
+
+Failures keep core's public error shape (`publicError`) with status 400, 403,
+404, 409 or 503. Unavailable failures, failed post-turn work and released
+internal turns are also reported to the operator as `transport`
+diagnostics.
+
+### Internal turns
+
+`lifecycle.internalTurns` is either `{"kind": "harness"}`, where the Pi
+harness runs core's internal turns in-process as before, or
+`{"kind": "delegated", host, claimTimeoutMs, runTimeoutMs}`. In delegated
+mode core's `InternalTurnPort` is the MCP internal-turn credentials over a
+queue (`createDelegatedInternalTurns`). For each request a credential is
+minted, and only the named bound principal may claim the request. The claim
+hands over the minted credential, the purpose and the prompt. A `prepare`
+made with that credential ignores the body's key and message: core's request
+fixes the trigger, as a `system_note` origin, never participant speech, and
+the key, which is the same one the Pi harness derives. The turn is owned by
+the job, and its settlement completes core's request.
+
+If nobody claims the request within `claimTimeoutMs`, it resolves as
+`unavailable (internal_turn_host)`. A claimed turn that is not settled within
+`runTimeoutMs` (at most the credential's lifetime), a released job, and
+shutdown all settle the job's open turn as failed and report it. Worker runs
+stay on the runtime's Pi worker host.
+
+### Hermes plugin
+
+`integrations/hermes/psfn_lite` is a Hermes memory-slot plugin, tested
+against Hermes `f0187332d13679e2ace74d1f0eb399eb91a90571`. It registers
+`pre_llm_call`, `pre_tool_call`, `post_llm_call`, `post_tool_call`,
+`on_session_end`, `on_session_finalize` and `subagent_start` once per
+process, plus a memory provider with no tools and no recall:
+
+1. **Prepare.** Each root turn of a bound sender is prepared under
+   `hermes:<sha256(session, turn)>`. A prepare whose answer was lost is sent
+   once more under the same key, which Lite resumes. Lite's context is
+   injected into the user message as labelled blocks with the same label
+   escaping as the Pi harness.
+2. **Settle.** `on_session_end` settles the turn as completed with the reply,
+   interrupted, or failed. Open turns are keyed by Hermes's turn id, which
+   survives a compression's mid-turn session rotation. Hermes fires
+   `on_session_end` only from `finalize_turn`, and several failure paths in
+   `agent/conversation_loop.py` return before it. A turn left open that way
+   is settled as failed (`hermes_turn_unfinished`) before the next turn of
+   the same conversation is prepared, or when Hermes finalizes the session.
+3. **Gate.** Hermes's MCP client sends the profile's standing credential on
+   every call, so `pre_tool_call` blocks the Lite tools outside an open Lite
+   turn of the process. That covers unbound senders, subagents, the review
+   fork, cron and flush agents, and a profile where the plugin is not usable.
+4. **Checkpoint.** Before compaction the provider calls `checkpoint`
+   (checkpoint API v2) and raises when Lite cannot prove the session's turns.
+   With `compression.checkpoint_required`, Hermes then keeps the
+   uncompressed transcript.
+
+Unless Hermes's own memory stores are off and compaction is fail-closed, the
+provider refuses to start, and the hooks refuse to drive any Lite turn and say
+so. Hermes only logs a provider that fails to start, so the hooks enforce
+this themselves. This keeps one authoritative memory per profile.
+Subagent sessions (seen through `subagent_start` or their `subagent` platform), the background review fork, and cron or flush agents never become Lite turns.
+
+Every event Lite did not accept is logged, kept in an owner-only SQLite
+ledger in the profile, reported through the warning callback, and named in
+the next turn's context. Each Lite turn has a ledger row from before its
+prepare until Lite accepts its settlement. A kept settlement is retried
+before the next turn and blocks compaction until Lite has it. When the turn's
+id was never learned, the retry prepares the kept key again first. The next
+standing process of the profile settles the turns of an exited process as
+failed (`hermes_process_ended`) under that process's host instance.
+
+In delegated mode the process started with `PSFN_LITE_INTERNAL_HOST=1`
+claims internal turns. It runs each one as its own Hermes process with the
+minted credential, so that turn's MCP tools act in the companion's self
+audience. Inside that process the root-turn guard still applies, so a
+subagent or the review fork never prepares or settles the job's turn.
+
+Known gaps: Hermes reports no partial reply for an interrupted or failed
+turn, and it delivers the reply after the hook, so delivery is recorded as
+`unknown`. Turns from senders outside the plugin's `senders` list are not
+recorded. They are told so in their context.
+
+Proof:
+
+- `tests/lifecycle/bridge.integration.test.ts` runs the standalone runtime
+  over Postgres. It covers credential binding, every outcome under stable
+  entry ids, resumption, checkpoints, cross-conversation activity disclosed
+  to the operator and not to a regular contact, MCP on the same runtime, and
+  delegated internal turns, including a release that fails visibly.
+- `integrations/hermes/tests` runs host contract tests inside the pinned
+  Hermes, and an end-to-end suite that drives Hermes's real MCP client and the
+  plugin against that runtime (`tests/hermes/fixtures/lite-host.ts`).
+

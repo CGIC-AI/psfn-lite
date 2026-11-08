@@ -79,7 +79,7 @@ export function useStandalone() {
       onDiagnostic: () => undefined,
     });
     if (!capabilities.ok) throw new Error(JSON.stringify(capabilities.error));
-    const runtime = await createLiteRuntime({ config: parsedConfig(install), databaseUrl: install.databaseUrl, host: capabilities.value });
+    const runtime = await createLiteRuntime({ config: parsedConfig(install), databaseUrl: install.databaseUrl, host: capabilities.value, env: install.env });
     if (!runtime.ok) throw new Error(JSON.stringify(runtime.error));
     opened.push(runtime.value);
     return { runtime: runtime.value, ...host };

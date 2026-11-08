@@ -31,8 +31,8 @@ export interface CliIo {
   readonly onInterrupt: (handler: () => void) => () => void;
 }
 
-const USAGE = 'usage: lite-standalone <init|once|chat|tick|maintain> --config <file> [--text <message>] [--key <key>] [--json]';
-const COMMANDS = ['init', 'once', 'chat', 'tick', 'maintain'] as const;
+const USAGE = 'usage: lite-standalone <init|once|chat|tick|maintain|serve> --config <file> [--text <message>] [--key <key>] [--json]';
+const COMMANDS = ['init', 'once', 'chat', 'tick', 'maintain', 'serve'] as const;
 type Command = (typeof COMMANDS)[number];
 
 interface Args {
@@ -75,7 +75,7 @@ export async function runCli(argv: readonly string[], io: CliIo, hostFactory: Ho
     io.stderr(`host capabilities refused:\n${formatError(host.error)}\n`);
     return 2;
   }
-  const runtime = await createLiteRuntime({ config, databaseUrl: loaded.value.secrets.databaseUrl, host: host.value });
+  const runtime = await createLiteRuntime({ config, databaseUrl: loaded.value.secrets.databaseUrl, host: host.value, env: io.env });
   if (!runtime.ok) {
     io.stderr(`the runtime could not start:\n${formatError(runtime.error)}\n`);
     return 1;
@@ -119,7 +119,25 @@ async function run(args: Args, runtime: LiteRuntime, io: CliIo): Promise<number>
     }
     case 'chat':
       return chat(runtime, io);
+    case 'serve':
+      return serve(runtime, io);
   }
+}
+
+/** Runs the scheduler and the configured transports until Ctrl-C; an external host drives the turns. */
+async function serve(runtime: LiteRuntime, io: CliIo): Promise<number> {
+  const { mcpUrl, lifecycleUrl } = runtime.transports;
+  if (mcpUrl === null) return usage(io, 'serve needs an mcp transport in the config');
+  runtime.startScheduler();
+  io.stdout(`mcp ${mcpUrl}\n`);
+  if (lifecycleUrl !== null) io.stdout(`lifecycle ${lifecycleUrl}\n`);
+  await new Promise<void>((resolve) => {
+    const unsubscribe = io.onInterrupt(() => {
+      unsubscribe();
+      resolve();
+    });
+  });
+  return 0;
 }
 
 async function chat(runtime: LiteRuntime, io: CliIo): Promise<number> {
