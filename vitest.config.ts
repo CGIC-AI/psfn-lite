@@ -2,13 +2,27 @@ import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   test: {
-    environment: 'node',
-    include: [
-      'packages/*/src/**/*.test.ts',
-      'apps/*/src/**/*.test.ts',
-      'tests/**/*.test.ts',
-      'scripts/**/*.test.ts',
+    // Shared-workstation budget: at most 16 test forks. Vitest's default for
+    // `run` is one fork per available CPU minus one (31 on the 32-core
+    // workstation), and uncapped runs there lost forks (docs/extraction.md).
+    maxWorkers: 16,
+    projects: [
+      {
+        test: {
+          name: 'lite',
+          environment: 'node',
+          include: [
+            'packages/*/src/**/*.test.ts',
+            'apps/*/src/**/*.test.ts',
+            'tests/**/*.test.ts',
+            'scripts/**/*.test.ts',
+          ],
+          // The extracted donor tree runs as its own project with the donor's test settings.
+          exclude: ['packages/companion/**', '**/node_modules/**'],
+          testTimeout: 10_000,
+        },
+      },
+      './packages/companion/vitest.config.ts',
     ],
-    testTimeout: 10_000,
   },
 });

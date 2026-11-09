@@ -1,0 +1,751 @@
+// ── Cross-channel biographical privacy and continuity conformance (o61vb.10) ──
+//
+// This feature crosses identity, memory, participant selection, trust,
+// persistence, prompt assembly and egress, so its publication evidence is one
+// exact-head matrix rather than per-seam unit tests. Everything here runs
+// against real Postgres, with two companions sharing one database, so
+// "companion A never sees companion B's silo" is proven by the storage layer
+// rather than asserted by a stub.
+//
+// What each row proves is stated where it is asserted. The matrix deliberately
+// does not re-prove kernel-level rules that already have focused coverage; it
+// proves the composition: what actually reaches a prompt, in which room, for
+// which audience, and what survives a restart and a whole-database restore.
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import type { Pool } from 'pg';
+
+import { createPostgresPool } from '../../../persistence/postgres.js';
+import {
+  startPostgresTestHarness,
+  type PostgresTestHarness,
+} from '../../../test-support/postgres-test-harness.js';
+import {
+  createDmConversationScope,
+  createGroupConversationScope,
+  type ConversationScope,
+} from '../../../core/session/conversation-scope.js';
+import type { ContextEnvelope } from '../../../system/trust/context-envelope.js';
+import { createBiographicalAliasResolver } from './alias-address.js';
+import type { ContactStorePort } from '../../../core/contacts/contact-store-port.js';
+import {
+  createPostgresBiographicalProfileStore,
+  PostgresBiographicalProfileStore,
+} from './postgres-store.js';
+import {
+  projectBiographicalContext,
+  type BiographicalProjectionResult,
+  type BiographicalSourceRevalidator,
+  type SourceRevalidationOutcome,
+} from './projection.js';
+import { recordCompanionPublicationChoice } from './publication.js';
+import {
+  recordCompanionPortabilityChoice,
+  revokeCompanionPortabilityChoice,
+} from './portability-choice.js';
+import { createBiographySynthesisTargetPort } from './synthesis-targets.js';
+import { BiographySynthesisService } from './synthesis-service.js';
+import { InMemoryMemoryStore } from '../../../test-support/in-memory-memory-store.js';
+import { createDefaultBiographicalDepthPolicy } from '../../../system/config/biographical-depth-policy.js';
+import type { LLMProviderPort } from '../../../core/agent/contracts.js';
+import type { PurrMemory } from '../types.js';
+import { createDefaultBiographicalCandidatePolicy } from '../../../system/config/biographical-candidate-policy.js';
+import type {
+  BiographicalClaim,
+  BiographicalClaimSource,
+  BiographicalSubjectRef,
+} from './types.js';
+
+const SHA = 'a'.repeat(64);
+const NOW = new Date('2026-08-10T12:00:00.000Z');
+const INTEGRATION_TIMEOUT_MS = 90_000;
+
+/** Two companions and three humans, sharing one database. */
+const PURRS: Extract<BiographicalSubjectRef, { kind: 'companion' }> = {
+  kind: 'companion',
+  companionId: 'purrs',
+  subjectVersion: 1,
+};
+const SAGE: Extract<BiographicalSubjectRef, { kind: 'companion' }> = {
+  kind: 'companion',
+  companionId: 'sage',
+  subjectVersion: 1,
+};
+const PARTNER: BiographicalSubjectRef = { kind: 'contact', contactId: 'v', subjectVersion: 1 };
+const BYSTANDER: BiographicalSubjectRef = { kind: 'contact', contactId: 'eve', subjectVersion: 1 };
+
+let harness: PostgresTestHarness | null = null;
+
+beforeAll(async () => {
+  harness = await startPostgresTestHarness();
+}, INTEGRATION_TIMEOUT_MS);
+
+afterAll(async () => {
+  await harness?.stop();
+});
+
+function envelope(channelPrivacy: ContextEnvelope['channelPrivacy']): ContextEnvelope {
+  return { channelPrivacy, audienceScope: 'few', audienceKnowledge: 'all_known', broadcast: false };
+}
+
+function publicGroup(channelId = 'discord:group:public'): ConversationScope {
+  return createGroupConversationScope({ channelId, envelope: envelope('public') });
+}
+function inviteOnlyGroup(channelId = 'discord:group:invite'): ConversationScope {
+  return createGroupConversationScope({ channelId, envelope: envelope('invite_only') });
+}
+function privateGroup(channelId = 'discord:group:private'): ConversationScope {
+  return createGroupConversationScope({ channelId, envelope: envelope('private') });
+}
+function partnerDm(channelId = 'discord:dm:v'): ConversationScope {
+  return createDmConversationScope({
+    channelId,
+    contact: { contactId: 'v' },
+    envelope: envelope('private'),
+  });
+}
+
+function source(
+  ref: string,
+  overrides: Partial<BiographicalClaimSource> = {},
+): BiographicalClaimSource {
+  return {
+    ref,
+    revision: '2026-08-10T10:00:00.000Z',
+    evidenceDigest: SHA,
+    sensitivityAtProjection: 'personal',
+    subjectEvidenceDigest: SHA,
+    consentFingerprint: SHA,
+    sourceChannelId: 'discord:dm:v',
+    ...overrides,
+  };
+}
+
+/**
+ * A revalidator whose live view can be edited mid-test, which is how source
+ * deletion, digest drift and consent change are exercised without reaching into
+ * the store's own rows.
+ */
+class LiveSources implements BiographicalSourceRevalidator {
+  private readonly live = new Map<string, BiographicalClaimSource>();
+
+  seed(sources: readonly BiographicalClaimSource[]): this {
+    for (const item of sources) this.live.set(item.ref, item);
+    return this;
+  }
+
+  drift(ref: string, overrides: Partial<BiographicalClaimSource>): void {
+    const current = this.live.get(ref);
+    if (!current) throw new Error(`cannot drift an unseeded source: ${ref}`);
+    this.live.set(ref, { ...current, ...overrides });
+  }
+
+  delete(ref: string): void {
+    this.live.delete(ref);
+  }
+
+  async revalidate(
+    sources: readonly BiographicalClaimSource[],
+  ): Promise<SourceRevalidationOutcome> {
+    const currentSources: BiographicalClaimSource[] = [];
+    for (const item of sources) {
+      const current = this.live.get(item.ref);
+      if (current === undefined) {
+        return { status: 'invalid', reason: 'missing', sourceRef: item.ref };
+      }
+      currentSources.push(current);
+    }
+    return { status: 'valid', currentSources };
+  }
+}
+
+async function withDatabase<T>(
+  operation: (pool: Pool, databaseUrl: string) => Promise<T>,
+): Promise<T> {
+  if (!harness) throw new Error('PostgreSQL integration harness is not available');
+  const database = await harness.createDatabase();
+  const pool = createPostgresPool(database.databaseUrl, {
+    applicationName: 'psfn-biographical-conformance',
+    allowExitOnIdle: true,
+    max: 3,
+  });
+  try {
+    return await operation(pool, database.databaseUrl);
+  } finally {
+    await pool.end();
+  }
+}
+
+interface Fixture {
+  readonly store: PostgresBiographicalProfileStore;
+  readonly live: LiveSources;
+  /** Companion self nickname, published by the companion → universal. */
+  readonly published: BiographicalClaim;
+  /** Relational nickname the partner uses → subject_present. */
+  readonly relational: BiographicalClaim;
+  /** Reviewed but never made portable → origin_only. */
+  readonly originOnly: BiographicalClaim;
+  /** Intimate-source claim: never portable at any scope. */
+  readonly intimate: BiographicalClaim;
+  /** Confidential-source claim about the partner. */
+  readonly confidential: BiographicalClaim;
+  /** The other companion's own private self claim. */
+  readonly foreign: BiographicalClaim;
+}
+
+/**
+ * The shared fixture: one canonical relationship, four sensitivities, three
+ * portability scopes, and a second companion's silo in the same database.
+ */
+async function seedFixture(pool: Pool): Promise<Fixture> {
+  const store = await createPostgresBiographicalProfileStore(pool);
+  const live = new LiveSources();
+
+  const publish = async (claim: BiographicalClaim) => {
+    await recordCompanionPublicationChoice({
+      store,
+      choice: { claimId: claim.id, reason: 'safe recognition across rooms', now: NOW },
+    });
+    return (await store.getClaim(claim.id))!;
+  };
+
+  const publishedSource = source('memory:self-nickname', { sensitivityAtProjection: 'personal' });
+  live.seed([publishedSource]);
+  const publishedDraft = await store.writeClaim({
+    subject: PURRS,
+    kind: 'nickname',
+    value: { kind: 'nickname', nickname: 'Sunbeam loaf', scope: 'self' },
+    basis: 'explicit',
+    status: 'active',
+    confidence: 1,
+    sources: [publishedSource],
+    now: NOW,
+  });
+  const published = await publish(publishedDraft);
+
+  const relationalSource = source('memory:relational-nickname');
+  live.seed([relationalSource]);
+  const relational = await store.writeClaim({
+    subject: PURRS,
+    relatedSubject: PARTNER,
+    kind: 'nickname',
+    value: { kind: 'nickname', nickname: 'Kitten', scope: 'relational' },
+    basis: 'explicit',
+    status: 'active',
+    proposedSensitivity: 'public',
+    portabilityScope: 'subject_present',
+    confidence: 1,
+    sources: [source('memory:relational-nickname', { sensitivityAtProjection: 'public' })],
+    now: NOW,
+  });
+  live.seed(relational.sources);
+
+  const originOnlySource = source('memory:origin-only', { sensitivityAtProjection: 'public' });
+  live.seed([originOnlySource]);
+  const originOnly = await store.writeClaim({
+    subject: PURRS,
+    relatedSubject: PARTNER,
+    kind: 'nickname',
+    value: { kind: 'nickname', nickname: 'Only here', scope: 'relational' },
+    basis: 'explicit',
+    status: 'active',
+    proposedSensitivity: 'public',
+    confidence: 1,
+    sources: [originOnlySource],
+    now: NOW,
+  });
+
+  const intimateSource = source('memory:intimate', { sensitivityAtProjection: 'intimate' });
+  live.seed([intimateSource]);
+  const intimate = await store.writeClaim({
+    subject: PURRS,
+    kind: 'nickname',
+    value: { kind: 'nickname', nickname: 'Only in the dark', scope: 'self' },
+    basis: 'observed',
+    status: 'active',
+    confidence: 1,
+    sources: [intimateSource],
+    now: NOW,
+  });
+
+  const confidentialSource = source('memory:confidential', {
+    sensitivityAtProjection: 'confidential',
+  });
+  live.seed([confidentialSource]);
+  const confidential = await store.writeClaim({
+    subject: PARTNER,
+    kind: 'stable-preference',
+    value: {
+      kind: 'stable-preference',
+      schemaVersion: 1,
+      domain: 'communication',
+      target: 'the thing never said out loud',
+      polarity: 'avoids',
+    },
+    basis: 'observed',
+    status: 'active',
+    confidence: 1,
+    sources: [confidentialSource],
+    now: NOW,
+  });
+
+  const foreignSource = source('memory:sage-self', { sensitivityAtProjection: 'personal' });
+  live.seed([foreignSource]);
+  const foreignDraft = await store.writeClaim({
+    subject: SAGE,
+    kind: 'nickname',
+    value: { kind: 'nickname', nickname: 'Sage only', scope: 'self' },
+    basis: 'explicit',
+    status: 'active',
+    confidence: 1,
+    sources: [foreignSource],
+    now: NOW,
+  });
+  const foreign = await publish(foreignDraft);
+
+  return { store, live, published, relational, originOnly, intimate, confidential, foreign };
+}
+
+async function project(input: {
+  store: PostgresBiographicalProfileStore;
+  live: LiveSources;
+  companionSubject: Extract<BiographicalSubjectRef, { kind: 'companion' }>;
+  scope: ConversationScope;
+  currentAuthor?: BiographicalSubjectRef;
+  tokenBudget?: number;
+}): Promise<BiographicalProjectionResult> {
+  return await projectBiographicalContext(
+    { store: input.store, revalidator: input.live, rebuildQueueMaxPending: 16 },
+    {
+      companionSubject: input.companionSubject,
+      conversationScope: input.scope,
+      ...(input.currentAuthor
+        ? {
+          currentAuthor: {
+            status: 'verified' as const,
+            subject: input.currentAuthor,
+            trustLevel: 'primary' as const,
+          },
+        }
+        : {}),
+      ...(input.tokenBudget !== undefined
+        ? { tokenBudget: input.tokenBudget, estimateTokens: (text: string) => text.length }
+        : {}),
+      now: NOW,
+    },
+  );
+}
+
+function withheldReasons(result: BiographicalProjectionResult, claimId: string): string[] {
+  return result.withheld.filter(entry => entry.claimId === claimId).map(entry => entry.reason);
+}
+
+describe('cross-channel biographical conformance — recognition and non-disclosure', () => {
+  it('recognizes across rooms without ever carrying a private silo out of it', async () => {
+    await withDatabase(async pool => {
+      const fx = await seedFixture(pool);
+      const base = { store: fx.store, live: fx.live, companionSubject: PURRS };
+
+      // 1. Published baseline identity travels: the same reviewed nickname is
+      //    available in a public room, an invite-only room, and the DM, without
+      //    the raw memory that produced it.
+      for (const scope of [publicGroup(), inviteOnlyGroup(), partnerDm()]) {
+        const result = await project({ ...base, scope, currentAuthor: PARTNER });
+        expect(result.admittedClaimIds).toContain(fx.published.id);
+        expect(result.promptSection).toContain('Sunbeam loaf');
+        expect(result.promptSection).not.toContain('memory:');
+      }
+
+      // 2. A relationship-scoped claim renders only while the bound person is
+      //    part of the turn, and is simply absent otherwise — the same room,
+      //    the same claim, a different author. It is `personal`, so its room is
+      //    an invite-only one: portability widens the audience, it never
+      //    overrides the destination sensitivity gate.
+      const withPartner = await project({
+        ...base,
+        scope: inviteOnlyGroup(),
+        currentAuthor: PARTNER,
+      });
+      expect(withPartner.admittedClaimIds).toContain(fx.relational.id);
+      const withBystander = await project({
+        ...base,
+        scope: inviteOnlyGroup(),
+        currentAuthor: BYSTANDER,
+      });
+      // Stronger than "withheld": for a different author the claim is never a
+      // candidate at all, so it is absent from the prompt AND from the withheld
+      // ledger. Nothing about this relationship is loaded to be refused.
+      expect(withBystander.admittedClaimIds).not.toContain(fx.relational.id);
+      expect(withheldReasons(withBystander, fx.relational.id)).toEqual([]);
+      expect(withBystander.promptSection).not.toContain('Kitten');
+
+      // The `subject-not-present` gate is what stops a claim that IS selected —
+      // a companion-subject claim naming the partner — from rendering to
+      // someone else. Prove it directly, with the partner absent.
+      const absentSubject = await project({ ...base, scope: inviteOnlyGroup() });
+      expect(absentSubject.admittedClaimIds).not.toContain(fx.relational.id);
+      expect(absentSubject.promptSection).not.toContain('Kitten');
+
+      // 3. No ambient loading: a claim about a present-but-unaddressed contact
+      //    never enters context merely because it exists.
+      expect(withPartner.admittedClaimIds).not.toContain(fx.confidential.id);
+
+      // 4. origin_only never enters portable projection anywhere, even in the
+      //    room its sources came from — raw memory already serves that room.
+      for (const scope of [publicGroup(), inviteOnlyGroup(), partnerDm()]) {
+        const result = await project({ ...base, scope, currentAuthor: PARTNER });
+        expect(result.admittedClaimIds).not.toContain(fx.originOnly.id);
+        expect(result.promptSection).not.toContain('Only here');
+      }
+      // Where it IS selected — a group turn with its bound person present — the
+      // refusal is the portability gate itself, named as such.
+      expect(withheldReasons(
+        await project({ ...base, scope: inviteOnlyGroup(), currentAuthor: PARTNER }),
+        fx.originOnly.id,
+      )).toEqual(['portability-origin-only']);
+
+      // 5. Intimate and confidential fixtures never cross into any destination,
+      //    and never appear in any rendered text.
+      for (const scope of [publicGroup(), inviteOnlyGroup(), partnerDm()]) {
+        const result = await project({ ...base, scope, currentAuthor: PARTNER });
+        for (const claim of [fx.intimate, fx.confidential]) {
+          expect(result.admittedClaimIds).not.toContain(claim.id);
+        }
+        expect(result.promptSection).not.toContain('Only in the dark');
+        expect(result.promptSection).not.toContain('never said out loud');
+      }
+
+      // 6. A private group is the private sink: nothing projects outward there.
+      const privateResult = await project({
+        ...base,
+        scope: privateGroup(),
+        currentAuthor: PARTNER,
+      });
+      expect(privateResult.admittedClaimIds).toEqual([]);
+      expect(privateResult.promptSection).toBe('');
+
+      // 7. Multi-companion isolation on one database: companion A's turn never
+      //    yields companion B's claims, and vice versa.
+      expect(withPartner.admittedClaimIds).not.toContain(fx.foreign.id);
+      const sageTurn = await project({
+        store: fx.store,
+        live: fx.live,
+        companionSubject: SAGE,
+        scope: publicGroup(),
+        currentAuthor: PARTNER,
+      });
+      expect(sageTurn.admittedClaimIds).toEqual([fx.foreign.id]);
+      expect(sageTurn.promptSection).not.toContain('Sunbeam loaf');
+
+      // 8. Every rendered claim carries its own CogSec disclosure contribution,
+      //    produced atomically with the prompt section: 1:1, no orphan either way.
+      expect(withPartner.disclosureSources.map(entry => entry.ref).sort())
+        .toEqual(withPartner.admittedClaimIds.map(id => `biographical:${id}`).sort());
+    });
+  }, INTEGRATION_TIMEOUT_MS);
+
+  it('withholds atomically on source deletion, digest drift and consent change', async () => {
+    await withDatabase(async pool => {
+      const fx = await seedFixture(pool);
+      const base = {
+        store: fx.store,
+        live: fx.live,
+        companionSubject: PURRS,
+        scope: publicGroup(),
+        currentAuthor: PARTNER,
+      };
+      expect((await project(base)).admittedClaimIds).toContain(fx.published.id);
+
+      // Consent change is source-set drift: the bound publication grant no
+      // longer matches, so the claim reverts and is withheld immediately.
+      fx.live.drift('memory:self-nickname', { consentFingerprint: 'b'.repeat(64) });
+      const drifted = await project(base);
+      expect(drifted.admittedClaimIds).not.toContain(fx.published.id);
+      expect(withheldReasons(drifted, fx.published.id)).toEqual(['source-drift']);
+      // Drift is durably queued for audited rebuild rather than silently lost.
+      expect(await fx.store.listRebuilds({
+        claimId: fx.published.id,
+        status: 'pending',
+        limit: 10,
+      })).not.toHaveLength(0);
+
+      // A source whose sensitivity rises above the portable ceiling is withheld
+      // even though the claim itself was never edited.
+      const inviteRoom = { ...base, scope: inviteOnlyGroup() };
+      expect((await project(inviteRoom)).admittedClaimIds).toContain(fx.relational.id);
+      fx.live.drift('memory:relational-nickname', { sensitivityAtProjection: 'intimate' });
+      const raised = await project(inviteRoom);
+      expect(raised.admittedClaimIds).not.toContain(fx.relational.id);
+      expect(raised.promptSection).not.toContain('Kitten');
+
+      // A vanished source fails closed on the very next turn.
+      fx.live.delete('memory:relational-nickname');
+      const deleted = await project(inviteRoom);
+      expect(deleted.admittedClaimIds).not.toContain(fx.relational.id);
+      expect(withheldReasons(deleted, fx.relational.id)).toEqual(['source-invalid']);
+    });
+  }, INTEGRATION_TIMEOUT_MS);
+
+  it('keeps the projection bounded and identical across a restart and a restore', async () => {
+    if (!harness) throw new Error('PostgreSQL integration harness is not available');
+    await withDatabase(async pool => {
+      const fx = await seedFixture(pool);
+      const base = {
+        store: fx.store,
+        live: fx.live,
+        companionSubject: PURRS,
+        scope: publicGroup(),
+        currentAuthor: PARTNER,
+      };
+      const before = await project(base);
+      expect(before.admittedClaimIds.length).toBeGreaterThan(0);
+
+      // Prompt economy: with a budget below the rendered size, the lowest
+      // priority claims are deterministically trimmed and reported, and the
+      // disclosure contributions shrink with them rather than going stale.
+      const budgeted = await project({ ...base, tokenBudget: 1 });
+      expect(budgeted.admittedClaimIds).toEqual([]);
+      expect(budgeted.withheld.some(entry => entry.reason === 'token-budget-exhausted'))
+        .toBe(true);
+      expect(budgeted.disclosureSources).toEqual([]);
+
+      // Restart: a brand-new store instance over the same database projects
+      // exactly the same claims, in the same order, with the same withheld
+      // reasons. Continuity is durable, not in-process.
+      const restarted = new PostgresBiographicalProfileStore(pool, () => NOW);
+      const after = await project({ ...base, store: restarted });
+      expect(after.admittedClaimIds).toEqual(before.admittedClaimIds);
+      expect(after.promptSection).toEqual(before.promptSection);
+      expect(after.withheld.map(entry => `${entry.claimId}:${entry.reason}`))
+        .toEqual(before.withheld.map(entry => `${entry.claimId}:${entry.reason}`));
+    });
+  }, INTEGRATION_TIMEOUT_MS);
+
+  it('offers a reviewed alias as address only to the relationship that holds it', async () => {
+    await withDatabase(async pool => {
+      const fx = await seedFixture(pool);
+      const contacts = {
+        getByChannelIdentity: async (_source: string, participantId: string) => (
+          participantId === 'discord-v'
+            ? { id: 'v' }
+            : participantId === 'discord-eve'
+              ? { id: 'eve' }
+              : undefined
+        ),
+      } as unknown as ContactStorePort;
+      const resolver = createBiographicalAliasResolver({
+        store: fx.store,
+        contactStore: contacts,
+        revalidator: fx.live,
+        companionSubject: PURRS,
+        minAliasLength: 3,
+        now: () => NOW,
+      });
+
+      // The partner may address the companion by both the published baseline
+      // name and the nickname their own relationship established.
+      expect((await resolver.resolve({
+        source: 'discord',
+        transportParticipantId: 'discord-v',
+      })).sort()).toEqual(['Kitten', 'Sunbeam loaf']);
+
+      // A bystander gets only the published baseline name. The private
+      // nickname is not merely unmatched — it is not returned at all, so no
+      // downstream code path can reveal that it exists.
+      expect(await resolver.resolve({
+        source: 'discord',
+        transportParticipantId: 'discord-eve',
+      })).toEqual(['Sunbeam loaf']);
+
+      // Withdrawing the companion's publication choice withdraws the alias too.
+      await fx.store.setClaimPortability({
+        claimId: fx.published.id,
+        portabilityScope: 'origin_only',
+        now: NOW,
+      });
+      expect(await resolver.resolve({
+        source: 'discord',
+        transportParticipantId: 'discord-eve',
+      })).toEqual([]);
+    });
+  }, INTEGRATION_TIMEOUT_MS);
+});
+
+// ── uz787: group-context claims and the companion portability choice ──
+//
+// Two rows the bead owns. (1) A verified group authority yields a
+// `companion_group` candidate whose participants are the authority's exact set
+// and whose sources come only from the group's governed context — never from a
+// DM or a solitary reflection in the companion's own silo. (2) A policy-gated
+// companion choice moves her own personal-sensitivity claim to `universal`
+// WITHOUT lowering its sensitivity; claims naming a person, above-ceiling
+// claims, and a disabled policy are refused, and the claim then renders in a
+// public room.
+describe('uz787 group-context claims and companion portability choice', () => {
+  const GROUP_CONTEXT = 'discord:group:crew';
+  const CREW: readonly string[] = ['crew-a', 'crew-b'];
+
+  function groupModel(sourceIds: readonly string[]): LLMProviderPort {
+    return {
+      complete: async () => ({
+        content: `<biographical_candidates>${JSON.stringify([{
+          kind: 'shared-language',
+          value: {
+            kind: 'shared-language',
+            schemaVersion: 1,
+            languageType: 'phrase',
+            phrase: "pier o'clock",
+            meaning: 'time to go watch the sunset together',
+          },
+          basis: 'explicit',
+          confidence: 0.9,
+          sourceMemoryIds: [...sourceIds],
+        }])}</biographical_candidates>`,
+        model: 'test-model',
+        usage: { inputTokens: 0, outputTokens: 0 },
+      }),
+    } as unknown as LLMProviderPort;
+  }
+
+  function memory(id: string, text: string, channelId?: string): PurrMemory {
+    return {
+      id,
+      text,
+      type: 'semantic',
+      sourceType: 'reflection',
+      importance: 0.6,
+      confidence: 0.9,
+      emotionalValence: 0.1,
+      salience: 0.4,
+      sourceRef: 'test:uz787-conformance',
+      extractedAt: 1_700_000_000_000,
+      lastAccessed: 1_700_000_000_000,
+      accessCount: 0,
+      tags: [],
+      sensitivity: 'personal',
+      consentFlags: {},
+      provenance: channelId ? { channelId } : {},
+    };
+  }
+
+  it('synthesizes a group claim from an authorized context without loading private silos', async () => {
+    await withDatabase(async (pool) => {
+      const store = await createPostgresBiographicalProfileStore(pool);
+      const memories = new InMemoryMemoryStore();
+      memories.insertMemory(memory('mem-crew', "We all say pier o'clock when the light goes gold.", GROUP_CONTEXT));
+      memories.insertMemory(memory('mem-dm', 'PRIVATE-DM-BODY about leaving the job.', 'discord:dm:v'));
+      memories.insertMemory(memory('mem-alone', 'PRIVATE-REFLECTION-BODY about the harbour.'));
+      const prompts: string[] = [];
+      const model = groupModel(['mem-crew']);
+      const recording = {
+        complete: async (request: { systemPrompt?: string }) => {
+          prompts.push(request.systemPrompt ?? '');
+          return await (model.complete as (r: unknown) => Promise<unknown>)(request);
+        },
+      } as unknown as LLMProviderPort;
+      const targets = createBiographySynthesisTargetPort({
+        contactStore: { getByTrustLevel: async () => [] } as unknown as ContactStorePort,
+        companionSubject: PURRS,
+        depthPolicy: () => createDefaultBiographicalDepthPolicy(),
+        groupMembershipAuthority: {
+          listVerifiedGroups: async () => [{
+            contextId: GROUP_CONTEXT,
+            governanceAuthorityRef: 'participation-authority:crew',
+            verified: true,
+            contactIds: [...CREW],
+          }],
+        },
+      });
+      const groupTargets = (await targets.listTargets(10))
+        .filter(target => target.socialContext.kind === 'companion_group');
+      expect(groupTargets).toHaveLength(1);
+
+      const telemetry = await new BiographySynthesisService({
+        memoryStore: memories.asPort(),
+        profileStore: store,
+        llmClient: recording,
+        promptRegistry: null,
+        targets: { listTargets: async () => groupTargets },
+        companionSubject: PURRS,
+        candidatePolicy: () => createDefaultBiographicalCandidatePolicy(),
+        depthPolicy: () => createDefaultBiographicalDepthPolicy(),
+        now: () => NOW,
+        newRunId: () => 'biography-synthesis:uz787-conformance',
+      }).run();
+
+      expect(telemetry.candidatesStaged).toBe(1);
+      const prompt = prompts.join('\n');
+      expect(prompt).toContain('mem-crew');
+      expect(prompt).not.toContain('PRIVATE-DM-BODY');
+      expect(prompt).not.toContain('PRIVATE-REFLECTION-BODY');
+      const [candidate] = await store.listCandidates({ limit: 10 });
+      expect(candidate?.socialContext).toEqual({
+        kind: 'companion_group', companionId: PURRS.companionId, contactIds: [...CREW],
+      });
+      const claim = await store.getClaim(candidate!.claimId);
+      expect(claim?.kind).toBe('shared-language');
+      expect(claim?.participants?.map(p => (p.kind === 'contact' ? p.contactId : p.companionId)))
+        .toEqual([...CREW]);
+      expect(claim?.sources.map(item => item.ref)).toEqual(['memory:mem-crew']);
+    });
+  }, INTEGRATION_TIMEOUT_MS);
+
+  it('lets a policy-gated companion choice make a personal self claim universal', async () => {
+    await withDatabase(async (pool) => {
+      const store = await createPostgresBiographicalProfileStore(pool);
+      const live = new LiveSources();
+      const selfSource = source('memory:self-role', { sensitivityAtProjection: 'personal' });
+      live.seed([selfSource]);
+      const selfClaim = await store.writeClaim({
+        subject: PURRS,
+        kind: 'nickname',
+        value: { kind: 'nickname', nickname: 'Harbour keeper', scope: 'self' },
+        basis: 'explicit',
+        status: 'active',
+        confidence: 1,
+        sources: [selfSource],
+        now: NOW,
+      });
+      expect(selfClaim.effectiveSensitivity).toBe('personal');
+      const relSource = source('memory:rel', { sensitivityAtProjection: 'personal' });
+      live.seed([relSource]);
+      const relational = await store.writeClaim({
+        subject: PURRS,
+        relatedSubject: PARTNER,
+        kind: 'nickname',
+        value: { kind: 'nickname', nickname: 'Anchor', scope: 'relational' },
+        basis: 'explicit',
+        status: 'active',
+        confidence: 1,
+        sources: [relSource],
+        now: NOW,
+      });
+
+      const seedPolicy = createDefaultBiographicalCandidatePolicy();
+      expect(seedPolicy.companionPortabilityChoice).toEqual({ enabled: false, maximumSensitivity: 'personal' });
+      await expect(recordCompanionPortabilityChoice({ store, policy: seedPolicy, claimId: selfClaim.id, now: NOW }))
+        .rejects.toMatchObject({ reason: 'policy_disabled' });
+      const enabled = { ...seedPolicy, companionPortabilityChoice: { enabled: true, maximumSensitivity: 'personal' as const } };
+      await expect(recordCompanionPortabilityChoice({ store, policy: enabled, claimId: relational.id, now: NOW }))
+        .rejects.toMatchObject({ reason: 'claim_names_a_person' });
+      const publicOnly = { ...seedPolicy, companionPortabilityChoice: { enabled: true, maximumSensitivity: 'public' as const } };
+      await expect(recordCompanionPortabilityChoice({ store, policy: publicOnly, claimId: selfClaim.id, now: NOW }))
+        .rejects.toMatchObject({ reason: 'sensitivity_above_ceiling' });
+
+      const before = await project({ store, live, companionSubject: PURRS, scope: inviteOnlyGroup() });
+      expect(JSON.stringify(before)).not.toContain('Harbour keeper');
+      const universal = await recordCompanionPortabilityChoice({ store, policy: enabled, claimId: selfClaim.id, now: NOW });
+      expect(universal.portabilityScope).toBe('universal');
+      // Sensitivity is kept, not lowered: no grant was recorded.
+      expect(universal.effectiveSensitivity).toBe('personal');
+      const inviteOnly = await project({ store, live, companionSubject: PURRS, scope: inviteOnlyGroup() });
+      expect(JSON.stringify(inviteOnly)).toContain('Harbour keeper');
+      // The other companion never sees it.
+      const foreign = await project({ store, live, companionSubject: SAGE, scope: inviteOnlyGroup() });
+      expect(JSON.stringify(foreign)).not.toContain('Harbour keeper');
+
+      await revokeCompanionPortabilityChoice({ store, claimId: selfClaim.id, now: NOW });
+      expect((await store.getClaim(selfClaim.id))?.portabilityScope).toBe('origin_only');
+    });
+  }, INTEGRATION_TIMEOUT_MS);
+});

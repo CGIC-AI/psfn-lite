@@ -1,7 +1,6 @@
 /**
  * The TypeScript runner's handle on a conformance host process: start it
- * over a HostState, send requests, wait for brain events, and kill it to
- * crash the runtime. A killed host's state (the last snapshot it reported)
+ * over a HostState, send requests, and kill it to crash the runtime. A killed host's state (the last snapshot it reported)
  * starts the successor.
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -12,7 +11,8 @@ import type { Vars } from './scenario.ts';
 
 const REPO = join(import.meta.dirname, '..', '..');
 const ENTRY = join(import.meta.dirname, 'fixtures', 'host-process.ts');
-const READY_TIMEOUT_MS = 60_000;
+/** Starting the companion core (migrations of every kept store) in a fresh process. */
+const READY_TIMEOUT_MS = 180_000;
 
 export interface HostReady {
   readonly mcpUrl: string;
@@ -30,7 +30,6 @@ interface Pending {
 export class HostProcess {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
-  private waiters: { readonly event: string; readonly resolve: () => void }[] = [];
   private exited = false;
   state: HostState;
 
@@ -90,13 +89,7 @@ export class HostProcess {
   }
 
   private receive(message: Record<string, unknown>): void {
-    if (typeof message['event'] === 'string') {
-      const event = message['event'];
-      const matched = this.waiters.filter((w) => w.event === event);
-      this.waiters = this.waiters.filter((w) => w.event !== event);
-      for (const waiter of matched) waiter.resolve();
-      return;
-    }
+    if (typeof message['event'] === 'string') return;
     const id = message['id'] as number;
     const entry = this.pending.get(id);
     if (entry === undefined) return;
@@ -118,20 +111,6 @@ export class HostProcess {
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
       this.child.stdin.write(`${JSON.stringify({ id, op, args })}\n`);
-    });
-  }
-
-  /** Resolves on the next event of that name after this call; register it before sending the request that causes it. */
-  nextEvent(event: string, timeoutMs = 30_000): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`no ${event} event within ${String(timeoutMs)} ms`)), timeoutMs);
-      this.waiters.push({
-        event,
-        resolve: () => {
-          clearTimeout(timer);
-          resolve();
-        },
-      });
     });
   }
 

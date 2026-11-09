@@ -20,3 +20,5 @@ backups/
 .agents/
 .codex/
 .claude/
+# A model cache downloaded into the checkout (a relative cache path of a host started here, as the donor ignored /models/); the companion keeps its own under its data directory.
+/models/

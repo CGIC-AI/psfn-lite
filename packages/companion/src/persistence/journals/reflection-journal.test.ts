@@ -1,0 +1,456 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { ReflectionJournalStore } from './reflection-journal.js';
+import { buildInternalStateSnapshotRef, cloneInternalState, InternalStateComputer } from '../../core/self-model/state.js';
+import { ACAC_ARTIFACT_TYPE, ACAC_SCHEMA_VERSION } from '../../core/emotion/acac.js';
+
+function buildInternalStateSample() {
+  const state = new InternalStateComputer().computeState({
+    emotionState: {
+      vad: { valence: 0.15, arousal: 0.4, dominance: 0.2 },
+      mood: { valence: 0.1, arousal: 0.3, dominance: 0.1 },
+      discrete: { calm: 0.5, curiosity: 0.6 },
+      confidence: 0.8,
+    },
+    acac: {
+      schemaVersion: ACAC_SCHEMA_VERSION,
+      artifactType: ACAC_ARTIFACT_TYPE,
+      provenance: {
+        kind: 'self_report',
+        source: 'heartbeat:emotional-check',
+        observedAt: '2026-03-02T01:00:00.000Z',
+      },
+      axes: {
+        agency: { score: 0.81, rationale: 'The next action feels available.' },
+        connection: { score: 0.62, rationale: 'The contact thread is present.' },
+        authenticity: { score: 0.73, rationale: 'The report matches the current context.' },
+        curiosity: { score: 0.9, rationale: 'There is an unresolved question.' },
+      },
+    },
+    activeConcerns: [{
+      id: 'concern-1',
+      text: 'Track value continuity across reflections',
+      priority: 'high',
+      source: 'heartbeat',
+      createdAt: '2026-03-01T00:00:00.000Z',
+      expiresAt: '2026-03-02T00:00:00.000Z',
+    }],
+    trustLevel: 'trusted',
+    contactId: 'contact-1',
+    sessionMetrics: {
+      userMessageText: 'How have I been processing today?',
+      responseText: 'I have been steady with moments of uncertainty.',
+      toolCallCount: 1,
+      recentTurnCount: 5,
+      lastSeenDeltaSeconds: 180,
+    },
+  });
+  return {
+    state,
+    snapshotRef: buildInternalStateSnapshotRef(state),
+  };
+}
+
+describe('ReflectionJournalStore', () => {
+  let tempDir: string;
+  let filePath: string;
+  let store: ReflectionJournalStore;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'reflection-journal-'));
+    filePath = join(tempDir, 'journal.jsonl');
+    store = new ReflectionJournalStore(filePath);
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('appends baseline reflection entries', () => {
+    const entry = store.append({
+      templateId: 'musing',
+      templateName: 'Musing',
+      prompt: 'Share a brief reflection.',
+      reflection: 'I felt grounded today.',
+      channelId: 'internal:reflection:musing',
+      mode: 'agent',
+      createdAt: '2026-03-02T00:00:00.000Z',
+    });
+
+    expect(entry.templateId).toBe('musing');
+    expect(entry.templateName).toBe('Musing');
+    const lines = readFileSync(filePath, 'utf-8').trim().split('\n');
+    expect(lines).toHaveLength(1);
+  });
+
+  it('normalizes legacy whisper template ids to musing on append', () => {
+    const entry = store.append({
+      templateId: 'whisper',
+      templateName: 'Whisper',
+      prompt: 'Share a brief reflection.',
+      reflection: 'I felt grounded today.',
+      channelId: 'internal:reflection:whisper',
+      mode: 'agent',
+      createdAt: '2026-03-02T00:00:00.000Z',
+    });
+
+    expect(entry.templateId).toBe('musing');
+    expect(entry.templateName).toBe('Musing');
+    const raw = readFileSync(filePath, 'utf-8').trim();
+    const persisted = JSON.parse(raw) as { templateId: string };
+    expect(persisted.templateId).toBe('musing');
+  });
+
+  it('lists recent entries in descending createdAt order', () => {
+    store.append({
+      templateId: 'musing',
+      templateName: 'Musing',
+      prompt: 'Share a brief reflection.',
+      reflection: 'Earlier reflection.',
+      channelId: 'internal:reflection:musing',
+      mode: 'agent',
+      createdAt: '2026-03-02T00:00:00.000Z',
+    });
+    store.append({
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'Later reflection.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      createdAt: '2026-03-02T01:00:00.000Z',
+    });
+
+    const entries = store.listRecent({ limit: 1 });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.templateId).toBe('experiential-review');
+    expect(entries[0]?.reflection).toBe('Later reflection.');
+  });
+
+  it('records only the snapshot ref for internal state, never a duplicated copy', () => {
+    const sample = buildInternalStateSample();
+    store.append({
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'I noticed a focused but slightly uncertain processing pattern.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      telemetry: {
+        narrativeContext: {
+          internalStateSnapshotRef: sample.snapshotRef,
+          metacognitiveFlags: [{ flag: 'uncertainty', confidence: 0.58 }],
+        },
+      },
+      createdAt: '2026-03-02T01:00:00.000Z',
+    });
+
+    const raw = readFileSync(filePath, 'utf-8').trim();
+    const persisted = JSON.parse(raw) as {
+      telemetry?: {
+        narrativeContext?: {
+          internalStateSnapshotRef?: string;
+          internalState?: unknown;
+          metacognitiveFlags?: Array<{ flag: string; confidence: number }>;
+        };
+      };
+    };
+    expect((persisted as Record<string, unknown>).internalStateSnapshotRef).toBeUndefined();
+    expect((persisted as Record<string, unknown>).metacognitiveFlags).toBeUndefined();
+    expect(persisted.telemetry?.narrativeContext?.internalStateSnapshotRef).toBe(sample.snapshotRef);
+    // ay2o: the full internal state lives once in the snapshot store and is
+    // never duplicated into the reflection entry.
+    expect(persisted.telemetry?.narrativeContext?.internalState).toBeUndefined();
+    expect(persisted.telemetry?.narrativeContext?.metacognitiveFlags).toEqual([{ flag: 'uncertainty', confidence: 0.58 }]);
+  });
+
+  it('accepts the snapshot ref alone as complete narrative context', () => {
+    const sample = buildInternalStateSample();
+    const entry = store.append({
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'A steady pattern.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      internalStateSnapshotRef: sample.snapshotRef,
+      createdAt: '2026-03-02T01:05:00.000Z',
+    });
+    expect(entry.telemetry?.narrativeContext?.internalStateSnapshotRef).toBe(sample.snapshotRef);
+    expect((entry.telemetry?.narrativeContext as Record<string, unknown> | undefined)?.internalState).toBeUndefined();
+  });
+
+  it('fails closed when metacognitive flags are supplied without a snapshot ref', () => {
+    expect(() => store.append({
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'I noticed a focused processing pattern.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      metacognitiveFlags: [{ flag: 'uncertainty', confidence: 0.58 }],
+    })).toThrow('requires internalStateSnapshotRef when narrative context is provided');
+  });
+
+  it('parses legacy entries that still embed a full internalState copy', () => {
+    const sample = buildInternalStateSample();
+    // Simulate an entry written before ay2o: the persisted narrativeContext still
+    // carries the now-removed embedded internalState copy. It must still parse.
+    const legacyEntry = {
+      id: 'reflection-legacy-1',
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'A legacy reflection.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      createdAt: '2026-03-01T00:00:00.000Z',
+      telemetry: {
+        narrativeContext: {
+          internalStateSnapshotRef: sample.snapshotRef,
+          internalState: cloneInternalState(sample.state),
+          metacognitiveFlags: [{ flag: 'uncertainty', confidence: 0.58 }],
+        },
+      },
+    };
+    writeFileSync(filePath, `${JSON.stringify(legacyEntry)}\n`);
+
+    const entries = store.listRecent({ limit: 5 });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.id).toBe('reflection-legacy-1');
+    expect(entries[0]?.telemetry?.narrativeContext?.internalStateSnapshotRef).toBe(sample.snapshotRef);
+  });
+
+  it('preserves reflection-journal normalization error prefixes', () => {
+    const sample = buildInternalStateSample();
+
+    expect(() => store.append({
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'I noticed a focused processing pattern.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      telemetry: {
+        narrativeContext: {
+          internalStateSnapshotRef: '   ',
+        },
+      },
+    })).toThrow('Reflection journal internalStateSnapshotRef must be a non-empty string when provided');
+
+    expect(() => store.append({
+      templateId: 'experiential-review',
+      templateName: 'Experiential Review',
+      prompt: 'Describe your recent experience.',
+      reflection: 'I noticed a focused processing pattern.',
+      channelId: 'internal:reflection:experiential-review',
+      mode: 'agent',
+      telemetry: {
+        narrativeContext: {
+          internalStateSnapshotRef: sample.snapshotRef,
+          metacognitiveFlags: [{ flag: '', confidence: 0.5 }],
+        },
+      },
+    })).toThrow('Reflection journal metacognitiveFlags[0].flag must be a non-empty string');
+  });
+});
+
+describe('ReflectionJournalStore concernArc telemetry (vw3w.2)', () => {
+  let tempDir: string;
+  let filePath: string;
+  let store: ReflectionJournalStore;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'reflection-journal-arc-'));
+    filePath = join(tempDir, 'concern-arcs.jsonl');
+    store = new ReflectionJournalStore(filePath);
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  const baseArcInput = () => ({
+    templateId: 'concern_arc',
+    templateName: 'Concern Arc',
+    prompt: 'Resolved concern: rollback follow-up',
+    reflection: 'When it formed this sat heavy; resolving it, that settled to lifted.',
+    channelId: 'internal:concern-resolution',
+    mode: 'agent' as const,
+    substrateBoundary: 'concern-resolution-arc',
+    substrateProvenanceRefs: ['concern:concern-1'],
+  });
+
+  it('round-trips a structured concern arc through append and listRecent', () => {
+    store.append({
+      ...baseArcInput(),
+      concernArc: {
+        concernId: 'concern-1',
+        resolutionGenerationId: 'generation-1',
+        formationVAD: { valence: -0.4, arousal: 0.6, dominance: -0.2 },
+        resolutionVAD: { valence: 0.3, arousal: 0.1, dominance: 0.2 },
+        reliefDelta: { valence: 0.7, arousal: -0.5, dominance: 0.4 },
+        source: 'decision',
+        durationMs: 7_200_000,
+        finalSalience: 0.42,
+      },
+    });
+    const entries = store.listRecent({ limit: 5 });
+    expect(entries).toHaveLength(1);
+    expect(entries[0]?.telemetry?.concernArc).toEqual({
+      concernId: 'concern-1',
+      resolutionGenerationId: 'generation-1',
+      formationVAD: { valence: -0.4, arousal: 0.6, dominance: -0.2 },
+      resolutionVAD: { valence: 0.3, arousal: 0.1, dominance: 0.2 },
+      reliefDelta: { valence: 0.7, arousal: -0.5, dominance: 0.4 },
+      source: 'decision',
+      durationMs: 7_200_000,
+      finalSalience: 0.42,
+    });
+    expect(entries[0]?.substrateProvenanceRefs).toEqual(['concern:concern-1']);
+  });
+
+  it('fails closed on a non-finite VAD axis', () => {
+    expect(() => store.append({
+      ...baseArcInput(),
+      concernArc: {
+        concernId: 'concern-1',
+        resolutionGenerationId: 'generation-1',
+        formationVAD: { valence: Number.NaN, arousal: 0.6, dominance: -0.2 },
+        resolutionVAD: { valence: 0.3, arousal: 0.1, dominance: 0.2 },
+        reliefDelta: { valence: 0.7, arousal: -0.5, dominance: 0.4 },
+        source: 'decision',
+      },
+    })).toThrow('Reflection journal concernArc.formationVAD.valence must be a finite number');
+  });
+
+  it('fails closed on a missing concernId', () => {
+    expect(() => store.append({
+      ...baseArcInput(),
+      concernArc: {
+        concernId: '  ',
+        resolutionGenerationId: 'generation-1',
+        formationVAD: { valence: -0.4, arousal: 0.6, dominance: -0.2 },
+        resolutionVAD: { valence: 0.3, arousal: 0.1, dominance: 0.2 },
+        reliefDelta: { valence: 0.7, arousal: -0.5, dominance: 0.4 },
+        source: 'decision',
+      },
+    })).toThrow('Reflection journal concernArc requires a non-empty concernId');
+  });
+
+  it('queries structured arcs by concern and provenance without exposing prompt prose', async () => {
+    store.append({
+      ...baseArcInput(),
+      concernArc: {
+        concernId: 'concern-1',
+        resolutionGenerationId: 'generation-1',
+        formationVAD: { valence: -0.4, arousal: 0.6, dominance: -0.2 },
+        resolutionVAD: { valence: 0.3, arousal: 0.1, dominance: 0.2 },
+        reliefDelta: { valence: 0.7, arousal: -0.5, dominance: 0.4 },
+        source: 'decision',
+      },
+    });
+    store.append({
+      ...baseArcInput(),
+      substrateProvenanceRefs: ['concern:concern-2', 'decision:decision-2'],
+      concernArc: {
+        concernId: 'concern-2',
+        resolutionGenerationId: 'generation-2',
+        formationVAD: { valence: 0.1, arousal: 0.2, dominance: 0.3 },
+        resolutionVAD: { valence: 0.2, arousal: 0.1, dominance: 0.4 },
+        reliefDelta: { valence: 0.1, arousal: -0.1, dominance: 0.1 },
+        source: 'decision',
+      },
+    });
+
+    const byConcern = await store.listConcernArcs({ concernId: 'concern-1', limit: 10 });
+    expect(byConcern).toHaveLength(1);
+    expect(byConcern[0]).toMatchObject({
+      arc: { concernId: 'concern-1', resolutionGenerationId: 'generation-1' },
+      provenanceRefs: ['concern:concern-1'],
+    });
+    expect(byConcern[0]).not.toHaveProperty('prompt');
+    expect(byConcern[0]).not.toHaveProperty('reflection');
+
+    await expect(store.listConcernArcs({
+      provenanceRef: 'decision:decision-2',
+      limit: 10,
+    })).resolves.toEqual([
+      expect.objectContaining({ arc: expect.objectContaining({ concernId: 'concern-2' }) }),
+    ]);
+  });
+});
+
+// ── Crash diagnostics parity with the sibling ledgers (bead psfn-framework-2xt9c) ──
+//
+// The charge, fatigue, and human-attention ledgers each hand their bounded
+// reader a named parse-error diagnostic. This journal handed it nothing, so a
+// line a crash left half-written surfaced as a bare `SyntaxError: Unexpected
+// end of JSON input` — no path, no line number, no ledger name — from whichever
+// read happened to run first. It still fails closed, which is the right answer
+// for a record of something the companion wrote about itself; what changed is
+// that it now says where to look, and only where.
+describe('ReflectionJournalStore crash diagnostics', () => {
+  let tempDir: string;
+  let filePath: string;
+  let store: ReflectionJournalStore;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'reflection-journal-torn-'));
+    filePath = join(tempDir, 'journal.jsonl');
+    store = new ReflectionJournalStore(filePath);
+    store.append({
+      templateId: 'musing',
+      templateName: 'Musing',
+      prompt: 'Share a brief reflection.',
+      reflection: 'Steady.',
+      channelId: 'channel-1',
+      mode: 'agent',
+    });
+    // Exactly what a crash mid-append leaves behind: a truncated final row.
+    writeFileSync(filePath, `${readFileSync(filePath, 'utf8')}{"id":"reflection-torn"`, 'utf8');
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  it('names the ledger, the file, and the line a crash left unreadable', () => {
+    expect(() => store.listRecent({ limit: 5 }))
+      .toThrow(/Reflection journal holds unreadable JSON at line 2 of .*journal\.jsonl/u);
+  });
+
+  it('says the same thing on every read path, not only the first one tried', async () => {
+    await expect(store.hasEntry('reflection-anything'))
+      .rejects.toThrow(/Reflection journal holds unreadable JSON at line 2/u);
+    await expect(store.listConcernArcs({ limit: 5 }))
+      .rejects.toThrow(/Reflection journal holds unreadable JSON at line 2/u);
+  });
+
+  it('carries the location and never the row', () => {
+    // `JSON.parse` quotes the offending input back into its own message, so a
+    // diagnostic that forwarded it would put the companion's prose into a log.
+    for (const torn of [
+      'a private thing the companion wrote\n',
+      '{"reflection": a private thing the companion wrote}\n',
+      '{"id":"reflection-1","reflection":"a private thing the companion wrote"\n',
+    ]) {
+      writeFileSync(filePath, torn, 'utf8');
+
+      let message = '';
+      try {
+        store.listRecent({ limit: 5 });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+
+      expect(message).toContain('unreadable JSON at line 1');
+      expect(message).toContain(filePath);
+      expect(message).not.toContain('private');
+      expect(message).not.toContain('companion wrote');
+    }
+  });
+});

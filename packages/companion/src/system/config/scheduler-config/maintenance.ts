@@ -1,0 +1,152 @@
+import { isRecord } from '../../../shared/utils/types.js';
+import { assertNoUnknownKeys } from '../validators.js';
+import { toInterval, toPositiveInteger } from './primitives.js';
+
+/**
+ * Shared cadence for cheap background housekeeping. The runtime exposes every
+ * operation attached to this tick in Garden; this is deliberately one honest
+ * knob rather than a hidden alias or one interval per maintenance operation.
+ */
+export interface BackgroundMaintenanceConfig {
+  /** Shared poll interval for every operation listed by the bundled task. */
+  intervalMs: number;
+  /** Bounded approved shared-world projection drift checks per maintenance tick. */
+  sharedWorldWikiCaretaker: {
+    batchSize: number;
+  };
+  /** Bounded doing-mirror dispositions whose Letter delivery is redriven per tick. */
+  doingMirrorLetters: {
+    batchSize: number;
+    /**
+     * Consecutive delivery failures a disposition may accumulate before the
+     * drain quarantines it. A quarantined row stops competing for the bounded
+     * batch, stays visible in Garden with its last error, and only an explicit
+     * operator retry clears the counter.
+     */
+    maxDeliveryFailures: number;
+  };
+  /** Ambient-presence eligibility thresholds evaluated on the shared tick. */
+  ambientPresence: {
+    minIdleMinutes: number;
+    minNoteIntervalMinutes: number;
+  };
+  /** Concern-set grooming threshold evaluated on the shared tick. */
+  concernGrooming: {
+    maxActiveConcerns: number;
+  };
+}
+
+export const DEFAULT_BACKGROUND_MAINTENANCE_CONFIG: BackgroundMaintenanceConfig = {
+  intervalMs: 3_600_000,
+  sharedWorldWikiCaretaker: {
+    batchSize: 25,
+  },
+  doingMirrorLetters: {
+    batchSize: 25,
+    maxDeliveryFailures: 5,
+  },
+  ambientPresence: {
+    minIdleMinutes: 180,
+    minNoteIntervalMinutes: 360,
+  },
+  concernGrooming: {
+    maxActiveConcerns: 7,
+  },
+};
+
+/**
+ * psfn-framework-cziwg: scheduler.json > artifactLifecycle lost its only
+ * reader when ArtifactLifecycleManager was retired (psfn-framework-yn6hy). An
+ * owner that still carries the block fails closed with migration guidance
+ * instead of being silently ignored.
+ */
+export function assertArtifactLifecycleRetired(raw: Record<string, unknown>, sourcePath: string): void {
+  if (raw.artifactLifecycle === undefined) return;
+  throw new Error(
+    `Invalid scheduler config at ${sourcePath}: artifactLifecycle was retired (it had no runtime consumer). `
+    + 'Run `npm run migrate:scheduler-owner -- --data-dir <companion-data-dir>` to plan the removal, then '
+    + 're-run it with --apply; no other setting changes.',
+  );
+}
+
+export function validateBackgroundMaintenanceConfig(
+  raw: unknown,
+  sourcePath: string,
+): BackgroundMaintenanceConfig {
+  if (!isRecord(raw)) {
+    throw new Error(`Invalid scheduler config at ${sourcePath}: backgroundMaintenance must be an object`);
+  }
+  if (!isRecord(raw.ambientPresence)) {
+    throw new Error(
+      `Invalid scheduler config at ${sourcePath}: backgroundMaintenance.ambientPresence must be an object`,
+    );
+  }
+  if (!isRecord(raw.sharedWorldWikiCaretaker)) {
+    throw new Error(
+      `Invalid scheduler config at ${sourcePath}: backgroundMaintenance.sharedWorldWikiCaretaker must be an object`,
+    );
+  }
+  assertNoUnknownKeys(
+    raw.sharedWorldWikiCaretaker,
+    ['batchSize'],
+    `${sourcePath}.backgroundMaintenance.sharedWorldWikiCaretaker`,
+    { errorPrefix: 'Invalid scheduler config' },
+  );
+  if (!isRecord(raw.doingMirrorLetters)) {
+    throw new Error(
+      `Invalid scheduler config at ${sourcePath}: backgroundMaintenance.doingMirrorLetters must be an object`,
+    );
+  }
+  assertNoUnknownKeys(
+    raw.doingMirrorLetters,
+    ['batchSize', 'maxDeliveryFailures'],
+    `${sourcePath}.backgroundMaintenance.doingMirrorLetters`,
+    { errorPrefix: 'Invalid scheduler config' },
+  );
+  if (!isRecord(raw.concernGrooming)) {
+    throw new Error(
+      `Invalid scheduler config at ${sourcePath}: backgroundMaintenance.concernGrooming must be an object`,
+    );
+  }
+  return {
+    intervalMs: toInterval(raw.intervalMs, 'backgroundMaintenance.intervalMs'),
+    sharedWorldWikiCaretaker: {
+      batchSize: toPositiveInteger(
+        raw.sharedWorldWikiCaretaker.batchSize,
+        'backgroundMaintenance.sharedWorldWikiCaretaker.batchSize',
+        1,
+      ),
+    },
+    doingMirrorLetters: {
+      batchSize: toPositiveInteger(
+        raw.doingMirrorLetters.batchSize,
+        'backgroundMaintenance.doingMirrorLetters.batchSize',
+        1,
+      ),
+      maxDeliveryFailures: toPositiveInteger(
+        raw.doingMirrorLetters.maxDeliveryFailures,
+        'backgroundMaintenance.doingMirrorLetters.maxDeliveryFailures',
+        1,
+      ),
+    },
+    ambientPresence: {
+      minIdleMinutes: toPositiveInteger(
+        raw.ambientPresence.minIdleMinutes,
+        'backgroundMaintenance.ambientPresence.minIdleMinutes',
+        1,
+      ),
+      minNoteIntervalMinutes: toPositiveInteger(
+        raw.ambientPresence.minNoteIntervalMinutes,
+        'backgroundMaintenance.ambientPresence.minNoteIntervalMinutes',
+        1,
+      ),
+    },
+    concernGrooming: {
+      maxActiveConcerns: toPositiveInteger(
+        raw.concernGrooming.maxActiveConcerns,
+        'backgroundMaintenance.concernGrooming.maxActiveConcerns',
+        1,
+      ),
+    },
+  };
+}

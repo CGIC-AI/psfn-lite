@@ -1,0 +1,392 @@
+// ── Custom Message Types + convertToLlm ──
+// Extends pi-agent-core's AgentMessage with companion-specific types
+// via TypeScript declaration merging. These are first-class in our session
+// pipeline but get flattened to standard Messages before hitting the LLM.
+
+import type {
+  Message,
+  UserMessage,
+  AssistantMessage as PiAssistantMessage,
+  ToolResultMessage,
+} from '@earendil-works/pi-ai';
+import type { AgentMessage } from '../../boundary/pi-agent/index.js';
+import type { SessionEntry, CompactionSummary } from '../session/types.js';
+import { parseToolObservationMetadata } from '../session/tool-observation.js';
+import {
+  MESSAGE_CLASSES,
+  tagMessageClass,
+  type MessageClassMetadata,
+} from './message-classes.js';
+import { renderSystemLanguageTemplate } from '../identity/system-language.js';
+import {
+  attachToolResultInvocationAudit,
+  stripToolResultInvocationAuditForModel,
+} from './tool-result-invocation-audit.js';
+import { parseLetterSessionMetadata } from '../letters/contracts.js';
+
+// ── Custom message types ──
+
+export interface CompactionMessage {
+  role: 'custom';
+  type: 'compaction';
+  messageClass: typeof MESSAGE_CLASSES.compaction;
+  summary: string;
+  coveredUpTo: number;
+  timestamp: number;
+}
+
+export interface SystemNoteMessage {
+  role: 'custom';
+  type: 'systemNote';
+  messageClass: typeof MESSAGE_CLASSES.systemNote;
+  content: string;
+  timestamp: number;
+}
+
+export interface InternalWhisperMessage {
+  role: 'custom';
+  type: 'internalWhisper';
+  messageClass: typeof MESSAGE_CLASSES.internalWhisper;
+  content: string;
+  speakerName?: string;
+  timestamp: number;
+}
+
+export interface ContinuityMessage {
+  role: 'custom';
+  type: 'continuity';
+  messageClass: typeof MESSAGE_CLASSES.continuity;
+  content: string;
+  originChannelId: string;
+  timestamp: number;
+}
+
+export interface MirrorMessage {
+  role: 'custom';
+  type: 'mirror';
+  messageClass: typeof MESSAGE_CLASSES.mirror;
+  content: string;
+  originChannelId: string;
+  sourceRole: 'user' | 'assistant';
+  sourceAuthorName?: string;
+  timestamp: number;
+}
+
+interface ClassifiedUserMessage extends UserMessage, MessageClassMetadata {}
+interface ClassifiedAssistantMessage extends PiAssistantMessage, MessageClassMetadata {}
+
+interface MirrorSessionMetadata {
+  type: 'mirror';
+  sourceChannelId?: string;
+  sourceRole?: 'user' | 'assistant';
+  sourceAuthorName?: string;
+}
+
+const MAX_MIRROR_RENDER_CHARS = 180;
+const LEGACY_OR_CANONICAL_MUSING_CHANNEL_PATTERN = /^internal:reflection:(musing|whisper)$/i;
+
+function createInternalAssistantMessage(
+  content: string,
+  timestamp: number,
+  messageClass: typeof MESSAGE_CLASSES.systemNote | typeof MESSAGE_CLASSES.internalWhisper,
+): ClassifiedAssistantMessage {
+  return {
+    role: 'assistant',
+    content: [{ type: 'text', text: content }],
+    api: '',
+    provider: '',
+    model: '',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'stop',
+    timestamp,
+    messageClass,
+  };
+}
+
+// ── Declaration merging ──
+// Sanctioned direct pi-agent-core coupling: module augmentation must target
+// the real package name (a re-export path cannot be augmented), so this block
+// stays outside src/boundary/pi-agent. It is not an import statement, so the
+// no-restricted-imports boundary rule does not apply. On a pi-agent-core
+// bump, confirm upstream still exposes the `CustomAgentMessages` extension
+// hook (see src/boundary/pi-agent/index.ts).
+
+declare module '@earendil-works/pi-agent-core' {
+  interface CustomAgentMessages {
+    compaction: CompactionMessage;
+    systemNote: SystemNoteMessage;
+    internalWhisper: InternalWhisperMessage;
+    continuity: ContinuityMessage;
+    mirror: MirrorMessage;
+  }
+}
+
+// ── Type guards ──
+
+/** Narrow AgentMessage to a record so we can check arbitrary properties without `as any`. */
+function hasCustomRole(m: AgentMessage): m is AgentMessage & { role: 'custom'; type: string } {
+  const record = m as unknown as Record<string, unknown>;
+  return record.role === 'custom' && typeof record.type === 'string';
+}
+
+export function isCompactionMessage(m: AgentMessage): m is CompactionMessage {
+  return hasCustomRole(m) && m.type === 'compaction';
+}
+
+export function isSystemNoteMessage(m: AgentMessage): m is SystemNoteMessage {
+  return hasCustomRole(m) && m.type === 'systemNote';
+}
+
+export function isInternalWhisperMessage(m: AgentMessage): m is InternalWhisperMessage {
+  return hasCustomRole(m) && m.type === 'internalWhisper';
+}
+
+export function isContinuityMessage(m: AgentMessage): m is ContinuityMessage {
+  return hasCustomRole(m) && m.type === 'continuity';
+}
+
+export function isMirrorMessage(m: AgentMessage): m is MirrorMessage {
+  return hasCustomRole(m) && m.type === 'mirror';
+}
+
+export function isCustomMessage(m: AgentMessage): boolean {
+  return hasCustomRole(m);
+}
+
+function resolveStandardMessageClass(
+  message: AgentMessage,
+): typeof MESSAGE_CLASSES.outwardSpeech | typeof MESSAGE_CLASSES.musing | typeof MESSAGE_CLASSES.letter {
+  const existingMessageClass = (message as { messageClass?: unknown }).messageClass;
+  if (existingMessageClass === MESSAGE_CLASSES.letter) return MESSAGE_CLASSES.letter;
+  return existingMessageClass === MESSAGE_CLASSES.musing
+    ? MESSAGE_CLASSES.musing
+    : MESSAGE_CLASSES.outwardSpeech;
+}
+
+function isMusingReflectionChannel(channelId: string): boolean {
+  return LEGACY_OR_CANONICAL_MUSING_CHANNEL_PATTERN.test(channelId.trim());
+}
+
+// ── convertToLlm ──
+
+/**
+ * Convert AgentMessage[] to LLM-compatible Message[].
+ *
+ * Standard messages (user, assistant, toolResult) pass through.
+ * Custom messages are converted:
+ * - compaction → user message with summary prefix
+ * - systemNote → assistant-side internal note with [System note] prefix
+ * - internalWhisper → assistant-side private runtime note
+ * - mirror → compact user-side mirror note
+ * - continuity → filtered out (injected into system prompt instead)
+ */
+export function convertToLlm(messages: AgentMessage[]): Message[] {
+  const result: Message[] = [];
+
+  for (const msg of messages) {
+    if (isCompactionMessage(msg)) {
+      const message = {
+        role: 'user',
+        content: `${renderSystemLanguageTemplate('compaction.header')}\n${msg.summary}`,
+        timestamp: msg.timestamp,
+        messageClass: MESSAGE_CLASSES.compaction,
+      } as ClassifiedUserMessage;
+      result.push(message);
+    } else if (isSystemNoteMessage(msg)) {
+      result.push(createInternalAssistantMessage(
+        `${renderSystemLanguageTemplate('system_note.prefix')} ${msg.content}`,
+        msg.timestamp,
+        MESSAGE_CLASSES.systemNote,
+      ));
+    } else if (isInternalWhisperMessage(msg)) {
+      result.push(createInternalAssistantMessage(
+        `${renderSystemLanguageTemplate('internal_whisper.prefix')} ${msg.content}`,
+        msg.timestamp,
+        MESSAGE_CLASSES.internalWhisper,
+      ));
+    } else if (isContinuityMessage(msg)) {
+      // Continuity messages are injected into system prompt, not as individual messages.
+      // Skip in LLM conversion.
+      continue;
+    } else if (isMirrorMessage(msg)) {
+      // Charter 8.12: a missing author name must never surface the raw wire role
+      // ("user"/"assistant") to the companion; fall back to a named, companion-
+      // configurable neutral label instead.
+      const speaker = msg.sourceAuthorName?.trim()
+        || renderSystemLanguageTemplate(
+          msg.sourceRole === 'assistant'
+            ? 'mirror_note.speaker_self'
+            : 'mirror_note.speaker_other',
+        );
+      const message = {
+        role: 'user',
+        content: `[Mirror note from ${msg.originChannelId}] ${speaker}: ${compactMirrorText(msg.content)}`,
+        timestamp: msg.timestamp,
+        messageClass: MESSAGE_CLASSES.mirror,
+      } as ClassifiedUserMessage;
+      result.push(message);
+    } else {
+      // Standard pi-ai Message — pass through, preserving canonical outward subtypes.
+      const standardRole = (msg as { role?: unknown }).role;
+      if (standardRole === 'toolResult') {
+        result.push(stripToolResultInvocationAuditForModel(msg as ToolResultMessage));
+      } else if (standardRole === 'user' || standardRole === 'assistant') {
+        result.push(tagMessageClass(msg, resolveStandardMessageClass(msg)) as Message);
+      } else {
+        throw new Error(`Unsupported agent message role "${String(standardRole)}"`);
+      }
+    }
+  }
+
+  return renderTrailingSystemNoteAsTurnTrigger(result);
+}
+
+/**
+ * A self-directed internal turn (free time, exploration, reflection) is
+ * triggered by a system note, so its conversation would END on the
+ * assistant-side note with no user turn. Strict OpenAI-compatible endpoints
+ * (z.ai coding plan: 400 code 1214) reject a request whose last message is an
+ * assistant message, so the trailing note -- and only a trailing one -- is sent
+ * as the user-role turn trigger. Its attribution prefix and content are
+ * unchanged, so it still reads as a runtime note rather than Participant speech
+ * (psfn-framework-3pye5).
+ */
+function renderTrailingSystemNoteAsTurnTrigger(result: Message[]): Message[] {
+  const last = result.at(-1) as (Message & { messageClass?: string }) | undefined;
+  if (!last || last.role !== 'assistant' || last.messageClass !== MESSAGE_CLASSES.systemNote) {
+    return result;
+  }
+  const text = (last as PiAssistantMessage).content
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map(block => block.text)
+    .join('');
+  result[result.length - 1] = {
+    role: 'user',
+    content: text,
+    timestamp: last.timestamp,
+    messageClass: MESSAGE_CLASSES.systemNote,
+  } as ClassifiedUserMessage;
+  return result;
+}
+
+// ── Session entry conversion ──
+
+/**
+ * Convert a SessionEntry (from JSONL) to an AgentMessage.
+ * This bridges the session store format to pi-agent-core's type system.
+ */
+export function sessionEntryToMessage(entry: SessionEntry): AgentMessage {
+  const ts = entry.timestamp;
+
+  if (entry.role === 'system') {
+    const mirrorMetadata = parseMirrorSessionMetadata(entry.metadata);
+    if (mirrorMetadata) {
+      return {
+        role: 'custom',
+        type: 'mirror',
+        messageClass: MESSAGE_CLASSES.mirror,
+        content: entry.content,
+        originChannelId: mirrorMetadata.sourceChannelId ?? entry.originChannelId ?? entry.channelId,
+        sourceRole: mirrorMetadata.sourceRole ?? 'assistant',
+        sourceAuthorName: mirrorMetadata.sourceAuthorName,
+        timestamp: ts,
+      } satisfies MirrorMessage;
+    }
+
+    return {
+      role: 'custom',
+      type: 'systemNote',
+      messageClass: MESSAGE_CLASSES.systemNote,
+      content: entry.content,
+      timestamp: ts,
+    } satisfies SystemNoteMessage;
+  }
+
+  if (entry.role === 'user') {
+    const messageClass = parseLetterSessionMetadata(entry.metadata)
+      ? MESSAGE_CLASSES.letter
+      : MESSAGE_CLASSES.outwardSpeech;
+    const message = {
+      role: 'user',
+      content: entry.content,
+      timestamp: ts,
+      messageClass,
+    } as ClassifiedUserMessage;
+    return message;
+  }
+
+  if (entry.role === 'tool') {
+    const toolObservation = parseToolObservationMetadata(entry.metadata);
+    if (!toolObservation) {
+      throw new Error(`Tool session entry ${entry.channelId}:${entry.id} is missing tool observation metadata`);
+    }
+    const message = {
+      role: 'toolResult',
+      toolCallId: toolObservation.toolCallId ?? `${entry.channelId}:${entry.id}`,
+      toolName: toolObservation.toolName,
+      content: [{ type: 'text', text: entry.content }],
+      isError: toolObservation.isError ?? false,
+      timestamp: ts,
+    } satisfies ToolResultMessage;
+    return toolObservation.invocationAudit
+      ? attachToolResultInvocationAudit(message, toolObservation.invocationAudit)
+      : message;
+  }
+
+  // assistant
+  const message = {
+    role: 'assistant',
+    content: [{ type: 'text', text: entry.content }],
+    api: '',
+    provider: '',
+    model: '',
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: 'stop',
+    timestamp: ts,
+    messageClass: parseLetterSessionMetadata(entry.metadata)
+      ? MESSAGE_CLASSES.letter
+      : isMusingReflectionChannel(entry.channelId)
+        ? MESSAGE_CLASSES.musing
+        : MESSAGE_CLASSES.outwardSpeech,
+  } as ClassifiedAssistantMessage;
+  return message;
+}
+
+/**
+ * Convert a CompactionSummary to a CompactionMessage.
+ */
+export function compactionToMessage(summary: CompactionSummary): CompactionMessage {
+  return {
+    role: 'custom',
+    type: 'compaction',
+    messageClass: MESSAGE_CLASSES.compaction,
+    summary: summary.summary,
+    coveredUpTo: summary.coveredUpTo,
+    timestamp: summary.createdAt,
+  };
+}
+
+function compactMirrorText(content: string): string {
+  const normalized = content.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= MAX_MIRROR_RENDER_CHARS) return normalized;
+  return `${normalized.slice(0, MAX_MIRROR_RENDER_CHARS - 3)}...`;
+}
+
+function parseMirrorSessionMetadata(metadata?: string): MirrorSessionMetadata | null {
+  if (!metadata) return null;
+
+  try {
+    const parsed = JSON.parse(metadata) as Partial<MirrorSessionMetadata>;
+    if (parsed.type !== 'mirror') return null;
+    return parsed as MirrorSessionMetadata;
+  } catch {
+    return null;
+  }
+}

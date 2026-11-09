@@ -12,10 +12,9 @@ prepares. The storage pattern (WAL, FULL sync, owner-only file, a binding
 row that refuses another bridge) is kept from the donor adapter's outbox
 (integrations/hermes-memory/psfn_memory/outbox.py).
 
-Rows carry their credential scope: ``standing`` rows were made with the
-profile's standing credential and any standing process of the profile may
-deliver them; ``job`` rows belong to one delegated internal-turn process,
-whose minted credential no other process holds.
+Rows carry their credential scope: every row is ``standing`` (made with
+the profile's standing credential), so any process of the profile may
+deliver it.
 """
 
 import json
@@ -26,7 +25,6 @@ from pathlib import Path
 
 SCHEMA_VERSION = 2
 STANDING = "standing"
-JOB = "job"
 
 
 def _encode(value) -> str:
@@ -78,12 +76,12 @@ class Ledger:
             )
             return int(cursor.lastrowid)
 
-    def open_turn(self, *, session_id: str, host_instance: str, scope: str, pid: int, hermes_turn: str, prepare: dict) -> int:
+    def open_turn(self, *, session_id: str, host_instance: str, pid: int, hermes_turn: str, prepare: dict) -> int:
         """The row of a turn about to be prepared; deleted once its settlement is accepted."""
         with self._connect() as db:
             cursor = db.execute(
                 "INSERT INTO events(kind,session_id,turn_id,payload,error,at_ms,host_instance,scope) VALUES('turn',?,NULL,?,'',?,?,?)",
-                (session_id, _encode({"pid": pid, "hermesTurn": hermes_turn, "prepare": prepare}), _now(), host_instance, scope),
+                (session_id, _encode({"pid": pid, "hermesTurn": hermes_turn, "prepare": prepare}), _now(), host_instance, STANDING),
             )
             return int(cursor.lastrowid)
 
@@ -105,14 +103,11 @@ class Ledger:
             rows = db.execute("SELECT sequence,session_id,turn_id,payload,host_instance,scope FROM events WHERE kind='turn' ORDER BY sequence")
             return [_row(r, ("sequence", "session_id", "turn_id", "payload", "host_instance", "scope")) for r in rows]
 
-    def pending_settlements(self, *, scope: str, instance: str) -> list:
-        """Kept settlements this process may deliver: every standing one, or a job process's own."""
+    def pending_settlements(self) -> list:
+        """Kept settlements this process may deliver."""
         query = "SELECT sequence,session_id,turn_id,payload,host_instance,scope FROM events WHERE kind='settle' AND payload IS NOT NULL"
         with self._connect() as db:
-            if scope == STANDING:
-                rows = db.execute(query + " AND scope=? ORDER BY sequence", (STANDING,))
-            else:
-                rows = db.execute(query + " AND scope=? AND host_instance=? ORDER BY sequence", (JOB, instance))
+            rows = db.execute(query + " AND scope=? ORDER BY sequence", (STANDING,))
             return [_row(r, ("sequence", "session_id", "turn_id", "payload", "host_instance", "scope")) for r in rows]
 
     def resolve(self, sequence: int) -> None:

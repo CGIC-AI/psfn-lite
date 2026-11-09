@@ -1,8 +1,8 @@
 /**
  * The stdio transport in a real child process, driven by the SDK's stdio
- * client: the process's credential selects its binding, every call is still
- * admitted through core ingress, and an unbound credential stops startup
- * without echoing it.
+ * client: the process's credential selects its binding, every call reaches
+ * the host tool port as that principal, and an unbound credential stops
+ * startup without echoing it.
  */
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { afterEach, describe, expect, it } from 'vitest';
-import { TOOL_INVENTORY } from '../../packages/core/src/index.ts';
+import { TOOLS } from './fixtures/port.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..');
 const FIXTURE = join(import.meta.dirname, 'fixtures', 'stdio-server.ts');
@@ -22,30 +22,23 @@ afterEach(async () => {
 });
 
 function credentials() {
-  return { primary: randomBytes(32).toString('base64url'), friend: randomBytes(32).toString('base64url') };
+  return { robin: randomBytes(32).toString('base64url'), sam: randomBytes(32).toString('base64url') };
 }
 
 function environment(creds: ReturnType<typeof credentials>, presented: string): Record<string, string> {
-  return { PATH: process.env['PATH'] ?? '', STDIO_PRIMARY: creds.primary, STDIO_FRIEND: creds.friend, LITE_MCP_CREDENTIAL: presented };
+  return { PATH: process.env['PATH'] ?? '', STDIO_ROBIN: creds.robin, STDIO_SAM: creds.sam, LITE_MCP_CREDENTIAL: presented };
 }
 
 describe('stdio transport', () => {
-  it('serves the inventory to the bound principal of the process', async () => {
+  it('serves the host catalog to the bound principal of the process', async () => {
     const creds = credentials();
     const client = new Client({ name: 'stdio-test', version: '0.0.0' });
     clients.push(client);
-    await client.connect(new StdioClientTransport({ command: process.execPath, args: ARGS, cwd: ROOT, env: environment(creds, creds.friend), stderr: 'pipe' }));
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: ARGS, cwd: ROOT, env: environment(creds, creds.sam), stderr: 'pipe' }));
     const listed = await client.listTools();
-    expect(listed.tools.map((t) => t.name)).toEqual(TOOL_INVENTORY.map((t) => t.name));
-
-    const written = await client.callTool({ name: 'memory', arguments: { action: 'write', writeId: 'w-1', kind: 'fact', content: 'Sam keeps a sourdough starter', sensitivity: 'personal' } });
-    expect(written.isError).not.toBe(true);
-    const found = await client.callTool({ name: 'memory', arguments: { action: 'search', query: 'sourdough' } });
-    expect(JSON.stringify(found.structuredContent)).toContain('sourdough');
-    // The process is Sam's: the companion-private reflection list stays closed to it.
-    const denied = await client.callTool({ name: 'journal', arguments: { action: 'reflections_list' } });
-    expect(denied.isError).toBe(true);
-    expect(denied.structuredContent).toMatchObject({ error: { kind: 'denied', reason: 'audience_not_admitted' } });
+    expect(listed.tools.map((t) => t.name)).toEqual(TOOLS.map((t) => t.name));
+    const called = await client.callTool({ name: 'memory', arguments: { action: 'search', principal: 'robin' } });
+    expect(called.structuredContent).toEqual({ origin: 'tool_result', text: 'ran memory for sam' });
   }, 30_000);
 
   it('refuses to start with an unbound credential and does not echo it', () => {
@@ -55,6 +48,6 @@ describe('stdio transport', () => {
     expect(run.status).toBe(2);
     expect(run.stdout).toBe('');
     expect(run.stderr).toContain('unknown_authority');
-    for (const secret of [presented, creds.primary, creds.friend]) expect(run.stderr).not.toContain(secret);
+    for (const secret of [presented, creds.robin, creds.sam]) expect(run.stderr).not.toContain(secret);
   }, 30_000);
 });

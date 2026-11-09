@@ -1,0 +1,28 @@
+{
+  "name": "lite-companion",
+  "version": "0.0.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "type": "module",
+  "description": "The PSFN companion core, extracted path-preserving from psfn-framework at e6a9546051f4e92bf7218b133b4523ac53a797c0.",
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.84.1",
+    "@earendil-works/pi-ai": "0.84.1",
+    "@huggingface/transformers": "4.2.0",
+    "@sinclair/typebox": "0.34.48",
+    "js-tiktoken": "1.0.21",
+    "pg": "8.20.0",
+    "uuid": "11.1.1",
+    "winston": "3.19.0"
+  },
+  "devDependencies": {
+    "@total-typescript/shoehorn": "0.1.2",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  }
+}

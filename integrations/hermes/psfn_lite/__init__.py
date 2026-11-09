@@ -9,6 +9,7 @@ from .provider import PsfnLiteProvider
 
 
 def register(ctx) -> None:
-    """Registers the MemoryProvider and, once per process, the lifecycle hooks."""
+    """Registers the MemoryProvider and, once per process, the lifecycle hooks and the hosted automata tool."""
     ctx.register_memory_provider(PsfnLiteProvider())
     runtime.register_hooks(ctx)
+    runtime.register_tools(ctx)

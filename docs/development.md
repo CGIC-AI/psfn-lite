@@ -1,7 +1,8 @@
 # Development and validation contract
 
-The repository is at bootstrap, with no product code or installed dependencies.
-Beads contains the executable work plan. Do not mistake this document for a task tracker.
+The product is the extracted donor core (`packages/companion`) and Lite's host
+adapters (see [architecture](architecture.md)). Beads contains the executable
+work plan. Do not mistake this document for a task tracker.
 
 ## Bootstrap commands
 
@@ -54,9 +55,45 @@ state ownership, harness handover and module isolation. Exercise real entrypoint
 and adapters where appropriate; no production in-memory fallback disguised as
 durability. Scope expensive validation to actual risk and changed behavior.
 
-Adapter integration tests (`*.integration.test.ts`) run inside `npx vitest run`
+## Validation commands
+
+```bash
+mise exec node@24.22.1 npm@11.17.0 -- npx tsc --noEmit -p tsconfig.json
+mise exec node@24.22.1 npm@11.17.0 -- npx tsc --noEmit -p packages/companion/tsconfig.json
+mise exec node@24.22.1 npm@11.17.0 -- npx eslint .
+mise exec node@24.22.1 npm@11.17.0 -- npx vitest run
+```
+
+`packages/companion` is the extracted donor core (see [extraction](extraction.md)).
+It keeps the donor's compiler options in its own `tsconfig.json`, so the root
+typecheck and eslint exclude it and the second command typechecks it. `npx vitest
+run` runs two projects: `lite` and `companion` (the extracted donor tests, with the
+donor's test settings). To check the companion tests against the donor baseline:
+
+```bash
+mise exec node@24.22.1 npm@11.17.0 -- npx vitest run --project companion --reporter=json --outputFile=/tmp/companion-report.json
+mise exec node@24.22.1 -- node packages/companion/extraction/compare-baseline.mjs /tmp/companion-report.json
+```
+
+The donor Postgres-harness tests need Docker. Each run gets its own harness
+profile and temp directory, and removes exactly its own containers. The temp
+directory goes under `$TMPDIR` when it is set, else `/tmp`; every test temp file
+lands there, so point `TMPDIR` at a short disk-backed path (for example
+`TMPDIR=/var/tmp/lv`) when `/tmp` is a small tmpfs. Both vitest
+configs cap the run at 16 forks (`maxWorkers`), the shared-workstation budget. Do
+not raise it with `--maxWorkers`: uncapped runs lost forks there (see
+[extraction](extraction.md)).
+
+Lite's integration tests (`*.integration.test.ts`: lifecycle, standalone,
+conformance) run inside `npx vitest run`
 against a throwaway pinned pgvector container, so Docker is required. Without it
 they fail. `LITE_SKIP_DOCKER_TESTS=1` skips them explicitly and prints that it did.
+`tests/standalone/transformers-embeddings.integration.test.ts` starts the
+donor's default embedding provider for real, so it downloads
+`Xenova/all-MiniLM-L6-v2` (91,100,283 bytes) into its temporary data directory.
+Set `LITE_TEST_TRANSFORMERS_CACHE` to a transformers.js cache directory that
+already holds the model (a kept `<dataDir>/models/transformers`) to copy it in
+instead.
 
 Run focused checks during implementation. Fetch the base, commit a clean head,
 run the complete local gate once, and publish through its wrapper. A coherent
@@ -68,12 +105,16 @@ checks pass. Close delivered implementation beads; track later live testing sepa
 
 `integrations/hermes` is Python. Its tests run in a project-local virtualenv
 (`integrations/hermes/.venv`, gitignored) with [uv](https://docs.astral.sh/uv/).
-Hermes itself is installed editable from a throwaway clone at the tested
-revision, `f0187332d13679e2ace74d1f0eb399eb91a90571`. Never install into an
-operator's Hermes checkout, `~/.hermes` profile or `hermes` binary. The suite
-sets `HERMES_HOME` to a temporary directory before importing Hermes, and it
-refuses to run unless the imported Hermes is a git checkout at that revision.
-Every test dependency is pinned exactly in `requirements-test.txt`.
+Hermes itself is installed editable from a throwaway clone at a tested
+revision. Two are tested (`HERMES_REVISIONS` in `psfn_lite/config.py`), and
+the suite runs once against each:
+`f0187332d13679e2ace74d1f0eb399eb91a90571` (Python 3.13, pins in
+`requirements-test.txt`) and `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`
+(Python 3.14, pins in `requirements-test-2bd378e.txt`). Never install into
+an operator's Hermes checkout, `~/.hermes` profile or `hermes` binary. The
+suite sets `HERMES_HOME` to a temporary directory before importing Hermes,
+and it refuses to run unless the imported Hermes is a git checkout at a
+tested revision. Every test dependency is pinned exactly.
 
 ```bash
 HERMES_CLONE=/tmp/hermes-agent-f0187332   # any disposable path
@@ -85,6 +126,30 @@ uv pip install --no-config --python .venv/bin/python -r requirements-test.txt
 uv pip install --no-config --python .venv/bin/python --no-deps -e "$HERMES_CLONE"
 mise exec node@24.22.1 npm@11.17.0 -- .venv/bin/python -I -m pytest -q
 ```
+
+For 2bd378e, use a second virtualenv outside the repository. A live Hermes
+install at that revision can be the clone's source, read-only: clone it
+(`git clone --no-hardlinks --no-checkout <live checkout> "$HERMES_CLONE"`),
+never install into it or run anything inside it. The pins are Hermes's own
+`uv.lock` (Hermes overrides a dependency there, so they install with
+`--no-deps`), plus pytest:
+
+```bash
+HERMES_CLONE=/tmp/hermes-agent-2bd378e   # any disposable path
+git clone --no-checkout https://github.com/NousResearch/hermes-agent.git "$HERMES_CLONE"
+git -C "$HERMES_CLONE" checkout --detach 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+VENV=/tmp/psfn-hermes-2bd378e-venv        # any disposable path
+uv venv --no-config --python 3.14 "$VENV"
+uv pip install --no-config --no-deps --python "$VENV/bin/python" -r integrations/hermes/requirements-test-2bd378e.txt
+uv pip install --no-config --no-deps --python "$VENV/bin/python" -e "$HERMES_CLONE"
+cd integrations/hermes
+mise exec node@24.22.1 npm@11.17.0 -- "$VENV/bin/python" -I -m pytest -q -p no:cacheprovider
+```
+
+`requirements-test-2bd378e.txt` is
+`uv export --no-config --frozen --no-hashes --no-header --no-annotate --extra mcp --no-dev --no-emit-project --python 3.14`
+run in the clone, followed by `iniconfig==2.3.1`, `pluggy==1.7.0` and
+`pytest==8.4.2`.
 
 Hermes's `setup.py` refuses to build a wheel, so it cannot be a locked uv git
 dependency; hence the editable install with `--no-deps`. `--no-config` keeps
@@ -103,9 +168,12 @@ uv pip compile --no-config "$HERMES_CLONE/pyproject.toml" /tmp/psfn-test-extra.i
 conformance host process the TypeScript runner drives. It needs the same
 Docker, Node and `node_modules`. See [conformance](conformance.md).
 
-`tests/test_e2e_lite.py` starts `tests/hermes/fixtures/lite-host.ts` (the
-standalone runtime over a throwaway pgvector container, with the MCP
-transport and the lifecycle bridge on loopback), so it needs Docker, Node on
-`PATH` (hence `mise exec`) and the repository's `node_modules`. As with the
+`tests/test_e2e_lite.py` starts `tests/hermes/fixtures/lite-host.ts` with
+`node --import tsx`. That is the conformance host (the standalone runtime
+over the extracted companion core, with the MCP transport and the lifecycle
+bridge on loopback) over a throwaway pgvector container. Before it reports
+ready, a seed turn of the standalone writes a thread for the Hermes tests
+to find. So the e2e tests need Docker, Node on `PATH` (hence `mise exec`)
+and the repository's `node_modules`. As with the
 TypeScript integration suites, `LITE_SKIP_DOCKER_TESTS=1` skips it explicitly.
 

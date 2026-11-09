@@ -1,0 +1,233 @@
+import { toError } from '../../shared/utils/errors.js';
+import { isExplicitToolContractError, isExplicitToolRequestError } from './explicit-tool-request.js';
+
+export type LLMErrorCategory =
+  | 'abort'
+  | 'endpoint_message_role'
+  | 'context_overflow'
+  | 'payment_required'
+  | 'rate_limit'
+  | 'connection_unavailable'
+  | 'timeout'
+  | 'auth'
+  | 'empty_response'
+  | 'tool_contract_incompatible'
+  | 'explicit_tool_request_invalid'
+  | 'unknown';
+
+export interface LLMErrorClassification {
+  category: LLMErrorCategory;
+  retryable: boolean;
+  statusCode?: number;
+}
+
+interface ErrorLike {
+  status?: unknown;
+  statusCode?: unknown;
+  code?: unknown;
+  response?: {
+    status?: unknown;
+  };
+  cause?: unknown;
+}
+
+const ABORT_PATTERNS = [
+  'abort',
+  'cancelled',
+  'canceled',
+] as const;
+
+// Coding-plan endpoints (z.ai GLM Code Plan and siblings) reject
+// conversations that do not end on a user- or tool-role message with
+// 400 {"code":"1214","message":"The messages parameter is illegal"}
+// (psfn-framework-3pye5, docs/setup.md "Coding-plan endpoints and
+// self-directed turns"). That is an endpoint-specific request-shape rule,
+// not an oversized prompt: the same request is accepted by other providers,
+// so a fallback candidate must get it (psfn-framework-ooy34). Matched on the
+// verbatim vendor message and on the body's code forms before the bare-400
+// context-overflow branch can swallow it.
+const CODING_PLAN_MESSAGE_ROLE_PATTERNS = [
+  'the messages parameter is illegal',
+  '"code":"1214"',
+  '"code": "1214"',
+  'code=1214',
+] as const;
+
+const CONTEXT_OVERFLOW_PATTERNS = [
+  'context length',
+  'maximum context length',
+  'prompt is too long',
+  'prompt too long',
+  'context window',
+  'too many tokens',
+  'token limit',
+  'input is too long',
+] as const;
+
+const RATE_LIMIT_PATTERNS = [
+  'rate limit',
+  'too many requests',
+  'quota exceeded',
+  'requests per minute',
+  'tokens per minute',
+  'over capacity',
+  'temporarily overloaded',
+] as const;
+
+const PAYMENT_REQUIRED_PATTERNS = [
+  'payment required',
+  'insufficient credits',
+  'insufficient balance',
+  'credits this account can afford',
+] as const;
+
+const CONNECTION_UNAVAILABLE_PATTERNS = [
+  'api connection error',
+  'connection error',
+  'cannot connect to host',
+  'connect call failed',
+  'connection refused',
+  'destination host unreachable',
+  'no route to host',
+  'network is unreachable',
+] as const;
+
+const TIMEOUT_PATTERNS = [
+  'timeout',
+  'timed out',
+  'deadline exceeded',
+  'socket hang up',
+  'connection reset',
+  'econnreset',
+  'etimedout',
+  'eai_again',
+  'network timeout',
+] as const;
+
+const AUTH_PATTERNS = [
+  'unauthorized',
+  'forbidden',
+  'invalid api key',
+  'authentication failed',
+  'authentication error',
+  'access denied',
+  'permission denied',
+] as const;
+
+const EMPTY_RESPONSE_PATTERNS = [
+  'contained no text',
+  'contained no text or tool calls',
+  'empty response',
+  'empty assistant',
+  'no text content',
+  'provider template artifact',
+] as const;
+
+function getStatusCode(error: ErrorLike): number | undefined {
+  const fromError = typeof error.status === 'number' ? error.status : undefined;
+  if (fromError !== undefined && Number.isFinite(fromError)) return fromError;
+
+  const fromStatusCode = typeof error.statusCode === 'number' ? error.statusCode : undefined;
+  if (fromStatusCode !== undefined && Number.isFinite(fromStatusCode)) return fromStatusCode;
+
+  const fromResponse = typeof error.response?.status === 'number'
+    ? error.response.status
+    : undefined;
+  if (fromResponse !== undefined && Number.isFinite(fromResponse)) return fromResponse;
+
+  return undefined;
+}
+
+function includesAny(haystack: string, needles: readonly string[]): boolean {
+  return needles.some((needle) => haystack.includes(needle));
+}
+
+function readErrorCode(error: ErrorLike): string | undefined {
+  if (typeof error.code === 'string' && error.code.trim().length > 0) {
+    return error.code.toUpperCase();
+  }
+  if (error.cause && typeof error.cause === 'object') {
+    return readErrorCode(error.cause as ErrorLike);
+  }
+  return undefined;
+}
+
+export function classifyLLMError(error: unknown): LLMErrorClassification {
+  const err = toError(error);
+  const errorLike = err as ErrorLike;
+  const statusCode = getStatusCode(errorLike);
+  const text = `${err.name} ${err.message}`.toLowerCase();
+  const code = readErrorCode(errorLike);
+
+  // The participant's own exact arguments are invalid for this tool surface;
+  // another attempt or candidate cannot change that.
+  if (isExplicitToolRequestError(error)) {
+    return {
+      category: 'explicit_tool_request_invalid',
+      retryable: false,
+      ...(statusCode !== undefined ? { statusCode } : {}),
+    };
+  }
+
+  if (isExplicitToolContractError(error)) {
+    return {
+      category: 'tool_contract_incompatible',
+      retryable: true,
+      ...(statusCode !== undefined ? { statusCode } : {}),
+    };
+  }
+
+  const abortByCode = code === 'ABORT_ERR' || code === 'ERR_ABORTED';
+  const abortByName = err.name === 'AbortError';
+  if (abortByCode || abortByName || includesAny(text, ABORT_PATTERNS)) {
+    return { category: 'abort', retryable: false, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  // Must run before the bare-400 context-overflow branch: a coding-plan
+  // message-role rejection is a 400 whose text names the vendor rule, and it
+  // is only recoverable by moving to a different candidate (ooy34).
+  if (statusCode === 400 && includesAny(text, CODING_PLAN_MESSAGE_ROLE_PATTERNS)) {
+    return { category: 'endpoint_message_role', retryable: true, statusCode };
+  }
+
+  const contextStatus = statusCode === 400 || statusCode === 413 || statusCode === 422;
+
+  if (contextStatus || includesAny(text, CONTEXT_OVERFLOW_PATTERNS)) {
+    return { category: 'context_overflow', retryable: false, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  if (statusCode === 402 || includesAny(text, PAYMENT_REQUIRED_PATTERNS)) {
+    return {
+      category: 'payment_required',
+      retryable: false,
+      ...(statusCode !== undefined ? { statusCode } : {}),
+    };
+  }
+
+  if (statusCode === 429 || includesAny(text, RATE_LIMIT_PATTERNS)) {
+    return { category: 'rate_limit', retryable: true, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  const connectionUnavailableCode = code === 'ECONNREFUSED'
+    || code === 'EHOSTUNREACH'
+    || code === 'ENETUNREACH';
+  if (connectionUnavailableCode || includesAny(text, CONNECTION_UNAVAILABLE_PATTERNS)) {
+    return { category: 'connection_unavailable', retryable: true, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  const timeoutStatus = statusCode === 408 || statusCode === 504;
+  const timeoutCode = code === 'ETIMEDOUT' || code === 'ECONNABORTED' || code === 'ECONNRESET';
+  if (timeoutStatus || timeoutCode || includesAny(text, TIMEOUT_PATTERNS)) {
+    return { category: 'timeout', retryable: true, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  if (statusCode === 401 || statusCode === 403 || includesAny(text, AUTH_PATTERNS)) {
+    return { category: 'auth', retryable: true, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  if (includesAny(text, EMPTY_RESPONSE_PATTERNS)) {
+    return { category: 'empty_response', retryable: true, ...(statusCode !== undefined ? { statusCode } : {}) };
+  }
+
+  return { category: 'unknown', retryable: true, ...(statusCode !== undefined ? { statusCode } : {}) };
+}

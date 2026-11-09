@@ -1,0 +1,158 @@
+// ── E3.4 contact-tracking policy gate: approval-flow integration ──
+// AC1: approval-mode room — a new speaker triggers a durable queue entry plus
+// an operator notification, creates zero contact rows until approval, and
+// resolves normally after approval through the standard upsert path.
+// AC3-adjacent: auto rooms with the gate wired behave identically to no gate.
+// AC4: role_gated fails closed at use with a clear error.
+// AC5: the Garden pending-contacts service drives approve/deny/reset.
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import type { SubstrateMessage } from '../../shared/contracts/runtime.js';
+import { resolveAuthorContext } from '../agent/substrate-agent/runtime-context.js';
+import { createTestPostgresContactStore } from '../../test-support/postgres-contact-store.js';
+import type { ContactStorePort } from './contact-store-port.js';
+import {
+  createFilePendingContactApprovalStore,
+  type PendingContactApprovalStore,
+} from './pending-contact-approvals.js';
+import { createContactTrackingGate, type ContactTrackingGate } from './tracking-gate.js';
+
+const PRIMARY_USER_ID = 'discord-primary-user';
+const APPROVAL_CHANNEL = 'discord:big-room';
+const AUTO_CHANNEL = 'discord:friends-room';
+const ROLE_GATED_CHANNEL = 'discord:reserved-room';
+
+const LOGGER = { warn: vi.fn(), debug: vi.fn() };
+
+function makeMessage(overrides: Partial<SubstrateMessage> = {}): SubstrateMessage {
+  return {
+    id: 'msg-1',
+    channelId: APPROVAL_CHANNEL,
+    channelType: 'discord',
+    authorId: 'stranger-42',
+    authorName: 'vtubegooner69',
+    content: 'first message in the big room',
+    timestamp: new Date('2026-06-01T12:00:00Z'),
+    ...overrides,
+  };
+}
+
+describe('contact-tracking approval flow (E3.4)', () => {
+  let contactStore: ContactStorePort;
+  let tempDir: string;
+  let pendingApprovals: PendingContactApprovalStore;
+  let notify: ReturnType<typeof vi.fn>;
+  let gate: ContactTrackingGate;
+
+  beforeEach(async () => {
+    ({ store: contactStore } = await createTestPostgresContactStore(PRIMARY_USER_ID));
+    tempDir = mkdtempSync(join(tmpdir(), 'psfn-approval-flow-'));
+    pendingApprovals = createFilePendingContactApprovalStore(join(tempDir, 'pending-approvals.json'));
+    notify = vi.fn().mockResolvedValue(undefined);
+    gate = createContactTrackingGate({
+      channelLabels: {
+        [APPROVAL_CHANNEL]: { contactTracking: 'approval' },
+        [ROLE_GATED_CHANNEL]: { contactTracking: 'role_gated' },
+      },
+      pendingApprovals,
+      notifyOperatorPendingContact: notify,
+      logger: LOGGER,
+    });
+    LOGGER.warn.mockClear();
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  async function resolveWithGate(message: SubstrateMessage) {
+    return await resolveAuthorContext({
+      message,
+      contactStore,
+      logger: LOGGER,
+      companionIdentityKey: 'companion-test',
+      companionDisplayName: 'Companion',
+      contactTracking: gate,
+    });
+  }
+
+  it('AC1: a new speaker in an approval room stays untracked, enqueues, and notifies', async () => {
+    const authorContext = await resolveWithGate(makeMessage());
+
+    // Untracked: transcript/prefix attribution only. Sprint-10 privacy regression
+    // H7/07-M1: an approval-pending untracked speaker resolves at the PUBLIC trust
+    // floor (never 'regular') and their self-asserted channel name is rendered
+    // marked-unverified rather than as a bare trusted identity.
+    expect(authorContext).toMatchObject({
+      trustLevel: 'public',
+      speakerRole: 'user',
+      resolvedUserName: 'vtubegooner69 (unverified)',
+      continuitySubjectKey: 'stranger-42',
+      continuityFallbackKeys: [],
+    });
+    expect(authorContext.canonicalContactKey).toBeUndefined();
+    expect(authorContext.relationshipType).toBeUndefined();
+
+    // Zero contact rows (and hence zero profile/social-graph rows keyed to one).
+    expect(await contactStore.getByChannelIdentity('discord', 'stranger-42')).toBeUndefined();
+    expect((await contactStore.listAll()).map(contact => contact.displayName)).toEqual([]);
+
+    // Durable queue entry with channel-scoped preview + operator notification.
+    const entry = await pendingApprovals.getByIdentity('discord', 'stranger-42');
+    expect(entry).toMatchObject({
+      channel: 'discord',
+      channelUserId: 'stranger-42',
+      displayName: 'vtubegooner69',
+      channelId: APPROVAL_CHANNEL,
+      status: 'pending',
+    });
+    expect(entry?.messagePreviews[0]?.preview).toBe('first message in the big room');
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // A second message keeps the speaker untracked without re-notifying.
+    const secondContext = await resolveWithGate(makeMessage({ id: 'msg-2', content: 'still chatting' }));
+    expect(secondContext.canonicalContactKey).toBeUndefined();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect((await contactStore.listAll())).toHaveLength(0);
+  });
+
+  it('AC6: auto rooms behave identically with and without the gate wired', async () => {
+    const withGate = await resolveWithGate(makeMessage({ channelId: AUTO_CHANNEL, id: 'msg-auto-1' }));
+    expect(withGate.canonicalContactKey).toBeDefined();
+    expect(withGate.resolvedUserName).toBe('vtubegooner69');
+
+    // Fresh identical store without any gate: same observable result shape.
+    const { store: bareStore } = await createTestPostgresContactStore(PRIMARY_USER_ID);
+    const withoutGate = await resolveAuthorContext({
+      message: makeMessage({ channelId: AUTO_CHANNEL, id: 'msg-auto-1' }),
+      contactStore: bareStore,
+      logger: LOGGER,
+      companionIdentityKey: 'companion-test',
+      companionDisplayName: 'Companion',
+    });
+
+    expect({ ...withGate, canonicalContactKey: 'normalized', continuitySubjectKey: 'normalized' })
+      .toEqual({ ...withoutGate, canonicalContactKey: 'normalized', continuitySubjectKey: 'normalized' });
+    expect(await pendingApprovals.list()).toHaveLength(0);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('AC4: a role_gated room fails closed at use with a clear, unswallowed error', async () => {
+    await expect(resolveWithGate(makeMessage({ channelId: ROLE_GATED_CHANNEL })))
+      .rejects.toThrow(/role_gated.*reserved.*not implemented/);
+    expect(await contactStore.getByChannelIdentity('discord', 'stranger-42')).toBeUndefined();
+  });
+
+  it('resolves already-tracked contacts in approval rooms exactly as before', async () => {
+    // Pre-existing contact (e.g. approved earlier or created in an auto room).
+    const existing = await contactStore.resolveChannelIdentity('discord', 'stranger-42', 'vtubegooner69');
+
+    const context = await resolveWithGate(makeMessage({ id: 'msg-known-1' }));
+    expect(context.canonicalContactKey).toBe(existing.id);
+    expect(await pendingApprovals.list()).toHaveLength(0);
+    expect(notify).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,247 @@
+{
+  "name": "automata_bus",
+  "description": "Reuse companion-scoped, evidence-bearing learned state across eligible ephemeral automata. Use action=brief (required: none; optional: query); action=search (required: query; optional: limit); action=note (required: text; optional: none); action=append (required: claim; optional: provenance, evidence, artifact_refs, verification_status, source, confidence); action=correct (required: target_event_id, relation, reason; optional: replacement_claim; rule: corrects and supersedes require replacement_claim; retracts forbids it); action=handoff (required: summary; optional: output_refs, validation_performed, blocker, next_action); action=runs (required: none; optional: status, class_id, task_id, limit); action=inspect (required: one alternative of [event_id] or [run_id]; optional: none). It returns bounded current findings, durable run references, handoff receipts, or append/correction identifiers. Read your spawn briefing (prior run notes) before working; when the job is done, leave one to three concise action=note entries for the next run. Do not query it on every turn. Bus findings are automata learned state, not companion memory or primary-prompt content. Example: {\"action\":\"search\",\"query\":\"known failure modes for this task\"}.",
+  "parameters": {
+    "additionalProperties": false,
+    "type": "object",
+    "required": [
+      "action"
+    ],
+    "properties": {
+      "action": {
+        "anyOf": [
+          {
+            "const": "brief",
+            "type": "string"
+          },
+          {
+            "const": "search",
+            "type": "string"
+          },
+          {
+            "const": "note",
+            "type": "string"
+          },
+          {
+            "const": "append",
+            "type": "string"
+          },
+          {
+            "const": "correct",
+            "type": "string"
+          },
+          {
+            "const": "handoff",
+            "type": "string"
+          },
+          {
+            "const": "runs",
+            "type": "string"
+          },
+          {
+            "const": "inspect",
+            "type": "string"
+          }
+        ]
+      },
+      "query": {
+        "type": "string"
+      },
+      "limit": {
+        "minimum": 1,
+        "type": "integer"
+      },
+      "claim": {
+        "type": "string"
+      },
+      "text": {
+        "type": "string"
+      },
+      "provenance": {
+        "anyOf": [
+          {
+            "const": "computed",
+            "type": "string"
+          },
+          {
+            "const": "fetched",
+            "type": "string"
+          },
+          {
+            "const": "recalled",
+            "type": "string"
+          },
+          {
+            "const": "testimony",
+            "type": "string"
+          }
+        ]
+      },
+      "evidence": {
+        "type": "array",
+        "items": {
+          "additionalProperties": false,
+          "type": "object",
+          "required": [
+            "kind",
+            "reference",
+            "summary"
+          ],
+          "properties": {
+            "kind": {
+              "anyOf": [
+                {
+                  "const": "artifact",
+                  "type": "string"
+                },
+                {
+                  "const": "command",
+                  "type": "string"
+                },
+                {
+                  "const": "external",
+                  "type": "string"
+                },
+                {
+                  "const": "session-span",
+                  "type": "string"
+                }
+              ]
+            },
+            "reference": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "digest": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "artifact_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "verification_status": {
+        "anyOf": [
+          {
+            "const": "pending",
+            "type": "string"
+          },
+          {
+            "const": "rejected",
+            "type": "string"
+          },
+          {
+            "const": "verified",
+            "type": "string"
+          }
+        ]
+      },
+      "source": {
+        "type": "string"
+      },
+      "confidence": {
+        "minimum": 0,
+        "maximum": 1,
+        "type": "number"
+      },
+      "lesson_attribution": {
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "prompt_revision",
+          "tool_name",
+          "failure_category",
+          "lesson_code",
+          "contradiction_event_ids"
+        ],
+        "properties": {
+          "prompt_revision": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "failure_category": {
+            "type": "string"
+          },
+          "lesson_code": {
+            "type": "string"
+          },
+          "contradiction_event_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "target_event_id": {
+        "type": "string"
+      },
+      "relation": {
+        "anyOf": [
+          {
+            "const": "corrects",
+            "type": "string"
+          },
+          {
+            "const": "retracts",
+            "type": "string"
+          },
+          {
+            "const": "supersedes",
+            "type": "string"
+          }
+        ]
+      },
+      "reason": {
+        "type": "string"
+      },
+      "replacement_claim": {
+        "type": "string"
+      },
+      "summary": {
+        "type": "string"
+      },
+      "output_refs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "validation_performed": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "blocker": {
+        "type": "string"
+      },
+      "next_action": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "class_id": {
+        "type": "string"
+      },
+      "task_id": {
+        "type": "string"
+      },
+      "event_id": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": "string"
+      }
+    }
+  }
+}

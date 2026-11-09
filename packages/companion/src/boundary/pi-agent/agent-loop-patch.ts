@@ -1,0 +1,434 @@
+import { isCompanionSelfReflectionContext } from '../../primitives/llm/request-context.js';
+// ── pi-agent-core Agent-Loop Graft ──
+// Part of the pi-agent version-coupling boundary (see ./index.ts). This file
+// monkey-patches PRIVATE pi-agent-core Agent internals, which no semver
+// contract protects — the patch can silently no-op or corrupt agent state
+// across a version bump even when the build stays green.
+//
+// ON EVERY pi-agent-core BUMP, re-audit these private internals against the
+// upstream Agent source and the `PatchedAgent` shape below:
+//   runPromptMessages / runContinuation / createLoopConfig / processEvents /
+//   activeRun / _state (model, systemPrompt, messages, tools, isStreaming,
+//   streamingMessage, pendingToolCalls, errorMessage) / streamFunction.
+
+import type { Agent, AgentLoopConfig, AgentMessage, AgentTool } from '@earendil-works/pi-agent-core';
+import type { LLMSystemPromptCacheBoundaries } from '../../shared/contracts/runtime.js';
+import { getRequestContext } from '../../primitives/llm/request-context.js';
+import {
+  agentLoopContinueWithScheduler,
+  agentLoopWithScheduler,
+  type ScheduledAgentLoopConfig,
+} from '../../core/agent/scheduled-agent-loop.js';
+import {
+  ParentTurnContinuationFuse,
+  type ParentTurnContinuationFuseLimits,
+} from '../../core/agent/turn-limits.js';
+import type { ToolCallSchedulerOptions } from '../../core/agent/tool-call-scheduler.js';
+
+export interface AgentLoopPromptCacheHooks {
+  /**
+   * Resolve the PromptPlan cachePlan boundaries for the EXACT system prompt
+   * the loop is about to ship (E2.4). Implementations must return undefined
+   * unless the given system prompt byte-matches the prompt the boundaries
+   * were computed for — stale boundaries are worse than none.
+   */
+  resolvePromptCacheBoundaries?: (systemPrompt: string) => LLMSystemPromptCacheBoundaries | undefined;
+  /**
+   * Resolves the tool array owned by the current async turn. This must not
+   * fall back to another concurrent turn's mutable Agent state.
+   */
+  resolveTurnTools?: () => readonly AgentTool<any>[] | undefined;
+}
+
+const installedTurnToolResolvers = new WeakMap<
+  Agent,
+  NonNullable<AgentLoopPromptCacheHooks['resolveTurnTools']>
+>();
+
+/**
+ * Resolve the tool snapshot owned by the current async turn for a patched
+ * agent. This is also the supported seam for prompt-loop test doubles: they
+ * must consume the same owner-bound resolver as the production loop instead
+ * of reading mutable Agent state.
+ */
+export function resolveInstalledAgentTurnTools(agent: Agent): readonly AgentTool<any>[] {
+  const resolveTurnTools = installedTurnToolResolvers.get(agent);
+  if (!resolveTurnTools) {
+    throw new Error('Agent does not have an installed turn-tool resolver');
+  }
+  const tools = resolveTurnTools();
+  if (!tools) {
+    throw new Error('Turn-owned tools are unavailable outside their exact async owner');
+  }
+  return [...tools];
+}
+
+type PatchedRunOptions = { skipInitialSteeringPoll?: boolean };
+
+/**
+ * Private pi-agent-core Agent internals (0.84.1) the scheduler graft relies on.
+ *
+ * `prompt()` and `continue()` both funnel into `runPromptMessages` /
+ * `runContinuation`; overriding those two methods swaps the stock agent loop
+ * for the companion runtime's scheduled loop while keeping the public Agent surface
+ * (steer/followUp queues, abort, waitForIdle, subscribe) intact.
+ */
+type PatchedAgent = {
+  __psfnToolSchedulerPatched?: boolean;
+  runPromptMessages: (messages: AgentMessage[], options?: PatchedRunOptions) => Promise<void>;
+  runContinuation: () => Promise<void>;
+  createLoopConfig: (options?: PatchedRunOptions) => AgentLoopConfig;
+  /** Public Agent surface: enqueue an internal follow-up onto the follow-up queue. */
+  followUp: (message: AgentMessage) => void;
+  processEvents: (event: unknown) => Promise<void>;
+  activeRun?: {
+    promise: Promise<void>;
+    resolve: () => void;
+    abortController: AbortController;
+    requestId?: string;
+    /** Runtime lane class of the turn that owns this run (from its request context). */
+    laneClass?: string;
+    /** Set when a higher-priority run preempted this one (z4vhu). */
+    preempted?: boolean;
+  };
+  _state: {
+    model: unknown;
+    systemPrompt: string;
+    messages: AgentMessage[];
+    tools: AgentTool<any>[];
+    isStreaming: boolean;
+    streamingMessage?: AgentMessage;
+    pendingToolCalls: ReadonlySet<string>;
+    errorMessage?: string;
+    /**
+     * Companion-runtime extension: index into messages where internal follow-up
+     * continuation begins for this run (null = no internal continuation).
+     */
+    userFacingBoundaryIndex?: number | null;
+  };
+  streamFunction: Parameters<typeof agentLoopWithScheduler>[4];
+};
+
+/**
+ * Canonical agent-busy prefix, so every existing busy / yield classifier
+ * (isBusyTurnError, isAgentProcessingPromptError) treats a preempted run as the
+ * durable contention it is.
+ */
+const AGENT_RUN_PREEMPTED_MESSAGE =
+  'Agent is already processing another prompt. Background run preempted by a foreground turn.';
+
+/** The active run was aborted so a higher-priority turn could take the run slot (z4vhu). */
+export class AgentRunPreemptedError extends Error {
+  constructor() {
+    super(AGENT_RUN_PREEMPTED_MESSAGE);
+    this.name = 'AgentRunPreemptedError';
+  }
+}
+
+/**
+ * Run-slot preemption hooks injected by the owning runtime (z4vhu). The
+ * boundary only knows lane-class strings from the request context; the runtime
+ * owns the priority policy and which turns are preempted.
+ */
+export interface AgentRunPreemptionHooks {
+  /** True when the turn calling prompt() was preempted before it started its run. */
+  isCurrentTurnPreempted(): boolean;
+}
+
+/**
+ * Abort the active run when `shouldPreempt(itsLaneClass)` says a
+ * higher-priority turn may take the slot. Returns the run's settlement promise
+ * (resolves once it released the slot), or null when nothing was preempted.
+ */
+export function preemptActiveAgentRun(
+  agent: Agent,
+  shouldPreempt: (activeLaneClass: string | undefined) => boolean,
+): Promise<void> | null {
+  const activeRun = (agent as unknown as PatchedAgent).activeRun;
+  if (!activeRun || !shouldPreempt(activeRun.laneClass)) return null;
+  activeRun.preempted = true;
+  if (!hasObservedAbort(activeRun.abortController.signal)) {
+    activeRun.abortController.abort(new AgentRunPreemptedError());
+  }
+  return activeRun.promise;
+}
+
+export type AgentRunAbortResult =
+  | { status: 'signaled' }
+  | { status: 'already_aborted' }
+  | { status: 'not_active' }
+  | { status: 'owner_mismatch' }
+  | { status: 'not_signaled' };
+
+function hasObservedAbort(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+/**
+ * Abort the canonical parent run and report what the active AbortSignal proves.
+ *
+ * `Agent.abort()` is intentionally void upstream, so invoking it alone cannot
+ * distinguish a real active-run transition from its documented idle no-op.
+ * AbortSignal changes synchronously; checking the exact signal captured before
+ * the call keeps cancellation acknowledgements truthful without exposing the
+ * patched agent's private `activeRun` shape outside this boundary.
+ *
+ * API callers must supply the request they intend to cancel. Runs whose owner
+ * differs or was not captured fail closed; unscoped callers remain available
+ * for internal timeout paths that intentionally abort whichever run is active.
+ */
+export function abortActiveAgentRun(
+  agent: Agent,
+  expectedRequestId?: string,
+): AgentRunAbortResult {
+  const activeRun = (agent as unknown as PatchedAgent).activeRun;
+  if (!activeRun) return { status: 'not_active' };
+  if (expectedRequestId !== undefined && activeRun.requestId !== expectedRequestId) {
+    return { status: 'owner_mismatch' };
+  }
+
+  const signal = activeRun.abortController.signal;
+  if (hasObservedAbort(signal)) return { status: 'already_aborted' };
+
+  agent.abort();
+  return hasObservedAbort(signal)
+    ? { status: 'signaled' }
+    : { status: 'not_signaled' };
+}
+
+/**
+ * Whether a run currently owns the agent. Concurrent ordinary turns share one
+ * pi Agent; only the run owner may write the agent's shared state
+ * (psfn-framework-97epu).
+ */
+export function isAgentRunActive(agent: Agent): boolean {
+  return (agent as unknown as PatchedAgent).activeRun !== undefined;
+}
+
+export function installAgentToolSchedulerPatch(
+  agent: Agent,
+  schedulerOptions: ToolCallSchedulerOptions,
+  promptCacheHooks?: AgentLoopPromptCacheHooks,
+  continuationFuseLimits?: Partial<ParentTurnContinuationFuseLimits>,
+  runPreemption?: AgentRunPreemptionHooks,
+): void {
+  const target = agent as unknown as PatchedAgent;
+  if (target.__psfnToolSchedulerPatched) {
+    return;
+  }
+  if (promptCacheHooks?.resolveTurnTools) {
+    installedTurnToolResolvers.set(agent, promptCacheHooks.resolveTurnTools);
+  }
+
+  async function runScheduledLoop(
+    this: PatchedAgent,
+    messages: AgentMessage[] | undefined,
+    options?: PatchedRunOptions,
+  ): Promise<void> {
+    const model = this._state.model;
+    if (!model) throw new Error('No model configured');
+    if (this.activeRun) {
+      throw new Error('Agent is already processing.');
+    }
+
+    const continuationFuse = new ParentTurnContinuationFuse({
+      ...continuationFuseLimits,
+      ...(isCompanionSelfReflectionContext(getRequestContext()) ? { maxWallTimeMs: null } : {}),
+    });
+    const abortController = new AbortController();
+    const requestId = getRequestContext()?.requestId;
+    const laneClass = getRequestContext()?.runtimeLaneClass;
+    const promptCacheBoundaries = promptCacheHooks?.resolvePromptCacheBoundaries?.(
+      typeof this._state.systemPrompt === 'string' ? this._state.systemPrompt : '',
+    );
+    const initialTurnTools = promptCacheHooks?.resolveTurnTools
+      ? resolveInstalledAgentTurnTools(this as unknown as Agent)
+      : [...this._state.tools];
+    const context = {
+      systemPrompt: this._state.systemPrompt,
+      messages: this._state.messages.slice(),
+      tools: [...initialTurnTools],
+      getTools: () => promptCacheHooks?.resolveTurnTools
+        ? [...resolveInstalledAgentTurnTools(this as unknown as Agent)]
+        : [...initialTurnTools],
+      ...(promptCacheBoundaries ? { promptCacheBoundaries } : {}),
+    };
+    const config = this.createLoopConfig(options) as ScheduledAgentLoopConfig;
+    // Re-enqueue hook: when a fresh user turn start-drains the follow-up queue
+    // (psfn-framework-8l9c) and then exits early (assistant error/abort or a
+    // throw) before delivering held-back EXTERNAL user follow-ups, the loop
+    // returns them here so the journaled user message is processed by a later
+    // run instead of being silently dropped.
+    config.requeueFollowUpMessages = (messages: AgentMessage[]): void => {
+      for (const message of messages) {
+        this.followUp(message);
+      }
+    };
+
+    let resolveRun: () => void = () => {};
+    const runPromise = new Promise<void>((resolve) => {
+      resolveRun = resolve;
+    });
+    const ownRun: NonNullable<PatchedAgent['activeRun']> = {
+      promise: runPromise,
+      resolve: resolveRun,
+      abortController,
+      ...(requestId !== undefined ? { requestId } : {}),
+      ...(laneClass !== undefined ? { laneClass } : {}),
+    };
+    this.activeRun = ownRun;
+    this._state.isStreaming = true;
+    this._state.streamingMessage = undefined;
+    this._state.errorMessage = undefined;
+    // User-facing boundary: index into _state.messages where internal
+    // follow-up continuation begins for this run (null = no internal
+    // continuation). Reset per run; set once when the loop drains queued
+    // internal follow-ups (psfn-framework-ay73).
+    this._state.userFacingBoundaryIndex = null;
+    const wallClockTimer = continuationFuse.limits.maxWallTimeMs === null ? null : setTimeout(() => {
+      const budgetError = continuationFuse.tripWallClock();
+      abortController.abort(budgetError);
+    }, continuationFuse.limits.maxWallTimeMs);
+    wallClockTimer?.unref();
+
+    let partial: AgentMessage | null = null;
+    let terminalStreamError: Error | null = null;
+    let sawTerminalStreamError = false;
+    try {
+      const stream = messages
+        ? agentLoopWithScheduler(
+            messages,
+            context,
+            config,
+            abortController.signal,
+            this.streamFunction,
+            schedulerOptions,
+            continuationFuse,
+          )
+        : agentLoopContinueWithScheduler(
+            context,
+            config,
+            abortController.signal,
+            this.streamFunction,
+            schedulerOptions,
+            continuationFuse,
+          );
+
+      for await (const event of stream) {
+        switch (event.type) {
+          case 'message_start':
+          case 'message_update':
+            partial = event.message;
+            break;
+          case 'message_end':
+            partial = null;
+            break;
+          case 'agent_error': {
+            const normalizedError = event.error instanceof Error
+              ? event.error
+              : new Error(String(event.error));
+            terminalStreamError = normalizedError;
+            sawTerminalStreamError = true;
+            partial = null;
+            this._state.errorMessage = normalizedError.message;
+            break;
+          }
+          case 'agent_end':
+            this._state.isStreaming = false;
+            break;
+          case 'user_facing_boundary':
+            if (this._state.userFacingBoundaryIndex == null) {
+              this._state.userFacingBoundaryIndex = this._state.messages.length;
+            }
+            // Internal marker for response extraction; not an agent event
+            // external subscribers know about.
+            continue;
+          default:
+            break;
+        }
+        // processEvents applies the stock state reduction (streamingMessage,
+        // transcript append on message_end, pendingToolCalls, errorMessage on
+        // turn_end) and awaits subscribed listeners. Custom events without a
+        // stock case (e.g. agent_error) still reach listeners.
+        await this.processEvents(event);
+      }
+
+      if (ownRun.preempted) {
+        throw new AgentRunPreemptedError();
+      }
+      const continuationBudgetError = continuationFuse.getError();
+      if (continuationBudgetError) {
+        throw continuationBudgetError;
+      }
+      if (terminalStreamError) {
+        throw terminalStreamError;
+      }
+
+      if (partial && partial.role === 'assistant' && partial.content.length > 0) {
+        const onlyEmpty = !partial.content.some((entry) => (
+          (entry.type === 'thinking' && entry.thinking.trim().length > 0)
+          || (entry.type === 'text' && entry.text.trim().length > 0)
+          || (entry.type === 'toolCall' && entry.name.trim().length > 0)
+        ));
+        if (!onlyEmpty) {
+          this._state.messages = [...this._state.messages, partial];
+        } else if (abortController.signal.aborted) {
+          throw new Error('Request was aborted');
+        }
+      }
+    } catch (error) {
+      const finalError = ownRun.preempted
+        ? new AgentRunPreemptedError()
+        : continuationFuse.getError()
+          ?? (error instanceof Error ? error : new Error(String(error)));
+      const errorMessage = finalError.message;
+      this._state.errorMessage = errorMessage;
+      partial = null;
+      if (!sawTerminalStreamError) {
+        await this.processEvents({
+          type: 'agent_error',
+          error: finalError,
+          messages: [],
+        });
+        await this.processEvents({ type: 'agent_end', messages: [] });
+      }
+      throw finalError;
+    } finally {
+      if (wallClockTimer) clearTimeout(wallClockTimer);
+      this._state.isStreaming = false;
+      this._state.streamingMessage = undefined;
+      this._state.pendingToolCalls = new Set();
+      const run = this.activeRun;
+      this.activeRun = undefined;
+      run.resolve();
+    }
+  }
+
+  if (runPreemption) {
+    // A preempted turn that had not started its run yet must not take the
+    // slot afterwards: it fails with the same typed contention instead.
+    const stockPrompt = agent.prompt.bind(agent);
+    agent.prompt = (async (...args: Parameters<Agent['prompt']>): Promise<void> => {
+      if (runPreemption.isCurrentTurnPreempted()) {
+        throw new AgentRunPreemptedError();
+      }
+      await stockPrompt(...args);
+    }) as Agent['prompt'];
+  }
+
+  target.runPromptMessages = async function patchedRunPromptMessages(
+    this: PatchedAgent,
+    messages: AgentMessage[],
+    options?: PatchedRunOptions,
+  ): Promise<void> {
+    await runScheduledLoop.call(this, messages, options);
+  };
+
+  target.runContinuation = async function patchedRunContinuation(
+    this: PatchedAgent,
+  ): Promise<void> {
+    await runScheduledLoop.call(this, undefined, undefined);
+  };
+
+  target.__psfnToolSchedulerPatched = true;
+}

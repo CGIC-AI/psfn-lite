@@ -1,0 +1,300 @@
+import type { EventBus } from '../../shared/event-bus.js';
+import type { BackgroundMaintenanceRegistrar } from '../scheduler/background-maintenance.js';
+import type { ConcernStorePort } from './concern-store-port.js';
+import type {
+  ConcernRouteDispatcher,
+  ConcernRouteOutcome,
+  ConcernRouteRequest,
+  ConcernRouteSource,
+  ConcernRouteTarget,
+} from './concern-route-handoff.js';
+import {
+  MAX_ACTIVE_CONCERNS,
+  isConcernAttentionStatus,
+  type ActiveConcern,
+  type ActiveConcernVAD,
+} from './concerns.js';
+import { emitConcernResolutionAppraisal } from './concern-resolution-appraisal.js';
+
+const CONCERN_GROOMING_OPERATION_ID = 'concern-grooming';
+const CONCERN_GROOMING_TASK_NAME = 'Concern Grooming';
+const DEFAULT_GROOMING_ROUTE_TARGET: ConcernRouteTarget = 'introspection';
+const STALE_RESOLUTION_OUTCOME =
+  'Retired from the short-time concern set after the review window elapsed.';
+const CAP_RESOLUTION_OUTCOME =
+  'Retired from concerns for durable tracking review because the active concern cap was reached.';
+
+export interface ConcernGroomingResult {
+  staleResolved: ActiveConcern[];
+  capResolved: ActiveConcern[];
+  activeCountBeforeCap: number;
+  activeCountAfterCap: number;
+  /**
+   * Route outcomes for retired concerns (etj1). Each retired concern produces a
+   * concrete routed handoff or an explicit blocked-route result rather than a
+   * free-text resolution that silently disappears. Empty when no dispatcher is
+   * configured.
+   */
+  routeOutcomes: ConcernRouteOutcome[];
+}
+
+export interface GroomConcernSetOptions {
+  concernStore: ConcernStorePort;
+  asOf?: string;
+  maxActiveConcerns?: number;
+  /** Durable-substrate dispatcher for retired concerns (etj1). */
+  routeDispatcher?: ConcernRouteDispatcher;
+  /** Target substrate for retired concerns; defaults to introspection. */
+  routeTarget?: ConcernRouteTarget;
+  /**
+   * Live emotional VAD provider (vw3w.1). Grooming resolves off-turn, so it
+   * reads the current VAD here to snapshot resolutionVAD symmetrically with
+   * formation. Returns undefined when no current state is available — the arc
+   * is then persisted without a resolution snapshot (no fabrication).
+   */
+  resolutionVadProvider?: (concern: ActiveConcern, asOf: string) => ActiveConcernVAD | undefined;
+}
+
+interface ConcernResolutionState {
+  emotional: {
+    vad: ActiveConcernVAD;
+    telemetry: {
+      status: 'trusted' | 'uncertain' | 'suppressed';
+      observedAtMs: number | null;
+      staleAfterMs: number;
+    };
+  };
+  relational: { contactId: string | null };
+}
+
+/**
+ * Resolve a background-safe VAD only when the latest internal state belongs to
+ * this concern's DM contact and remains inside its own telemetry freshness
+ * window. Global concerns and missing/untrusted/future snapshots are omitted.
+ */
+export function resolveCurrentInternalStateConcernVAD(
+  concern: Pick<ActiveConcern, 'id' | 'contactId'>,
+  state: ConcernResolutionState | null | undefined,
+  asOf: string,
+): ActiveConcernVAD | undefined {
+  if (!state || !concern.contactId || state.relational.contactId !== concern.contactId) {
+    return undefined;
+  }
+  const { telemetry, vad } = state.emotional;
+  const asOfMs = Date.parse(asOf);
+  const observedAtMs = telemetry.observedAtMs;
+  if (
+    telemetry.status !== 'trusted'
+    || observedAtMs === null
+    || !Number.isFinite(asOfMs)
+    || observedAtMs > asOfMs
+    || asOfMs - observedAtMs > telemetry.staleAfterMs
+  ) {
+    return undefined;
+  }
+  return { valence: vad.valence, arousal: vad.arousal, dominance: vad.dominance };
+}
+
+export async function groomConcernSet(options: GroomConcernSetOptions): Promise<ConcernGroomingResult> {
+  const asOf = normalizeAsOf(options.asOf);
+  const staleResolved = await options.concernStore.resolveStaleConcerns({
+    asOf,
+    limit: 200,
+    evidenceRefs: [{ kind: 'runtime', ref: `concern-grooming:stale:${asOf}` }],
+    outcome: STALE_RESOLUTION_OUTCOME,
+    ...(options.resolutionVadProvider
+      ? { resolutionVADProvider: options.resolutionVadProvider }
+      : {}),
+  });
+
+  const maxActiveConcerns = normalizeMaxActiveConcerns(options.maxActiveConcerns);
+  const activeAfterStale = (await options.concernStore.list({
+    includeResolved: false,
+    includeExpired: false,
+    asOf,
+    limit: 200,
+  })).filter(concern => isConcernAttentionStatus(concern.status));
+
+  const activeCountBeforeCap = activeAfterStale.length;
+  const kept = selectConcernsToKeep(activeAfterStale, maxActiveConcerns);
+  const keptIds = new Set(kept.map(concern => concern.id));
+  const overflow = activeAfterStale.filter(concern => !keptIds.has(concern.id));
+  const capResolved: ActiveConcern[] = [];
+  for (const concern of overflow) {
+    const resolutionVAD = options.resolutionVadProvider?.(concern, asOf);
+    const resolved = await options.concernStore.resolveConcern(concern.id, {
+      outcome: CAP_RESOLUTION_OUTCOME,
+      resolvedAt: asOf,
+      evidenceRefs: [{ kind: 'runtime', ref: `concern-grooming:cap:${asOf}` }],
+      ...(resolutionVAD ? { resolutionVAD } : {}),
+    });
+    if (resolved) capResolved.push(resolved);
+  }
+
+  // etj1: each retired concern becomes a concrete durable route (or an explicit
+  // blocked-route result) instead of a free-text resolution. The concern stays
+  // resolved regardless — routing failure never reopens it.
+  const routeOutcomes = await routeRetiredConcerns({
+    ...(options.routeDispatcher ? { routeDispatcher: options.routeDispatcher } : {}),
+    routeTarget: options.routeTarget ?? DEFAULT_GROOMING_ROUTE_TARGET,
+    staleResolved,
+    capResolved,
+  });
+
+  return {
+    staleResolved,
+    capResolved,
+    activeCountBeforeCap,
+    activeCountAfterCap: Math.min(activeCountBeforeCap, maxActiveConcerns),
+    routeOutcomes,
+  };
+}
+
+async function routeRetiredConcerns(input: {
+  routeDispatcher?: ConcernRouteDispatcher;
+  routeTarget: ConcernRouteTarget;
+  staleResolved: readonly ActiveConcern[];
+  capResolved: readonly ActiveConcern[];
+}): Promise<ConcernRouteOutcome[]> {
+  if (!input.routeDispatcher) {
+    return [];
+  }
+  const outcomes: ConcernRouteOutcome[] = [];
+  for (const concern of input.staleResolved) {
+    outcomes.push(await input.routeDispatcher.dispatch(
+      buildConcernRouteRequest(concern, 'grooming_stale', input.routeTarget, STALE_RESOLUTION_OUTCOME),
+    ));
+  }
+  for (const concern of input.capResolved) {
+    outcomes.push(await input.routeDispatcher.dispatch(
+      buildConcernRouteRequest(concern, 'grooming_cap_overflow', input.routeTarget, CAP_RESOLUTION_OUTCOME),
+    ));
+  }
+  return outcomes;
+}
+
+function buildConcernRouteRequest(
+  concern: ActiveConcern,
+  source: ConcernRouteSource,
+  target: ConcernRouteTarget,
+  reason: string,
+): ConcernRouteRequest {
+  return {
+    target,
+    source,
+    title: deriveConcernTitle(concern.text),
+    summary: concern.text,
+    priority: concern.priority,
+    reason,
+    evidenceRefs: concern.evidenceRefs,
+    ...(concern.contactId ? { contactId: concern.contactId } : {}),
+    concernId: concern.id,
+  };
+}
+
+function deriveConcernTitle(text: string): string {
+  const compacted = text.replace(/\s+/g, ' ').trim();
+  return compacted.length <= 78 ? compacted : `${compacted.slice(0, 75).trim()}...`;
+}
+
+export interface RegisterConcernGroomingOperationOptions {
+  backgroundMaintenance: BackgroundMaintenanceRegistrar;
+  concernStore: ConcernStorePort;
+  eventBus?: EventBus | null;
+  maxActiveConcerns: number;
+  routeDispatcher?: ConcernRouteDispatcher;
+  routeTarget?: ConcernRouteTarget;
+  /** Live emotional VAD provider for resolution-as-appraisal (vw3w.1). */
+  resolutionVadProvider?: (concern: ActiveConcern, asOf: string) => ActiveConcernVAD | undefined;
+}
+
+async function executeConcernGrooming(
+  options: Pick<
+    RegisterConcernGroomingOperationOptions,
+    | 'concernStore'
+    | 'eventBus'
+    | 'maxActiveConcerns'
+    | 'routeDispatcher'
+    | 'routeTarget'
+    | 'resolutionVadProvider'
+  >,
+): Promise<void> {
+  const result = await groomConcernSet({
+    concernStore: options.concernStore,
+    maxActiveConcerns: options.maxActiveConcerns,
+    ...(options.routeDispatcher ? { routeDispatcher: options.routeDispatcher } : {}),
+    ...(options.routeTarget ? { routeTarget: options.routeTarget } : {}),
+    ...(options.resolutionVadProvider ? { resolutionVadProvider: options.resolutionVadProvider } : {}),
+  });
+  // Resolution-as-appraisal (vw3w.1): each resolved concern that carries both a
+  // formation and a resolution VAD emits a relief-delta appraisal. No-op when
+  // the arc is incomplete; persistence already recorded resolution_vad.
+  for (const concern of result.staleResolved) {
+    await emitConcernResolutionAppraisal(options.eventBus, { concern, source: 'grooming_stale' });
+  }
+  for (const concern of result.capResolved) {
+    await emitConcernResolutionAppraisal(options.eventBus, { concern, source: 'grooming_cap' });
+  }
+  const routedCount = result.routeOutcomes.filter(o => o.disposition === 'routed').length;
+  const blockedRouteCount = result.routeOutcomes.filter(o => o.disposition === 'blocked').length;
+  await options.eventBus?.emit('intention.concern.groomed', {
+    staleResolvedCount: result.staleResolved.length,
+    capResolvedCount: result.capResolved.length,
+    activeCountBeforeCap: result.activeCountBeforeCap,
+    activeCountAfterCap: result.activeCountAfterCap,
+    routedCount,
+    blockedRouteCount,
+    timestamp: Date.now(),
+  });
+}
+
+export function registerConcernGroomingOperation(
+  options: RegisterConcernGroomingOperationOptions,
+): void {
+  options.backgroundMaintenance.registerOperation({
+    id: CONCERN_GROOMING_OPERATION_ID,
+    name: CONCERN_GROOMING_TASK_NAME,
+    description:
+      `Resolves expired concerns and enforces the scheduler-owned active cap of ${options.maxActiveConcerns}.`,
+    eligibility: { requiredTokens: ['memory.write'] },
+    handler: () => executeConcernGrooming(options),
+  });
+}
+
+function normalizeAsOf(value: string | undefined): string {
+  if (!value) return new Date().toISOString();
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) {
+    throw new Error('Concern grooming asOf must be a valid ISO timestamp');
+  }
+  return new Date(parsed).toISOString();
+}
+
+function normalizeMaxActiveConcerns(value: number | undefined): number {
+  if (value === undefined) return MAX_ACTIVE_CONCERNS;
+  if (!Number.isFinite(value) || value < 1) {
+    throw new Error('Concern grooming maxActiveConcerns must be a positive number');
+  }
+  return Math.floor(value);
+}
+
+function selectConcernsToKeep(
+  concerns: readonly ActiveConcern[],
+  maxActiveConcerns: number,
+): ActiveConcern[] {
+  return [...concerns]
+    .sort((left, right) => (
+      priorityRank(left.priority) - priorityRank(right.priority)
+      || Date.parse(left.expiresAt) - Date.parse(right.expiresAt)
+      || Date.parse(left.createdAt) - Date.parse(right.createdAt)
+      || right.salience - left.salience
+      || left.id.localeCompare(right.id)
+    ))
+    .slice(0, maxActiveConcerns);
+}
+
+function priorityRank(priority: ActiveConcern['priority']): number {
+  if (priority === 'high') return 0;
+  if (priority === 'medium') return 1;
+  return 2;
+}

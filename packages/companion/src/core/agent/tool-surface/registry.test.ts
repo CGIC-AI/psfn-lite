@@ -1,0 +1,328 @@
+import { describe, expect, it } from 'vitest';
+import { CANONICAL_TOOL_SURFACE_DESCRIPTIONS } from './descriptions.js';
+import {
+  CANONICAL_FIRST_PARTY_TOOL_SURFACES,
+  assertNoRetiredFirstPartyToolAliases,
+  getCanonicalToolSurface,
+  getRetiredToolAlias,
+  isCanonicalFirstPartyToolName,
+  listRetiredToolAliases,
+  resolveToolAliasMatchers,
+  resolveToolAliasMatchersFrom,
+  resolveToolPresentationRank,
+  type CanonicalToolSurfaceEntry,
+  type RetiredToolAlias,
+} from './registry.js';
+import { createJournalTool } from '../../../boundary/integrations/journal/tools.js';
+import { isRecord } from '../../../shared/utils/types.js';
+import { hasDeclaredCapabilityPolicyForToolName } from '../../../system/capabilities/requirements.js';
+
+function countCompleteSentences(description: string): number {
+  return description.match(/[.!?](?=\s|$)/gu)?.length ?? 0;
+}
+
+function actionContractPattern(action: string): RegExp {
+  const escaped = action.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+  return new RegExp(`\\baction\\s*=\\s*["']?${escaped}\\b`, 'u');
+}
+
+const FORBIDDEN_LEGACY_ACTION_NAMES = [
+  'session_new',
+  'session_resume',
+  'session_list',
+  'session_search',
+  'session_grep',
+  'focus_start',
+  'focus_complete',
+  'spawn_subagent',
+  'image_create',
+  'image_edit',
+  'image_analyze',
+  'scratchpad_write',
+  'memory_import_batch',
+  'memory_patch',
+  'memory_redact',
+  'memory_delete',
+  'undo_memory_delete',
+  'contact_note',
+  'contact_set_trust',
+  'contact_link_identity',
+  'contact_set_channel_privacy',
+] as const;
+
+function extractLiteralStrings(schema: unknown): string[] {
+  if (!isRecord(schema)) return [];
+  if (typeof schema.const === 'string') return [schema.const];
+  const unionItems = Array.isArray(schema.anyOf)
+    ? schema.anyOf
+    : Array.isArray(schema.oneOf)
+      ? schema.oneOf
+      : [];
+  return unionItems.flatMap(extractLiteralStrings);
+}
+
+function extractActionLiterals(toolParameters: unknown): string[] {
+  if (!isRecord(toolParameters)) return [];
+  const properties = isRecord(toolParameters.properties) ? toolParameters.properties : {};
+  return extractLiteralStrings(properties.action).sort();
+}
+
+describe('first-party tool surface registry', () => {
+  it('keeps canonical tool names unique and self-describing', () => {
+    const names = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map(entry => entry.name);
+    expect(new Set(names).size).toBe(names.length);
+    expect(Object.keys(CANONICAL_TOOL_SURFACE_DESCRIPTIONS).filter(name => name !== 'notify').sort()).toEqual([...names].sort());
+
+    for (const entry of CANONICAL_FIRST_PARTY_TOOL_SURFACES) {
+      expect(entry.name).toMatch(/^[a-z][a-z0-9_]*$/u);
+      expect(entry.description.trim().length).toBeGreaterThan(12);
+      expect(entry.domain).toBeTruthy();
+      expect(entry.exposure).toMatch(/^(core|extended)$/u);
+      expect(entry.capabilityMetadata.source).toMatch(/^src\/|^docs\//u);
+      if (entry.actions) {
+        expect(entry.actions.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('gives every canonical surface a decision-ready schema description', () => {
+    for (const entry of CANONICAL_FIRST_PARTY_TOOL_SURFACES) {
+      const context = `${entry.name} description`;
+      expect(countCompleteSentences(entry.description), context).toBeGreaterThanOrEqual(3);
+      expect(entry.description, context).toMatch(/\bUse\b/u);
+      expect(entry.description, context).toContain('Example:');
+      expect(entry.description, context).toMatch(
+        /\b(?:returns?|reads?|writes?|changes?|reports?|does not|never|only)\b/iu,
+      );
+      expect(entry.description, `${context} missing adjacent-tool or when-not-use guidance`).toMatch(
+        /\b(?:do not|never|instead|prefer|does not replace)\b|\buse\s+[^.]{0,80}\b(?:for|first)\b/iu,
+      );
+
+      for (const action of entry.actions ?? []) {
+        expect(entry.description, `${context} missing action=${action}`)
+          .toMatch(actionContractPattern(action));
+      }
+
+      if ((entry.actions?.length ?? 0) > 1) {
+        expect(entry.description, `${context} required-input boundary`).toMatch(/\brequire(?:d|s)?\b/iu);
+        expect(entry.description, `${context} optional-input boundary`).toMatch(/\boptional\b/iu);
+      }
+    }
+  });
+
+  it('keeps every canonical first-party tool covered by an executable capability policy', () => {
+    const missing = CANONICAL_FIRST_PARTY_TOOL_SURFACES
+      .map(entry => entry.name)
+      .filter(name => !hasDeclaredCapabilityPolicyForToolName(name));
+
+    expect(missing, `canonical tools missing capability policy: ${missing.join(', ')}`).toEqual([]);
+  });
+
+  it('keeps companion-autonomy registry descriptions free of sensitive control-plane details', () => {
+    for (const toolName of ['contact']) {
+      expect(getCanonicalToolSurface(toolName)?.description).not.toMatch(/\b(?:permit|private|fleet)\b/iu);
+    }
+  });
+
+  it('maps every retired alias to a canonical surface without name collisions', () => {
+    const retiredAliases = listRetiredToolAliases();
+    const retiredNames = retiredAliases.map(entry => entry.alias);
+    expect(new Set(retiredNames).size).toBe(retiredNames.length);
+
+    for (const retired of retiredAliases) {
+      expect(isCanonicalFirstPartyToolName(retired.alias)).toBe(false);
+      expect(getCanonicalToolSurface(retired.canonicalName)).toBeDefined();
+      expect(retired.reason.trim().length).toBeGreaterThan(12);
+      if (retired.exposure === 'retired') {
+        expect(retired.replacementAction).toBeDefined();
+      }
+    }
+  });
+
+  it('has no open charter exceptions for retired model-facing aliases', () => {
+    const retiredAliases = listRetiredToolAliases();
+    expect(retiredAliases.filter(alias => alias.charterException)).toEqual([]);
+    expect(() => assertNoRetiredFirstPartyToolAliases(
+      retiredAliases.map(alias => alias.alias),
+      'canonical retired aliases',
+    )).toThrow();
+  });
+
+  it('keeps every retired tool alias non-canonical and guarded', () => {
+    for (const { alias: name } of listRetiredToolAliases()) {
+      expect(isCanonicalFirstPartyToolName(name)).toBe(false);
+      expect(getRetiredToolAlias(name), name).toBeDefined();
+    }
+    expect(() => assertNoRetiredFirstPartyToolAliases(
+      listRetiredToolAliases().map(alias => alias.alias),
+      'retired tool set',
+    )).toThrow();
+  });
+
+  it('derives registration protection from every registry alias without a second list', () => {
+    for (const { alias } of listRetiredToolAliases()) {
+      expect(() => assertNoRetiredFirstPartyToolAliases([alias], 'drift check')).toThrow(
+        `drift check includes retired first-party tool aliases: ${alias}->`,
+      );
+    }
+  });
+
+  it('keeps canonical action metadata free of legacy callable names', () => {
+    for (const entry of CANONICAL_FIRST_PARTY_TOOL_SURFACES) {
+      expect(entry.actions ?? []).not.toEqual(
+        expect.arrayContaining([...FORBIDDEN_LEGACY_ACTION_NAMES]),
+      );
+    }
+  });
+
+  it('declares memory visibility actions on the canonical memory surface', () => {
+    expect(getCanonicalToolSurface('memory')?.actions).toEqual(
+      expect.arrayContaining(['episode_search', 'get', 'census', 'exists']),
+    );
+  });
+
+  it('does not publish an unregistered shard control plane as canonical', () => {
+    expect(getCanonicalToolSurface('shard')).toBeUndefined();
+    expect(isCanonicalFirstPartyToolName('shard')).toBe(false);
+  });
+
+  it('keeps journal canonical actions aligned with the actual tool schema', () => {
+    const journalTool = createJournalTool({
+      list: async () => ({
+        root: '/tmp/journal',
+        notes: [],
+        truncated: false,
+        totalFiles: 0,
+      }),
+      read: async () => ({
+        path: 'note.md',
+        content: '',
+        offsetBytes: 0,
+        nextOffsetBytes: null,
+        eof: true,
+        truncated: false,
+      }),
+      write: async (path: string) => ({ path, mode: 'write', created: true }),
+      append: async (path: string) => ({ path, mode: 'append', created: false }),
+      search: async (query: string) => ({
+        query,
+        results: [],
+        complete: true,
+        resultLimitReached: false,
+        scannedFiles: 0,
+        scannedBytes: 0,
+        totalFiles: 0,
+        skippedOversizedFiles: [],
+      }),
+    });
+
+    expect(getCanonicalToolSurface('journal')?.actions?.slice().sort()).toEqual(
+      extractActionLiterals(journalTool.parameters),
+    );
+  });
+
+  it('throws when a model-facing list contains retired aliases without an explicit exception', () => {
+    expect(() => assertNoRetiredFirstPartyToolAliases([
+      'tool_search',
+      'session_new',
+      'spawn_subagent',
+    ], 'test surface')).toThrow(
+      'test surface includes retired first-party tool aliases: session_new->session, spawn_subagent->subagent',
+    );
+  });
+
+  it('keeps the high-risk retired aliases attached to their canonical owners', () => {
+    expect(getRetiredToolAlias('session_new')).toMatchObject({
+      canonicalName: 'session',
+      replacementAction: 'new',
+      exposure: 'retired',
+    });
+    expect(getRetiredToolAlias('values_add')).toMatchObject({
+      canonicalName: 'orient',
+      replacementAction: 'values_add',
+      exposure: 'retired',
+    });
+  });
+
+  it('keeps the audited img2 default stack: social/self/expressive core, dev/admin/heavy extended', () => {
+    // Core = tools the companion reaches for in ordinary social/self/expressive
+    // interaction, plus the discovery/control surfaces that reach everything else.
+    const expectedCore = [
+      'tool_search', 'toolset', 'response_control',
+      'memory', 'scratchpad', 'journal',
+      'orient', 'contact', 'session', 'identity',
+      'schedule', 'subagent',
+    ];
+    for (const name of expectedCore) {
+      expect(getCanonicalToolSurface(name)?.exposure, `${name} should be core`).toBe('core');
+    }
+    // Extended = dev / admin / infrequent / heavy, reached via toolset + promotion.
+    const expectedExtended = ['north_star'];
+    for (const name of expectedExtended) {
+      expect(getCanonicalToolSurface(name)?.exposure, `${name} should be extended`).toBe('extended');
+    }
+  });
+
+  it('ranks unknown/plugin tools behind every audited first-party domain', () => {
+    // psfn img2 audit decision: unaudited third-party/plugin verbs sort to the
+    // very tail, after boundary and system, so audited tools present first.
+    const tailCanonicalRanks = ['response_control'].map(resolveToolPresentationRank);
+    const unknownRank = resolveToolPresentationRank('some_plugin_tool_xyz');
+    for (const rank of tailCanonicalRanks) {
+      expect(unknownRank).toBeGreaterThan(rank);
+    }
+  });
+});
+
+describe('resolveToolAliasMatchers (pre_tool_use hook alias equivalence, psfn-framework-816w)', () => {
+  it('lists the retired aliases when invoked by the canonical name', () => {
+    // `toolset` retires `load_tools` / `promoted_tools_list` / `promoted_tools_add`; a policy
+    // written against any of those must be able to match the canonical call.
+    const matchers = resolveToolAliasMatchers('toolset');
+    expect(matchers).toEqual(
+      expect.arrayContaining(['load_tools', 'promoted_tools_list', 'promoted_tools_add']),
+    );
+    // The invoked name is never included in its own alias set.
+    expect(matchers).not.toContain('toolset');
+  });
+
+  it('lists the canonical name plus sibling aliases when invoked by a retired alias', () => {
+    // An alias-form invocation (`load_tools`) must expose the canonical `toolset`
+    // (so a canonical policy matches) and its siblings, but not itself.
+    const matchers = resolveToolAliasMatchers('load_tools');
+    expect(matchers).toContain('toolset');
+    expect(matchers).toEqual(expect.arrayContaining(['promoted_tools_list', 'promoted_tools_add']));
+    expect(matchers).not.toContain('load_tools');
+  });
+
+  it('returns an empty set for third-party / unknown tool names (not a bypass)', () => {
+    expect(resolveToolAliasMatchers('some_plugin_tool')).toEqual([]);
+    expect(resolveToolAliasMatchers('analysis_workbench')).toEqual([]);
+  });
+
+  it('fails closed (throws) when a retired alias targets an unknown canonical tool', () => {
+    // Malformed metadata: the alias resolves, but its canonicalName does not.
+    const brokenAlias: RetiredToolAlias = {
+      alias: 'ghost_read',
+      canonicalName: 'ghost',
+      exposure: 'hidden',
+      reason: 'dangling canonical reference',
+    };
+    const source = {
+      getCanonicalToolSurface: (name: string): CanonicalToolSurfaceEntry | undefined =>
+        name === 'ghost' ? undefined : getCanonicalToolSurface(name),
+      getRetiredToolAlias: (name: string): RetiredToolAlias | undefined =>
+        name === 'ghost_read' ? brokenAlias : undefined,
+    };
+    expect(() => resolveToolAliasMatchersFrom('ghost_read', source)).toThrow(
+      /Malformed tool alias metadata.*ghost_read.*ghost/u,
+    );
+  });
+
+  it('every real retired alias resolves to a live canonical surface (no dangling metadata)', () => {
+    for (const alias of listRetiredToolAliases()) {
+      expect(() => resolveToolAliasMatchers(alias.alias)).not.toThrow();
+      expect(resolveToolAliasMatchers(alias.alias)).toContain(alias.canonicalName);
+    }
+  });
+});

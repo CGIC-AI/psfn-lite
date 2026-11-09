@@ -1,0 +1,150 @@
+import { describe, expect, it } from 'vitest';
+import {
+  buildExtractionEntryChunks,
+  formatExtractionTranscript,
+  isExtractionTranscriptEntry,
+} from './chunk-compose.js';
+import { buildSessionMetadataWithRuntimeFallbackProvenance } from '../../../core/session/runtime-fallback-provenance.js';
+import { buildSessionMetadataWithMessageAddressing } from '../../../core/session/message-addressing.js';
+import { buildSessionMetadataWithTurn } from '../../../core/session/turn-provenance.js';
+import { createTurnId } from '../../../core/turns/id.js';
+
+describe('chunk-compose extraction transcript filtering', () => {
+  it('treats only user and assistant entries as extraction transcript content', () => {
+    const entries = [
+      { id: 1, channelId: 'api:test', role: 'system', content: 'hidden system', timestamp: 1 },
+      { id: 2, channelId: 'api:test', role: 'tool', content: 'tool payload', timestamp: 2, authorName: 'memory_write' },
+      { id: 3, channelId: 'api:test', role: 'user', content: 'User said a real thing', timestamp: 3, authorName: 'Morgan' },
+      { id: 4, channelId: 'api:test', role: 'assistant', content: 'Assistant replied', timestamp: 4, authorName: 'Purr' },
+    ] as const;
+
+    expect(entries.filter(isExtractionTranscriptEntry).map(entry => entry.id)).toEqual([3, 4]);
+    expect(formatExtractionTranscript(entries)).toBe([
+      '[message_id:3] Morgan: User said a real thing',
+      '[message_id:4] Purr: Assistant replied',
+    ].join('\n'));
+  });
+
+  it('chunks only extraction-eligible entries after filtering', () => {
+    const entries = [
+      { id: 1, channelId: 'api:test', role: 'user', content: 'one', timestamp: 1 },
+      { id: 2, channelId: 'api:test', role: 'tool', content: 'ignore', timestamp: 2 },
+      { id: 3, channelId: 'api:test', role: 'assistant', content: 'two', timestamp: 3 },
+      { id: 4, channelId: 'api:test', role: 'system', content: 'ignore', timestamp: 4 },
+      { id: 5, channelId: 'api:test', role: 'user', content: 'three', timestamp: 5 },
+    ] as const;
+
+    const filtered = entries.filter(isExtractionTranscriptEntry);
+    expect(buildExtractionEntryChunks(filtered, 2).map(chunk => chunk.map(entry => entry.id))).toEqual([
+      [1, 3],
+      [5],
+    ]);
+  });
+
+  it('excludes runtime-authored fallback entries from extraction transcripts (psfn-framework-zagpk)', () => {
+    // The exact persisted shape: role assistant + the metadata the runtime
+    // fallback path writes through buildSessionMetadataWithRuntimeFallbackProvenance.
+    const fallbackMetadata = buildSessionMetadataWithRuntimeFallbackProvenance(undefined, {
+      schemaVersion: 1,
+      authoredBy: 'runtime',
+      model: 'runtime-fallback',
+      strategy: 'runtime_nonfabricating_notice',
+    });
+    const entries = [
+      { id: 1, channelId: 'api:test', role: 'user', content: 'here is a picture', timestamp: 1, authorName: 'Morgan' },
+      {
+        id: 2,
+        channelId: 'api:test',
+        role: 'assistant',
+        content: 'I got the image attachment, but my image reader failed before I could inspect it.',
+        timestamp: 2,
+        authorName: 'Purr',
+        metadata: fallbackMetadata,
+      },
+      { id: 3, channelId: 'api:test', role: 'assistant', content: 'Her genuine reply', timestamp: 3, authorName: 'Purr' },
+    ] as const;
+
+    expect(entries.filter(isExtractionTranscriptEntry).map(entry => entry.id)).toEqual([1, 3]);
+    expect(formatExtractionTranscript(entries)).toBe([
+      '[message_id:1] Morgan: here is a picture',
+      '[message_id:3] Purr: Her genuine reply',
+    ].join('\n'));
+  });
+
+  it('fails closed on a malformed provenance marker: still excluded from extraction', () => {
+    const entry = {
+      id: 7,
+      channelId: 'api:test',
+      role: 'assistant',
+      content: 'notice text',
+      timestamp: 7,
+      metadata: JSON.stringify({ runtimeFallbackProvenance: { schemaVersion: 999 } }),
+    } as const;
+
+    expect(isExtractionTranscriptEntry(entry)).toBe(false);
+  });
+
+  it('renders transport addressing and reply lineage into the extraction transcript', () => {
+    const addressingMetadata = buildSessionMetadataWithMessageAddressing(undefined, {
+      schemaVersion: 2,
+      source: 'discord',
+      author: { authorId: 'operator-1', authorName: 'Operator' },
+      observer: { authorId: 'lyra-bot', authorName: 'Lyra' },
+      mentionedTargets: [
+        { authorId: 'other-companion', authorName: 'Other Companion' },
+        { authorId: 'second-companion', authorName: 'Second Companion' },
+      ],
+      replyTarget: {
+        messageId: 'discord-parent-1',
+        author: { authorId: 'other-companion', authorName: 'Other Companion' },
+      },
+      channel: { scope: 'group', channelId: 'discord-room', threadId: 'discord-thread' },
+      resolvedAddressee: {
+        kind: 'participants',
+        participants: [
+          {
+            authorId: 'other-companion',
+            authorName: 'Other Companion',
+            evidence: ['mention', 'reply'],
+          },
+          {
+            authorId: 'second-companion',
+            authorName: 'Second Companion',
+            evidence: ['mention'],
+          },
+        ],
+      },
+    });
+    const metadata = buildSessionMetadataWithTurn(addressingMetadata, {
+      turnId: createTurnId(),
+      requestId: 'request-addressing-transcript',
+      sourceMessageId: 'discord-message-5',
+      replyToMessageId: 'discord-parent-1',
+      role: 'user',
+    });
+
+    expect(formatExtractionTranscript([{
+      id: 5,
+      channelId: 'discord:shared-room',
+      role: 'user',
+      content: '<@other-companion> hello there',
+      authorName: 'Operator',
+      timestamp: 5,
+      metadata,
+    }])).toBe(
+      '[message_id:5] '
+      + '[platform_source: discord] '
+      + '[author: Operator (author_id=operator-1)] '
+      + '[observer: Lyra (author_id=lyra-bot)] '
+      + '[channel_scope: group] '
+      + '[channel_id: discord-room] '
+      + '[thread_id: discord-thread] '
+      + '[mentioned_targets: Other Companion (author_id=other-companion), '
+      + 'Second Companion (author_id=second-companion)] '
+      + '[reply_target: message_id=discord-parent-1, Other Companion (author_id=other-companion)] '
+      + '[resolved_addressee: Other Companion (author_id=other-companion; evidence=mention+reply), '
+      + 'Second Companion (author_id=second-companion; evidence=mention)] '
+      + 'Operator: <@other-companion> hello there',
+    );
+  });
+});

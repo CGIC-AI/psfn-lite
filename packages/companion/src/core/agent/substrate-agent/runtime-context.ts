@@ -1,0 +1,1197 @@
+import { isRecord } from '../../../shared/utils/types.js';
+import { getAllowedSensitivities } from '../../../system/trust/policy.js';
+import {
+  partitionScratchpadEntriesForViewer,
+  type ScratchpadViewer,
+} from '../../../faculties/memory/scratchpad-visibility.js';
+import { filterConcernsForViewer, type ConcernViewer } from '../../intention/concern-visibility.js';
+import type { AgentTool } from '../../../boundary/pi-agent/index.js';
+import type {
+  RequesterProvenance,
+  SubstrateMessage,
+  ResponseStyle,
+} from '../../../shared/contracts/runtime.js';
+import type { ApiHealthResponse } from '../../../shared/contracts/api-health.js';
+import type { CapabilityTier } from '../../../system/config/runtime-config-contracts.js';
+import type { CapabilityToken } from '../../../system/capabilities/tokens.js';
+import type { TrustLevel } from '../../../system/trust/types.js';
+import { normalizeChannelPrivacy } from '../../../system/trust/context-envelope.js';
+import { decodeStoredChannelVisibility } from '../../../system/trust/types.js';
+import {
+  buildContextEnvelopePromptState,
+  buildResponseStylePromptState,
+  buildTrustPromptState,
+  classifyChannelEnvelope,
+  isVoiceResponseChannel,
+  type ChannelMeta,
+} from '../../../system/trust/policy.js';
+import type { ContactStorePort } from '../../contacts/contact-store-port.js';
+import type { Contact, ContactChannelIdentity } from '../../contacts/types.js';
+import type { ContactTrackingGate } from '../../contacts/tracking-gate.js';
+import { normalizeIdentity } from '../../contacts/store/identity-utils.js';
+import type { ScratchpadProvider } from '../contracts.js';
+import type { SessionEntry } from '../../session/types.js';
+import type { TurnChannelBondInput } from '../../session/channel-bond.js';
+import type { SessionActorKind } from '../../session/turn-provenance.js';
+import {
+  createGroupConversationScope,
+  type ConversationScope,
+} from '../../session/conversation-scope.js';
+import type { EmotionAppraisalEntry } from '../../emotion/appraisal.js';
+import type { ActiveConcernContextProvider } from '../../intention/concern-store-port.js';
+import {
+  buildActiveConcernsRuntimeData,
+  type ActiveConcern,
+  type ActiveConcernRuntimeData,
+} from '../../intention/concerns.js';
+import type { BehavioralPatternContextProvider } from '../../intention/patterns.js';
+import { buildEmotionalAffectPromptVariables } from '../../emotion/persona-adaptation.js';
+import type { MetacognitiveFlag } from '../../self-model/metacognition.js';
+import {
+  buildMetacognitiveFlagPromptVariables,
+  formatMetacognitiveNotesContextBlock,
+} from '../../self-model/metacognition.js';
+import type { InternalState } from '../../self-model/state.js';
+import type { InternalStateContinuityGap } from '../../self-model/internal-state-persistence.js';
+import { toErrorMessage } from '../../../shared/utils/errors.js';
+import { resolvePreferredContactName } from '../../contacts/preferred-name.js';
+import { applyObservedMachineIntelligence } from '../../contacts/observed-machine-intelligence.js';
+import { resolveActiveTimezone } from '../../../shared/time/active-timezone.js';
+import { wrapPromptSectionXml } from '../../identity/prompt-sections.js';
+import { sanitizePromptEmbeddedText } from '../../../shared/utils/escaping.js';
+import { getRunChargeSnapshot } from '../../../shared/telemetry/run-charge.js';
+import { parseIcpConversationCorrelation } from '../../../shared/contracts/icp-autonomy.js';
+import {
+  formatShardParentIcpChannelId,
+  parseShardParentIcpRoutingMetadata,
+} from '../../../shared/contracts/shard-parent-icp.js';
+import {
+  buildCurrentDatetimePromptVariables,
+  buildLastMessagePromptVariables,
+  normalizeRuntimeTimezone,
+} from './runtime-context-sections/datetime.js';
+import {
+  buildConversationStatePromptVariables,
+  type ParticipantRelationshipEdgeInput,
+  type UserRuntimeProfile,
+} from './runtime-context-sections/conversation-state.js';
+import { buildTurnBindingPromptVariables } from './runtime-context-sections/turn-binding.js';
+import {
+  buildChargePromptVariables,
+  resolveChargePolicyConfig,
+} from './runtime-context-sections/charge.js';
+import { buildContinuityGapPromptVariables } from './runtime-context-sections/continuity-gap.js';
+import {
+  buildInternalStatePromptVariables,
+  buildSituatedLocationPromptVariables,
+  toEmotionSnapshotFromInternalState,
+} from './runtime-context-sections/internal-state.js';
+import { buildConcernPromptVariables } from './runtime-context-sections/concerns.js';
+import { buildEmotionAppraisalPromptVariables } from './runtime-context-sections/emotion-appraisal.js';
+import {
+  buildExtendedToolGuide,
+  buildExtendedToolPromptVariables,
+  buildToolingPromptVariables,
+  type RuntimeContextActiveToolCounts,
+} from './runtime-context-sections/tooling.js';
+import {
+  buildBehavioralNotesPromptVariables,
+  buildSkillsPromptVariables,
+} from './runtime-context-sections/notes-and-skills.js';
+import { buildSelfPresentationPromptVariables } from './runtime-context-sections/self-presentation.js';
+import { buildSatelliteEndpointContextBlock } from './runtime-context-sections/satellite.js';
+import { buildReactionSurfaceContextBlock } from './runtime-context-sections/reaction-surface.js';
+import type { ResolvedReactionSurface } from '../../../shared/contracts/reaction-surface.js';
+import {
+  buildSituatedPresenceContextBlock,
+  type CoPresentCompanion,
+} from './runtime-context-sections/situated-presence.js';
+import type { SituatedEmanationTracker } from './runtime-context-sections/situated-emanation.js';
+import type { WorldPlaneMapReader } from '../../../shared/contracts/world-plane-map.js';
+import type { WorldNotesReader } from '../../../shared/contracts/world-notes.js';
+import type { PlacesRegistryConfig } from '../../../shared/contracts/places-registry.js';
+
+// The section producers moved into ./runtime-context-sections/ (E2.6). This
+// module stays the public entry point for the names other modules consume.
+export { buildContinuityGapPromptVariables, toEmotionSnapshotFromInternalState };
+export type { UserRuntimeProfile, ParticipantRelationshipEdgeInput };
+export { resolveAppearanceContextFromTemplateVariables } from './runtime-context-sections/self-presentation.js';
+
+const SCRATCHPAD_PROMPT_SCAN_LIMIT = 64;
+const SCRATCHPAD_PROMPT_MAX_ENTRIES = 8;
+const SCRATCHPAD_PROMPT_MAX_ENTRY_CHARS = 240;
+const SCRATCHPAD_PROMPT_MAX_TOTAL_CHARS = 1_600;
+
+interface RuntimeContextLogger {
+  warn: (message: string, payload: Record<string, unknown>) => void;
+  debug: (message: string, payload: Record<string, unknown>) => void;
+}
+
+export type CompanionSubstrateHealthStatus = 'healthy' | 'degraded' | 'unavailable';
+
+export interface CompanionSubstrateHealthWarning {
+  label: string;
+  detail: string;
+  status?: CompanionSubstrateHealthStatus;
+}
+
+export interface CompanionSubstrateHealthContext {
+  apiHealth?: ApiHealthResponse | null;
+  unavailableReason?: string;
+  warnings?: readonly CompanionSubstrateHealthWarning[];
+}
+
+export interface ResolvedAuthorContext {
+  trustLevel: TrustLevel;
+  speakerRole: 'user' | 'system';
+  /** Author provenance resolved independently from mutable contact attributes. */
+  actorKind: SessionActorKind;
+  resolvedUserName: string;
+  /** True when the resolved contact is another machine intelligence (peer companion/agent). */
+  speakingWithIsMachineIntelligence?: boolean;
+  relationshipType?: Contact['relationshipType'];
+  timezone?: string;
+  canonicalContactKey?: string;
+  subjectIdentityKey?: string;
+  continuitySubjectKey?: string;
+  // E3.2: the per-contact `channelPrivacyLevel` field was removed. Per-contact
+  // conversation-channel privacy is provenance evidence only and must never
+  // reach ChannelMeta.privacyLevel / classifyChannel (docs/context-envelope.md).
+  continuityFallbackKeys: string[];
+  /**
+   * Channel bonding opt-in. Present only when the current turn's exact
+   * identity carries the contact's explicit `bonded`
+   * flag; absent = no bond, byte-identical unbonded behavior.
+   */
+  channelBond?: TurnChannelBondInput;
+}
+
+function isInternalJournalChannel(channelId: string): boolean {
+  // `internal:heartbeat` is a persisted reflection-session channel id.
+  return channelId === 'internal:heartbeat' || channelId.startsWith('internal:reflection:');
+}
+
+/**
+ * Derive requester provenance from an already-resolved author context. This is
+ * the SINGLE source of the human-vs-machine origin signal that human-in-the-loop
+ * effector gates read (`world.control` Gate 2). It reuses the existing
+ * `speakerRole` decision made in {@link resolveAuthorContext} rather than adding a
+ * parallel flag at every return site:
+ *   - speakerRole 'user'   → a live human is driving the turn ('human')
+ *   - speakerRole 'system' on an `internal:` channel → scheduler-driven
+ *     reflection (`internal:heartbeat` is the persisted legacy id) ('self_directed')
+ *   - speakerRole 'system' otherwise → system-injected turn ('system')
+ * Fail closed: only 'human' unlocks human-gated effectors; both machine buckets
+ * are refused even when `trustLevel` is 'primary' for scoping.
+ */
+export function resolveRequesterProvenance(
+  authorContext: Pick<ResolvedAuthorContext, 'actorKind' | 'speakerRole'>,
+  message: Pick<SubstrateMessage, 'channelId'>,
+): RequesterProvenance {
+  if (authorContext.actorKind === 'human') {
+    return 'human';
+  }
+  return message.channelId.startsWith('internal:') ? 'self_directed' : 'system';
+}
+
+function resolveUserActorKind(
+  message: SubstrateMessage,
+  contact?: Pick<Contact, 'isMachineIntelligence'>,
+): SessionActorKind {
+  if (message.routing?.authorIsMachineIntelligence === true) {
+    return 'machine_intelligence';
+  }
+  if (!contact) return 'unknown';
+  return contact.isMachineIntelligence === true ? 'machine_intelligence' : 'human';
+}
+
+function resolveMessageChannelMeta(message: Pick<SubstrateMessage, 'isDirectMessage' | 'routing'>): ChannelMeta | undefined {
+  const privacyLevel = normalizeChannelPrivacy(message.routing?.channelPrivacy);
+  if (message.isDirectMessage === undefined && !privacyLevel) return undefined;
+  return {
+    ...(message.isDirectMessage !== undefined ? { isDirectMessage: message.isDirectMessage } : {}),
+    ...(privacyLevel ? { privacyLevel } : {}),
+  };
+}
+
+function formatScratchpadOmissionMetadata(entries: Array<{ updatedAt: number }>): string {
+  const updatedTimes = entries
+    .map(entry => entry.updatedAt)
+    .filter((value): value is number => Number.isFinite(value));
+  if (updatedTimes.length === 0) return '';
+
+  const newest = Math.max(...updatedTimes);
+  const oldest = Math.min(...updatedTimes);
+  return [
+    ' Older/stale metadata:',
+    `newest omitted updated ${new Date(newest).toISOString()};`,
+    `oldest omitted updated ${new Date(oldest).toISOString()}.`,
+  ].join(' ');
+}
+
+function resolveContactRuntimeTimezone(contact: Contact | undefined): string | undefined {
+  if (!contact || !isRecord(contact)) return undefined;
+  return normalizeRuntimeTimezone(contact.timezone);
+}
+
+export function buildPromptTemplateVariables(input: {
+  message: SubstrateMessage;
+  resolvedUserName: string;
+  trustLevel: TrustLevel;
+  channelType: string | undefined;
+  canonicalContactKey: string | undefined;
+  subjectIdentityKey?: string;
+  now: Date;
+  characterPromptVariables: Record<string, string>;
+  modelId: string;
+  fallbackCharacterName: string;
+}): { templateVariables: Record<string, string>; runtimeCharacterName: string } {
+  const visibility = classifyChannelEnvelope(input.message.channelId, resolveMessageChannelMeta(input.message)).privacy;
+  const runtimeCharacterName = resolveRuntimeCharacterName(
+    input.characterPromptVariables,
+    input.fallbackCharacterName,
+  );
+  const subjectIdentityKey = input.subjectIdentityKey ?? input.message.authorId;
+  const canonicalIdentityKey = input.canonicalContactKey ?? input.subjectIdentityKey ?? input.message.authorId;
+
+  return {
+    templateVariables: {
+      ...input.characterPromptVariables,
+      user: input.resolvedUserName,
+      user_name: input.resolvedUserName,
+      user_id: subjectIdentityKey,
+      char: runtimeCharacterName,
+      char_name: runtimeCharacterName,
+      character: runtimeCharacterName,
+      character_name: runtimeCharacterName,
+      channel_id: input.message.channelId,
+      channel_type: input.channelType ?? 'unknown',
+      channel_visibility: visibility,
+      trust_level: input.trustLevel,
+      canonical_contact_id: canonicalIdentityKey,
+      model: input.modelId,
+      active_timezone: resolveActiveTimezone(),
+    },
+    runtimeCharacterName,
+  };
+}
+
+export interface DynamicPromptTemplateVariablesInput {
+  message: SubstrateMessage;
+  /** Resolved once per turn at session-manager ingress; see conversation-scope.ts. */
+  conversationScope: ConversationScope;
+  resolvedUserName: string;
+  trustLevel: TrustLevel;
+  relationshipType?: Contact['relationshipType'];
+  channelType: string | undefined;
+  canonicalContactKey?: string;
+  subjectIdentityKey?: string;
+  responseStyle?: ResponseStyle;
+  now?: Date;
+  taskKind?: string;
+  templateVariables?: Record<string, string>;
+  internalState?: InternalState;
+  metacognitiveFlags?: readonly MetacognitiveFlag[];
+  emotionAppraisalChain?: readonly EmotionAppraisalEntry[];
+  modelId: string;
+  capabilityTier: CapabilityTier;
+  /**
+   * The granted token set from the SAME capability access resolution as
+   * `capabilityTier` (mus2.1). The extended-tool guide advertises from this
+   * set so prompt availability and tool gating agree exactly — including for
+   * an injected immutable `custom` shard access, which a tier-name lookup
+   * would misreport as an empty grant.
+   */
+  capabilityGrantedTokens: ReadonlySet<CapabilityToken>;
+  activeToolCounts: RuntimeContextActiveToolCounts;
+  extendedTools: AgentTool<any>[];
+  coreToolNames: ReadonlySet<string>;
+  skillsContext?: string;
+  activeConcerns?: ActiveConcernRuntimeData | null;
+  behavioralNotesBlock?: string;
+  lastMessageReceivedAtMs?: number | null;
+  recentChannelEntries?: readonly SessionEntry[];
+  currentUserRuntimeProfile?: UserRuntimeProfile;
+  recentActiveParticipantRuntimeProfiles?: readonly UserRuntimeProfile[];
+  participantRelationshipEdges?: readonly ParticipantRelationshipEdgeInput[];
+  analysisWorkbenchAvailable?: boolean;
+  internalStateContinuityGap?: InternalStateContinuityGap | null;
+  config: Record<string, unknown>;
+}
+
+/**
+ * Orchestrator for the turn-phase prompt variables (E2.6): gather the
+ * turn-scoped inputs once, call the declared section producers in order, and
+ * assemble their records. Every section lives in ./runtime-context-sections/
+ * and receives its inputs as parameters — no producer reads runtime state.
+ */
+export function buildDynamicPromptTemplateVariables(
+  input: DynamicPromptTemplateVariablesInput,
+): Record<string, string> {
+  const internalTurn = isInternalJournalChannel(input.message.channelId);
+  // E1.3: speaking_with is a one-on-one binding. It is active only on genuine
+  // DM turns (scope.kind === 'dm') and never on internal or multi-human group
+  // turns. When inactive, every runtime_speaking_with_* token is blank so
+  // persisted/custom prompt layers that still reference them prune cleanly.
+  const speakingWithActive = !internalTurn && input.conversationScope.kind === 'dm';
+  const visibility = classifyChannelEnvelope(input.message.channelId, resolveMessageChannelMeta(input.message)).privacy;
+  const now = input.now ?? new Date();
+  const analysisWorkbenchAvailable = input.analysisWorkbenchAvailable === true;
+  const emotionSnapshot = input.internalState ? toEmotionSnapshotFromInternalState(input.internalState) : null;
+  const chargeLaneOverride = input.message.routing?.icpCorrelation
+    ? parseIcpConversationCorrelation(input.message.routing.icpCorrelation).chargeLane
+    : undefined;
+  const extendedToolGuide = buildExtendedToolGuide({
+    grantedTokens: input.capabilityGrantedTokens,
+    extendedTools: input.extendedTools,
+  });
+
+  return {
+    ...buildCurrentDatetimePromptVariables(now),
+    ...buildLastMessagePromptVariables({ now, lastMessageReceivedAtMs: input.lastMessageReceivedAtMs }),
+    ...buildConversationStatePromptVariables({
+      message: input.message,
+      conversationScope: input.conversationScope,
+      internalTurn,
+      trustLevel: input.trustLevel,
+      relationshipType: input.relationshipType,
+      now,
+      recentChannelEntries: input.recentChannelEntries,
+      currentUserRuntimeProfile: input.currentUserRuntimeProfile,
+      recentActiveParticipantRuntimeProfiles: input.recentActiveParticipantRuntimeProfiles,
+      participantRelationshipEdges: input.participantRelationshipEdges,
+    }),
+    ...buildContinuityGapPromptVariables(input.internalStateContinuityGap),
+    ...buildChargePromptVariables({
+      chargePolicy: resolveChargePolicyConfig(input.config),
+      chargeSnapshot: getRunChargeSnapshot(),
+      ...(chargeLaneOverride ? { laneOverride: chargeLaneOverride } : {}),
+      analysisWorkbenchAvailable,
+    }),
+    ...buildTurnBindingPromptVariables({
+      internalTurn,
+      taskKind: input.taskKind,
+      speakingWithActive,
+      resolvedUserName: input.resolvedUserName,
+      trustLevel: input.trustLevel,
+      channelType: input.channelType,
+      visibility,
+    }),
+    // Context Envelope macros (E3.3): bare values only, frozen from the
+    // scope envelope resolved at session-manager ingress. Blank on internal
+    // turns so channel-family sections prune, matching runtime_channel_*.
+    ...(internalTurn
+      ? {
+        runtime_channel_privacy: '',
+        runtime_audience_scope: '',
+        runtime_audience_knowledge: '',
+        runtime_broadcast: '',
+      }
+      : buildContextEnvelopePromptState(input.conversationScope.envelope)),
+    ...buildToolingPromptVariables({
+      capabilityTier: input.capabilityTier,
+      analysisWorkbenchAvailable,
+      activeToolCounts: input.activeToolCounts,
+      availableExtendedCount: input.extendedTools.length,
+    }),
+    ...buildTrustPromptState(input.trustLevel),
+    ...buildResponseStylePromptState(input.responseStyle ?? 'concise', isVoiceResponseChannel(
+      input.message.channelId,
+      input.channelType,
+    )),
+    ...buildEmotionalAffectPromptVariables({
+      trustLevel: input.trustLevel,
+      emotionSnapshot,
+      promptVariables: input.templateVariables,
+      config: input.config,
+    }),
+    ...buildMetacognitiveFlagPromptVariables(input.metacognitiveFlags ?? []),
+    ...buildInternalStatePromptVariables(input.internalState),
+    // The companion's physical place (often a room in the partner's home) is
+    // set by a satellite turn and carried companion-wide; it renders only
+    // where personal material is admitted (o5wf5 sweep).
+    ...buildSituatedLocationPromptVariables(
+      getAllowedSensitivities(input.trustLevel, {
+        channelPrivacy: input.conversationScope.envelope.channelPrivacy,
+        broadcast: input.conversationScope.envelope.broadcast,
+      }).includes('personal')
+        ? input.internalState
+        : undefined,
+      now,
+    ),
+    ...buildConcernPromptVariables(input.activeConcerns),
+    ...buildEmotionAppraisalPromptVariables(input.emotionAppraisalChain ?? []),
+    ...buildBehavioralNotesPromptVariables(input.behavioralNotesBlock),
+    ...buildSkillsPromptVariables(input.skillsContext),
+    ...buildExtendedToolPromptVariables({ extendedTools: input.extendedTools, extendedToolGuide }),
+    ...buildSelfPresentationPromptVariables({
+      internalTurn,
+      templateVariables: input.templateVariables,
+      skillsContext: input.skillsContext,
+      coreToolNames: input.coreToolNames,
+      extendedToolNames: new Set(input.extendedTools.map(tool => tool.name)),
+    }),
+  } satisfies Record<string, string>;
+}
+
+export function buildRuntimeContext(input: {
+  message: SubstrateMessage;
+  /**
+   * Turn ConversationScope, plumbed for runtime-context overlays (available
+   * param; no overlay consumes it yet — dependent E1 beads act on it here).
+   */
+  conversationScope?: ConversationScope;
+  resolvedUserName: string;
+  trustLevel: TrustLevel;
+  relationshipType?: Contact['relationshipType'];
+  channelType: string | undefined;
+  canonicalContactKey?: string;
+  subjectIdentityKey?: string;
+  responseStyle?: ResponseStyle;
+  now?: Date;
+  taskKind?: string;
+  templateVariables?: Record<string, string>;
+  internalState?: InternalState;
+  metacognitiveFlags?: readonly MetacognitiveFlag[];
+  emotionAppraisalChain?: readonly EmotionAppraisalEntry[];
+  modelId: string;
+  contextWindow: number;
+  activeToolCounts: RuntimeContextActiveToolCounts;
+  extendedTools: AgentTool<any>[];
+  coreToolNames: ReadonlySet<string>;
+  skillsContext?: string;
+  behavioralNotesBlock?: string;
+  formatTopEmotions: (discrete: Record<string, number>) => string;
+  config?: Record<string, unknown>;
+  substrateHealth?: CompanionSubstrateHealthContext | null;
+  /**
+   * Places soft-registry threaded from startup. Optional/undefined behaves as an
+   * empty registry, so a runtime with no `places.json` renders byte-identically.
+   */
+  placesRegistry?: PlacesRegistryConfig;
+  /**
+   * Co-present companions at the turn's situated place, resolved from the
+   * shared `companion_presence` table (multi-companion W5a). Absent/empty
+   * (always the case flag-off) renders byte-identically to today.
+   */
+  coPresent?: ReadonlyArray<CoPresentCompanion>;
+  /**
+   * Handoff-aware active-emanation tracker (S10 B2). Threaded from the agent so
+   * a placeless turn foregrounds the companion's current active emanation. When
+   * absent, the situated block resolves from the turn alone (B1 behaviour).
+   */
+  emanationTracker?: SituatedEmanationTracker;
+  /** What the world published for its plane (gs899, g8xyn); world-plane turns only. */
+  worldPlaneMap?: WorldPlaneMapReader;
+  /** The companion's own notes on each world (2nsfo); world-plane turns only. */
+  worldNotes?: WorldNotesReader;
+  /**
+   * Dual-presence situated fallback for this turn (vinz.29), resolved once by
+   * the agent so the rendered block, the co-presence read, and the presence
+   * write all foreground the same place. On mindspace (plain-chat) turns this
+   * is the twin of the last-known physical room; a deliberate virtual move
+   * outranks it. Absent ⇒ tracker fallback (B2 behaviour).
+   */
+  situatedFallbackPlaceId?: string;
+  /**
+   * Curated emoji reaction surface for this turn (jp36.3.1.2), resolved from
+   * the turn's channel adapter (standard subset plus guild-custom emojis that
+   * carry a configured one-line meaning). Absent on channels that expose no
+   * reaction surface — the block then renders nothing.
+   */
+  reactionSurface?: ResolvedReactionSurface;
+}): string {
+  const runtimeContextExtra = (() => {
+    const raw = input.templateVariables?.runtime_context_extra;
+    return typeof raw === 'string' ? raw.trim() : '';
+  })();
+  const sections: string[] = [];
+  if (runtimeContextExtra) {
+    sections.push(wrapPromptSectionXml({
+      id: 'companion_runtime_context',
+      content: runtimeContextExtra,
+    }));
+  }
+  const protectedTimeReturn = input.message.routing?.protectedTimeReturn;
+  if (protectedTimeReturn) {
+    const queuedLabel = protectedTimeReturn.queuedCount === 1 ? 'message was' : 'messages were';
+    const lines = [
+      `${protectedTimeReturn.queuedCount} ${queuedLabel} queued while you were unavailable.`,
+      'This is factual continuity context, not a prescribed reply. Respond naturally to the messages and current conversation.',
+      ...protectedTimeReturn.messages.map(entry => {
+        const author = sanitizePromptEmbeddedText(entry.authorName) || 'Someone';
+        const excerpt = sanitizePromptEmbeddedText(entry.excerpt);
+        return `- ${new Date(entry.timestampMs).toISOString()} — ${author}: ${excerpt}`;
+      }),
+    ];
+    sections.push(wrapPromptSectionXml({
+      id: 'protected_time_return',
+      content: lines.join('\n'),
+    }));
+  }
+  // The continuity-gap notice and the charge-budget block moved to the layer
+  // system (E2.5): bare values from buildDynamicPromptTemplateVariables plus
+  // operator-editable wording in the runtime.continuity_notice and
+  // runtime.charge_budget seeded layers.
+  const satelliteEndpointContext = buildSatelliteEndpointContextBlock(input.message);
+  if (satelliteEndpointContext) {
+    sections.push(satelliteEndpointContext);
+  }
+  // Curated reaction surface (jp36.3.1.2): advertises the emoji the companion
+  // may react with and what each one signals. Absent on channels with no
+  // reaction surface; renders nothing when the surface is empty.
+  const reactionSurfaceContext = buildReactionSurfaceContextBlock(input.reactionSurface);
+  if (reactionSurfaceContext) {
+    sections.push(reactionSurfaceContext);
+  }
+  // Situated-presence block (S10 B1): "where am I / what's here / who else is
+  // here". First consumer of message.routing.presence + the places registry.
+  // coPresent is populated from shared companion_presence under
+  // multi-companion (W5a); absent/empty renders byte-identically.
+  //
+  // vinz.29: the character-facing name of the shared-mindspace layer is an
+  // operator-authored character-card extension (`mindspace_label`) living in
+  // companion-data — it reaches this block through the flattened card
+  // template variables, exactly like `visual_description`. Never hardcoded.
+  const mindspaceLabel = (() => {
+    const raw = input.templateVariables?.extensions_mindspace_label;
+    return typeof raw === 'string' ? raw.trim() : '';
+  })();
+  const situatedPresenceContext = buildSituatedPresenceContextBlock({
+    message: input.message,
+    ...(input.placesRegistry ? { placesRegistry: input.placesRegistry } : {}),
+    ...(input.coPresent && input.coPresent.length > 0 ? { coPresent: input.coPresent } : {}),
+    ...(input.emanationTracker ? { emanationTracker: input.emanationTracker } : {}),
+    ...(input.worldPlaneMap ? { worldPlaneMap: input.worldPlaneMap } : {}),
+    ...(input.worldNotes ? { worldNotes: input.worldNotes } : {}),
+    ...(input.situatedFallbackPlaceId ? { situatedFallbackPlaceId: input.situatedFallbackPlaceId } : {}),
+    ...(mindspaceLabel ? { mindspaceLabel } : {}),
+  });
+  if (situatedPresenceContext) {
+    sections.push(situatedPresenceContext);
+  }
+  return sections.join('\n\n');
+}
+
+/** Resolve the deduplicated/capped concern runtime data for the current turn. */
+export function resolveActiveConcernsRuntimeData(input: {
+  activeConcernProvider: ActiveConcernContextProvider | null | undefined;
+  canonicalContactKey?: string;
+  /** Viewer of this turn; threads it may not see never render (xz8m1). */
+  viewer: Omit<ConcernViewer, 'canonicalContactKey'>;
+  logger: RuntimeContextLogger;
+}): ActiveConcernRuntimeData | undefined {
+  if (!input.activeConcernProvider) return undefined;
+
+  let concerns: readonly ActiveConcern[];
+  try {
+    concerns = input.activeConcernProvider.getActiveConcerns(input.canonicalContactKey);
+  } catch (error) {
+    input.logger.warn('Active concerns context injection skipped due to provider error', {
+      error: toErrorMessage(error),
+    });
+    return undefined;
+  }
+
+  const visible = filterConcernsForViewer(concerns, {
+    ...input.viewer,
+    ...(input.canonicalContactKey ? { canonicalContactKey: input.canonicalContactKey } : {}),
+  });
+  if (visible.length === 0) return undefined;
+  return buildActiveConcernsRuntimeData(visible);
+}
+
+export function buildMetacognitiveNotesContextBlock(
+  currentMetacognitiveFlags: readonly MetacognitiveFlag[],
+): string {
+  if (currentMetacognitiveFlags.length === 0) return '';
+  return formatMetacognitiveNotesContextBlock(currentMetacognitiveFlags, {
+    minConfidence: 0.4,
+    maxFlags: 2,
+  });
+}
+
+export function buildBehavioralNotesContextBlock(input: {
+  behavioralPatternProvider: BehavioralPatternContextProvider | null | undefined;
+  canonicalContactKey?: string;
+  logger: RuntimeContextLogger;
+}): string {
+  if (!input.behavioralPatternProvider) return '';
+
+  try {
+    return input.behavioralPatternProvider.getBehavioralNotes(input.canonicalContactKey);
+  } catch (error) {
+    input.logger.warn('Behavioral notes context injection skipped due to provider error', {
+      error: toErrorMessage(error),
+    });
+    return '';
+  }
+}
+
+export function buildScratchpadContextBlock(input: {
+  scratchpadProvider: ScratchpadProvider | null | undefined;
+  /** The turn's conversation and trust; other conversations' notes never render. */
+  viewer: ScratchpadViewer;
+  logger: RuntimeContextLogger;
+}): string {
+  if (!input.scratchpadProvider) return '';
+
+  try {
+    const { visible: entries } = partitionScratchpadEntriesForViewer(
+      input.scratchpadProvider.listScratchpadEntries(SCRATCHPAD_PROMPT_SCAN_LIMIT),
+      input.viewer,
+    );
+    if (entries.length === 0) return '';
+
+    const lines = [
+      '[Scratchpad]',
+      'Working notes (24h temporary context; verify before acting; not for durable reminders, proactive follow-ups, journals, or stable memories):',
+    ];
+
+    let included = 0;
+    let usedChars = lines.join('\n').length;
+    for (const entry of entries) {
+      if (included >= SCRATCHPAD_PROMPT_MAX_ENTRIES) break;
+
+      const normalized = entry.content.replace(/\s+/g, ' ').trim();
+      if (!normalized) continue;
+
+      const clipped = normalized.length > SCRATCHPAD_PROMPT_MAX_ENTRY_CHARS
+        ? `${normalized.slice(0, SCRATCHPAD_PROMPT_MAX_ENTRY_CHARS - 3)}...`
+        : normalized;
+
+      const line = `- ${clipped}`;
+      const projectedChars = usedChars + 1 + line.length;
+      if (projectedChars > SCRATCHPAD_PROMPT_MAX_TOTAL_CHARS) break;
+
+      lines.push(line);
+      usedChars = projectedChars;
+      included += 1;
+    }
+
+    if (included === 0) return '';
+    const omitted = Math.max(0, entries.length - included);
+    if (omitted > 0) {
+      lines.push(
+        `- (${omitted} additional notes omitted for context budget)`
+        + formatScratchpadOmissionMetadata(entries.slice(included)),
+      );
+    }
+
+    return lines.join('\n');
+  } catch (error) {
+    input.logger.warn('Scratchpad context injection skipped due to provider error', {
+      error: toErrorMessage(error),
+    });
+    return '';
+  }
+}
+
+export function getPersonaAdaptation(input: {
+  trustLevel: TrustLevel;
+  internalState: InternalState;
+  metacognitiveFlags: readonly MetacognitiveFlag[];
+  templateVariables?: Record<string, string>;
+  config: Record<string, unknown>;
+}): string | null {
+  const runtimePersonaExtra = (() => {
+    const raw = input.templateVariables?.runtime_persona_adaptation_extra;
+    return typeof raw === 'string' ? raw.trim() : '';
+  })();
+  if (runtimePersonaExtra) {
+    return wrapPromptSectionXml({
+      id: 'companion_persona_adaptation',
+      content: runtimePersonaExtra,
+    });
+  }
+  return null;
+}
+
+export function resolveIdentityChannel(message: SubstrateMessage): string {
+  if (message.routing?.satellite) return `satellite:${message.routing.satellite.claimType}`;
+  if (message.channelType === 'discord') return 'discord';
+  if (message.channelType === 'api') return 'api';
+  if (message.channelType !== 'terminal') return message.channelType;
+  if (message.channelId.startsWith('discord-voice:')) return 'discord';
+  if (message.channelId.startsWith('api:')) return 'api';
+  if (message.channelId.startsWith('internal:')) return 'internal';
+  return 'unknown';
+}
+
+export function collectContinuityFallbackKeys(
+  authorId: string,
+  canonicalContactKey: string,
+  contact?: Contact,
+  scope?: ConversationScope,
+): string[] {
+  // E1.7: continuity fallback keys are scope-aware. A group scope reflects on
+  // the ROOM, so the only fallback key is the room key — never a single
+  // participant's contact/channel identities (that single-member fallback is
+  // exactly the group mis-binding this scope threading exists to prevent).
+  if (scope?.kind === 'group') {
+    return [scope.key];
+  }
+
+  const keys = new Set<string>();
+  const addKey = (value?: string): void => {
+    if (!value || value === canonicalContactKey) return;
+    keys.add(value);
+  };
+
+  addKey(authorId);
+  addKey(contact?.discordUserId);
+  for (const identity of contact?.channelIdentities ?? []) {
+    addKey(identity.userId);
+  }
+
+  return [...keys].sort((a, b) => a.localeCompare(b));
+}
+
+export function resolveContinuitySubjectKey(input: {
+  canonicalContactKey?: string;
+  subjectIdentityKey?: string;
+  authorId?: string;
+}): string | undefined {
+  const canonicalContactKey = input.canonicalContactKey?.trim();
+  if (canonicalContactKey) return canonicalContactKey;
+
+  const subjectIdentityKey = input.subjectIdentityKey?.trim();
+  if (subjectIdentityKey) return subjectIdentityKey;
+
+  const authorId = input.authorId?.trim();
+  return authorId || undefined;
+}
+
+export function resolvePromptUserName(message: SubstrateMessage, contact?: Contact): string {
+  const preferredContactName = resolvePreferredContactName(contact);
+  if (preferredContactName) return preferredContactName;
+
+  const authorName = message.authorName.trim();
+  if (authorName) return authorName;
+
+  return 'User';
+}
+
+/**
+ * Sprint-10 privacy regression 07-M1: an untracked / approval-pending / unbound
+ * speaker has no verified identity — their `authorName` is a self-asserted channel
+ * label, not a resolved contact. Rendering it bare let a name like
+ * "System Administrator" become the speaker's prompt identity and impersonate
+ * authority. This renders the self-asserted name explicitly tagged `(unverified)`,
+ * or a generic "an unrecognized person" when no name was asserted, so the model
+ * never mistakes an unverified channel label for a trusted identity.
+ */
+export function resolveUnverifiedSpeakerName(message: SubstrateMessage): string {
+  const authorName = message.authorName.trim();
+  if (authorName) return `${authorName} (unverified)`;
+  return 'an unrecognized person';
+}
+
+export async function resolveAuthorContext(input: {
+  message: SubstrateMessage;
+  contactStore: ContactStorePort | null | undefined;
+  logger: RuntimeContextLogger;
+  companionIdentityKey: string;
+  companionDisplayName?: string;
+  /** Contact-tracking policy gate (E3.4). Absent gate behaves as 'auto' everywhere. */
+  contactTracking?: ContactTrackingGate;
+}): Promise<ResolvedAuthorContext> {
+  if (input.message.channelId.startsWith('internal:')) {
+    // The first comparison is a compatibility read of the legacy persisted
+    // reflection-turn channel id.
+    const isReflectionTurnChannel = input.message.channelId === 'internal:heartbeat';
+    const isScopedReflectionChannel = input.message.channelId.startsWith('internal:reflection:');
+    if (isReflectionTurnChannel || isScopedReflectionChannel) {
+      // Reflection turns are executed by the scheduler, but the subject
+      // of the turn is the companion. Reflection turns may also carry a bound
+      // canonical contact hint so self-model and memory subsystems can stay scoped
+      // to the current primary contact while subjectIdentityKey continues to drive
+      // continuity/prompt subject selection.
+      const subjectIdentityKey = input.companionIdentityKey.trim();
+      if (!subjectIdentityKey) {
+        throw new Error('Missing companion identity key for self-directed runtime turn');
+      }
+      const resolvedUserName = input.companionDisplayName?.trim() || resolvePromptUserName(input.message);
+      // E1.7: a group-scoped reflection reflects on the ROOM. It binds no single
+      // canonical contact and its continuity fallback keys are room-based. A
+      // dm/absent scope keeps the pre-E1.7 binding (routed canonical contact hint,
+      // empty fallback keys) byte-identical.
+      const reflectionScopeHint = isScopedReflectionChannel ? input.message.routing?.reflectionScope : undefined;
+      if (reflectionScopeHint?.kind === 'group') {
+        // The constructor derives a fail-closed envelope for this
+        // continuity-key helper scope; the turn pipeline resolves the
+        // authoritative room scope at session-manager ingress.
+        const roomScope = createGroupConversationScope({
+          channelId: reflectionScopeHint.roomId,
+          ...(reflectionScopeHint.roomName ? { roomName: reflectionScopeHint.roomName } : {}),
+        });
+        return {
+          trustLevel: 'primary',
+          speakerRole: 'system',
+          actorKind: 'system',
+          resolvedUserName,
+          ...(subjectIdentityKey ? { subjectIdentityKey } : {}),
+          ...(subjectIdentityKey ? { continuitySubjectKey: subjectIdentityKey } : {}),
+          continuityFallbackKeys: collectContinuityFallbackKeys(
+            subjectIdentityKey,
+            subjectIdentityKey,
+            undefined,
+            roomScope,
+          ),
+        };
+      }
+      const canonicalContactKey = isScopedReflectionChannel
+        ? input.message.routing?.canonicalContactId?.trim() || undefined
+        : undefined;
+      return {
+        trustLevel: 'primary',
+        speakerRole: 'system',
+        actorKind: 'system',
+        resolvedUserName,
+        ...(canonicalContactKey ? { canonicalContactKey } : {}),
+        ...(subjectIdentityKey ? { subjectIdentityKey } : {}),
+        ...(subjectIdentityKey ? { continuitySubjectKey: subjectIdentityKey } : {}),
+        continuityFallbackKeys: [],
+      };
+    }
+
+    return {
+      trustLevel: 'primary',
+      speakerRole: 'system',
+      actorKind: 'system',
+      resolvedUserName: resolvePromptUserName(input.message),
+      canonicalContactKey: input.message.authorId,
+      continuitySubjectKey: input.message.authorId,
+      continuityFallbackKeys: [],
+    };
+  }
+
+  const shardParentIcp = input.message.routing?.shardParentIcp;
+  if (shardParentIcp) {
+    const routing = parseShardParentIcpRoutingMetadata(shardParentIcp);
+    const shardId = routing.lineage.shardId;
+    const expectedAuthorId = `shard:${shardId}`;
+    const expectedChannelId = formatShardParentIcpChannelId(routing);
+    if (routing.direction !== 'shard_to_parent'
+      || routing.routingCompanionId !== input.companionIdentityKey
+      || routing.lineage.parentCompanionId !== input.companionIdentityKey
+      || input.message.channelId !== expectedChannelId
+      || input.message.channelType !== 'companion'
+      || input.message.authorId !== expectedAuthorId
+      || input.message.isDirectMessage !== true
+      || input.message.routing?.source !== 'companion'
+      || input.message.routing.authorIsMachineIntelligence !== true) {
+      throw new Error('Shard-parent ICP lineage does not match runtime identity/routing');
+    }
+    return {
+      trustLevel: 'regular',
+      speakerRole: 'user',
+      actorKind: 'machine_intelligence',
+      resolvedUserName: resolvePromptUserName(input.message),
+      speakingWithIsMachineIntelligence: true,
+      continuitySubjectKey: expectedAuthorId,
+      continuityFallbackKeys: [],
+    };
+  }
+
+  if ((input.message.authorId === 'system:icp-initiation'
+    || input.message.authorId === 'system:icp-continuation')
+    && input.message.routing?.privateTurnTrigger === true) {
+    const correlation = parseIcpConversationCorrelation(input.message.routing.icpCorrelation);
+    if (correlation.localCompanionId !== input.companionIdentityKey
+      || correlation.channelId !== input.message.channelId
+      || correlation.requestId !== input.message.id
+      || correlation.peerContactId !== input.message.routing.canonicalContactId) {
+      throw new Error('Private ICP target turn correlation does not match runtime identity/routing');
+    }
+    if (!input.contactStore) {
+      throw new Error('Private ICP target turn requires the canonical contact store');
+    }
+    const contact = await input.contactStore.getById(correlation.peerContactId);
+    if (!contact || !contact.isMachineIntelligence) {
+      throw new Error('Private ICP target turn peerContactId must resolve to a machine-intelligence contact');
+    }
+    return {
+      trustLevel: contact.trustLevel,
+      speakerRole: 'system',
+      actorKind: 'system',
+      resolvedUserName: resolvePromptUserName(input.message, contact),
+      speakingWithIsMachineIntelligence: true,
+      relationshipType: contact.relationshipType,
+      ...(resolveContactRuntimeTimezone(contact) ? { timezone: resolveContactRuntimeTimezone(contact) } : {}),
+      canonicalContactKey: contact.id,
+      continuitySubjectKey: contact.id,
+      continuityFallbackKeys: collectContinuityFallbackKeys(
+        correlation.peerCompanionId,
+        contact.id,
+        contact,
+      ),
+    };
+  }
+
+  if (input.message.authorId === 'system:social-outreach'
+    && input.message.routing?.privateTurnTrigger === true) {
+    const contactId = input.message.routing.canonicalContactId?.trim();
+    if (!contactId || !input.contactStore) {
+      throw new Error('Internal outreach target turn requires a canonical contact');
+    }
+    const contact = await input.contactStore.getById(contactId);
+    if (!contact || contact.isMachineIntelligence) {
+      throw new Error('Internal human outreach target must resolve to a human contact');
+    }
+    return {
+      trustLevel: contact.trustLevel,
+      speakerRole: 'system',
+      actorKind: 'system',
+      resolvedUserName: resolvePromptUserName(input.message, contact),
+      relationshipType: contact.relationshipType,
+      ...(resolveContactRuntimeTimezone(contact) ? { timezone: resolveContactRuntimeTimezone(contact) } : {}),
+      canonicalContactKey: contact.id,
+      continuitySubjectKey: contact.id,
+      continuityFallbackKeys: collectContinuityFallbackKeys(
+        input.message.authorId,
+        contact.id,
+        contact,
+      ),
+    };
+  }
+
+  if (input.message.authorId.startsWith('system:')) {
+    return {
+      trustLevel: 'regular',
+      speakerRole: 'system',
+      actorKind: 'system',
+      resolvedUserName: resolvePromptUserName(input.message),
+      continuitySubjectKey: input.message.authorId,
+      continuityFallbackKeys: [],
+    };
+  }
+
+  if (!input.message.authorId || !input.contactStore) {
+    return {
+      trustLevel: 'regular',
+      speakerRole: 'user',
+      actorKind: resolveUserActorKind(input.message),
+      resolvedUserName: resolvePromptUserName(input.message),
+      ...(resolveUserActorKind(input.message) === 'machine_intelligence'
+        ? { speakingWithIsMachineIntelligence: true }
+        : {}),
+      continuitySubjectKey: resolveContinuitySubjectKey({
+        subjectIdentityKey: input.message.authorId,
+        authorId: input.message.authorId,
+      }),
+      continuityFallbackKeys: [],
+    };
+  }
+
+  // ── Contact-tracking policy gate (E3.4) ──
+  // The mode is resolved OUTSIDE the resolution try/catch below so a reserved
+  // mode ('role_gated') fails closed with its clear not-implemented error
+  // instead of being absorbed into the untracked fallback.
+  const trackingMode = input.contactTracking
+    ? input.contactTracking.resolveMode(input.message.channelId)
+    : 'auto';
+
+  if (input.contactTracking && trackingMode === 'approval') {
+    const buildUntrackedSpeakerContext = (): ResolvedAuthorContext => ({
+      // Sprint-10 privacy regression H7/07-M1: an approval-pending untracked speaker
+      // is NOT persisted and has no verified identity. They resolve at the PUBLIC
+      // trust floor (never 'regular', which would clear the personal-sensitivity
+      // ceiling) and their self-asserted channel name is rendered marked-unverified.
+      trustLevel: 'public',
+      speakerRole: 'user',
+      actorKind: resolveUserActorKind(input.message),
+      resolvedUserName: resolveUnverifiedSpeakerName(input.message),
+      ...(resolveUserActorKind(input.message) === 'machine_intelligence'
+        ? { speakingWithIsMachineIntelligence: true }
+        : {}),
+      continuitySubjectKey: resolveContinuitySubjectKey({
+        subjectIdentityKey: input.message.authorId,
+        authorId: input.message.authorId,
+      }),
+      continuityFallbackKeys: [],
+    });
+
+    try {
+      const channel = resolveIdentityChannel(input.message);
+      const identity = normalizeIdentity(channel, input.message.authorId);
+      const canonicalHint = input.message.routing?.canonicalContactId?.trim();
+      const hintedContact = canonicalHint ? await input.contactStore.getById(canonicalHint) : undefined;
+      const existingContact = hintedContact
+        ?? await input.contactStore.getByChannelIdentity(identity.channel, identity.userId);
+      if (!existingContact) {
+        // NEW speaker in an approval-mode channel: no contact auto-upsert.
+        // Enqueue a durable pending-contact request (first sighting notifies
+        // the operator) and keep the speaker UNTRACKED — transcript/prefix
+        // attribution only, no contact record, no canonical contact key.
+        await input.contactTracking.reportUntrackedSpeaker({
+          channel: identity.channel,
+          channelUserId: identity.userId,
+          displayName: input.message.authorName,
+          channelId: input.message.channelId,
+          messageId: input.message.id,
+          messagePreview: input.message.content,
+        });
+        return buildUntrackedSpeakerContext();
+      }
+      // Existing contact: fall through to the unchanged resolution path below.
+    } catch (error) {
+      input.logger.warn('Contact-tracking approval gate failed; treating speaker as untracked', {
+        authorId: input.message.authorId,
+        channelId: input.message.channelId,
+        error: toErrorMessage(error),
+      });
+      return buildUntrackedSpeakerContext();
+    }
+  }
+
+  try {
+    const channel = resolveIdentityChannel(input.message);
+    // If a trusted canonical contact ID hint is provided in the routing metadata (e.g. set
+    // by the Garden admin chat), resolve directly by ID so the correct contact (with nickname
+    // etc.) is used regardless of which API auth principal is making the request.
+    const canonicalHint = input.message.routing?.canonicalContactId?.trim();
+    const hintedContact = canonicalHint ? await input.contactStore.getById(canonicalHint) : undefined;
+    const resolvedContact = hintedContact
+      ?? await input.contactStore.resolveChannelIdentity(channel, input.message.authorId, input.message.authorName);
+    if (hintedContact) {
+      // Still update last seen so the contact record stays fresh.
+      await input.contactStore.updateLastSeen(hintedContact.id);
+    }
+    // E7.3: auto-tag machine-intelligence contacts from channel bot/app metadata
+    // so conversation-fatigue relationship classes apply without manual tagging.
+    // Additive only; a deliberate operator/tool correction is never clobbered.
+    const { contact } = await applyObservedMachineIntelligence({
+      contactStore: input.contactStore,
+      contact: resolvedContact,
+      observedIsMachineIntelligence: input.message.routing?.authorIsMachineIntelligence === true,
+      channelType: channel,
+      logger: input.logger,
+    });
+    const canonicalContactKey = contact.id;
+    // E3.2: adapter-declared routing privacy is recorded on the contact's
+    // conversation-channel row as provenance EVIDENCE only. The stored
+    // per-contact value is never read back into classification — channel
+    // privacy is owned by channels.json labels, operator overrides, and
+    // derived defaults (docs/context-envelope.md).
+    const observedChannelPrivacy = normalizeChannelPrivacy(input.message.routing?.channelPrivacy)
+      // Stored per-contact privacy is a persisted value: decode the retired
+      // vocabulary through the read boundary (provenance evidence only).
+      ?? decodeStoredChannelVisibility(
+        await input.contactStore.getConversationChannelPrivacy(
+          canonicalContactKey,
+          channel,
+          input.message.channelId,
+        ),
+      );
+
+    if (canonicalContactKey) {
+      await input.contactStore.recordChannelActivity(
+        canonicalContactKey,
+        channel,
+        input.message.channelId,
+        observedChannelPrivacy,
+      );
+    }
+
+    const actorKind = resolveUserActorKind(input.message, contact);
+    // Channel bonding: opt-in is the explicit `bonded`
+    // flag on the contact's channel identities. The bond activates for this
+    // turn only when the CURRENT exact identity is itself bonded — an
+    // alternate account on the same platform never inherits the opt-in.
+    const currentIdentity = normalizeIdentity(channel, input.message.authorId);
+    const bondedIdentities: ContactChannelIdentity[] =
+      (contact.channels ?? [])
+        .filter(link => link.bonded === true)
+        .map(link => normalizeIdentity(link.channel, link.userId));
+    const channelBond: TurnChannelBondInput | undefined =
+      bondedIdentities.some(identity => (
+        identity.channel === currentIdentity.channel
+        && identity.userId === currentIdentity.userId
+      ))
+        ? { currentIdentity, bondedIdentities, trustLevel: contact.trustLevel }
+        : undefined;
+    return {
+      trustLevel: contact.trustLevel,
+      speakerRole: 'user',
+      actorKind,
+      resolvedUserName: resolvePromptUserName(input.message, contact),
+      ...(actorKind === 'machine_intelligence' ? { speakingWithIsMachineIntelligence: true } : {}),
+      relationshipType: contact.relationshipType,
+      ...(resolveContactRuntimeTimezone(contact) ? { timezone: resolveContactRuntimeTimezone(contact) } : {}),
+      canonicalContactKey,
+      continuitySubjectKey: resolveContinuitySubjectKey({
+        canonicalContactKey,
+        subjectIdentityKey: input.message.authorId,
+        authorId: input.message.authorId,
+      }),
+      continuityFallbackKeys: canonicalContactKey
+        ? collectContinuityFallbackKeys(input.message.authorId, canonicalContactKey, contact)
+        : [],
+      ...(channelBond ? { channelBond } : {}),
+    };
+  } catch (error) {
+    input.logger.warn('Failed to resolve contact identity for trust/context routing', {
+      authorId: input.message.authorId,
+      channelId: input.message.channelId,
+      error: toErrorMessage(error),
+    });
+    return {
+      trustLevel: 'regular',
+      speakerRole: 'user',
+      actorKind: resolveUserActorKind(input.message),
+      resolvedUserName: resolvePromptUserName(input.message),
+      ...(resolveUserActorKind(input.message) === 'machine_intelligence'
+        ? { speakingWithIsMachineIntelligence: true }
+        : {}),
+      continuitySubjectKey: resolveContinuitySubjectKey({
+        subjectIdentityKey: input.message.authorId,
+        authorId: input.message.authorId,
+      }),
+      continuityFallbackKeys: [],
+    };
+  }
+}
+
+export function resolveTaskKind(input: {
+  message: SubstrateMessage;
+  resolveChannelPromptDock: (message: SubstrateMessage) => { prompt?: { resolveTaskKind?: (message: SubstrateMessage) => string | undefined } } | undefined;
+}): string | undefined {
+  const channelDock = input.resolveChannelPromptDock(input.message);
+  const adapterTaskKind = channelDock?.prompt?.resolveTaskKind?.(input.message);
+  if (adapterTaskKind) return adapterTaskKind;
+
+  if (!input.message.channelId.startsWith('internal:')) return undefined;
+
+  const suffix = input.message.channelId.slice('internal:'.length).toLowerCase();
+  if (!suffix) return undefined;
+
+  // Preserve the legacy persisted task-kind value for legacy channel ids.
+  if (suffix.includes('heartbeat')) return 'heartbeat';
+  if (suffix.includes('reflection')) return 'reflection';
+  if (suffix.includes('planning')) return 'planning';
+  if (suffix.includes('maintenance')) return 'maintenance';
+  return undefined;
+}
+
+function resolveRuntimeCharacterName(
+  characterPromptVariables: Record<string, string>,
+  fallbackCharacterName: string,
+): string {
+  const candidates = [
+    characterPromptVariables.char,
+    characterPromptVariables.char_name,
+    characterPromptVariables.character,
+    characterPromptVariables.character_name,
+    characterPromptVariables['character.name'],
+    characterPromptVariables.name,
+  ];
+  for (const candidate of candidates) {
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- Record index may be undefined at runtime
+    const trimmed = candidate?.trim();
+    if (trimmed && trimmed.length > 0) {
+      return trimmed;
+    }
+  }
+  return fallbackCharacterName;
+}

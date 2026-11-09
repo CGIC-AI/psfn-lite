@@ -9,15 +9,15 @@ second prepare records the turn late, with the message Hermes ran it on and
 the outcome it actually had.
 
 A turn row left by a Hermes process that has exited is settled as failed by
-the next standing process of the profile, with the exited process's host
-instance, which is the owner Lite checks.
+the next process of the profile, with the exited process's host instance,
+which is the owner Lite checks. (Lite's host-turn timeout fails such a turn
+anyway; settling it sooner frees the companion's one agent.)
 """
 
 import logging
 import os
 
 from .bridge import BridgeError
-from .ledger import JOB, STANDING
 from .outcomes import failure
 
 logger = logging.getLogger(__name__)
@@ -38,11 +38,10 @@ def process_alive(pid) -> bool:
 
 
 class Delivery:
-    def __init__(self, client, ledger, *, instance: str, scope: str, fail, notice):
+    def __init__(self, client, ledger, *, instance: str, fail, notice):
         self.client = client
         self.ledger = ledger
         self.instance = instance
-        self.scope = scope
         self._fail = fail
         self._notice = notice
 
@@ -73,7 +72,7 @@ class Delivery:
     def retry(self) -> tuple:
         """Delivers settlements kept from earlier failures. Returns (warnings for those still kept, [(session, Lite turn)] delivered)."""
         warnings, delivered = [], []
-        for row in self.ledger.pending_settlements(scope=self.scope, instance=self.instance):
+        for row in self.ledger.pending_settlements():
             kept = row["payload"]
             try:
                 answer, settle = self._deliver(row["session_id"], kept["settle"], kept.get("prepare"))
@@ -89,23 +88,15 @@ class Delivery:
         return warnings, delivered
 
     def recover(self, alive=process_alive) -> None:
-        """Settles, as failed, the turns of standing Hermes processes of this profile that exited before their turns ended."""
-        if self.scope != STANDING:
-            return
+        """Settles, as failed, the turns of Hermes processes of this profile that exited before their turns ended."""
         for row in self.ledger.turns():
             if row["host_instance"] == self.instance or alive(row["payload"].get("pid")):
-                continue
-            if row["scope"] == JOB:
-                # Lite fails a delegated turn itself when its host releases it or its run times out.
-                logger.warning("psfn_lite dropped the turn row of exited internal-turn process %s; Lite settles that turn", row["host_instance"])
-                self.ledger.resolve(row["sequence"])
                 continue
             self._notice(row["session_id"], "A turn of a Hermes process that has exited is recorded in your continuity as failed: the process ended before the turn did.")
             settle = {
                 "hostInstance": row["host_instance"],
                 "turnId": row["turn_id"],
                 "outcome": failure("hermes_process_ended", "the Hermes process running the turn exited before the turn ended"),
-                "toolCallCount": 0,
             }
             self.settle(row["session_id"], row["sequence"], settle, row["payload"].get("prepare"))
 
@@ -120,15 +111,10 @@ class Delivery:
                     # Another turn of the same Lite conversation is running; this one is delivered after it.
                     raise BridgeError(f"{error}; delivered once that turn ends", kind="unavailable") from None
                 raise
-            if prepared.get("kind") == "replayed":
-                self._notice(session_id, f"Lite had already recorded a turn as {prepared.get('status')} before Hermes's outcome for it arrived; Lite keeps its record.")
+            if prepared.get("kind") in ("replayed", "answered"):
+                self._notice(session_id, "Lite had already recorded a turn before Hermes's outcome for it arrived; Lite keeps its record.")
                 return None, settle
             if prepared.get("kind") != "prepared" or not isinstance(prepared.get("turnId"), str):
                 raise BridgeError("Lite answered prepare with an unexpected shape", kind="protocol")
             settle = {**settle, "turnId": prepared["turnId"]}
-        answer = self.client.call("settle", settle)
-        post = answer.get("postTurn") if isinstance(answer.get("postTurn"), dict) else {}
-        for part, value in post.items():
-            if isinstance(value, dict) and value.get("ok") is False:
-                self._fail(f"post_turn_{part}", session_id, settle["turnId"], f"Lite's post-turn {part} work failed")
-        return answer, settle
+        return self.client.call("settle", settle), settle
