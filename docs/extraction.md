@@ -483,7 +483,7 @@ their Garden subjects; the kept core paths in those tests are unchanged.
 Every cut has a row in `packages/companion/extraction/cuts.tsv` (seam, site
 file:line, cut type, detail, behaviour change). `node
 packages/companion/extraction/remaining-seams.mjs [--summary]` lists the core
-tree's remaining imports of vendored scaffolding; Step B7 ends with it empty.
+tree's remaining imports of vendored scaffolding; it is empty since Step B7.
 Core for that check = the Step A0 closure, plus donor files **promoted** to
 core (kind `promoted` in `vendored-files.txt`: self-contained files a cut kept
 unchanged at their donor paths), plus the Lite files the cuts add.
