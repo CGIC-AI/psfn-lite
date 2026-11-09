@@ -1,13 +1,15 @@
 """Drives the Lite turn lifecycle from Hermes plugin hooks.
 
 Every root Hermes turn (not a subagent, not the background review fork, not
-a cron or flush agent) of a bound sender, or the root turn of a delegated
-internal-turn process, becomes one Lite turn:
+a cron or flush agent) of a bound sender becomes one host-driven turn of
+the donor companion core:
 
-- ``pre_llm_call`` prepares it under a stable idempotency key and injects
-  Lite's labelled context into the user message;
-- ``post_llm_call`` and ``post_tool_call`` collect the reply and the
-  governed tool calls;
+- ``pre_llm_call`` prepares it under a stable idempotency key, in the Lite
+  session of the Hermes conversation (the root of its compression lineage),
+  and injects the context the donor assembled into the user message;
+- the companion's tools, called over the Lite MCP server inside the turn,
+  run in the donor's own tool loop;
+- ``post_llm_call`` collects the reply;
 - ``on_session_end`` settles it as completed, interrupted or failed.
 
 Open turns are keyed by Hermes's turn id, which Hermes mints once per turn,
@@ -20,6 +22,35 @@ Lite turn, because Hermes's MCP client sends the profile's standing
 credential whoever the turn is for. Before Hermes compacts, ``checkpoint``
 proves every Lite turn of the session is in Lite's canonical history.
 
+A participant's explicit tool request ("call tool_search, then orient") is
+the donor's own contract on each model call of the turn: exactly the
+requested tool while the sequence runs, then no tool. Prepare's context
+carries the first call's choice; after each Lite tool call the plugin asks
+the bridge (``tool-choice``) for the next one, and the ``llm_request``
+middleware rewrites Hermes's provider request with it (toolchoice.py).
+``pre_tool_call`` checks a forced step's call before Lite sees it: the
+first miss is blocked so the model calls again, a second fails the turn
+(``_contract_miss``). Once the companion's turn is over (the plugin failed
+it, or Lite refused a call because it ended), Lite's tools are blocked and
+the model gets no tools for the rest of the Hermes turn, so Hermes's MCP
+circuit breaker never counts a refusal for a turn Lite already ended.
+
+The companion's memory deletions are decided by Hermes's human. The donor
+``memory`` tool never deletes on its own: ``action=delete`` records a pending
+proposal. ``pre_tool_call`` escalates that call to Hermes's approval gate
+(``{"action": "approve"}``, which Hermes resolves in
+``tools.approval.request_tool_approval``: once, session, always or deny, and a
+timeout or a gate failure blocks the call). The model cannot skip it: Hermes
+asks before the call runs. A denied call never reaches Lite, so no proposal is
+made and the memory stays. After an approved call, ``post_tool_call`` tells
+Lite to approve the proposal that call created (``memory-deletion/approve``);
+Lite accepts that once, only from the turn that made the call.
+
+A Hermes install (its desktop, gateway, mobile, messaging and CLI surfaces)
+is one source serving one user, and Lite binds its sessions to the install:
+prepare and checkpoint name the install id Hermes keeps in its root, and a
+Lite bridge bound to another install refuses them.
+
 Nothing fails silently. A lifecycle event Lite did not accept is logged,
 kept in the local ledger (a turn and, once it ends, its outcome, so it is
 retried before the next turn), reported through the provider's warning
@@ -27,28 +58,124 @@ callback, and named in the next turn's context.
 """
 
 import hashlib
+import json
 import logging
 import os
+import re
 import secrets
 import threading
 
+from .automata import AutomataHost
+from . import toolchoice
 from .bridge import BridgeClient, BridgeError
 from .config import NON_INTERACTIVE_PLATFORMS, Config
 from .delivery import Delivery
-from .ledger import JOB, STANDING, Ledger
-from .outcomes import outcome, unfinished
+from .ledger import Ledger
+from .outcomes import failure, outcome, unfinished
 from .render import block, render_context
 
 logger = logging.getLogger(__name__)
 
-#: Set in the environment of a Hermes process the plugin starts to run one delegated internal turn.
-INTERNAL_JOB_ENV = "PSFN_LITE_INTERNAL_JOB"
 _SWEPT_KEPT = 256
+#: The donor memory tool's name on the Lite MCP server, and the text its delete returns (faculties/memory/tools.ts).
+_MEMORY_TOOL = "memory"
+_PROPOSAL = re.compile(r"Memory deletion proposal ([A-Za-z0-9:._-]{1,128}) is pending")
+_EXPLANATION_SHOWN = 400
+#: The donor's memory_id aliases for a delete (shared/tool-argument-normalization.ts normalizeUnifiedMemoryArguments).
+_MEMORY_ID_ALIASES = ("id", "memoryid")
+
+
+def _argument_key(key) -> str:
+    """The donor's normalizeArgumentKey: trimmed, edge punctuation removed, lower case."""
+    return re.sub(r"[^a-zA-Z0-9_]+$", "", re.sub(r"^[^a-zA-Z0-9_]+", "", key.strip())).lower() if isinstance(key, str) else ""
+
+
+def _memory_id(args) -> str:
+    """The memory a delete names, resolved as the donor tool resolves it: memory_id, else its first non-empty alias."""
+    if not isinstance(args, dict):
+        return ""
+    canonical = args.get("memory_id")
+    if isinstance(canonical, str) and canonical.strip():
+        return canonical.strip()
+    for key, value in args.items():
+        if isinstance(value, str) and value.strip() and _argument_key(key) in _MEMORY_ID_ALIASES:
+            return value.strip()
+    return ""
 _NOTE = "system note: psfn_lite"
 TOOL_BLOCKED = (
     "PSFN Lite tools work only inside a turn recorded in the companion's Lite continuity: not in a subagent, "
     "the background review, a cron or flush run, a conversation not bound to Lite, or a turn Lite refused."
 )
+#: The Lite refusals of a tool call (packages/lifecycle/src/bridge.ts callTool) that mean the companion's turn is over.
+_TURN_OVER = ("turn_ended", "no_open_turn")
+#: Calls of a forced step that may miss the required call before the turn fails (the plugin's own retry; see _contract_miss).
+_STEP_RETRIES = 1
+#: The donor's failure category for a model that does not make the required call (error-classify.ts tool_contract_incompatible).
+CONTRACT_FAILURE = "tool_contract_incompatible"
+
+
+def turn_over_text(reason: str) -> str:
+    return (
+        f"PSFN Lite has ended the companion's turn ({reason}), so its tools do not run again in this turn. "
+        "Do not call them again; answer the participant without tools."
+    )
+
+
+def _exact_value(schema):
+    """The one value the donor's exact-arguments schema admits (explicit-tool-arguments.ts exactValueSchema)."""
+    if not isinstance(schema, dict):
+        raise ValueError("not a schema")
+    if schema.get("type") == "null":
+        return None
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        return {key: _exact_value(value) for key, value in schema["properties"].items()}
+    enum = schema.get("enum")
+    if isinstance(enum, list) and len(enum) == 1:
+        return enum[0]
+    raise ValueError("not an exact-value schema")
+
+
+def expected_arguments(parameters):
+    """The arguments a forced step requires, from the schema Lite hands over (buildExactToolArgumentsModelSchema), or None."""
+    if not isinstance(parameters, dict):
+        return None
+    try:
+        value = _exact_value(parameters)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def exact_match(actual, expected) -> bool:
+    """The donor's exactToolArgumentsMatch (explicit-tool-arguments.ts): the same keys, the same JSON values, nothing else."""
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and sorted(actual) == sorted(expected) and all(exact_match(actual[k], expected[k]) for k in expected)
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(actual) == len(expected) and all(exact_match(a, e) for a, e in zip(actual, expected))
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(expected, (int, float)):
+        return isinstance(actual, (int, float)) and actual == expected
+    return type(actual) is type(expected) and actual == expected
+
+
+def _turn_over_reason(result):
+    """``turn_ended`` or ``no_open_turn`` when a Lite tool result is that refusal (Hermes wraps the MCP error text once)."""
+    value = result
+    for _ in range(3):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+        if not isinstance(value, dict):
+            return None
+        error = value.get("error")
+        if isinstance(error, dict):
+            reason = error.get("reason")
+            return reason if reason in _TURN_OVER else None
+        value = error
+    return None
 
 
 def idempotency_key(session_id: str, turn_id: str) -> str:
@@ -62,33 +189,40 @@ def host_instance() -> str:
 
 
 class Driver:
-    def __init__(self, config: Config, ledger: Ledger, client: BridgeClient, *, instance: str, internal_job: bool, notify):
+    def __init__(self, config: Config, ledger: Ledger, client: BridgeClient, *, instance: str, install: str, notify):
         self.config = config
         self.ledger = ledger
         self.client = client
         self.instance = instance
-        self.internal_job = internal_job
+        #: The Hermes install id (config.hermes_install_id); Lite serves the install it is bound to.
+        self.install = install
         self._notify = notify
         self._lock = threading.RLock()
         #: Hermes session id -> Lite turn ids prepared in it (inherited across a compression's session rotation).
         self._turns = {}
-        #: Hermes turn id -> the open Lite turn ({turn, session, reply, tools, prepare, row}).
+        #: Hermes turn id -> the open Lite turn ({turn, session, reply, prepare, row, choice, choice_fresh, misses, ended, settled}).
         self._open = {}
         #: Hermes session id -> the session it continues after a compression.
         self._parents = {}
         #: Hermes turn ids settled as unfinished, so a late on_session_end is reported, not ignored.
         self._swept = {}
         self._subagents = set()
+        #: Memory delete calls sent to Hermes's approval gate: tool call key -> the memory id the human was asked about.
+        self._deletions = {}
         #: Warnings to show in the next turn's context, per Hermes session.
         self._carry = {}
-        self.delivery = Delivery(client, ledger, instance=instance, scope=JOB if internal_job else STANDING, fail=self._fail, notice=self._notice)
+        self.delivery = Delivery(client, ledger, instance=instance, fail=self._fail, notice=self._notice)
+        #: Hosted automata: the companion's automata claimed at the start of a bound root turn and run as this Hermes's subagents.
+        self.automata = None if config.automata is None else AutomataHost(client, instance=instance, claim_limit=config.automata.claim_limit, notify=notify)
 
     # -- hooks ---------------------------------------------------------------
 
-    def subagent_start(self, child_session_id=None, **_):
+    def subagent_start(self, child_session_id=None, **kwargs):
         if isinstance(child_session_id, str) and child_session_id:
             with self._lock:
                 self._subagents.add(child_session_id)
+        if self.automata is not None:
+            self.automata.subagent_start(child_session_id=child_session_id, **kwargs)
 
     def session_switch(self, new_session_id: str, parent_session_id: str) -> None:
         """A compression rotated the session id; the provider forwards only that reason of Hermes's notification."""
@@ -97,12 +231,12 @@ class Driver:
                 self._link(new_session_id, parent_session_id)
 
     def pre_llm_call(self, session_id="", turn_id="", user_message="", parent_session_id="", platform="", sender_id="", **_):
-        # Subagents, the review fork and cron or flush agents never drive Lite, in an internal-turn process too.
+        # Subagents, the review fork and cron or flush agents never drive Lite.
         if not self._root(session_id, parent_session_id, platform):
             return None
         # Sessions are linked only by a compression (on_session_switch) or a turn seen under a rotated id;
         # Hermes gives a root agent no parent session id, and a branch is another conversation.
-        if not self.internal_job and not self.config.binds(platform or "", sender_id or ""):
+        if not self.config.binds(platform or "", sender_id or ""):
             # Logged and reported, not carried: an unbound conversation never gets Lite context to show it in.
             logger.error("psfn_lite unbound_sender for session %s: platform %r sender is not bound to PSFN Lite", session_id, platform)
             self._notify(f"PSFN Lite ignored a turn from platform {platform!r}: its sender is not bound to PSFN Lite")
@@ -117,8 +251,10 @@ class Driver:
         warnings = carried + warnings
         body = {
             "hostInstance": self.instance,
+            "hermesInstallId": self.install,
             "idempotencyKey": idempotency_key(session_id, turn_id),
-            "message": None if self.internal_job else user_message,
+            "sessionId": self._lite_session(session_id),
+            "message": user_message,
         }
         entry = self._begin(session_id, turn_id, body)
         try:
@@ -136,42 +272,159 @@ class Driver:
             )])}
         if prepared.get("kind") == "replayed":
             self._drop(turn_id)
-            return {"context": block(_NOTE, f"Lite already recorded this turn as {prepared.get('status')}; it is not recorded again.")}
+            return {"context": block(_NOTE, "Lite already recorded this turn; it is not recorded again.")}
+        if prepared.get("kind") == "answered":
+            # The donor ended the turn before asking for a model answer; it is recorded with the donor's own reply.
+            self._drop(turn_id)
+            with self._lock:
+                if isinstance(prepared.get("turnId"), str):
+                    self._remember(session_id, prepared["turnId"])
+            return {"context": block(_NOTE, "Your PSFN Lite continuity ended this turn itself and recorded it; nothing you reply now is recorded there.")}
         lite_turn = prepared.get("turnId")
         if prepared.get("kind") != "prepared" or not isinstance(lite_turn, str) or not isinstance(prepared.get("context"), dict):
             self._fail("prepare", session_id, None, "Lite answered prepare with an unexpected shape", record=False)
             return {"context": block(_NOTE, "Your PSFN Lite continuity answered unexpectedly; you have no fresh continuity context for this turn.")}
+        choice = prepared["context"].get("toolChoice")
         with self._lock:
-            known = set(self._turns.get(session_id, []))
             entry["turn"] = lite_turn
+            # The donor's tool choice for the first model call; null means the model chooses for the whole turn.
+            entry["choice"] = choice if isinstance(choice, dict) else None
+            entry["choice_fresh"] = True
             self._remember(session_id, lite_turn)
         self.ledger.bind_turn(entry["row"], lite_turn)
-        text = render_context(prepared["context"], known_turns=known, internal=prepared.get("internal"), warnings=warnings, limit=self.config.max_context_chars)
+        if self.automata is not None:
+            # Inside the root turn, where Hermes bound the parent its lifecycle children belong to.
+            warnings += self.automata.claim_and_launch()
+        text = render_context(prepared["context"], warnings=warnings, limit=self.config.max_context_chars)
         return {"context": text}
 
-    def pre_tool_call(self, tool_name="", session_id="", turn_id="", **_):
-        """Lite's governed tools run only inside an open Lite turn; Hermes sends the standing credential for every caller."""
-        if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
+    def pre_tool_call(self, tool_name="", session_id="", turn_id="", args=None, tool_call_id="", **_):
+        """Lite's governed tools run only inside an open Lite turn; Hermes sends the standing credential for every caller.
+
+        A forced step's call is checked against the donor's contract before it runs (_contract_miss); once the
+        companion's turn is over, Lite's tools are blocked for the rest of the Hermes turn. A memory delete inside
+        the turn goes to Hermes's human approval gate first.
+        """
+        if not isinstance(tool_name, str):
             return None
+        lite = tool_name.startswith(self.config.tool_prefix)
         entry = self._entry(turn_id, session_id)
-        if entry is not None:
+        if entry is None:
+            if not lite:
+                return None
+            logger.warning("psfn_lite blocked %s outside a Lite turn (session %s, turn %s)", tool_name, session_id, turn_id)
+            return {"action": "block", "message": TOOL_BLOCKED}
+        with self._lock:
+            over = entry.get("ended")
+        if over is not None:
+            # Hermes's MCP client counts each Lite refusal toward its circuit breaker; a block is never counted.
+            return {"action": "block", "message": turn_over_text(over)} if lite else None
+        miss = self._contract_miss(entry, tool_name, args)
+        if miss is not None:
+            return {"action": "block", "message": miss}
+        if not lite or not self._is_memory_delete(tool_name, args):
             return None
-        logger.warning("psfn_lite blocked %s outside a Lite turn (session %s, turn %s)", tool_name, session_id, turn_id)
-        return {"action": "block", "message": TOOL_BLOCKED}
+        memory_id = _memory_id(args)
+        category = args.get("justification_category")
+        category = category if isinstance(category, str) else ""
+        explanation = args.get("explanation")
+        explanation = explanation if isinstance(explanation, str) else ""
+        shown = explanation if len(explanation) <= _EXPLANATION_SHOWN else explanation[:_EXPLANATION_SHOWN] + "..."
+        digest = hashlib.sha256(f"{memory_id}\n{category}\n{explanation}".encode("utf-8")).hexdigest()[:12]
+        with self._lock:
+            self._deletions[self._call_key(turn_id, tool_call_id)] = memory_id
+        return {
+            "action": "approve",
+            "message": (
+                f"The companion asks to delete one of its memories (memory {memory_id or '(no id)'}; "
+                f"reason {category or '(none)'}: {shown or '(no explanation)'}). "
+                "Approve only if this memory should be deleted; deny to keep it."
+            ),
+            # The [a]lways and session grain: this memory, for this reason; never every memory delete.
+            "rule_key": f"psfn_lite_memory_delete:{digest}",
+        }
+
+    def post_tool_call(self, tool_name="", args=None, result=None, session_id="", turn_id="", tool_call_id="", status="", **_):
+        """After Hermes's human approved a memory delete and it ran, Lite approves the proposal that call created.
+
+        A Lite tool call that ran moves an explicit tool sequence on, so the next model call's choice is asked again;
+        a blocked call never reached Lite and moves nothing. A call Lite refused because the companion's turn is over
+        ends the plugin's side of the turn too.
+        """
+        if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
+            return
+        current = self._entry(turn_id, session_id)
+        if current is not None and status != "blocked":
+            reason = _turn_over_reason(result)
+            with self._lock:
+                if current.get("choice") is not None:
+                    current["choice_fresh"] = False
+                current["misses"] = 0
+            if reason is not None:
+                self._end_turn(current, reason, f"PSFN Lite refused a companion tool call because the companion's turn is over ({reason}); its tools are blocked for the rest of this Hermes turn.")
+        with self._lock:
+            asked = self._deletions.pop(self._call_key(turn_id, tool_call_id), None)
+        if asked is None:
+            return  # not a delete this plugin sent to the gate
+        if status != "ok":
+            return  # blocked (denied, timed out, gate failure) or refused by the tool: no proposal to approve
+        entry = self._entry(turn_id, session_id)
+        memory_id = _memory_id(args)
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        found = _PROPOSAL.search(text or "")
+        if entry is None or not self._is_memory_delete(tool_name, args) or not asked or memory_id != asked or found is None:
+            # Another plugin changed the call, the turn ended, or the result names no proposal: it stays pending.
+            self._notice(session_id, f"The memory deletion approved in Hermes was not applied: the call that ran was not the one approved (memory {asked or '(no id)'} is kept).")
+            return
+        try:
+            self.client.call("memory-deletion/approve", {
+                "hostInstance": self.instance,
+                "hermesInstallId": self.install,
+                "proposalId": found.group(1),
+                "memoryId": memory_id,
+            })
+        except BridgeError as error:
+            self._notice(session_id, f"The memory deletion approved in Hermes did not reach Lite ({error}); memory {memory_id} is kept and its proposal stays pending.")
+
+    def llm_request(self, request=None, turn_id="", session_id="", api_mode="", provider="", base_url="", **_):
+        """Hermes's llm_request middleware: the provider request rewritten for the donor's tool choice of this model call."""
+        entry = self._entry(turn_id, session_id)
+        if entry is None or not isinstance(request, dict):
+            return None
+        with self._lock:
+            lite_turn, choice, fresh, over = entry.get("turn"), entry.get("choice"), entry.get("choice_fresh", True), entry.get("ended")
+        if over is not None:
+            return self._without_tools(entry, request, api_mode, provider, base_url, over)
+        if lite_turn is None or choice is None:
+            return None
+        if not fresh:
+            try:
+                answer = self.client.call("tool-choice", {"hostInstance": self.instance, "turnId": lite_turn})
+            except BridgeError as error:
+                if error.kind == "not_found":
+                    # Lite answers an ended turn's choice as not found (bridge.ts toolChoice): the companion's turn is over.
+                    self._end_turn(entry, "turn_ended", "PSFN Lite has no open turn for the companion's next step; its tools are blocked for the rest of this Hermes turn.")
+                    return self._without_tools(entry, request, api_mode, provider, base_url, "turn_ended")
+                self._notice(entry["session"], f"PSFN Lite did not say which tool the companion's next step must call ({error}); the model call goes as Hermes built it.")
+                return None
+            choice = answer.get("toolChoice") if isinstance(answer, dict) else None
+            choice = choice if isinstance(choice, dict) else None
+            with self._lock:
+                entry["choice"], entry["choice_fresh"] = choice, True
+            if choice is None:
+                return None
+        try:
+            rewritten = toolchoice.apply(request, api_mode, choice, self.config.tool_prefix, provider=provider, base_url=base_url)
+        except toolchoice.ChoiceError as error:
+            self._notice(entry["session"], f"PSFN Lite could not hold the model to the companion's requested tool step ({error}); Lite may fail the turn.")
+            return None
+        return {"request": rewritten, "source": "psfn_lite", "reason": "the companion's explicit tool request", "name": "psfn_lite_tool_choice"}
 
     def post_llm_call(self, session_id="", turn_id="", assistant_response=None, **_):
         entry = self._entry(turn_id, session_id)
         if entry is not None and isinstance(assistant_response, str) and assistant_response.strip():
             with self._lock:
                 entry["reply"] = assistant_response
-
-    def post_tool_call(self, session_id="", turn_id="", tool_name="", status="", **_):
-        if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix) or status == "blocked":
-            return
-        entry = self._entry(turn_id, session_id)
-        if entry is not None:
-            with self._lock:
-                entry["tools"] += 1
 
     def on_session_end(self, session_id="", turn_id="", completed=False, failed=False, interrupted=False, turn_exit_reason="", **_):
         entry = self._entry(turn_id, session_id)
@@ -184,6 +437,10 @@ class Driver:
                 kind = "interrupted" if interrupted else ("completed" if completed and not failed else "failed")
                 self._notice(session_id, f"Hermes reported a turn as {kind} after it was recorded in your continuity as unfinished; Lite keeps the failure.")
             return
+        with self._lock:
+            settled = entry.get("settled", False)
+        if settled:
+            return  # the plugin failed the turn at the contract violation; Lite already has its outcome
         self._finish(entry, outcome(entry["reply"], completed=completed, failed=failed, interrupted=interrupted, reason=turn_exit_reason))
 
     def on_session_finalize(self, session_id="", **_):
@@ -199,7 +456,7 @@ class Driver:
         with self._lock:
             lineage = self._related(session_id)
             turns = list(self._turns.get(session_id, []))
-        kept = [r for r in self.ledger.pending_settlements(scope=self.delivery.scope, instance=self.instance) if r["session_id"] in lineage]
+        kept = [r for r in self.ledger.pending_settlements() if r["session_id"] in lineage]
         if kept:
             raise BridgeError(f"{len(kept)} turn outcomes of this session are not yet in Lite; compaction would lose them", kind="undelivered")
         unknown = [r for r in self.ledger.turns() if r["host_instance"] == self.instance and r["turn_id"] is None and r["session_id"] in lineage]
@@ -207,7 +464,7 @@ class Driver:
             raise BridgeError(f"{len(unknown)} turns of this session are not yet known to Lite; compaction would lose them", kind="undelivered")
         if not turns:
             return
-        result = self.client.call("checkpoint", {"turnIds": turns})
+        result = self.client.call("checkpoint", {"hermesInstallId": self.install, "sessionId": self._lite_session(session_id), "turnIds": turns})
         proven = set(result.get("settled", [])) | set(result.get("open", []))
         if not set(turns) <= proven:
             raise BridgeError("Lite did not prove every turn of this session", kind="protocol")
@@ -227,8 +484,10 @@ class Driver:
             entry = self._open.get(turn_id)
         if entry is not None:
             return entry  # Hermes prepared the same turn again; Lite resumes its key
-        row = self.ledger.open_turn(session_id=session_id, host_instance=self.instance, scope=self.delivery.scope, pid=os.getpid(), hermes_turn=turn_id, prepare=body)
-        entry = {"turn": None, "session": session_id, "reply": None, "tools": 0, "prepare": body, "row": row}
+        row = self.ledger.open_turn(session_id=session_id, host_instance=self.instance, pid=os.getpid(), hermes_turn=turn_id, prepare=body)
+        entry = {"turn": None, "session": session_id, "reply": None, "prepare": body, "row": row, "choice": None, "choice_fresh": True,
+                 # Calls of the current forced step that missed it; why the companion's turn is over; whether the plugin settled it.
+                 "misses": 0, "ended": None, "settled": False}
         with self._lock:
             self._open[turn_id] = entry
         return entry
@@ -240,30 +499,105 @@ class Driver:
             self.ledger.resolve(entry["row"])
 
     def _finish(self, entry: dict, result: dict) -> None:
-        settle = {"hostInstance": self.instance, "turnId": entry["turn"], "outcome": result, "toolCallCount": min(entry["tools"], 10_000)}
+        settle = {"hostInstance": self.instance, "turnId": entry["turn"], "outcome": result}
         answer = self.delivery.settle(entry["session"], entry["row"], settle, entry["prepare"])
         if answer is not None and entry["turn"] is None and isinstance(answer.get("turnId"), str):
             with self._lock:
                 self._remember(entry["session"], answer["turnId"])
+
+    def _contract_miss(self, entry: dict, tool_name: str, args):
+        """The block message for a call that is not the forced step's required call, or None when it is (or no step is forced).
+
+        The donor offered a forced step's one tool with a required choice, so the provider itself held the model to
+        the tool's name; its stream adapter failed the turn on any other call (explicit-tool-request.ts
+        assertExplicitToolContractSatisfied, mismatched_tool_call and invalid_arguments) and retried one fresh
+        completion only when the model made no call at all (stream-adapter.ts missing_required_call). Through
+        Hermes's Tool Search bridge the provider holds only ``tool_call``; the Lite tool's name is held by the
+        narrowed schema alone, which a model can ignore (shakedown r3: DeepSeek, 1 of 60 forced steps). So the plugin
+        checks the call before it reaches Lite: the first miss of a step is blocked with a corrective message and
+        the model calls again; a second miss of the same step fails the turn as the donor fails it
+        (``tool_contract_incompatible``, with the donor's own violation text). A blocked call never reaches Lite.
+        """
+        prefix = self.config.tool_prefix
+        with self._lock:
+            choice = entry.get("choice")
+            if not (isinstance(choice, dict) and choice.get("kind") == "tool" and isinstance(choice.get("name"), str)
+                    and entry.get("choice_fresh", True) and entry.get("turn") is not None):
+                return None
+            required = choice["name"]
+            wanted = prefix + required
+            expected = expected_arguments(choice.get("parameters"))
+            if tool_name == wanted and (expected is None or exact_match(args, expected)):
+                return None
+            entry["misses"] = entry.get("misses", 0) + 1
+            last = entry["misses"] > _STEP_RETRIES
+            if last:
+                entry["ended"], entry["settled"] = CONTRACT_FAILURE, True
+        if tool_name == wanted:
+            violation = f"Provider changed exact requested arguments for required tool call: {required}"
+            made = f"a {wanted} call with other arguments"
+        else:
+            shown = tool_name[len(prefix):] if tool_name.startswith(prefix) else tool_name
+            violation = f"Provider violated explicit tool contract: expected exactly one {json.dumps(required)} call, received {json.dumps([shown])}"
+            made = f"a {tool_name} call"
+        need = f"exactly one {wanted} call" + ("" if expected is None else f" with exactly these arguments: {json.dumps(expected, ensure_ascii=False)}")
+        if not last:
+            logger.warning("psfn_lite blocked %s: the forced step of turn %s requires %s", tool_name, entry["turn"], wanted)
+            return (f"PSFN Lite did not run this call: this step of the companion's turn requires {need}, and this was {made}. "
+                    "Make that call now; another call that is not exactly it fails the companion's turn.")
+        logger.error("psfn_lite fails turn %s: the model missed its forced step (%s) twice", entry["turn"], wanted)
+        self._notice(entry["session"], f"The companion's turn is recorded as failed ({CONTRACT_FAILURE}): the model twice made another call than the {wanted} call the participant asked for.")
+        self._finish(entry, failure(CONTRACT_FAILURE, violation))
+        return (f"PSFN Lite did not run this call and has ended the companion's turn ({CONTRACT_FAILURE}): this step required {need}, "
+                f"and this was again {made}. The companion's tools do not run again in this turn; answer the participant without tools.")
+
+    def _end_turn(self, entry: dict, reason: str, message: str) -> None:
+        """The companion's turn is over (Lite ended it): Lite's tools are blocked and the model gets no tools for the rest of the Hermes turn."""
+        with self._lock:
+            if entry.get("ended") is not None:
+                return
+            entry["ended"] = reason
+        self._notice(entry["session"], message)
+
+    def _without_tools(self, entry: dict, request: dict, api_mode: str, provider: str, base_url: str, reason: str):
+        """The provider request with no tools, so the model answers and Hermes's turn ends: Hermes gives a plugin no way to stop it."""
+        try:
+            rewritten = toolchoice.apply(request, api_mode, {"kind": "none"}, self.config.tool_prefix, provider=provider, base_url=base_url)
+        except toolchoice.ChoiceError as error:
+            self._notice(entry["session"], f"PSFN Lite could not take the tools out of the model call after the companion's turn ended ({error}); its tools stay blocked.")
+            return None
+        if rewritten == request:
+            return None
+        return {"request": rewritten, "source": "psfn_lite", "reason": f"the companion's turn is over ({reason})", "name": "psfn_lite_tool_choice"}
 
     def _sweep(self, session_id: str, *, keep, why: str) -> list:
         """Settles as failed the open turns of this conversation Hermes never reported the end of; returns warnings."""
         with self._lock:
             lineage = self._related(session_id)
             stale = [(t, e) for t, e in self._open.items() if t != keep and e["session"] in lineage]
-            for hermes_turn, _ in stale:
+            for hermes_turn, entry in stale:
                 del self._open[hermes_turn]
-                self._swept[hermes_turn] = True
+                if not entry.get("settled"):
+                    self._swept[hermes_turn] = True  # a late on_session_end is reported; a turn already failed needs no report
             while len(self._swept) > _SWEPT_KEPT:
                 del self._swept[next(iter(self._swept))]
         warnings = []
         for _, entry in stale:
+            if entry.get("settled"):
+                continue  # failed at a contract violation; Lite already has the outcome
             message = f"An earlier turn is recorded in your continuity as failed: Hermes did not report how it ended ({why})."
             logger.error("psfn_lite settles an unfinished turn of session %s as failed: %s", entry["session"], why)
             self._notify(message)
             warnings.append(message)
-            self._finish(entry, unfinished(entry["reply"], why))
+            self._finish(entry, unfinished(why))
         return warnings
+
+    def _is_memory_delete(self, tool_name, args) -> bool:
+        return tool_name == self.config.tool_prefix + _MEMORY_TOOL and isinstance(args, dict) and args.get("action") == "delete"
+
+    @staticmethod
+    def _call_key(turn_id, tool_call_id) -> str:
+        return f"{turn_id if isinstance(turn_id, str) else ''}\n{tool_call_id if isinstance(tool_call_id, str) else ''}"
 
     def _entry(self, turn_id, session_id):
         """The open turn for a Hermes turn id, following the turn when a compression rotated its session id."""
@@ -278,6 +612,15 @@ class Driver:
         self._parents[child] = parent
         if parent in self._turns and child not in self._turns:
             self._turns[child] = list(self._turns[parent])
+
+    def _lite_session(self, session_id: str) -> str:
+        """The Lite session of a Hermes conversation: the session its compressions rotated from first, so it stays one donor session."""
+        with self._lock:
+            seen = {session_id}
+            while session_id in self._parents and self._parents[session_id] not in seen:
+                session_id = self._parents[session_id]
+                seen.add(session_id)
+            return session_id
 
     def _remember(self, session_id: str, lite_turn: str) -> None:
         turns = self._turns.setdefault(session_id, [])

@@ -8,7 +8,7 @@
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
-import { invalid, ok, type Result } from './core.ts';
+import { invalid, ok, type Result } from './result.ts';
 
 export const MIN_CREDENTIAL_LENGTH = 32;
 const MAX_CREDENTIAL_LENGTH = 4096;

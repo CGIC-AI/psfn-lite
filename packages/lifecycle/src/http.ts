@@ -1,53 +1,72 @@
 /**
  * The lifecycle bridge: an authenticated HTTP JSON surface through which an
- * external companion host drives core's turn lifecycle. Every request carries
- * a bearer credential; the caller is identified from it before the body is
- * read and admitted by core ingress from it, never from the body. Each route
- * calls one core use case (`HostedTurns`) and holds no business logic. It
+ * external companion host (Hermes) drives host-driven companion turns. Every
+ * request carries a bearer credential; the principal is identified from it
+ * before the body is read, never from the body. Each route calls one bridge
+ * use case (prepare, settle, checkpoint, tool-choice, and with hosted
+ * automata the attempt routes under `automata/`) and holds no business logic. It
  * binds loopback unless the operator explicitly opts out and names the Host
  * values it serves.
  */
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { bearerCredential, invalid, ok, publicError, unavailable, type HostError, type Result } from './mcp.ts';
+import type { HostTurnBridge } from './bridge.ts';
+import type { HostedAttemptRefusal, HostedAutomataExecutor, HostedResult } from './companion.ts';
+import type { HostMemoryDeletionApprovals } from './memory-deletion.ts';
 import {
-  invalid,
-  ok,
-  unavailable,
-  type CoreError,
-  type HostedTurns,
-  type Result,
-  type TrustedIngress,
-  type TrustedTurnScope,
-  type TurnId,
-  type TurnOwner,
-} from './core.ts';
-import type { DelegatedInternalTurns, DelegatedJob } from './delegated.ts';
-import { bearerCredential, publicError, type McpCallers } from './mcp.ts';
-import { parseCheckpoint, parseClaim, parsePrepare, parseRelease, parseSettle, renderContext, renderRecord } from './wire.ts';
+  parseMemoryDeletionApprove,
+  parseAutomataAttempt,
+  parseAutomataBus,
+  parseAutomataClaim,
+  parseAutomataReport,
+  parseCheckpoint,
+  parsePrepare,
+  parseSettle,
+  parseToolChoice,
+  renderContext,
+  renderToolChoice,
+} from './wire.ts';
 
 export interface LifecycleErrorReport {
   readonly route: string;
-  /** The bound caller's name, or null before identification. */
-  readonly caller: string | null;
-  readonly error: CoreError | { readonly kind: 'exception'; readonly message: string };
+  /** The bound principal, or null before identification. */
+  readonly principal: string | null;
+  readonly error: HostError | { readonly kind: 'exception'; readonly message: string };
 }
 
 export interface LifecycleBridgeOptions {
-  readonly hosted: HostedTurns;
-  /** Built with the same callers' authenticator; admits every request. */
-  readonly ingress: TrustedIngress;
-  /** Operator bindings combined with the internal-turn credentials. */
-  readonly callers: Pick<McpCallers, 'identify'>;
-  /** Null when internal turns run in this process's own harness. */
-  readonly delegated: DelegatedInternalTurns | null;
-  /** The one bound principal that may claim delegated internal turns. */
-  readonly internalTurnHost: string | null;
+  readonly bridge: HostTurnBridge;
+  /** The same principal bindings the MCP tool transport uses. */
+  readonly identify: (credential: string) => string | null;
   readonly port: number;
   /** Default 127.0.0.1. Anything that is not loopback needs `exposeBeyondLoopback`. */
   readonly host?: string;
   readonly exposeBeyondLoopback?: { readonly allowedHosts: readonly string[] };
   readonly maxBodyBytes?: number;
   readonly onError: (report: LifecycleErrorReport) => void;
+  /**
+   * Hosted automata (operator automata rule 4): the core executor whose
+   * attempts the host claims, runs as its own subagents and reports. The
+   * routes `automata/claim`, `automata/heartbeat`, `automata/bus` and
+   * `automata/report` exist only when it is set. The owner of an attempt is
+   * the bound principal and the body's hostInstance.
+   */
+  readonly automata?: Pick<HostedAutomataExecutor, 'claim' | 'heartbeat' | 'callBus' | 'report'> | null;
+  /**
+   * Which principals may run automata. An automaton's goal and context are
+   * the companion's own work at its private trust, so the standalone host
+   * admits only principals bound to its primary contact. Required with `automata`.
+   */
+  readonly automataAdmits?: (principal: string) => boolean;
+  /**
+   * Memory deletion approved by the host's human (Step E3): the route
+   * `memory-deletion/approve` exists only when it is set. Only principals
+   * `primaryAdmits` admits (bound to the primary contact, who decides
+   * deletions as the donor's Operator did) approve.
+   */
+  readonly memoryDeletion?: HostMemoryDeletionApprovals | null;
+  readonly primaryAdmits?: (principal: string) => boolean;
 }
 
 export interface LifecycleBridge {
@@ -61,20 +80,9 @@ const DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
 const LOOPBACK_HOST_HEADERS = new Set(['127.0.0.1', '[::1]', 'localhost']);
 
-/** The turn owner a credential settles as: the bound caller, narrowed by the host's own process instance. */
-export function hostOwner(scope: TrustedTurnScope, caller: string, hostInstance: string): TurnOwner {
-  return { surface: scope.surface, instance: `${caller}/${hostInstance}` };
-}
-
-/** A delegated internal turn is owned by its job, so only that job's credential settles it. */
-export function delegatedOwner(scope: TrustedTurnScope, jobId: string): TurnOwner {
-  return { surface: scope.surface, instance: `delegated/${jobId}` };
-}
-
 interface Request {
   readonly route: string;
-  readonly credential: string;
-  readonly caller: string;
+  readonly principal: string;
   readonly body: unknown;
 }
 
@@ -88,9 +96,6 @@ export async function startLifecycleBridge(options: LifecycleBridgeOptions): Pro
     return invalid(`refusing to bind ${host}: the lifecycle bridge binds loopback unless exposeBeyondLoopback is set`);
   }
   if (options.exposeBeyondLoopback?.allowedHosts.length === 0) return invalid('exposeBeyondLoopback needs at least one allowed Host');
-  if ((options.delegated === null) !== (options.internalTurnHost === null)) {
-    return invalid('delegated internal turns and the internal-turn host principal are configured together');
-  }
   const allowedHosts = options.exposeBeyondLoopback === undefined ? null : new Set(options.exposeBeyondLoopback.allowedHosts.map((h) => h.toLowerCase()));
   const routes = createRoutes(options);
 
@@ -110,134 +115,138 @@ export async function startLifecycleBridge(options: LifecycleBridgeOptions): Pro
 type Routes = Readonly<Record<string, (request: Request) => Promise<Reply>>>;
 
 function createRoutes(options: LifecycleBridgeOptions): Routes {
-  const { hosted, delegated } = options;
-  const admit = async (request: Request): Promise<Result<TrustedTurnScope>> => options.ingress.admit({ kind: 'mcp_credential', credential: request.credential });
-  const fail = (request: Request, error: CoreError): Reply => {
-    if (error.kind === 'unavailable') options.onError({ route: request.route, caller: request.caller, error });
+  const { bridge } = options;
+  const fail = (request: Request, error: HostError): Reply => {
+    if (error.kind === 'unavailable') options.onError({ route: request.route, principal: request.principal, error });
     return { status: STATUS[error.kind], body: { error: publicError(error) } };
   };
-  const internalHost = (request: Request): Reply | null =>
-    delegated !== null && request.caller === options.internalTurnHost
-      ? null
-      : fail(request, { kind: 'denied', reason: 'unknown_authority', detail: 'only the configured internal-turn host claims internal turns' });
 
   return {
+    ...(options.automata ? createAutomataRoutes(options.automata, options.automataAdmits ?? (() => false), fail) : {}),
+    ...(options.memoryDeletion ? { 'memory-deletion/approve': memoryDeletionRoute(options.memoryDeletion, bridge, options.primaryAdmits ?? (() => false), fail) } : {}),
     async prepare(request) {
       const body = parsePrepare(request.body);
       if (!body.ok) return fail(request, body.error);
-      const scope = await admit(request);
-      if (!scope.ok) return fail(request, scope.error);
-      const job = delegated?.jobFor(request.credential) ?? null;
-      if (job === null && scope.value.caller.kind !== 'participant') {
-        return fail(request, { kind: 'denied', reason: 'unknown_authority', detail: 'only a participant credential or a claimed internal-turn credential prepares turns' });
-      }
-      if ((job === null) === (body.value.message === null)) {
-        return fail(request, { kind: 'invalid', issues: [job === null ? 'message is required for a participant turn' : 'an internal turn takes no message; core fixed its trigger'] });
-      }
-      const prepared = await hosted.prepare(scope.value, job === null
-        ? { owner: hostOwner(scope.value, request.caller, body.value.hostInstance), idempotencyKey: body.value.idempotencyKey, trigger: { kind: 'participant_message', text: body.value.message ?? '' } }
-        : { owner: delegatedOwner(scope.value, job.jobId), idempotencyKey: job.idempotencyKey, trigger: internalTrigger(job) });
+      const prepared = await bridge.prepare(request.principal, body.value);
       if (!prepared.ok) return fail(request, prepared.error);
-      if (prepared.value.kind === 'replayed') return { status: 200, body: { kind: 'replayed', ...renderRecord(prepared.value.record) } };
-      const turn = prepared.value;
-      if (job !== null) delegated?.bindTurn(job.jobId, scope.value, turn.turnId);
-      return {
-        status: 200,
-        body: {
-          kind: 'prepared',
-          turnId: turn.turnId,
-          sessionId: turn.sessionId,
-          resumed: turn.resumed,
-          internal: job === null ? null : { purpose: job.request.purpose, reference: job.request.reference },
-          context: renderContext(turn.context),
-        },
-      };
+      const answer = prepared.value;
+      switch (answer.kind) {
+        case 'replayed':
+          return { status: 200, body: { kind: 'replayed' } };
+        case 'answered':
+          return { status: 200, body: { kind: 'answered', turnId: answer.turnId, reply: answer.reply } };
+        case 'prepared':
+          return { status: 200, body: { kind: 'prepared', turnId: answer.turnId, resumed: answer.resumed, context: renderContext(answer.context) } };
+      }
     },
 
     async settle(request) {
       const body = parseSettle(request.body);
       if (!body.ok) return fail(request, body.error);
-      const scope = await admit(request);
-      if (!scope.ok) return fail(request, scope.error);
-      const job = delegated?.jobFor(request.credential) ?? null;
-      const owner = job === null ? hostOwner(scope.value, request.caller, body.value.hostInstance) : delegatedOwner(scope.value, job.jobId);
-      const settled = await hosted.settle(scope.value, { owner, turnId: body.value.turnId, outcome: body.value.outcome, toolCallCount: body.value.toolCallCount });
-      if (!settled.ok) return fail(request, settled.error);
-      const { record, settledNow, postTurn } = settled.value;
-      const outcome = record.settlement?.outcome;
-      if (job !== null && outcome !== undefined) {
-        delegated?.complete(job.jobId, { status: outcome.kind, reply: outcome.kind === 'completed' ? outcome.reply : outcome.partialReply });
+      if (body.value.outcome.kind === 'failed') {
+        options.onError({
+          route: request.route,
+          principal: request.principal,
+          error: { kind: 'exception', message: `host turn ${body.value.turnId} failed: ${body.value.outcome.code}: ${body.value.errorMessage ?? ''}` },
+        });
       }
-      const part = (result: Result<unknown> | null, name: string) => {
-        if (result === null) return null;
-        if (result.ok) return { ok: true };
-        options.onError({ route: `${request.route}:${name}`, caller: request.caller, error: result.error });
-        return { ok: false, error: publicError(result.error) };
-      };
-      return {
-        status: 200,
-        body: { ...renderRecord(record), settledNow, postTurn: { emotion: part(postTurn.emotion, 'emotion'), workers: part(postTurn.workers, 'workers') } },
-      };
+      const settled = await bridge.settle(request.principal, { hostInstance: body.value.hostInstance, turnId: body.value.turnId, outcome: body.value.outcome });
+      if (!settled.ok) return fail(request, settled.error);
+      return { status: 200, body: { turnId: settled.value.turnId, status: settled.value.status, reply: settled.value.reply } };
+    },
+
+    // The explicit tool contract of the open turn's pending model call (host-turns.ts HostToolChoice).
+    'tool-choice': async (request) => {
+      const body = parseToolChoice(request.body);
+      if (!body.ok) return fail(request, body.error);
+      const answer = await bridge.toolChoice(request.principal, body.value.hostInstance, body.value.turnId);
+      return answer.ok ? { status: 200, body: { toolChoice: renderToolChoice(answer.value.toolChoice) } } : fail(request, answer.error);
     },
 
     async checkpoint(request) {
       const body = parseCheckpoint(request.body);
       if (!body.ok) return fail(request, body.error);
-      const scope = await admit(request);
-      if (!scope.ok) return fail(request, scope.error);
-      const checkpoint = await hosted.checkpoint(scope.value, body.value);
+      const checkpoint = await bridge.checkpoint(request.principal, body.value.hermesInstallId, body.value.sessionId, body.value.turnIds);
       return checkpoint.ok ? { status: 200, body: { settled: checkpoint.value.settled, open: checkpoint.value.open } } : fail(request, checkpoint.error);
     },
-
-    async 'internal/claim'(request) {
-      const refused = internalHost(request);
-      if (refused !== null) return refused;
-      const body = parseClaim(request.body);
-      if (!body.ok) return fail(request, body.error);
-      const job = await delegated?.claim(body.value.waitMs);
-      return { status: 200, body: { job: job == null ? null : claimed(job) } };
-    },
-
-    async 'internal/release'(request) {
-      const refused = internalHost(request);
-      if (refused !== null) return refused;
-      const body = parseRelease(request.body);
-      if (!body.ok) return fail(request, body.error);
-      options.onError({ route: request.route, caller: request.caller, error: { kind: 'exception', message: `internal turn ${body.value.jobId} released: ${body.value.error.code}` } });
-      const released = await delegated?.release(body.value.jobId, body.value.error);
-      return released === undefined || released.ok ? { status: 200, body: { released: true } } : fail(request, released.error);
-    },
   };
 }
 
-function internalTrigger(job: DelegatedJob) {
-  const { purpose, prompt } = job.request;
-  return { kind: 'internal', origin: { kind: 'system_note', source: purpose }, purpose, text: prompt } as const;
-}
+const STATUS: Readonly<Record<HostError['kind'], number>> = { denied: 403, not_found: 404, conflict: 409, invalid: 400, unavailable: 503 };
 
-function claimed(job: DelegatedJob): Readonly<Record<string, unknown>> {
-  return { jobId: job.jobId, credential: job.credential, purpose: job.request.purpose, prompt: job.request.prompt, reference: job.request.reference };
-}
-
-/** Settles a delegated turn whose job ended without the host settling it. */
-export function abandonDelegatedTurn(hosted: () => HostedTurns | null, onError: (report: LifecycleErrorReport) => void) {
-  return async (scope: TrustedTurnScope, turnId: TurnId, jobId: string, error: { readonly code: string; readonly message: string }): Promise<void> => {
-    const turns = hosted();
-    if (turns === null) return;
-    const settled = await turns.settle(scope, {
-      owner: delegatedOwner(scope, jobId),
-      turnId,
-      outcome: { kind: 'failed', error, partialReply: null, delivery: 'not_attempted' },
-      toolCallCount: 0,
-    });
-    // A turn the host settled just before the timeout is already recorded; anything else is reported.
-    if (!settled.ok && !(settled.error.kind === 'conflict' && settled.error.reason === 'turn_already_settled')) {
-      onError({ route: 'internal/abandon', caller: null, error: settled.error });
+function memoryDeletionRoute(
+  approvals: HostMemoryDeletionApprovals,
+  bridge: HostTurnBridge,
+  admits: (principal: string) => boolean,
+  fail: (request: Request, error: HostError) => Reply,
+): (request: Request) => Promise<Reply> {
+  return async (request) => {
+    if (!admits(request.principal)) {
+      return fail(request, { kind: 'denied', reason: 'deletion_not_admitted', detail: 'only the primary contact approves memory deletion' });
     }
+    const body = parseMemoryDeletionApprove(request.body);
+    if (!body.ok) return fail(request, body.error);
+    const bound = bridge.boundInstall(body.value.hermesInstallId);
+    if (!bound.ok) return fail(request, bound.error);
+    const owner = `${request.principal}/${body.value.hostInstance}`;
+    const approved = await approvals.approve(owner, body.value.proposalId, body.value.memoryId, `host:${request.principal}`);
+    return approved.ok ? { status: 200, body: { ...approved.value } } : fail(request, approved.error);
   };
 }
 
-const STATUS: Readonly<Record<CoreError['kind'], number>> = { denied: 403, not_found: 404, conflict: 409, invalid: 400, unavailable: 503 };
+/** An attempt refusal as HTTP: an ended attempt is gone (410), a stranger's is forbidden. */
+const REFUSAL_STATUS: Readonly<Record<HostedAttemptRefusal, number>> = {
+  unknown_attempt: 404,
+  attempt_ended: 410,
+  not_attempt_owner: 403,
+  budget_exceeds_policy: 409,
+  invalid: 400,
+  no_bus_access: 403,
+  cancel_requested: 409,
+};
+
+function createAutomataRoutes(
+  automata: NonNullable<LifecycleBridgeOptions['automata']>,
+  admits: (principal: string) => boolean,
+  fail: (request: Request, error: HostError) => Reply,
+): Routes {
+  const owner = (request: Request, hostInstance: string) => `${request.principal}/${hostInstance}`;
+  const admitted = (route: (request: Request) => Promise<Reply>) => async (request: Request): Promise<Reply> => (admits(request.principal)
+    ? await route(request)
+    : fail(request, { kind: 'denied', reason: 'automata_not_admitted', detail: 'this principal does not run the companion\'s automata' }));
+  const answer = <T>(result: HostedResult<T>, render: (value: T) => Readonly<Record<string, unknown>>): Reply => (result.ok
+    ? { status: 200, body: render(result.value) }
+    : { status: REFUSAL_STATUS[result.refusal], body: { error: { kind: result.refusal, detail: result.message } } });
+  return {
+    'automata/claim': admitted(async (request) => {
+      const body = parseAutomataClaim(request.body);
+      if (!body.ok) return fail(request, body.error);
+      return answer(
+        automata.claim(owner(request, body.value.hostInstance), { maxIterations: body.value.maxIterations, limit: body.value.limit }),
+        (claims) => ({ attempts: claims }),
+      );
+    }),
+    'automata/heartbeat': admitted(async (request) => {
+      const body = parseAutomataAttempt(request.body);
+      if (!body.ok) return fail(request, body.error);
+      return answer(automata.heartbeat(owner(request, body.value.hostInstance), body.value.attemptCredential), (status) => ({ ...status }));
+    }),
+    'automata/bus': admitted(async (request) => {
+      const body = parseAutomataBus(request.body);
+      if (!body.ok) return fail(request, body.error);
+      const result = await automata.callBus(owner(request, body.value.hostInstance), body.value.attemptCredential, body.value.arguments);
+      return answer(result, (value) => ({ ...value }));
+    }),
+    'automata/report': admitted(async (request) => {
+      const body = parseAutomataReport(request.body);
+      if (!body.ok) return fail(request, body.error);
+      return answer(
+        automata.report(owner(request, body.value.hostInstance), body.value.attemptCredential, body.value.outcome),
+        (value) => ({ ...value }),
+      );
+    }),
+  };
+}
 
 interface ServeContext {
   readonly options: LifecycleBridgeOptions;
@@ -249,6 +258,7 @@ interface ServeContext {
 async function serve(req: IncomingMessage, res: ServerResponse, context: ServeContext): Promise<void> {
   const { options, routes } = context;
   let route = '';
+  let principal: string | null = null;
   try {
     const url = new URL(req.url ?? '/', 'http://lifecycle.invalid');
     route = url.pathname.startsWith(`${LIFECYCLE_PATH}/`) ? url.pathname.slice(LIFECYCLE_PATH.length + 1) : '';
@@ -258,8 +268,8 @@ async function serve(req: IncomingMessage, res: ServerResponse, context: ServeCo
     if (req.headers.origin !== undefined) return reply(res, 403, { error: 'browser origins are not accepted' });
     if (!hostAllowed(req.headers.host, context.allowedHosts)) return reply(res, 403, { error: 'host not accepted' });
     const credential = bearerCredential(req.headers.authorization);
-    const caller = credential === null ? null : options.callers.identify(credential);
-    if (credential === null || caller === null) {
+    principal = credential === null ? null : options.identify(credential);
+    if (credential === null || principal === null) {
       return reply(res, 401, { error: 'a bound bearer credential is required' }, { 'WWW-Authenticate': 'Bearer realm="psfn-lite"' });
     }
     if (req.method !== 'POST') return reply(res, 405, { error: 'method not allowed' }, { Allow: 'POST' });
@@ -272,10 +282,10 @@ async function serve(req: IncomingMessage, res: ServerResponse, context: ServeCo
     } catch {
       return reply(res, 400, { error: { kind: 'invalid', issues: ['body must be JSON'] } });
     }
-    const answer = await handler({ route, credential, caller, body });
+    const answer = await handler({ route, principal, body });
     reply(res, answer.status, answer.body);
   } catch (error) {
-    options.onError({ route, caller: null, error: { kind: 'exception', message: error instanceof Error ? error.message : 'non-error thrown' } });
+    options.onError({ route, principal, error: { kind: 'exception', message: error instanceof Error ? error.message : 'non-error thrown' } });
     if (!res.headersSent) reply(res, 500, { error: 'bridge failure' });
     else res.destroy();
   }

@@ -1,0 +1,257 @@
+import { createHash } from 'node:crypto';
+import type {
+  AutomataWorkerRunBinding,
+  AutomataWorkerRunPort,
+} from '../../automata/bus/worker-access.js';
+import type { AutomataRunRecord } from '../../automata/registry-contract.js';
+import { AUTOMATA_RUN_PROCESS_RESTART_REASON, type AutomataRunRegistry } from '../../automata/run-registry.js';
+import {
+  readCommittedAutomataTerminalHandoff,
+  type AutomataTerminalLifecyclePort,
+  type AutomataWorkerLineage,
+} from '../../automata/terminal-lifecycle.js';
+import type { ExtractionTriggerReason } from './types.js';
+
+const MEMORY_EXTRACTION_WORKER_ID = 'memory-extraction';
+const MEMORY_EXTRACTION_TASK_LABEL = 'Memory extraction';
+const MEMORY_EXTRACTION_COMPLETED_REASON = 'memory_extraction_completed';
+const MEMORY_EXTRACTION_FAILED_REASON = 'memory_extraction_failed';
+const MEMORY_EXTRACTION_TURN_RUN_SUFFIX = ':memory-extraction';
+/** Failure reason for an owner-less run interrupted by a retryable control signal (8fbwe). */
+export const MEMORY_EXTRACTION_PREEMPTED_FAILURE = 'interrupted_without_owner';
+
+/**
+ * The run id an extraction opens for a turn whose context carries no request
+ * id. Shared with background-work restart linkage so a redelivered job is
+ * recognized as the owner of the run it would re-enter.
+ */
+export function memoryExtractionTurnRunId(turnId: string): string {
+  return `${turnId}${MEMORY_EXTRACTION_TURN_RUN_SUFFIX}`;
+}
+
+/** The turn id a {@link memoryExtractionTurnRunId} run id was derived from. */
+export function memoryExtractionTurnIdFromRunId(runId: string): string | undefined {
+  if (!runId.endsWith(MEMORY_EXTRACTION_TURN_RUN_SUFFIX)) return undefined;
+  const turnId = runId.slice(0, -MEMORY_EXTRACTION_TURN_RUN_SUFFIX.length);
+  return turnId.length > 0 ? turnId : undefined;
+}
+
+export interface BeginMemoryExtractionAutomataRunInput {
+  runId: string;
+  taskId: string;
+  sessionId: string;
+  triggerReason: ExtractionTriggerReason;
+  createdAtMs?: number;
+}
+
+function lineageFromRun(run: AutomataRunRecord): AutomataWorkerLineage {
+  return {
+    automatonClass: 'memory.extraction',
+    runId: run.runId,
+    taskId: run.taskId,
+    workerId: run.workerId,
+    ...(run.parentRunId ? { parentRunId: run.parentRunId } : {}),
+    ...(run.sourceRunId ? { sourceRunId: run.sourceRunId } : {}),
+    sessionIds: [...run.sessionIds],
+  };
+}
+
+function isBackgroundWorkOwnedRun(run: AutomataRunRecord): boolean {
+  return run.workerId.startsWith('background-work:');
+}
+
+function assertExactMemoryExtractionRun(
+  run: AutomataRunRecord,
+  input: BeginMemoryExtractionAutomataRunInput,
+): void {
+  if (
+    run.automatonClass !== 'memory.extraction'
+    || (run.workerId !== MEMORY_EXTRACTION_WORKER_ID && !isBackgroundWorkOwnedRun(run))
+    || run.taskId !== input.taskId
+    || !run.sessionIds.includes(input.sessionId)
+  ) {
+    throw new Error('Memory extraction Automata run lineage does not match the authoritative request');
+  }
+}
+
+async function beginMemoryExtractionAutomataRun(
+  registry: AutomataRunRegistry,
+  input: BeginMemoryExtractionAutomataRunInput,
+  terminal: AutomataTerminalLifecyclePort | null | undefined,
+): Promise<AutomataWorkerRunBinding> {
+  let run = await registry.loadExactRun(input.runId);
+  if (!run) {
+    run = await registry.register({
+      runId: input.runId,
+      automatonClass: 'memory.extraction',
+      workerId: MEMORY_EXTRACTION_WORKER_ID,
+      taskId: input.taskId,
+      taskLabel: MEMORY_EXTRACTION_TASK_LABEL,
+      taskSummary: `Memory extraction triggered by ${input.triggerReason}`,
+      sessionIds: [input.sessionId],
+      ...(input.createdAtMs === undefined ? {} : { createdAtMs: input.createdAtMs }),
+    });
+  }
+  assertExactMemoryExtractionRun(run, input);
+  while (run.workerId === MEMORY_EXTRACTION_WORKER_ID
+    && run.status === 'failed'
+    && ((run.statusReason === MEMORY_EXTRACTION_FAILED_REASON
+      && ((input.triggerReason === 'external_conversation' && run.failureReason === 'orchestration_failure')
+        || run.failureReason === MEMORY_EXTRACTION_PREEMPTED_FAILURE))
+      // Durable external intake is its redelivery owner. It survives a restart
+      // even when the background-work oracle does not own this extraction run.
+      || (input.triggerReason === 'external_conversation' && run.statusReason === AUTOMATA_RUN_PROCESS_RESTART_REASON))) {
+    const sourceRunId: string = run.runId;
+    const retryRunId = `memory-extraction-retry:${createHash('sha256').update(sourceRunId).digest('hex')}`;
+    const existingRetry: AutomataRunRecord | null = await registry.loadExactRun(retryRunId);
+    if (existingRetry && (existingRetry.sourceRunId !== sourceRunId
+      || existingRetry.workerGeneration !== run.workerGeneration + 1
+      || existingRetry.workerId !== MEMORY_EXTRACTION_WORKER_ID)) {
+      throw new Error('Memory extraction retry lineage does not match the failed run');
+    }
+    run = existingRetry ?? await registry.register({
+      runId: retryRunId,
+      automatonClass: 'memory.extraction',
+      workerId: MEMORY_EXTRACTION_WORKER_ID,
+      workerGeneration: run.workerGeneration + 1,
+      taskId: input.taskId,
+      taskLabel: MEMORY_EXTRACTION_TASK_LABEL,
+      taskSummary: `Memory extraction triggered by ${input.triggerReason}`,
+      sourceRunId,
+      sessionIds: [input.sessionId],
+      ...(input.createdAtMs === undefined ? {} : { createdAtMs: input.createdAtMs }),
+    });
+    assertExactMemoryExtractionRun(run, input);
+  }
+  const binding = (record: AutomataRunRecord, execute: boolean): AutomataWorkerRunBinding => ({
+    companionId: record.companionId,
+    lineage: lineageFromRun(record),
+    attempt: record.workerGeneration,
+    execute,
+  });
+
+  if (run.status === 'completed') return binding(run, false);
+  if (run.status === 'failed' || run.status === 'cancelled') {
+    throw new Error(`Memory extraction Automata run is a terminal ${run.status} run`);
+  }
+  if (run.status === 'queued') {
+    run = await registry.transition(run.runId, {
+      status: 'running',
+      reason: 'memory_extraction_started',
+      ...(input.createdAtMs === undefined ? {} : { atMs: input.createdAtMs }),
+    });
+    return binding(run, true);
+  }
+  // Already running when this process opened it — either the background-work
+  // supervisor started it or a previous attempt crashed. A committed Bus
+  // terminal means the extraction already ran to a durable terminal and died
+  // before terminalizing the registry (psfn-framework-8n40k): re-running it
+  // would repeat a real, chargeable extraction model call. Skip the work and
+  // converge the registry on the durable terminal instead.
+  const committed = await readCommittedAutomataTerminalHandoff(
+    terminal,
+    lineageFromRun(run),
+    run.workerGeneration,
+  );
+  if (!committed) return binding(run, true);
+  return { ...binding(run, false), replayTerminal: committed };
+}
+
+/**
+ * Durable run adapter binding one memory-extraction run to the governed Bus
+ * lifecycle. A run created by the background-work supervisor is adopted here
+ * rather than duplicated, and terminalization stays idempotent so the
+ * supervisor's own completion callback cannot record a second terminal.
+ */
+export function createMemoryExtractionAutomataRunPort(
+  registry: AutomataRunRegistry,
+  input: BeginMemoryExtractionAutomataRunInput,
+  terminal?: AutomataTerminalLifecyclePort | null,
+): AutomataWorkerRunPort {
+  let boundRunId: string | undefined;
+  return {
+    begin: async () => {
+      const binding = await beginMemoryExtractionAutomataRun(registry, input, terminal);
+      boundRunId = binding.lineage.runId;
+      return binding;
+    },
+    terminalize: async request => {
+      if (!boundRunId) throw new Error('Memory extraction Automata run must begin before terminalization');
+      if (request.lifecycleState === 'completed') {
+        await completeMemoryExtractionAutomataRun(registry, boundRunId, request.atMs);
+        return;
+      }
+      await failMemoryExtractionAutomataRun(
+        registry,
+        boundRunId,
+        request.failureReason ?? request.stateReason,
+        request.atMs,
+      );
+    },
+  };
+}
+
+/**
+ * The run id a memory derived by this extraction may record as its
+ * `AutomataWorkerLineage.runId` (psfn-framework-ccgdz.3).
+ *
+ * Verified, never inferred: the id is returned only when the authoritative run
+ * registry holds a `memory.extraction` run under it. The governed Bus lifecycle
+ * hands its binding's lineage directly; this covers the Bus-ineligible path,
+ * where the background-work supervisor registered the run but no governed
+ * lifecycle opened. A correlation id that merely happens to equal a run id is
+ * never accepted as one.
+ */
+export function resolveMemoryExtractionDerivationRunId(
+  registry: AutomataRunRegistry | null | undefined,
+  runId: string,
+): string | undefined {
+  if (!registry) return undefined;
+  const run = registry.getRun(runId);
+  if (!run || run.automatonClass !== 'memory.extraction') return undefined;
+  return run.runId;
+}
+
+async function completeMemoryExtractionAutomataRun(
+  registry: AutomataRunRegistry,
+  runId: string,
+  atMs = Date.now(),
+): Promise<void> {
+  const run = registry.getRun(runId);
+  if (!run) throw new Error('Memory extraction Automata run disappeared before completion');
+  if (run.status === 'completed') return;
+  if (run.status !== 'running') {
+    throw new Error(`Memory extraction Automata run cannot complete from ${run.status}`);
+  }
+  await registry.transition(run.runId, {
+    status: 'completed',
+    reason: MEMORY_EXTRACTION_COMPLETED_REASON,
+    outcome: 'completed',
+    atMs,
+  });
+}
+
+export async function failMemoryExtractionAutomataRun(
+  registry: AutomataRunRegistry,
+  runId: string,
+  failureReason = 'orchestration_failure',
+  atMs = Date.now(),
+): Promise<void> {
+  const run = registry.getRun(runId);
+  if (!run) throw new Error('Memory extraction Automata run disappeared before failure recording');
+  if (run.status === 'failed'
+    && run.statusReason === MEMORY_EXTRACTION_FAILED_REASON
+    && run.failureReason === failureReason) {
+    return;
+  }
+  if (run.status !== 'queued' && run.status !== 'running') {
+    throw new Error(`Memory extraction Automata run cannot fail from ${run.status}`);
+  }
+  await registry.transition(run.runId, {
+    status: 'failed',
+    reason: MEMORY_EXTRACTION_FAILED_REASON,
+    outcome: 'blocked',
+    failureReason,
+    atMs,
+  });
+}

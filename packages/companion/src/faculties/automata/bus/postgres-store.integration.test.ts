@@ -1,0 +1,725 @@
+import { readFileSync } from 'node:fs';
+import type { Pool } from 'pg';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { createPostgresPool, runPostgresMigrations } from '../../../persistence/postgres.js';
+import { POSTGRES_AUTOMATA_MIGRATIONS } from '../../../persistence/postgres/migrations.js';
+import { POSTGRES_VECTOR_EXTENSION_MIGRATION } from '../../../persistence/postgres/vector-extension-migration.js';
+import {
+  PGVECTOR_POSTGRES_TEST_IMAGE,
+  startPostgresTestHarness,
+  type PostgresTestHarness,
+} from '../../../test-support/postgres-test-harness.js';
+import type { AutomataRunRecord } from '../registry-contract.js';
+import type { AutomataBusEvent } from './contract.js';
+import type { AutomataBusProductionRuntime } from './production-runtime.js';
+import { CanonicalAutomataBusWriter } from './production-worker-adapter.js';
+import {
+  AUTOMATA_BUS_POSTGRES_RELATIONS,
+  AUTOMATA_BUS_POSTGRES_ROLLBACK_STATEMENTS,
+  AUTOMATA_BUS_POSTGRES_SCHEMA_STATEMENTS,
+} from './postgres-schema.js';
+import { PostgresAutomataBusStore } from './postgres-store.js';
+import { assertAutomataBusPostgresReady } from './runtime-store.js';
+
+const INTEGRATION_TIMEOUT_MS = 120_000;
+
+let harness: PostgresTestHarness | null = null;
+
+beforeAll(async () => {
+  harness = await startPostgresTestHarness({ image: PGVECTOR_POSTGRES_TEST_IMAGE });
+}, INTEGRATION_TIMEOUT_MS);
+
+afterAll(async () => {
+  await harness?.stop();
+}, INTEGRATION_TIMEOUT_MS);
+
+async function withStore<T>(
+  operation: (store: PostgresAutomataBusStore, pool: Pool) => Promise<T>,
+): Promise<T> {
+  if (!harness) throw new Error('Automata Bus Postgres integration harness is unavailable');
+  const database = await harness.createDatabase();
+  const pool = createPostgresPool(database.databaseUrl, {
+    applicationName: 'automata-bus-store-integration',
+    allowExitOnIdle: true,
+    max: 8,
+  });
+  try {
+    await runPostgresMigrations(pool, POSTGRES_AUTOMATA_MIGRATIONS);
+    return await operation(new PostgresAutomataBusStore(pool), pool);
+  } finally {
+    await pool.end();
+  }
+}
+
+async function withIndependentStores<T>(
+  operation: (
+    first: PostgresAutomataBusStore,
+    second: PostgresAutomataBusStore,
+    firstPool: Pool,
+  ) => Promise<T>,
+): Promise<T> {
+  if (!harness) throw new Error('Automata Bus Postgres integration harness is unavailable');
+  const database = await harness.createDatabase();
+  const firstPool = createPostgresPool(database.databaseUrl, {
+    applicationName: 'automata-bus-writer-a',
+    allowExitOnIdle: true,
+    max: 2,
+  });
+  const secondPool = createPostgresPool(database.databaseUrl, {
+    applicationName: 'automata-bus-writer-b',
+    allowExitOnIdle: true,
+    max: 2,
+  });
+  try {
+    await runPostgresMigrations(firstPool, POSTGRES_AUTOMATA_MIGRATIONS);
+    return await operation(
+      new PostgresAutomataBusStore(firstPool),
+      new PostgresAutomataBusStore(secondPool),
+      firstPool,
+    );
+  } finally {
+    await Promise.all([firstPool.end(), secondPool.end()]);
+  }
+}
+
+function finding(overrides: Partial<AutomataBusEvent> = {}): AutomataBusEvent {
+  return {
+    schemaVersion: 1,
+    eventId: 'finding-1',
+    companionId: 'companion-a',
+    sequence: 1,
+    occurredAt: '2026-08-11T12:00:00.000Z',
+    mustUnderstand: [],
+    context: {
+      automatonClass: 'memory-extraction',
+      runId: 'run-1',
+      taskId: 'task-1',
+      sessionIds: ['session-1'],
+      artifactRefs: ['artifact:report'],
+    },
+    type: 'finding',
+    body: {
+      claim: 'The report uses deterministic section ordering.',
+      provenance: 'computed',
+      evidence: [{
+        kind: 'artifact',
+        reference: 'artifact:report',
+        summary: 'Rendered report snapshot',
+      }],
+      verification: { status: 'pending' },
+    },
+    ...overrides,
+  } as AutomataBusEvent;
+}
+
+function writerRun(): AutomataRunRecord {
+  return {
+    companionId: 'companion-a',
+    runId: 'run-1',
+    automatonClass: 'memory.extraction',
+    workerId: 'worker-1',
+    workerGeneration: 1,
+    taskId: 'task-1',
+    taskLabel: 'Concurrent writer certification',
+    taskSummary: 'Certify canonical sequence allocation across processes.',
+    sessionIds: ['session-1'],
+    artifacts: [],
+    status: 'running',
+    statusReason: 'started',
+    promotionState: 'not_requested',
+    foldState: 'not_required',
+    createdAtMs: 1_700_000_000_000,
+    startedAtMs: 1_700_000_000_001,
+    retentionDeadlineMs: 1_700_086_400_000,
+  };
+}
+
+function nonIndexingRuntime(): AutomataBusProductionRuntime {
+  return {
+    canonical: { getCurrentByEventIds: async () => [] },
+    indexing: {
+      indexCurrentFinding: async () => {
+        throw new Error('Concurrent writer test must not index a missing projection');
+      },
+    },
+  } as unknown as AutomataBusProductionRuntime;
+}
+
+interface AutomataBusStateFixture {
+  events: AutomataBusEvent[];
+  projection: {
+    effectiveFindings: Array<{ eventId: string; claim: string }>;
+    dispositions: Array<{
+      targetEventId: string;
+      relation: 'corrects' | 'retracts' | 'supersedes';
+      byEventId: string;
+    }>;
+  };
+}
+
+function stateFixture(name: 'correction-chain' | 'retraction'): AutomataBusStateFixture {
+  return JSON.parse(readFileSync(
+    new URL(`./conformance/v1/state/${name}.json`, import.meta.url),
+    'utf8',
+  )) as AutomataBusStateFixture;
+}
+
+describe('PostgresAutomataBusStore real Postgres', () => {
+  it('allocates monotonic unique sequences across independent canonical writers', async () => {
+    await withIndependentStores(async (firstStore, secondStore, firstPool) => {
+      await firstPool.query(`
+        CREATE FUNCTION delay_automata_bus_race_insert() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM pg_sleep(0.2);
+          RETURN NEW;
+        END
+        $$
+      `);
+      await firstPool.query(`
+        CREATE TRIGGER delay_automata_bus_race_insert_trigger
+        BEFORE INSERT ON automata_bus_events
+        FOR EACH ROW EXECUTE FUNCTION delay_automata_bus_race_insert()
+      `);
+      const runtime = nonIndexingRuntime();
+      const firstWriter = new CanonicalAutomataBusWriter({
+        companionId: 'companion-a',
+        store: firstStore,
+        runtime,
+      });
+      const secondWriter = new CanonicalAutomataBusWriter({
+        companionId: 'companion-a',
+        store: secondStore,
+        runtime,
+      });
+      const append = (eventId: string, occurredAt: string) => ({
+        eventId,
+        occurredAt,
+        run: writerRun(),
+        type: 'finding' as const,
+        body: {
+          claim: `Concurrent finding ${eventId}.`,
+          provenance: 'computed' as const,
+          evidence: [{
+            kind: 'command' as const,
+            reference: `test:${eventId}`,
+            summary: 'Independent canonical writer invocation.',
+          }],
+          verification: { status: 'pending' as const },
+        },
+        audiences: ['eligible-automata'] as const,
+        sensitivity: 'personal' as const,
+      });
+
+      const results = await Promise.all([
+        firstWriter.append(append('race-a', '2026-08-11T12:00:00.000Z')),
+        secondWriter.append(append('race-b', '2026-08-11T12:01:00.000Z')),
+      ]);
+
+      expect(results.every(result => result.inserted)).toBe(true);
+      expect(results.map(result => result.event.sequence).sort()).toEqual([1, 2]);
+      await expect(firstStore.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toMatchObject([
+        { sequence: 1 },
+        { sequence: 2 },
+      ]);
+    });
+  });
+
+  it('makes concurrent duplicate appends atomic and idempotent', async () => {
+    await withStore(async (store) => {
+      const input = {
+        companionId: 'companion-a',
+        event: finding(),
+        audiences: ['eligible-automata'] as const,
+        sensitivity: 'personal' as const,
+      };
+
+      const results = await Promise.all(Array.from({ length: 8 }, async () => store.append(input)));
+
+      expect(results.filter(result => result.inserted)).toHaveLength(1);
+      await expect(store.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([finding()]);
+      await expect(store.readCurrentState({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toMatchObject({
+        history: [finding()],
+        effectiveFindings: [{ eventId: 'finding-1' }],
+      });
+    });
+  });
+
+  it('rolls back a conflicting replay and accepts the next valid append', async () => {
+    await withStore(async (store) => {
+      const original = finding();
+      await store.append({
+        companionId: 'companion-a',
+        event: original,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      });
+
+      await expect(store.append({
+        companionId: 'companion-a',
+        event: finding({
+          body: {
+            claim: 'Different content under the same event ID.',
+            provenance: 'computed',
+            evidence: [{
+              kind: 'artifact',
+              reference: 'artifact:report',
+              summary: 'Conflicting snapshot',
+            }],
+            verification: { status: 'pending' },
+          },
+        } as Partial<AutomataBusEvent>),
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      })).rejects.toThrow(/reused with different content/u);
+
+      const recovery = finding({
+        eventId: 'finding-2',
+        sequence: 2,
+        occurredAt: '2026-08-11T12:01:00.000Z',
+      });
+      await expect(store.append({
+        companionId: 'companion-a',
+        event: recovery,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      })).resolves.toMatchObject({ inserted: true });
+      await expect(store.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([original, recovery]);
+    });
+  });
+
+  it('rolls back ledger insertion when current-state materialization fails', async () => {
+    await withStore(async (store, pool) => {
+      const original = finding();
+      await store.append({
+        companionId: 'companion-a',
+        event: original,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      });
+      await pool.query(`
+        CREATE FUNCTION reject_automata_projection() RETURNS trigger
+        LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.event_id = 'projection-failure' THEN
+            RAISE EXCEPTION 'injected projection failure';
+          END IF;
+          RETURN NEW;
+        END
+        $$
+      `);
+      await pool.query(`
+        CREATE TRIGGER reject_automata_projection_trigger
+        BEFORE INSERT ON automata_bus_current_findings
+        FOR EACH ROW EXECUTE FUNCTION reject_automata_projection()
+      `);
+      const blocked = finding({
+        eventId: 'projection-failure',
+        sequence: 2,
+        occurredAt: '2026-08-11T12:01:00.000Z',
+      });
+
+      await expect(store.append({
+        companionId: 'companion-a',
+        event: blocked,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      })).rejects.toThrow(/injected projection failure/u);
+      await expect(store.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([original]);
+
+      await pool.query('DROP TRIGGER reject_automata_projection_trigger ON automata_bus_current_findings');
+      await pool.query('DROP FUNCTION reject_automata_projection()');
+      await expect(store.append({
+        companionId: 'companion-a',
+        event: blocked,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      })).resolves.toMatchObject({ inserted: true });
+    });
+  });
+
+  it.each(['correction-chain', 'retraction'] as const)(
+    'matches the pinned %s current-state fixture',
+    async (fixtureName) => {
+      await withStore(async (store) => {
+        const fixture = stateFixture(fixtureName);
+        for (const event of fixture.events) {
+          await store.append({
+            companionId: event.companionId,
+            event,
+            audiences: ['eligible-automata'],
+            sensitivity: 'personal',
+          });
+        }
+
+        const state = await store.readCurrentState({
+          companionId: 'companion-a',
+          audience: 'eligible-automata',
+          maxSensitivity: 'personal',
+        });
+
+        expect(state.effectiveFindings.map(entry => ({
+          eventId: entry.eventId,
+          claim: entry.body.claim,
+        }))).toEqual(fixture.projection.effectiveFindings);
+        expect(state.dispositions).toEqual(fixture.projection.dispositions);
+      });
+    },
+  );
+
+  it('reconstructs after restart and fails closed on projection drift', async () => {
+    await withStore(async (store, pool) => {
+      const event = finding();
+      await store.append({
+        companionId: 'companion-a',
+        event,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      });
+      const restarted = new PostgresAutomataBusStore(pool);
+
+      await expect(restarted.readCurrentState({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toMatchObject({
+        history: [event],
+        effectiveFindings: [{ eventId: 'finding-1' }],
+      });
+
+      await pool.query(
+        'DELETE FROM automata_bus_current_findings WHERE companion_id = $1 AND event_id = $2',
+        ['companion-a', 'finding-1'],
+      );
+      await expect(restarted.readCurrentState({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).rejects.toThrow(/projection does not match immutable history/u);
+    });
+  });
+
+  it('isolates companion, audience, and sensitivity scopes in SQL-backed reads', async () => {
+    await withStore(async (store) => {
+      await store.append({
+        companionId: 'companion-a',
+        event: finding({ eventId: 'automata-public' }),
+        audiences: ['eligible-automata'],
+        sensitivity: 'public',
+      });
+      await store.append({
+        companionId: 'companion-a',
+        event: finding({
+          eventId: 'operator-personal',
+          sequence: 2,
+          occurredAt: '2026-08-11T12:01:00.000Z',
+        }),
+        audiences: ['operator'],
+        sensitivity: 'personal',
+      });
+      await store.append({
+        companionId: 'companion-a',
+        event: finding({
+          eventId: 'automata-confidential',
+          sequence: 3,
+          occurredAt: '2026-08-11T12:02:00.000Z',
+        }),
+        audiences: ['eligible-automata'],
+        sensitivity: 'confidential',
+      });
+      await store.append({
+        companionId: 'companion-b',
+        event: finding({ companionId: 'companion-b', eventId: 'other-companion' }),
+        audiences: ['eligible-automata'],
+        sensitivity: 'public',
+      });
+
+      await expect(store.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([finding({ eventId: 'automata-public' })]);
+      await expect(store.readHistory({
+        companionId: 'companion-a',
+        audience: 'operator',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([finding({
+        eventId: 'operator-personal',
+        sequence: 2,
+        occurredAt: '2026-08-11T12:01:00.000Z',
+      })]);
+      await expect(store.readCurrentFindingsByEventIds({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+        eventIds: [
+          'automata-public',
+          'operator-personal',
+          'automata-confidential',
+          'other-companion',
+        ],
+      })).resolves.toEqual([{
+        effectiveFinding: expect.objectContaining({ eventId: 'automata-public' }),
+        audiences: ['eligible-automata'],
+        sensitivity: 'public',
+      }]);
+    });
+  });
+
+  it('keeps identical event identities isolated across tenant schemas', async () => {
+    if (!harness) throw new Error('Automata Bus Postgres integration harness is unavailable');
+    const database = await harness.createDatabase();
+    const owner = createPostgresPool(database.databaseUrl, { max: 1 });
+    let tenantA: Pool | undefined;
+    let tenantB: Pool | undefined;
+    try {
+      await owner.query('CREATE SCHEMA automata_tenant_a');
+      await owner.query('CREATE SCHEMA automata_tenant_b');
+      tenantA = createPostgresPool(database.databaseUrl, {
+        applicationName: 'automata-bus-tenant-a',
+        schema: 'automata_tenant_a',
+        max: 2,
+      });
+      tenantB = createPostgresPool(database.databaseUrl, {
+        applicationName: 'automata-bus-tenant-b',
+        schema: 'automata_tenant_b',
+        max: 2,
+      });
+      const migrations = [
+        POSTGRES_VECTOR_EXTENSION_MIGRATION,
+        ...AUTOMATA_BUS_POSTGRES_SCHEMA_STATEMENTS,
+      ];
+      await runPostgresMigrations(tenantA, migrations);
+      await runPostgresMigrations(tenantB, migrations);
+      const storeA = new PostgresAutomataBusStore(tenantA);
+      const storeB = new PostgresAutomataBusStore(tenantB);
+      const eventA = finding();
+      const eventB = finding({
+        body: {
+          claim: 'Tenant B has an independent finding under the same event ID.',
+          provenance: 'computed',
+          evidence: [{
+            kind: 'artifact',
+            reference: 'artifact:report',
+            summary: 'Tenant B report snapshot',
+          }],
+          verification: { status: 'pending' },
+        },
+      } as Partial<AutomataBusEvent>);
+      await storeA.append({
+        companionId: 'companion-a',
+        event: eventA,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      });
+      await storeB.append({
+        companionId: 'companion-a',
+        event: eventB,
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      });
+
+      await expect(storeA.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([eventA]);
+      await expect(storeB.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([eventB]);
+    } finally {
+      await tenantA?.end();
+      await tenantB?.end();
+      await owner.end();
+    }
+  });
+
+  it('rejects invalid ledger identity and disclosure labels in Postgres itself', async () => {
+    await withStore(async (_store, pool) => {
+      const insert = (input: {
+        eventId: string;
+        sequence: number;
+        audiences?: string[];
+        sensitivity?: string;
+      }) => {
+        const event = finding({ eventId: input.eventId, sequence: input.sequence });
+        return pool.query(`
+          INSERT INTO automata_bus_events (
+            companion_id, event_id, sequence, schema_version, occurred_at,
+            event_type, automaton_class, run_id, task_id, audiences, sensitivity, event_json
+          ) VALUES ($1, $2, $3, 1, $4, 'finding', 'task-worker', 'run-1', 'task-1', $5, $6, $7)
+        `, [event.companionId, event.eventId, event.sequence, event.occurredAt,
+          input.audiences ?? ['eligible-automata'], input.sensitivity ?? 'personal', event]);
+      };
+      await insert({ eventId: 'original', sequence: 1 });
+      await expect(insert({ eventId: 'original', sequence: 2 }))
+        .rejects.toMatchObject({ code: '23505', constraint: 'automata_bus_events_pkey' });
+      await expect(insert({ eventId: 'duplicate-sequence', sequence: 1 }))
+        .rejects.toMatchObject({ code: '23505', constraint: 'automata_bus_events_companion_id_sequence_key' });
+      for (const audiences of [[], ['unknown-audience']]) {
+        await expect(insert({ eventId: 'invalid-audience', sequence: 2, audiences }))
+          .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_events_audiences_check' });
+      }
+      await expect(insert({ eventId: 'invalid-sensitivity', sequence: 2, sensitivity: 'unknown' }))
+        .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_events_sensitivity_check' });
+      // The same next identity remains usable after each rejected write.
+      await insert({ eventId: 'next', sequence: 2, audiences: ['operator'], sensitivity: 'confidential' });
+      expect((await pool.query('SELECT event_id FROM automata_bus_events ORDER BY sequence')).rows)
+        .toEqual([{ event_id: 'original' }, { event_id: 'next' }]);
+    });
+  });
+
+  it('enforces projection/vector foreign keys, dimensions, and dependent cleanup', async () => {
+    await withStore(async (store, pool) => {
+      await store.append({
+        companionId: 'companion-a', event: finding(), audiences: ['eligible-automata'], sensitivity: 'personal',
+      });
+      await expect(pool.query("UPDATE automata_bus_current_findings SET audiences = ARRAY['unknown-audience']"))
+        .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_current_findings_audiences_check' });
+      await expect(pool.query("UPDATE automata_bus_current_findings SET sensitivity = 'unknown'"))
+        .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_current_findings_sensitivity_check' });
+      await expect(pool.query(`
+        INSERT INTO automata_bus_current_findings
+          (companion_id, event_id, sequence, audiences, sensitivity, event_json)
+        VALUES ('companion-a', 'absent-event', 2, ARRAY['eligible-automata'], 'personal', $1)
+      `, [finding({ eventId: 'absent-event', sequence: 2 })]))
+        .rejects.toMatchObject({ code: '23503' });
+      const insertVector = (eventId: string, dimensions: number) => pool.query(`
+        INSERT INTO automata_bus_finding_vectors
+          (companion_id, event_id, provider, model, dimensions, embedding)
+        VALUES ('companion-a', $1, 'test', 'test-vector', $2, '[1,0,0]')
+      `, [eventId, dimensions]);
+      await expect(insertVector('finding-1', 2)).rejects.toMatchObject({ code: '23514' });
+      await expect(insertVector('absent-event', 3)).rejects.toMatchObject({ code: '23503' });
+      await insertVector('finding-1', 3);
+      await pool.query(`
+        INSERT INTO automata_bus_vector_lag
+          (companion_id, event_id, stage, provider, model, dimensions)
+        VALUES ('companion-a', 'finding-1', 'embedding', 'test', 'test-vector', 3)
+      `);
+      expect((await pool.query('SELECT mutation_fence FROM automata_bus_finding_vectors')).rows)
+        .toEqual([{ mutation_fence: '0' }]);
+      expect((await pool.query('SELECT mutation_fence FROM automata_bus_vector_lag')).rows)
+        .toEqual([{ mutation_fence: '0' }]);
+      await pool.query("DELETE FROM automata_bus_current_findings WHERE event_id = 'finding-1'");
+      expect((await pool.query('SELECT event_id FROM automata_bus_finding_vectors')).rows).toEqual([]);
+      expect((await pool.query('SELECT event_id FROM automata_bus_vector_lag')).rows).toEqual([]);
+      expect((await pool.query('SELECT event_id FROM automata_bus_events')).rows)
+        .toEqual([{ event_id: 'finding-1' }]);
+    });
+  });
+
+  it('requires a complete fenced lease only while reindexing is running', async () => {
+    await withStore(async (_store, pool) => {
+      await pool.query(`
+        INSERT INTO automata_bus_vector_state
+          (companion_id, provider, model, dimensions, index_state, reindex_state)
+        VALUES ('companion-a', 'test', 'test-vector', 3, 'ready', 'current')
+      `);
+      expect((await pool.query('SELECT mutation_fence FROM automata_bus_vector_state')).rows)
+        .toEqual([{ mutation_fence: '0' }]);
+      await expect(pool.query("UPDATE automata_bus_vector_state SET reindex_state = 'unknown'"))
+        .rejects.toMatchObject({ code: '23514' });
+      await expect(pool.query("UPDATE automata_bus_vector_state SET reindex_state = 'running'"))
+        .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_vector_reindex_lease_check' });
+      await pool.query(`
+        UPDATE automata_bus_vector_state SET reindex_state = 'running',
+          reindex_lease_token = '11111111-1111-4111-8111-111111111111',
+          reindex_lease_until = CURRENT_TIMESTAMP + INTERVAL '1 minute',
+          reindex_snapshot_sequence = 1, reindex_snapshot_mutation_fence = 0
+      `);
+      for (const column of [
+        'reindex_lease_token', 'reindex_lease_until',
+        'reindex_snapshot_sequence', 'reindex_snapshot_mutation_fence',
+      ]) {
+        await expect(pool.query(`UPDATE automata_bus_vector_state SET ${column} = NULL`))
+          .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_vector_reindex_lease_check' });
+      }
+      await expect(pool.query('UPDATE automata_bus_vector_state SET mutation_fence = -1'))
+        .rejects.toMatchObject({ code: '23514' });
+      await expect(pool.query("UPDATE automata_bus_vector_state SET reindex_state = 'current'"))
+        .rejects.toMatchObject({ code: '23514', constraint: 'automata_bus_vector_reindex_lease_check' });
+      await pool.query(`
+        UPDATE automata_bus_vector_state SET reindex_state = 'current',
+          reindex_lease_token = NULL, reindex_lease_until = NULL,
+          reindex_snapshot_sequence = NULL, reindex_snapshot_mutation_fence = NULL
+      `);
+      expect((await pool.query('SELECT reindex_state FROM automata_bus_vector_state')).rows)
+        .toEqual([{ reindex_state: 'current' }]);
+    });
+  });
+
+  it('proves exported readiness and rollback requirements against Postgres', async () => {
+    await withStore(async (_store, pool) => {
+      await expect(assertAutomataBusPostgresReady(pool)).resolves.toBeUndefined();
+      for (const relation of AUTOMATA_BUS_POSTGRES_RELATIONS) {
+        await expect(pool.query<{ relation: string | null }>(
+          'SELECT to_regclass($1)::text AS relation',
+          [relation],
+        )).resolves.toMatchObject({ rows: [{ relation }] });
+      }
+
+      for (const statement of AUTOMATA_BUS_POSTGRES_ROLLBACK_STATEMENTS) {
+        await pool.query(statement);
+      }
+      for (const relation of AUTOMATA_BUS_POSTGRES_RELATIONS) {
+        await expect(pool.query<{ relation: string | null }>(
+          'SELECT to_regclass($1)::text AS relation',
+          [relation],
+        )).resolves.toMatchObject({ rows: [{ relation: null }] });
+      }
+      expect((await pool.query(
+        "SELECT to_regprocedure('reject_automata_bus_event_mutation()')::text AS function",
+      )).rows).toEqual([{ function: null }]);
+      await expect(assertAutomataBusPostgresReady(pool)).rejects.toThrow(/required access/u);
+    });
+  });
+
+  it('denies update, delete, and truncate against immutable event history', async () => {
+    await withStore(async (store, pool) => {
+      await store.append({
+        companionId: 'companion-a',
+        event: finding(),
+        audiences: ['eligible-automata'],
+        sensitivity: 'personal',
+      });
+
+      await expect(pool.query(
+        "UPDATE automata_bus_events SET task_id = 'mutated' WHERE event_id = 'finding-1'",
+      )).rejects.toThrow(/append-only/u);
+      await expect(pool.query(
+        "DELETE FROM automata_bus_events WHERE event_id = 'finding-1'",
+      )).rejects.toThrow(/append-only/u);
+      await expect(pool.query('TRUNCATE automata_bus_events CASCADE'))
+        .rejects.toThrow(/append-only/u);
+      await expect(store.readHistory({
+        companionId: 'companion-a',
+        audience: 'eligible-automata',
+        maxSensitivity: 'personal',
+      })).resolves.toEqual([finding()]);
+    });
+  });
+});

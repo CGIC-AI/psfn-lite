@@ -1,0 +1,767 @@
+import { beforeEach, describe, expect, it } from 'vitest';
+import type { ConcernStorePort } from './concern-store-port.js';
+import { createTestPostgresIntentionPorts } from '../../test-support/postgres-intention-ports.js';
+import type { FakeIntentionPool } from '../../test-support/fake-postgres-intention-pool.js';
+import type { DurableConcernCandidateReviewSnapshot } from './concern-candidate-review-snapshot.js';
+import {
+  buildActiveConcernsPromptVariables,
+  buildActiveConcernsRuntimeData,
+} from './concerns.js';
+import { injectPromptRuntimeTokens } from '../identity/prompt-runtime.js';
+import { getRuntimePromptLayerDefinition } from '../identity/runtime-prompt-layers.js';
+import {
+  mapActiveConcernRow,
+  type ActiveConcernRow,
+} from './postgres-adapters/shared.js';
+
+function textFixture(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function durableCandidateReviewSnapshot(id: string): DurableConcernCandidateReviewSnapshot {
+  return {
+    schemaVersion: 1,
+    title: `Lifecycle ${id}`,
+    summary: `Review lifecycle candidate ${id}.`,
+    followUpHint: 'internal_only',
+    channelId: 'api:concern-store-test',
+    triggerReason: 'manual',
+    sourceRef: `test:${id}`,
+    sourceMessageIds: [],
+    conversationContext: [],
+    relatedMemoryContext: [],
+  };
+}
+
+function concernRow(overrides: Partial<ActiveConcernRow> = {}): ActiveConcernRow {
+  return {
+    id: 'concern-1',
+    text: 'A persisted concern',
+    priority: 'medium',
+    source: 'agent',
+    status: 'resolved',
+    created_at: '2026-02-01T10:00:00.000Z',
+    expires_at: '2026-02-02T10:00:00.000Z',
+    salience: 0.5,
+    sensitivity: 'personal',
+    owner: 'companion',
+    evidence_refs: null,
+    resolution_evidence_refs: null,
+    resolved_at: '2026-02-01T11:00:00.000Z',
+    resolution_outcome: 'Handled',
+    contact_id: null,
+    formation_vad: null,
+    resolution_vad: null,
+    last_reviewed_at: null,
+    next_review_at: null,
+    merged_from_ids: null,
+    split_from_id: null,
+    origin_icp_root_initiation_id: null,
+    candidate_review_snapshot: null,
+    resolution_generation_id: null,
+    ...overrides,
+  };
+}
+
+describe('production Postgres concern row mapping', () => {
+  it('rejects malformed and out-of-range VAD at the actual adapter boundary', () => {
+    expect(() => mapActiveConcernRow(concernRow({
+      formation_vad: JSON.stringify({ valence: 2, arousal: 0, dominance: 0 }),
+    }))).toThrow(/formation_vad\.valence/);
+
+    expect(() => mapActiveConcernRow(concernRow({
+      resolution_vad: { valence: 0, arousal: Number.NaN, dominance: 0 },
+    }))).toThrow(/resolution_vad\.arousal/);
+
+    expect(() => mapActiveConcernRow(concernRow({
+      resolution_vad: { valence: 0, arousal: 0 },
+    }))).toThrow(/resolution_vad\.dominance/);
+  });
+});
+
+describe('ActiveConcernStore', () => {
+  let nowMs: number;
+  let idCounter: number;
+  let store: ConcernStorePort;
+  let pool: FakeIntentionPool;
+
+  beforeEach(() => {
+    nowMs = Date.parse('2026-02-01T10:00:00.000Z');
+    idCounter = 0;
+    const testRuntime = createTestPostgresIntentionPorts({
+      now: () => new Date(nowMs),
+      idFactory: () => `concern-${++idCounter}`,
+    });
+    pool = testRuntime.pool;
+    store = testRuntime.ports.concernStore;
+  });
+
+  it('creates concerns with default medium priority/source and medium TTL', async () => {
+    const created = await store.create({
+      text: 'Check in tomorrow about the medication reminder.',
+      createdAt: '2026-02-01T10:00:00.000Z',
+    });
+
+    expect(created.priority).toBe('medium');
+    expect(created.source).toBe('agent');
+    expect(created.status).toBe('active');
+    expect(created.salience).toBe(0.5);
+    expect(created.sensitivity).toBe('personal');
+    expect(created.owner).toBe('companion');
+    expect(created.evidenceRefs).toEqual([]);
+    expect(created.expiresAt).toBe('2026-02-02T10:00:00.000Z');
+  });
+
+  it('creates concerns in differentiated lifecycle states with safe evidence refs', async () => {
+    const states = [
+      'candidate',
+      'active',
+      'watching',
+      'deferred',
+      'blocked',
+      'resolved',
+      'dismissed',
+      'suppressed',
+    ] as const;
+
+    for (const status of states) {
+      const commonInput = {
+        text: `Lifecycle ${status}`,
+        evidenceRefs: [{
+          kind: 'redacted' as const,
+          ref: `audit:${status}`,
+          sensitivity: 'redacted' as const,
+          redacted: true,
+          hash: `sha256:${status}`,
+        }],
+        salience: 0.7,
+        sensitivity: 'confidential' as const,
+        owner: 'system' as const,
+      };
+      const created = status === 'candidate'
+        ? await store.create({
+          ...commonInput,
+          status,
+          candidateReviewSnapshot: durableCandidateReviewSnapshot(status),
+        })
+        : await store.create({ ...commonInput, status });
+
+      expect(created.status).toBe(status);
+      expect(created.evidenceRefs).toEqual([{
+        kind: 'redacted',
+        ref: `audit:${status}`,
+        sensitivity: 'redacted',
+        redacted: true,
+        hash: `sha256:${status}`,
+      }]);
+      expect(created).not.toHaveProperty('raw');
+      if (status === 'resolved' || status === 'dismissed' || status === 'suppressed') {
+        expect(created.resolvedAt).toBe(created.createdAt);
+      }
+    }
+  });
+
+  it('orders active concerns deterministically by priority, expiry, creation, and id', async () => {
+    await store.create({
+      text: 'medium later',
+      priority: 'medium',
+      createdAt: '2026-02-01T10:10:00.000Z',
+      expiresAt: '2026-02-02T11:00:00.000Z',
+    });
+    await store.create({
+      text: 'high earlier expiry',
+      priority: 'high',
+      createdAt: '2026-02-01T10:20:00.000Z',
+      expiresAt: '2026-02-02T09:00:00.000Z',
+    });
+    await store.create({
+      text: 'high later expiry',
+      priority: 'high',
+      createdAt: '2026-02-01T09:20:00.000Z',
+      expiresAt: '2026-02-02T10:00:00.000Z',
+    });
+    await store.create({
+      text: 'low concern',
+      priority: 'low',
+      createdAt: '2026-02-01T08:20:00.000Z',
+      expiresAt: '2026-02-02T12:00:00.000Z',
+    });
+
+    const ordered = await store.getActiveConcerns();
+    expect(ordered.map(item => item.text)).toEqual([
+      'high earlier expiry',
+      'high later expiry',
+      'medium later',
+      'low concern',
+    ]);
+  });
+
+  it('filters active concerns to global + matching contact concerns', async () => {
+    await store.create({
+      text: 'Global concern',
+      priority: 'medium',
+    });
+    await store.create({
+      text: 'Contact A concern',
+      contactId: 'contact-a',
+      priority: 'high',
+    });
+    await store.create({
+      text: 'Contact B concern',
+      contactId: 'contact-b',
+      priority: 'high',
+    });
+
+    const forA = await store.getActiveConcerns('contact-a');
+    expect(forA.map(item => item.text)).toEqual([
+      'Contact A concern',
+      'Global concern',
+    ]);
+  });
+
+  it('excludes resolved and expired concerns from active list', async () => {
+    const resolved = await store.create({
+      text: 'Resolve me',
+      expiresAt: '2026-02-01T12:00:00.000Z',
+    });
+    await store.create({
+      text: 'Expire me',
+      expiresAt: '2026-02-01T10:30:00.000Z',
+    });
+    await store.create({
+      text: 'Still active',
+      expiresAt: '2026-02-01T13:00:00.000Z',
+    });
+
+    const result = await store.resolveConcern(resolved.id, { outcome: 'Handled' });
+    expect(result?.resolvedAt).toBeDefined();
+    expect(result?.resolutionOutcome).toBe('Handled');
+
+    nowMs = Date.parse('2026-02-01T11:00:00.000Z');
+    const active = await store.getActiveConcerns();
+    expect(active).toHaveLength(1);
+    expect(active[0].text).toBe('Still active');
+  });
+
+  it('persists resolutionVAD when resolving a concern (symmetric to formationVAD)', async () => {
+    const created = await store.create({
+      text: 'Resolve with a captured VAD snapshot',
+      formationVAD: { valence: -0.4, arousal: 0.6, dominance: -0.2 },
+    });
+
+    const resolved = await store.resolveConcern(created.id, {
+      outcome: 'Handled',
+      resolutionVAD: { valence: 0.3, arousal: 0.1, dominance: 0.2 },
+    });
+    expect(resolved?.resolvedAt).toBeDefined();
+    expect(resolved?.formationVAD).toEqual({ valence: -0.4, arousal: 0.6, dominance: -0.2 });
+    expect(resolved?.resolutionVAD).toEqual({ valence: 0.3, arousal: 0.1, dominance: 0.2 });
+
+    const reloaded = await store.getById(created.id);
+    expect(reloaded?.resolutionVAD).toEqual({ valence: 0.3, arousal: 0.1, dominance: 0.2 });
+  });
+
+  it('fails closed when the fake Postgres boundary returns a malformed persisted VAD', async () => {
+    const created = await store.create({ text: 'Corrupt persisted VAD boundary' });
+    pool.corruptActiveConcern(created.id, {
+      resolution_vad: { valence: 0, arousal: 3, dominance: 0 },
+    });
+
+    await expect(store.getById(created.id)).rejects.toThrow(/resolution_vad\.arousal/);
+  });
+
+  it('captures resolutionVAD on a terminal transition and clears it on reopen', async () => {
+    const created = await store.create({
+      text: 'Terminal transition captures resolution VAD',
+      formationVAD: { valence: 0.1, arousal: 0.2, dominance: 0.3 },
+    });
+
+    const dismissed = await store.transitionConcernStatus(created.id, {
+      status: 'dismissed',
+      outcome: 'No longer relevant',
+      evidenceRefs: [{ kind: 'runtime', ref: 'test:dismiss' }],
+      resolutionVAD: { valence: -0.2, arousal: -0.1, dominance: 0.0 },
+    });
+    expect(dismissed?.resolutionVAD).toEqual({ valence: -0.2, arousal: -0.1, dominance: 0.0 });
+
+    const reopened = await store.transitionConcernStatus(created.id, {
+      status: 'active',
+      evidenceRefs: [{ kind: 'runtime', ref: 'test:reopen' }],
+    });
+    expect(reopened?.status).toBe('active');
+    expect(reopened?.resolutionVAD).toBeUndefined();
+  });
+
+  it('does not fabricate a resolutionVAD when none is provided', async () => {
+    const created = await store.create({
+      text: 'Resolve without a VAD snapshot',
+      formationVAD: { valence: 0.1, arousal: 0.2, dominance: 0.3 },
+    });
+    const resolved = await store.resolveConcern(created.id, { outcome: 'Handled' });
+    expect(resolved?.resolvedAt).toBeDefined();
+    expect(resolved?.resolutionVAD).toBeUndefined();
+  });
+
+  it('rejects invalid lifecycle transitions fail-closed', async () => {
+    const created = await store.create({
+      text: 'Suppress this source.',
+      status: 'suppressed',
+    });
+
+    await expect(store.transitionConcernStatus(created.id, {
+      status: 'active',
+      evidenceRefs: [{ kind: 'message', ref: 'msg-new' }],
+    })).rejects.toThrow(/Invalid active concern transition: suppressed -> active/);
+    expect((await store.getById(created.id))?.status).toBe('suppressed');
+  });
+
+  it('rejects transitions into the internal candidate state', async () => {
+    const created = await store.create({ text: 'Ordinary active concern.' });
+
+    await expect(store.transitionConcernStatus(created.id, {
+      status: 'candidate',
+    })).rejects.toThrow(/Invalid active concern transition: active -> candidate/);
+    expect((await store.getById(created.id))?.status).toBe('active');
+
+    const legacyCandidate = await store.create({
+      text: 'Legacy candidate with missing review state.',
+      status: 'candidate',
+      candidateReviewSnapshot: durableCandidateReviewSnapshot('legacy'),
+    });
+    pool.corruptActiveConcern(legacyCandidate.id, { candidate_review_snapshot: null });
+
+    await expect(store.transitionConcernStatus(legacyCandidate.id, {
+      status: 'candidate',
+    })).rejects.toThrow(/Invalid active concern transition: candidate -> candidate/);
+  });
+
+  it('transitions through deferred, blocked, dismissed, and suppressed lifecycle states', async () => {
+    const deferred = await store.create({
+      text: 'Watch the delayed appointment.',
+      status: 'watching',
+      nextReviewAt: '2026-02-01T12:00:00.000Z',
+    });
+    const blocked = await store.transitionConcernStatus(deferred.id, {
+      status: 'blocked',
+      transitionedAt: '2026-02-01T10:05:00.000Z',
+      evidenceRefs: [{ kind: 'runtime', ref: 'gate:missing-contact' }],
+    });
+    expect(blocked).toMatchObject({
+      status: 'blocked',
+      lastReviewedAt: '2026-02-01T10:05:00.000Z',
+    });
+    expect(blocked?.evidenceRefs).toEqual([
+      { kind: 'runtime', ref: 'gate:missing-contact' },
+    ]);
+
+    const dismissed = await store.create({ text: 'Dismiss after operator review.' });
+    expect((await store.transitionConcernStatus(dismissed.id, {
+      status: 'dismissed',
+      outcome: 'Operator said this is not needed.',
+    }))?.status).toBe('dismissed');
+
+    const suppressed = await store.create({ text: 'Suppress redacted duplicate.' });
+    const suppressedResult = await store.transitionConcernStatus(suppressed.id, {
+      status: 'suppressed',
+      evidenceRefs: [{ kind: 'redacted', ref: 'audit:redacted-1', sensitivity: 'redacted' }],
+    });
+    expect(suppressedResult?.status).toBe('suppressed');
+    expect(suppressedResult?.resolutionEvidenceRefs).toEqual([
+      { kind: 'redacted', ref: 'audit:redacted-1', sensitivity: 'redacted', redacted: true },
+    ]);
+  });
+
+  it('lists recently resolved concerns within the configured lookback window', async () => {
+    const recent = await store.create({
+      text: 'Recent cleanup reminder',
+      contactId: 'contact-a',
+    });
+    const stale = await store.create({
+      text: 'Old cleanup reminder',
+      contactId: 'contact-a',
+    });
+
+    await store.resolveConcern(recent.id, {
+      outcome: 'Handled during this conversation',
+      resolvedAt: '2026-02-01T09:30:00.000Z',
+    });
+    await store.resolveConcern(stale.id, {
+      outcome: 'Handled yesterday',
+      resolvedAt: '2026-01-31T23:00:00.000Z',
+    });
+
+    const recentResolved = await store.listRecentlyResolvedConcerns('contact-a', {
+      asOf: '2026-02-01T10:00:00.000Z',
+      withinMs: 2 * 60 * 60 * 1000,
+    });
+    expect(recentResolved.map(concern => concern.text)).toEqual([
+      'Recent cleanup reminder',
+    ]);
+  });
+
+  it('matches similar recently resolved concerns to suppress duplicate recreation', async () => {
+    const created = await store.create({
+      text: 'Follow up on medication tomorrow morning',
+      contactId: 'contact-a',
+    });
+    await store.resolveConcern(created.id, {
+      outcome: 'Handled already',
+      resolvedAt: '2026-02-01T09:45:00.000Z',
+    });
+
+    const match = await store.findRecentlyResolvedSimilarConcern({
+      text: 'Follow up on medication tomorrow',
+      contactId: 'contact-a',
+      asOf: '2026-02-01T10:00:00.000Z',
+      withinMs: 60 * 60 * 1000,
+    });
+    expect(match?.id).toBe(created.id);
+
+    const staleMatch = await store.findRecentlyResolvedSimilarConcern({
+      text: 'Follow up on medication tomorrow',
+      contactId: 'contact-a',
+      asOf: '2026-02-02T10:00:00.000Z',
+      withinMs: 60 * 60 * 1000,
+    });
+    expect(staleMatch).toBeNull();
+  });
+
+  it('dedupes active concerns by merging lifecycle metadata', async () => {
+    const first = await store.create({
+      text: 'Follow up on hydration tomorrow',
+      priority: 'low',
+      status: 'watching',
+      evidenceRefs: [{ kind: 'message', ref: 'msg-1' }],
+      expiresAt: '2026-02-01T12:00:00.000Z',
+    });
+    const second = await store.create({
+      text: 'Follow up on hydration tomorrow morning',
+      priority: 'high',
+      status: 'blocked',
+      evidenceRefs: [{ kind: 'appraisal', ref: 'appraisal-2' }],
+      expiresAt: '2026-02-01T14:00:00.000Z',
+      salience: 0.9,
+    });
+
+    expect(second.id).toBe(first.id);
+    expect(second.priority).toBe('high');
+    expect(second.status).toBe('blocked');
+    expect(second.salience).toBe(0.9);
+    expect(second.expiresAt).toBe('2026-02-01T14:00:00.000Z');
+    expect(second.evidenceRefs).toEqual([
+      { kind: 'message', ref: 'msg-1' },
+      { kind: 'appraisal', ref: 'appraisal-2' },
+    ]);
+    expect(await store.list({ includeExpired: true })).toHaveLength(1);
+  });
+
+  it('does not silently resolve stale concerns while creating another thread', async () => {
+    const stale = await store.create({
+      text: 'Follow up on hydration tomorrow morning',
+      priority: 'medium',
+      status: 'watching',
+      createdAt: '2026-02-01T08:00:00.000Z',
+      expiresAt: '2026-02-01T09:00:00.000Z',
+    });
+
+    const duplicate = await store.create({
+      text: 'Follow up on hydration tomorrow',
+      priority: 'high',
+      createdAt: '2026-02-01T10:00:00.000Z',
+      evidenceRefs: [{ kind: 'message', ref: 'msg-hydration-repeat' }],
+    });
+
+    expect(duplicate.id).not.toBe(stale.id);
+    expect(duplicate.status).toBe('active');
+    expect((await store.getById(stale.id))?.status).toBe('watching');
+    expect((await store.getById(stale.id))?.resolvedAt).toBeUndefined();
+    expect(await store.getActiveConcerns()).toEqual([duplicate]);
+    expect(await store.list({ includeResolved: true, includeExpired: true })).toHaveLength(2);
+  });
+
+  it('serializes terminal resolution so concurrent callers share one immutable generation', async () => {
+    const created = await store.create({
+      text: 'Resolve exactly once under concurrent delivery',
+      formationVAD: { valence: -0.4, arousal: 0.6, dominance: -0.2 },
+    });
+
+    const [left, right] = await Promise.all([
+      store.resolveConcern(created.id, {
+        outcome: 'Handled once',
+        resolvedAt: '2026-02-01T10:05:00.000Z',
+        resolutionVAD: { valence: 0.2, arousal: 0.1, dominance: 0.3 },
+      }),
+      store.resolveConcern(created.id, {
+        outcome: 'Handled once',
+        resolvedAt: '2026-02-01T10:05:00.000Z',
+        resolutionVAD: { valence: 0.2, arousal: 0.1, dominance: 0.3 },
+      }),
+    ]);
+
+    expect(left).not.toBeNull();
+    expect(right).not.toBeNull();
+    expect(left?.resolutionGenerationId).toEqual(expect.any(String));
+    expect(right?.resolutionGenerationId).toBe(left?.resolutionGenerationId);
+    expect(right?.resolvedAt).toBe(left?.resolvedAt);
+    expect(right?.resolutionOutcome).toBe(left?.resolutionOutcome);
+    expect(right?.resolutionVAD).toEqual(left?.resolutionVAD);
+  });
+
+  it('keeps an exact terminal retry immutable and gives a reopened resolution a new generation', async () => {
+    const created = await store.create({ text: 'Retry and reopen resolution' });
+    const first = await store.resolveConcern(created.id, {
+      outcome: 'First outcome',
+      resolvedAt: '2026-02-01T10:05:00.000Z',
+      resolutionVAD: { valence: 0.1, arousal: -0.2, dominance: 0.3 },
+    });
+    const retry = await store.resolveConcern(created.id, {
+      outcome: 'First outcome',
+      resolvedAt: '2026-02-01T10:05:00.000Z',
+      resolutionVAD: { valence: 0.1, arousal: -0.2, dominance: 0.3 },
+    });
+
+    expect(retry).toEqual(first);
+
+    const reopened = await store.transitionConcernStatus(created.id, {
+      status: 'active',
+      transitionedAt: '2026-02-01T10:06:00.000Z',
+      evidenceRefs: [{ kind: 'runtime', ref: 'new-evidence' }],
+    });
+    expect(reopened?.resolutionGenerationId).toBeUndefined();
+
+    const second = await store.resolveConcern(created.id, {
+      outcome: 'Second outcome',
+      resolvedAt: '2026-02-01T10:07:00.000Z',
+    });
+    expect(second?.resolutionGenerationId).toEqual(expect.any(String));
+    expect(second?.resolutionGenerationId).not.toBe(first?.resolutionGenerationId);
+  });
+
+  it('records split children with parent provenance', async () => {
+    const parent = await store.create({
+      text: 'Separate mixed deployment and care follow-up thread',
+    });
+    const deployment = await store.create({
+      text: 'Track deployment rollback risk separately',
+      splitFromId: parent.id,
+      status: 'blocked',
+    });
+    const care = await store.create({
+      text: 'Track care check-in separately',
+      splitFromId: parent.id,
+      status: 'watching',
+    });
+    const resolvedParent = await store.transitionConcernStatus(parent.id, {
+      status: 'resolved',
+      outcome: `Split into ${deployment.id} and ${care.id}`,
+    });
+
+    expect(deployment.splitFromId).toBe(parent.id);
+    expect(care.splitFromId).toBe(parent.id);
+    expect(resolvedParent).toMatchObject({
+      status: 'resolved',
+      resolutionOutcome: `Split into ${deployment.id} and ${care.id}`,
+    });
+  });
+
+  it('resolves stale unresolved concerns explicitly', async () => {
+    await store.create({
+      text: 'Expired watch item',
+      status: 'watching',
+      expiresAt: '2026-02-01T10:30:00.000Z',
+    });
+    await store.create({
+      text: 'Still future item',
+      status: 'active',
+      expiresAt: '2026-02-01T13:00:00.000Z',
+    });
+
+    const stale = await store.resolveStaleConcerns({
+      asOf: '2026-02-01T11:00:00.000Z',
+      evidenceRefs: [{ kind: 'runtime', ref: 'stale-sweep:2026-02-01T11' }],
+    });
+
+    expect(stale).toHaveLength(1);
+    expect(stale[0]).toMatchObject({
+      text: 'Expired watch item',
+      status: 'resolved',
+      resolutionOutcome: 'Resolved as stale after review window elapsed.',
+    });
+    expect((await store.getActiveConcerns()).map(concern => concern.text)).toEqual(['Still future item']);
+  });
+
+  it('keeps recently resolved concerns terminal until explicit new evidence reopens them', async () => {
+    const resolved = await store.create({
+      text: 'Check the medication reminder',
+      contactId: 'contact-a',
+    });
+    await store.resolveConcern(resolved.id, {
+      outcome: 'Handled already',
+      resolvedAt: '2026-02-01T09:45:00.000Z',
+    });
+
+    const duplicate = await store.create({
+      text: 'Check the medication reminder',
+      contactId: 'contact-a',
+      createdAt: '2026-02-01T10:00:00.000Z',
+    });
+    expect(duplicate.id).toBe(resolved.id);
+    expect(duplicate.status).toBe('resolved');
+    expect(await store.getActiveConcerns('contact-a')).toHaveLength(0);
+
+    await expect(store.transitionConcernStatus(resolved.id, {
+      status: 'active',
+    })).rejects.toThrow(/requires new safe evidence refs/);
+
+    const reopened = await store.create({
+      text: 'Check the medication reminder',
+      contactId: 'contact-a',
+      createdAt: '2026-02-01T10:05:00.000Z',
+      reopenResolved: true,
+      evidenceRefs: [{ kind: 'message', ref: 'msg-new-medication-update' }],
+    });
+    expect(reopened.id).toBe(resolved.id);
+    expect(reopened.status).toBe('active');
+    expect(reopened.resolvedAt).toBeUndefined();
+    expect(reopened.evidenceRefs).toEqual([
+      { kind: 'message', ref: 'msg-new-medication-update' },
+    ]);
+  });
+
+  it('throws when expiresAt is not after createdAt', async () => {
+    await expect(store.create({
+      text: 'Bad expiry',
+      createdAt: '2026-02-01T10:00:00.000Z',
+      expiresAt: '2026-02-01T09:59:59.000Z',
+    })).rejects.toThrow(/expiresAt must be after createdAt/);
+  });
+
+  it('clamps concern expiry to the one-week hard lifetime', async () => {
+    const created = await store.create({
+      text: 'Long horizon item should leave concerns after a week.',
+      createdAt: '2026-02-01T10:00:00.000Z',
+      expiresAt: '2026-03-01T10:00:00.000Z',
+    });
+
+    expect(created.expiresAt).toBe('2026-02-08T10:00:00.000Z');
+  });
+
+  it('rejects an eighth active concern while allowing duplicate merge into the capped set', async () => {
+    const activeTexts = [
+      'Confirm Tuesday cardiology appointment logistics.',
+      'Review database migration rollback checklist.',
+      'Check whether voice latency regression returned.',
+      'Track hydration routine follow up after medication change.',
+      'Revisit backup verification evidence after tonight.',
+      'Clarify calendar scheduling conflict with Sam.',
+      'Inspect avatar render pipeline failure notes.',
+    ];
+    for (const [i, text] of activeTexts.entries()) {
+      await store.create({
+        text,
+        priority: i === 0 ? 'high' : 'low',
+      });
+    }
+
+    await expect(store.create({
+      text: 'An eighth distinct concern should not be opened.',
+    })).rejects.toThrow(/Active concern cap reached \(7\)/);
+
+    const merged = await store.create({
+      text: activeTexts[0]!,
+      priority: 'high',
+      evidenceRefs: [{ kind: 'runtime', ref: 'merge-under-cap' }],
+    });
+    expect(merged.text).toBe(activeTexts[0]);
+    expect(await store.getActiveConcerns()).toHaveLength(7);
+  });
+
+  it('treats concerns beyond the one-week hard lifetime as stale even with future expiresAt', async () => {
+    const created = await store.create({
+      text: 'Legacy long-lived concern',
+      createdAt: '2026-02-01T10:00:00.000Z',
+      expiresAt: '2026-02-08T10:00:00.000Z',
+    });
+    pool.corruptActiveConcern(created.id, { expires_at: '2026-03-01T10:00:00.000Z' });
+
+    const activeAtBoundary = await store.list({
+      asOf: '2026-02-08T10:00:00.000Z',
+      includeResolved: false,
+      includeExpired: false,
+    });
+    expect(activeAtBoundary).toHaveLength(0);
+
+    const stale = await store.resolveStaleConcerns({
+      asOf: '2026-02-08T10:00:00.000Z',
+      evidenceRefs: [{ kind: 'runtime', ref: 'hard-lifetime-sweep' }],
+    });
+    expect(stale).toHaveLength(1);
+    expect(stale[0]?.id).toBe(created.id);
+  });
+
+  it('formats active concerns context block with bounded output', async () => {
+    const uniqueTopics = [
+      'medication reminder logistics',
+      'calendar scheduling conflict',
+      'database migration rollback',
+      'voice latency regression',
+      'breakfast habit followup',
+      'sleep schedule drift',
+      'hydration routine check',
+      'avatar render pipeline',
+      'backup verification audit',
+    ];
+    for (let i = 0; i < 7; i++) {
+      await store.create({
+        text: textFixture(uniqueTopics[i]!),
+        priority: i === 0 ? 'high' : 'low',
+        expiresAt: `2026-02-01T${(11 + i).toString().padStart(2, '0')}:00:00.000Z`,
+      });
+    }
+
+    // E2.5 purity rule: the open-threads framing sentence lives in the
+    // editable runtime.attention layer, rendered from bare concern variables —
+    // no prose is constructed in concerns.ts anymore.
+    const runtimeData = buildActiveConcernsRuntimeData(await store.getActiveConcerns(), 5);
+    const attentionLayer = getRuntimePromptLayerDefinition('runtime.attention')?.content ?? '';
+    const block = injectPromptRuntimeTokens(attentionLayer, {
+      variables: {
+        ...buildActiveConcernsPromptVariables(runtimeData),
+        runtime_behavioral_notes_body: '',
+        runtime_skills_index_body: '',
+      },
+    });
+    expect(block).toContain('<open_threads>');
+    expect(block).toContain('These are simply things that may be worth revisiting if they fit the moment.');
+    expect(block).toContain('additional lower-salience threads omitted');
+    const concernLines = block.split('\n').filter(line => line.startsWith('- '));
+    expect(concernLines.length).toBe(6);
+  });
+
+  it('builds atomic active-concern runtime data without the prose opener', async () => {
+    await store.create({
+      text: textFixture('medication reminder logistics'),
+      priority: 'high',
+      expiresAt: '2026-02-01T11:00:00.000Z',
+    });
+    await store.create({
+      text: textFixture('sleep schedule drift'),
+      priority: 'low',
+      expiresAt: '2026-02-01T12:00:00.000Z',
+    });
+    await store.create({
+      text: textFixture('hydration routine check'),
+      priority: 'low',
+      expiresAt: '2026-02-01T13:00:00.000Z',
+    });
+
+    const runtimeData = buildActiveConcernsRuntimeData(await store.getActiveConcerns(), 2);
+
+    expect(runtimeData.totalCount).toBe(3);
+    expect(runtimeData.topPriorities).toEqual(['high', 'low']);
+    expect(runtimeData.omittedCount).toBe(1);
+    expect(runtimeData.topLines).toHaveLength(2);
+    expect(runtimeData.topLines[0]).toMatch(/^- medication reminder logistics \(high salience; available through /);
+    expect(runtimeData.topLines[1]).toMatch(/^- sleep schedule drift \(low salience; available through /);
+  });
+});

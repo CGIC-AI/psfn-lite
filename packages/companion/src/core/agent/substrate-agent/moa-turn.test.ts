@@ -1,0 +1,379 @@
+import { fromAny } from '@total-typescript/shoehorn';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { buildMoaPrompt, runMoaTurn, type ResolvedMoaSettings } from './moa-turn.js';
+import { runDeliberation } from '../../../primitives/llm/deliberation.js';
+import type { LLMContext, ObservabilityCallType, SubstrateMessage } from '../../../shared/contracts/runtime.js';
+import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
+import type { ChargePolicyConfig } from '../../../shared/contracts/charge-policy.js';
+import { resetRunChargeRollingWindowForTests } from '../../../shared/telemetry/run-charge.js';
+import { makeTestFatiguePolicyConfig } from '../../../test-support/charge-policy.js';
+
+vi.mock('../../../primitives/llm/deliberation.js', () => ({
+  runDeliberation: vi.fn(),
+}));
+
+const mockedRunDeliberation = vi.mocked(runDeliberation);
+
+beforeEach(() => {
+  mockedRunDeliberation.mockReset();
+});
+
+afterEach(() => {
+  resetRunChargeRollingWindowForTests();
+});
+
+function makeChargePolicy(): ChargePolicyConfig {
+  return {
+    schemaVersion: 1,
+    runChargeQuotaByLane: {
+      interactive: 100,
+      background: 100,
+      maintenance: 0,
+      subagent: 100,
+      shard: 100,
+    },
+    surfaceCosts: {
+      localImageGeneration: 0,
+      paidImageGeneration: 6,
+      analysisWorkbenchExtensionBand: 1,
+      subagentLaunch: 1,
+      shardLaunch: 8,
+      externalModelConsult: 1,
+      moaRoundBase: 1,
+    },
+    moa: {
+      perRoundMultiplierByReferenceModelClass: {
+        local: 1,
+        subscription: 1,
+        cheap_cloud: 1,
+        premium_cloud: 2,
+      },
+    },
+    referenceModelClassPricing: {
+      local: 0,
+      subscription: 0,
+      cheap_cloud: 1,
+      premium_cloud: 4,
+    },
+    fatigue: makeTestFatiguePolicyConfig(),
+  };
+}
+
+describe('runMoaTurn', () => {
+  it('uses neutral role labels in the MoA transcript', async () => {
+    mockedRunDeliberation.mockResolvedValueOnce({
+      sessionId: 'session-1',
+      output: 'final answer',
+      stopReason: 'max_rounds',
+      rounds: [
+        {
+          index: 0,
+          voices: [
+            {
+              purpose: 'reasoning',
+              content: 'analysis',
+              model: 'reasoning-model',
+              inputTokens: 1,
+              outputTokens: 1,
+            },
+          ],
+          synthesis: 'final answer',
+          novelty: 1,
+          fatigue: 0,
+          continueProbability: 0,
+          inputTokens: 2,
+          outputTokens: 1,
+          durationMs: 1,
+        },
+      ],
+      voices: ['reasoning'],
+      caps: { maxRounds: 1, maxTotalTokens: 1, maxWallTimeMs: 1 },
+      totalInputTokens: 2,
+      totalOutputTokens: 1,
+      totalTokens: 3,
+      estimatedCostUsd: 0,
+      startedAt: 0,
+      endedAt: 1,
+      durationMs: 1,
+    });
+
+    const context: LLMContext = {
+      systemPrompt: 'You are a helper.',
+      messages: [
+        { role: 'user', content: 'Hello', timestamp: Date.now() },
+        { role: 'assistant', content: 'Hi', timestamp: Date.now() },
+      ],
+    } as LLMContext;
+    const settings: ResolvedMoaSettings = {
+      maxRounds: 1,
+      timeoutMs: 1_000,
+      referenceModels: [],
+    };
+    const emitTelemetry = vi.fn();
+
+    await runMoaTurn({
+      prompt: buildMoaPrompt(context, { role: 'user', content: 'current turn' }),
+      authoritativeSystemPrompt: context.systemPrompt,
+      llmClient: fromAny({}),
+      context,
+      message: { channelId: 'api:test' } as SubstrateMessage,
+      settings,
+      config: {} as SubstrateConfig,
+      turnId: 'turn-1',
+      requestId: 'req-1',
+      callType: 'chat' as ObservabilityCallType,
+      correlation: {
+        sessionId: 'logical-session-1',
+        channelId: 'api:test',
+        channelType: 'api',
+        callType: 'chat',
+        purpose: 'agent.turn',
+        conversationId: 'logical-session-1',
+        rootInitiationId: 'root-initiation-1',
+      },
+      contextWindow: 1_000,
+      emitTelemetry,
+    });
+
+    const prompt = mockedRunDeliberation.mock.calls[0]?.[1] ?? '';
+    expect(prompt).not.toContain('You are a helper.');
+    expect(prompt).toContain('user:\nHello');
+    expect(prompt).toContain('assistant:\nHi');
+    expect(prompt).toContain('Current turn:\nuser:\ncurrent turn');
+    expect(mockedRunDeliberation.mock.calls[0]?.[2]).toMatchObject({
+      authoritativeSystemPrompt: 'You are a helper.',
+      correlation: {
+        sessionId: 'logical-session-1',
+        channelId: 'api:test',
+        channelType: 'api',
+        conversationId: 'logical-session-1',
+        rootInitiationId: 'root-initiation-1',
+        chargeSurface: 'externalModelConsult',
+      },
+    });
+  });
+
+  it('emits base round and consult charge events for MoA deliberation', async () => {
+    mockedRunDeliberation.mockResolvedValueOnce({
+      sessionId: 'session-2',
+      output: 'final answer',
+      stopReason: 'max_rounds',
+      rounds: [
+        {
+          index: 0,
+          voices: [
+            {
+              purpose: 'reasoning',
+              content: 'analysis',
+              model: 'openrouter/cheap-model',
+              inputTokens: 1,
+              outputTokens: 1,
+            },
+          ],
+          synthesis: 'final answer',
+          aggregatorModel: 'openrouter/premium-model',
+          novelty: 1,
+          fatigue: 0,
+          continueProbability: 0,
+          inputTokens: 2,
+          outputTokens: 1,
+          durationMs: 1,
+        },
+      ],
+      voices: ['reasoning'],
+      caps: { maxRounds: 1, maxTotalTokens: 1, maxWallTimeMs: 1 },
+      totalInputTokens: 2,
+      totalOutputTokens: 1,
+      totalTokens: 3,
+      estimatedCostUsd: 0,
+      startedAt: 0,
+      endedAt: 1,
+      durationMs: 1,
+    });
+
+    const emitted: Array<[string, Record<string, unknown>]> = [];
+    const emitTelemetry = vi.fn((eventName: string, payload: Record<string, unknown>) => {
+      emitted.push([eventName, payload]);
+    });
+
+    await runMoaTurn({
+      prompt: 'current turn',
+      authoritativeSystemPrompt: 'You are a helper.',
+      llmClient: fromAny({}),
+      context: {
+        systemPrompt: 'You are a helper.',
+        messages: [],
+      } as LLMContext,
+      message: { channelId: 'api:test' } as SubstrateMessage,
+      settings: {
+        maxRounds: 1,
+        timeoutMs: 1_000,
+        referenceModels: ['openrouter/cheap-model'],
+        aggregatorModel: 'openrouter/premium-model',
+      },
+      config: {
+        chargePolicy: makeChargePolicy(),
+      } as SubstrateConfig,
+      turnId: 'turn-2',
+      requestId: 'req-2',
+      callType: 'chat' as ObservabilityCallType,
+      contextWindow: 1_000,
+      emitTelemetry,
+    });
+
+    const chargeEvents = emitted.filter(([eventName]) => eventName === 'agent.charge');
+    expect(chargeEvents.map(([, payload]) => (fromAny(payload)).surface)).toEqual([
+      'moaRoundBase',
+      'externalModelConsult',
+      'externalModelConsult',
+    ]);
+  });
+
+  it('refuses MoA work when the charge quota is exhausted before charging the first round', async () => {
+    mockedRunDeliberation.mockResolvedValueOnce({
+      sessionId: 'session-3',
+      output: 'final answer',
+      stopReason: 'max_rounds',
+      rounds: [
+        {
+          index: 0,
+          voices: [
+            {
+              purpose: 'reasoning',
+              content: 'analysis',
+              model: 'openrouter/cheap-model',
+              inputTokens: 1,
+              outputTokens: 1,
+            },
+          ],
+          synthesis: 'final answer',
+          novelty: 1,
+          fatigue: 0,
+          continueProbability: 0,
+          inputTokens: 2,
+          outputTokens: 1,
+          durationMs: 1,
+        },
+      ],
+      voices: ['reasoning'],
+      caps: { maxRounds: 1, maxTotalTokens: 1, maxWallTimeMs: 1 },
+      totalInputTokens: 2,
+      totalOutputTokens: 1,
+      totalTokens: 3,
+      estimatedCostUsd: 0,
+      startedAt: 0,
+      endedAt: 1,
+      durationMs: 1,
+    });
+
+    const emitted: Array<[string, Record<string, unknown>]> = [];
+    const emitTelemetry = vi.fn((eventName: string, payload: Record<string, unknown>) => {
+      emitted.push([eventName, payload]);
+    });
+
+    const result = await runMoaTurn({
+      prompt: 'current turn',
+      authoritativeSystemPrompt: 'You are a helper.',
+      llmClient: fromAny({}),
+      context: {
+        systemPrompt: 'You are a helper.',
+        messages: [],
+      } as LLMContext,
+      message: { channelId: 'api:test' } as SubstrateMessage,
+      settings: {
+        maxRounds: 1,
+        timeoutMs: 1_000,
+        referenceModels: ['openrouter/cheap-model'],
+      },
+      config: {
+        chargePolicy: {
+          ...makeChargePolicy(),
+          runChargeQuotaByLane: {
+            interactive: 0,
+            background: 100,
+            maintenance: 0,
+            subagent: 100,
+            shard: 100,
+          },
+        },
+      } as SubstrateConfig,
+      turnId: 'turn-3',
+      requestId: 'req-3',
+      callType: 'chat' as ObservabilityCallType,
+      contextWindow: 1_000,
+      emitTelemetry,
+    });
+
+    expect(result.stopReason).toBe('charge quota');
+    expect(result.output).toContain('next charge could be applied');
+    expect(mockedRunDeliberation).toHaveBeenCalledTimes(1);
+    expect(emitted.some(([eventName, payload]) => eventName === 'agent.moa.turn' && (fromAny(payload)).stopReason === 'charge quota')).toBe(true);
+  });
+
+  it('keeps the configured MoA round ceiling authoritative when charge quota is available', async () => {
+    mockedRunDeliberation.mockResolvedValueOnce({
+      sessionId: 'session-4',
+      output: 'final answer',
+      stopReason: 'max_rounds',
+      rounds: [
+        {
+          index: 0,
+          voices: [
+            {
+              purpose: 'reasoning',
+              content: 'analysis',
+              model: 'openrouter/cheap-model',
+              inputTokens: 1,
+              outputTokens: 1,
+            },
+          ],
+          synthesis: 'final answer',
+          novelty: 1,
+          fatigue: 0,
+          continueProbability: 0,
+          inputTokens: 2,
+          outputTokens: 1,
+          durationMs: 1,
+        },
+      ],
+      voices: ['reasoning'],
+      caps: { maxRounds: 1, maxTotalTokens: 1, maxWallTimeMs: 1 },
+      totalInputTokens: 2,
+      totalOutputTokens: 1,
+      totalTokens: 3,
+      estimatedCostUsd: 0,
+      startedAt: 0,
+      endedAt: 1,
+      durationMs: 1,
+    });
+
+    const emitTelemetry = vi.fn();
+
+    await runMoaTurn({
+      prompt: 'current turn',
+      authoritativeSystemPrompt: 'You are a helper.',
+      llmClient: fromAny({}),
+      context: {
+        systemPrompt: 'You are a helper.',
+        messages: [],
+      } as LLMContext,
+      message: { channelId: 'api:test' } as SubstrateMessage,
+      settings: {
+        maxRounds: 1,
+        timeoutMs: 1_000,
+        referenceModels: ['openrouter/cheap-model'],
+      },
+      config: {
+        chargePolicy: makeChargePolicy(),
+      } as SubstrateConfig,
+      turnId: 'turn-4',
+      requestId: 'req-4',
+      callType: 'chat' as ObservabilityCallType,
+      contextWindow: 1_000,
+      emitTelemetry,
+    });
+
+    const caps = mockedRunDeliberation.mock.calls.at(-1)?.[2]?.caps as { maxRounds?: number } | undefined;
+    expect(caps?.maxRounds).toBe(1);
+  });
+});

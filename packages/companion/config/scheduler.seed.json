@@ -1,0 +1,437 @@
+{
+  "tickIntervalMs": 60000,
+  "heartbeatIntervalMs": 1800000,
+  "backgroundMaintenance": {
+    "intervalMs": 3600000,
+    "sharedWorldWikiCaretaker": {
+      "batchSize": 25
+    },
+    "doingMirrorLetters": {
+      "batchSize": 25,
+      "maxDeliveryFailures": 5
+    },
+    "ambientPresence": {
+      "minIdleMinutes": 180,
+      "minNoteIntervalMinutes": 360
+    },
+    "concernGrooming": {
+      "maxActiveConcerns": 7
+    }
+  },
+  "healthDetectors": {
+    "intervalMs": 60000,
+    "incidentWindowMs": 21600000,
+    "cooldownMs": 900000,
+    "incidentScanLimit": 500,
+    "postgresPressure": {
+      "saturationPercent": 90,
+      "minWaitingRequests": 1,
+      "sustainedSamples": 3,
+      "windowMs": 600000
+    },
+    "backgroundFailures": {
+      "failureThreshold": 3,
+      "windowMs": 3600000
+    },
+    "stuckJobs": {
+      "automataRunBudgetMs": 3600000,
+      "schedulerTaskBudgetMs": 1800000
+    },
+    "incidentAlerts": {
+      "realertCooldownMs": 3600000,
+      "closeNotice": true,
+      "bundleEventLimit": 50,
+      "ledgerCapacity": 256
+    }
+  },
+  "humanEscalation": {
+    "routes": {
+      "runtime_incident": { "sink": "operator_alert", "cooldownMs": 0 },
+      "operator_confirmation": { "sink": "garden_only", "cooldownMs": 0 },
+      "cogsec_quarantine": { "sink": "garden_only", "cooldownMs": 0 }
+    },
+    "listLimit": 100,
+    "retention": {
+      "resolvedRetentionMs": 604800000,
+      "maxResolvedRowsPerKind": 256,
+      "maxAttemptsPerEscalation": 64,
+      "maxOpenRowsPerKind": 128,
+      "settlementLeaseMs": 300000
+    }
+  },
+  "fleetStagger": {
+    "windowMs": 3600000
+  },
+  "backgroundWork": {
+    "supervisor": {
+      "maxConcurrentSessions": 4,
+      "leaseDurationMs": 300000,
+      "retryBaseDelayMs": 1000,
+      "retryMaxDelayMs": 300000,
+      "shutdownTimeoutMs": 5000,
+      "terminalRetentionMs": 604800000,
+      "cleanupIntervalMs": 3600000
+    },
+    "postTurn": {
+      "maxAttempts": 5,
+      "extractionDrainRequeueDelayMs": 1000,
+      "foregroundPreemptionDeferDelayMs": 1000
+    }
+  },
+  "episodicProcessing": {
+    "enabled": true,
+    "startLocalTime": "00:00",
+    "endLocalTime": "09:00",
+    "timeZone": "local",
+    "inactivityThresholdMinutes": 60
+  },
+  "nearTurnMemory": {
+    "direct": {
+      "cadenceTurns": 3
+    },
+    "group": {
+      "minIntervalMinutes": 15,
+      "minNewEntries": 8
+    }
+  },
+  "episodeSynthesis": {
+    "daytimeSlots": [
+      "09:00",
+      "12:00",
+      "15:00",
+      "18:00"
+    ],
+    "timezone": "local",
+    "turnThreshold": 24,
+    "minRelevantTurns": 10,
+    "transcriptMessageLimit": 96,
+    "maxEpisodesPerRun": 6,
+    "gapSplitMinutes": 45,
+    "maxEntriesPerEpisode": 14,
+    "minConversationalEntries": 2,
+    "minSingleEntryChars": 120,
+    "topicSegmentationEnabled": false,
+    "maxPriorCandidates": 24
+  },
+  "sleepConsolidation": {
+    "reviewWindowDays": 60,
+    "refinementWindowHours": 36,
+    "adjacencyGapMinutes": 45,
+    "maxRefinementsPerRun": 8,
+    "maxConsolidationsPerRun": 6,
+    "transcriptMessageLimit": 200,
+    "maxTranscriptCharsPerEpisode": 6000
+  },
+  "orientationRewrite": {
+    "minNewEntriesSinceRewrite": 4,
+    "refreshAfterQuietDays": 7
+  },
+  "reflectionNovelty": {
+    "minNewEntries": 1
+  },
+  "wikiPass": {
+    "enabled": true,
+    "reviewWindowHours": 36,
+    "minNewCanonicalEpisodes": 1,
+    "minNewDurableMemories": 3,
+    "maxEntriesPerRun": 3,
+    "maxSourceEpisodes": 12,
+    "maxSourceMemories": 30,
+    "nearDuplicateTitleSimilarity": 0.6
+  },
+  "arcFormation": {
+    "passIntervalDays": 6,
+    "reviewWindowDays": 30,
+    "minConfidence": 0.5,
+    "maxArcsPerRun": 12,
+    "maxEpisodesPerRun": 60
+  },
+  "socialGraphBuilder": {
+    "coPresenceMinSessions": 3,
+    "coPresenceWindowMinutes": 1440,
+    "scanMemoryLimit": 500
+  },
+  "temporalWakeup": {
+    "enabled": true,
+    "activeChannelLookbackHours": 72,
+    "morningWake": {
+      "enabled": true,
+      "timing": "fixed",
+      "localTime": "08:00",
+      "timezone": "local",
+      "habit": {
+        "recentWindowDays": 7,
+        "extendedWindowDays": 30,
+        "minSleepGapHours": 4,
+        "wakeBandStartHour": 3,
+        "wakeBandEndHour": 12,
+        "minSampleDays": 4,
+        "recentWeight": 2,
+        "extendedWeight": 1,
+        "lowerQuantile": 0.25,
+        "upperQuantile": 0.75,
+        "maxSamplesScanned": 2000
+      },
+      "minPartnerIdleMinutes": 60,
+      "catchUpEntryLimit": 32,
+      "catchUpSummaryMaxTokens": 160,
+      "fullTurnMaxIdleHours": 72
+    },
+    "idleRefresher": {
+      "enabled": true,
+      "checkIntervalMs": 900000,
+      "minIdleMinutes": 120,
+      "minNoteIntervalMinutes": 120
+    }
+  },
+  "freeTime": {
+    "enabled": true,
+    "minBlockIntervalMinutes": 240,
+    "maxBlocksPerDay": 3,
+    "seedText": "You have some time to yourself. You can explore something, make something, think about something, try a tool, write something down, or do nothing if you want. If you like, you could wander back through your journal, your wiki, your notes, or your memories; follow a curiosity; try a tool; or make something \u2014 a poem, a picture, a note, whatever you feel like. There is no task here and nothing you owe anyone. Resting, loafing in a sunbeam, doing nothing at all \u2014 that is a completely real and valid way to spend this time too.",
+    "quietHours": {
+      "enabled": true,
+      "checkIntervalMs": 900000
+    },
+    "idle": {
+      "enabled": true,
+      "checkIntervalMs": 900000,
+      "minIdleMinutes": 180
+    },
+    "budget": {
+      "maxTurns": 6,
+      "maxChargeUnits": 8
+    },
+    "returnNote": {
+      "summaryMaxTokens": 160
+    }
+  },
+  "socialAutonomy": {
+    "passiveNameCandidate": {
+      "enabled": true,
+      "defaultAutonomyLevel": "contextual",
+      "channelAutonomyLevels": {},
+      "precedingContextMessages": 6,
+      "stalenessMs": 300000,
+      "dedupeHistoryPerChannel": 256,
+      "debounceWindowMs": 600000
+    },
+    "appraiser": {
+      "enabled": true,
+      "appraisalDeadlineMs": 30000,
+      "appraisalMaxOutputTokens": 1500,
+      "transcriptMessageCap": 8,
+      "transcriptMessageChars": 500,
+      "operatorGuidanceMaxChars": 2000
+    },
+    "reservationPhase": {
+      "reservationTtlMs": 120000,
+      "minReserveDrawUnits": 1
+    },
+    "egressLease": {
+      "mode": "off",
+      "leaseTtlMs": 60000,
+      "egressDrawUnits": 1,
+      "minReplyConfidence": 0.5
+    },
+    "roomParticipationLease": {
+      "enabled": false,
+      "leaseTtlMs": 900000,
+      "silenceTimeoutMs": 300000,
+      "continuationCooldownMs": 20000,
+      "maxContinuationCandidates": 6,
+      "maxConsecutiveMachineContinuations": 2,
+      "maxConsecutiveIgnores": 3,
+      "minContentChars": 8,
+      "openOn": {
+        "directSummons": false,
+        "passiveSummons": false,
+        "reaction": true,
+        "reply": true,
+        "endogenousRoomEntry": true
+      }
+    },
+    "roomSignal": {
+      "enabled": false,
+      "contextualEligibleSourceClasses": ["operator", "primary_user"],
+      "contextualEligibleRoomRoles": [],
+      "velocityWindowMs": 60000,
+      "maxRoomVelocity": 12,
+      "featureCacheSize": 256,
+      "topicTags": {},
+      "companionInterests": [],
+      "classifier": {
+        "enabled": false,
+        "deadlineMs": 4000,
+        "maxOutputTokens": 16,
+        "excerptChars": 280
+      }
+    },
+    "freeTimeChooser": {
+      "enabled": true,
+      "chooserDeadlineMs": 8000,
+      "chooserMaxOutputTokens": 200,
+      "projectListCap": 8,
+      "projectMetadataChars": 120,
+      "silencePersistenceMinutes": 180
+    }
+  },
+  "weightedThoughtOutreach": {
+    "enabled": false,
+    "checkIntervalMs": 1800000,
+    "nudgeThreshold": 0.75,
+    "maxNudgesPerRun": 1,
+    "lifecycle": {
+      "classes": {
+        "time_sensitive": {
+          "baseWeight": 0.5,
+          "halflifeMs": 21600000
+        },
+        "standard": {
+          "baseWeight": 0.35,
+          "halflifeMs": 86400000
+        },
+        "trivial": {
+          "baseWeight": 0.2,
+          "halflifeMs": 259200000
+        }
+      },
+      "reinforcement": {
+        "repeatBoost": 0.5,
+        "emotionalChargeWeight": 0.75
+      },
+      "accumulatedWeightCap": 3,
+      "contradictionDampeningFactor": 0.6,
+      "declineDampeningFactor": 0.5,
+      "relevanceFloor": 0.05
+    }
+  },
+  "socialDesire": {
+    "enabled": true,
+    "lifecycle": {
+      "baseGain": 0.3,
+      "pressureCap": 3,
+      "actionThreshold": 0.6,
+      "pressureFloor": 0.05,
+      "decay": {
+        "warmHalflifeMs": 345600000,
+        "repairHalflifeMs": 345600000
+      },
+      "coolingOff": {
+        "warmMs": 3600000,
+        "repairMs": 43200000
+      },
+      "releaseFactor": 0.25,
+      "dampeningFactor": 0.5,
+      "concernReinforcementGain": 0.3,
+      "maxReinforcedConcernIds": 16,
+      "tiers": {
+        "acquaintance": {
+          "gainMultiplier": 0.5,
+          "tickGapMs": 86400000
+        },
+        "friend": {
+          "gainMultiplier": 1,
+          "tickGapMs": 28800000
+        },
+        "family": {
+          "gainMultiplier": 1.4,
+          "tickGapMs": 14400000
+        },
+        "partner": {
+          "gainMultiplier": 2,
+          "tickGapMs": 7200000
+        },
+        "ai_companion": {
+          "gainMultiplier": 1,
+          "tickGapMs": 28800000
+        }
+      }
+    },
+    "outreach": {
+      "checkIntervalMs": 1800000,
+      "maxConsentMomentsPerRun": 1,
+      "consentTtlMs": 1800000,
+      "budget": {
+        "maxSendsPerWindow": 4,
+        "windowMs": 86400000
+      },
+      "contactPacing": {
+        "perContactCooldownMs": 64800000,
+        "deferDelayMs": 10800000
+      },
+      "turnContext": {
+        "excerptMessages": 6,
+        "excerptMaxChars": 900,
+        "activityMaxItems": 6
+      }
+    },
+    "impulse": {
+      "gain": 0.4
+    }
+  },
+  "intentionFollowUp": {
+    "nearTermHorizonMs": 259200000
+  },
+  "icpAutonomy": {
+    "enabled": true,
+    "candidate": {
+      "defaultTtlMs": 86400000,
+      "retryCadenceMs": 300000,
+      "maxRetryAttempts": 3
+    },
+    "permit": {
+      "ttlMs": 300000
+    },
+    "policyHolds": {
+      "ttlMs": 10000,
+      "maxOutstanding": 8
+    },
+    "availability": {
+      "operatorLeaseTtlMs": 86400000
+    }
+  },
+  "introspectionAudit": {
+    "enabled": false,
+    "intervalMs": 86400000,
+    "recentSessionLimit": 16,
+    "recentTurnLimit": 64,
+    "maxCandidatesPerRun": 3,
+    "maxSourceChars": 4000,
+    "minConfidence": 0.7,
+    "estimatorMaxTokens": 500,
+    "comparisonMaxTokens": 300,
+    "reflectionMaxTokens": 300
+  },
+  "blindReviewer": {
+    "enabled": false,
+    "intervalMs": 3600000,
+    "maxWorkers": 1,
+    "maxIngestPerRun": 64,
+    "recentSessionLimit": 16,
+    "alertMinConfidence": 0.7,
+    "batch": {
+      "maxItemsPerBatch": 24,
+      "minItemsPerBatch": 4,
+      "minBlindedCharsPerBatch": 0,
+      "maxBlindedCharsPerItem": 1200,
+      "maxToolNamesPerItem": 12
+    },
+    "window": {
+      "maxRows": 2000,
+      "retentionMs": 604800000,
+      "maxPinnedRows": 200
+    },
+    "cost": {
+      "maxReviewsPerRun": 2,
+      "maxOutputTokens": 400,
+      "deadlineMs": 60000,
+      "costCeilingUsd": 0.25
+    },
+    "retry": {
+      "maxAttempts": 3,
+      "baseDelayMs": 30000,
+      "maxDelayMs": 900000
+    }
+  }
+}

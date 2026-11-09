@@ -1,0 +1,334 @@
+import { Type } from '@sinclair/typebox';
+import { CANONICAL_TOOL_SURFACE_DESCRIPTIONS } from '../../core/agent/tool-surface/descriptions.js';
+import type { AgentToolResult } from '../../boundary/pi-agent/index.js';
+import type { SubstrateAgentTool } from '../../boundary/pi-agent/index.js';
+import { withCapabilityRequirement } from '../../system/capabilities/requirements.js';
+import { tagToolWithReversibility } from '../../system/capabilities/safeguards.js';
+import type { SubagentControlPort } from './port.js';
+import { textResult, textResultWithError } from '../../core/tools/results.js';
+import { toErrorMessage } from '../../shared/utils/errors.js';
+import { getRequestContext } from '../../primitives/llm/request-context.js';
+import { buildSubagentWorkSpec } from './work-spec.js';
+import {
+  canViewerSeeSubagentTask,
+  partitionSubagentTaskViews,
+  requireVisibleSubagentTask,
+} from './task-visibility.js';
+
+type SubagentToolAction = 'spawn' | 'message' | 'wait' | 'cancel' | 'status' | 'discover' | 'inspect';
+
+interface SubagentToolParams {
+  action?: SubagentToolAction;
+  subagent_id?: string;
+  name?: string;
+  task?: string;
+  message?: string;
+  reason?: string;
+  role?: string;
+  system_prompt?: string;
+  max_turns?: number;
+  capabilities?: string[];
+  required_capabilities?: string[];
+  task_limit?: number;
+  transcript_limit?: number;
+  task_query?: string;
+}
+
+export function createSubagentTool(port: SubagentControlPort): SubstrateAgentTool {
+  const tool: SubstrateAgentTool = {
+    name: 'subagent',
+    label: 'subagent',
+    description: CANONICAL_TOOL_SURFACE_DESCRIPTIONS.subagent,
+    parameters: Type.Object({
+      action: Type.Optional(Type.Union([
+        Type.Literal('spawn'),
+        Type.Literal('message'),
+        Type.Literal('wait'),
+        Type.Literal('cancel'),
+        Type.Literal('status'),
+        Type.Literal('discover'),
+        Type.Literal('inspect'),
+      ], { description: 'Automata control action. Default: spawn.' })),
+      subagent_id: Type.Optional(Type.String({ description: 'The automaton id (the subagent_id returned by spawn or status) to message, wait on, cancel, or check status for.' })),
+      name: Type.Optional(Type.String({ description: 'Short label for a spawned automaton.' })),
+      task: Type.Optional(Type.String({ description: 'Initial bounded task for a spawned automaton.' })),
+      message: Type.Optional(Type.String({ description: 'Follow-up instruction for an active automaton.' })),
+      reason: Type.Optional(Type.String({ description: 'Optional cancellation note.' })),
+      role: Type.Optional(Type.String({
+        description: 'Optional named role profile (e.g. researcher, reviewer, implementer, awaiter, '
+          + 'observer). Layers role instructions over inherited companion identity and narrows the '
+          + 'toolset/limits. An unknown role fails the spawn closed.',
+      })),
+      system_prompt: Type.Optional(Type.String({ description: 'Optional automaton system prompt override.' })),
+      max_turns: Type.Optional(Type.Number({
+        minimum: 1,
+        maximum: 16,
+        description: 'Optional max turns for the bounded automaton loop.',
+      })),
+      capabilities: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+        description: 'Optional advertised capability tokens for routing diagnostics.',
+      })),
+      required_capabilities: Type.Optional(Type.Array(Type.String({ minLength: 1 }), {
+        description: 'Optional required capability tokens that must be present before execution.',
+      })),
+      task_limit: Type.Optional(Type.Integer({
+        minimum: 1,
+        maximum: 50,
+        description: 'Optional status snapshot task limit.',
+      })),
+      transcript_limit: Type.Optional(Type.Integer({
+        minimum: 1,
+        maximum: 50,
+        description: 'Optional transcript entry limit for status views.',
+      })),
+      task_query: Type.Optional(Type.String({
+        description: 'Task id, label, or description fragment for durable automata discovery.',
+      })),
+    }),
+    execute: async (
+      _toolCallId: string,
+      params: SubagentToolParams,
+    ): Promise<AgentToolResult<{ isError?: boolean }>> => {
+      const action = params.action ?? 'spawn';
+
+      try {
+        switch (action) {
+          case 'spawn': {
+            const requestContext = getRequestContext();
+            const task = await port.spawn({
+              name: normalizeRequiredText(params.name, 'name'),
+              task: normalizeRequiredText(params.task, 'task'),
+              // mmo9.7.7: carry the typed work spec through the faculty, seeded
+              // with the spawning turn's correlation so subagent model-call
+              // attribution flows through the existing client boundary.
+              workSpec: buildSubagentWorkSpec(
+                requestContext ? { correlation: requestContext } : {},
+              ),
+              ...(typeof params.role === 'string' && params.role.trim().length > 0
+                ? { role: params.role.trim() }
+                : {}),
+              ...(typeof params.system_prompt === 'string' ? { systemPrompt: params.system_prompt } : {}),
+              ...(typeof params.max_turns === 'number' ? { maxTurns: params.max_turns } : {}),
+              ...(params.capabilities?.length ? { capabilities: params.capabilities } : {}),
+              ...(params.required_capabilities?.length
+                ? { requiredCapabilities: params.required_capabilities }
+                : {}),
+              ...(requestContext?.channelId
+                ? {
+                    sourceContext: {
+                      channelId: requestContext.channelId,
+                      ...(requestContext.sessionId ? { logicalSessionId: requestContext.sessionId } : {}),
+                      ...(requestContext.requestId ? { requestId: requestContext.requestId } : {}),
+                      ...(requestContext.turnId ? { turnId: requestContext.turnId } : {}),
+                      ...(requestContext.workloadId
+                        ? { originatingTaskId: requestContext.workloadId }
+                        : {}),
+                      ...(requestContext.chargeRunId ? { parentRunId: requestContext.chargeRunId } : {}),
+                      ...(requestContext.chargeRootRunId ? { sourceRunId: requestContext.chargeRootRunId } : {}),
+                    },
+                  }
+                : {}),
+            });
+            return textResult(formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'bounded_worker',
+              subagent_id: task.subagentId,
+              subagentId: task.subagentId,
+              next_action: {
+                action: 'wait',
+                subagent_id: task.subagentId,
+              },
+              task,
+            }));
+          }
+
+          case 'message': {
+            const subagentId = normalizeRequiredText(params.subagent_id, 'subagent_id');
+            await requireVisibleSubagentTask(port, subagentId);
+            const view = await port.message(
+              subagentId,
+              normalizeRequiredText(params.message, 'message'),
+            );
+            return textResult(formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'bounded_worker',
+              task: view.task,
+              resume: view.resume,
+            }));
+          }
+
+          case 'wait': {
+            const subagentId = resolveWaitSubagentId(port, params.subagent_id);
+            await requireVisibleSubagentTask(port, subagentId);
+            const result = await port.wait(subagentId);
+            const payload = formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'bounded_worker',
+              result,
+            });
+            return result.outcome === 'completed'
+              ? textResult(payload)
+              : textResultWithError(payload, true);
+          }
+
+          case 'cancel': {
+            const subagentId = normalizeRequiredText(params.subagent_id, 'subagent_id');
+            await requireVisibleSubagentTask(port, subagentId);
+            const result = await port.cancel(subagentId, params.reason);
+            return textResult(formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'bounded_worker',
+              result,
+            }));
+          }
+
+          case 'status': {
+            const transcriptLimit = params.transcript_limit;
+            if (typeof params.subagent_id === 'string' && params.subagent_id.trim().length > 0) {
+              const detail = port.getRuntimeTaskDetail(params.subagent_id, {
+                ...(typeof transcriptLimit === 'number' ? { transcriptLimit } : {}),
+              });
+              if (!detail || !canViewerSeeSubagentTask(detail.view.task)) {
+                return textResultWithError(`Unknown automaton task "${params.subagent_id}".`, true);
+              }
+              return textResult(formatPayload({
+                action,
+                surface: 'subagent',
+                semantics: 'bounded_worker',
+                detail,
+              }));
+            }
+
+            const snapshot = port.getRuntimeSnapshot({
+              ...(typeof params.task_limit === 'number' ? { taskLimit: params.task_limit } : {}),
+              ...(typeof transcriptLimit === 'number' ? { transcriptLimit } : {}),
+            });
+            const active = partitionSubagentTaskViews(snapshot.activeTasks);
+            const recent = partitionSubagentTaskViews(snapshot.recentTasks);
+            const withheld = active.withheldCount + recent.withheldCount;
+            return textResult(formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'bounded_worker',
+              snapshot: {
+                ...snapshot,
+                activeCount: snapshot.activeCount - active.withheldCount,
+                activeTasks: active.visible,
+                recentTasks: recent.visible,
+              },
+              ...(withheld > 0
+                ? { withheldByVisibility: withheld, withheldNote: 'Some automata tasks belong to other conversations.' }
+                : {}),
+            }));
+          }
+
+          case 'discover': {
+            const discovered = await port.discover(
+              normalizeRequiredText(params.task_query, 'task_query'),
+              params.task_limit,
+            );
+            const tasks = discovered.filter(task => canViewerSeeSubagentTask(task));
+            const withheld = discovered.length - tasks.length;
+            return textResult(formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'durable_registry_discovery',
+              tasks,
+              ...(withheld > 0
+                ? { withheldByVisibility: withheld, withheldNote: 'Some automata tasks belong to other conversations.' }
+                : {}),
+            }));
+          }
+
+          case 'inspect': {
+            const detail = await port.inspect(
+              normalizeRequiredText(params.subagent_id, 'subagent_id'),
+            );
+            if (!detail || !canViewerSeeSubagentTask(detail.task)) {
+              return textResultWithError(`Unknown automaton task "${params.subagent_id}".`, true);
+            }
+            return textResult(formatPayload({
+              action,
+              surface: 'subagent',
+              semantics: 'durable_registry_and_bus_inspection',
+              detail,
+            }));
+          }
+        }
+      } catch (error) {
+        return textResultWithError(`automata ${action} failed: ${toErrorMessage(error)}`, true);
+      }
+    },
+  };
+
+  return tagToolWithReversibility(
+    withCapabilityRequirement(tool, (params) => {
+      const action = typeof params.action === 'string' ? params.action : 'spawn';
+      return action === 'status' || action === 'wait' || action === 'discover' || action === 'inspect'
+        ? 'identity.read'
+        : 'shard.spawn';
+    }),
+    'irreversible',
+  );
+}
+
+function formatPayload(payload: Record<string, unknown>): string {
+  return JSON.stringify(payload, null, 2);
+}
+
+function normalizeRequiredText(value: string | undefined, field: string): string {
+  const normalized = value?.trim();
+  if (!normalized) {
+    if (field === 'name' || field === 'task') {
+      throw new Error(
+        `Missing required field "${field}". Minimal valid JSON: {"action":"spawn","name":"short-label","task":"bounded task to run"}.`,
+      );
+    }
+    if (field === 'message') {
+      throw new Error(
+        'Missing required field "message". Minimal valid JSON: {"action":"message","subagent_id":"subagent-1","message":"follow-up instruction"}.',
+      );
+    }
+    if (field === 'subagent_id') {
+      throw new Error(
+        'Missing required field "subagent_id". Use the id returned by action=spawn or action=status. '
+        + 'Minimal valid JSON: {"action":"message","subagent_id":"subagent-1","message":"follow-up instruction"}.',
+      );
+    }
+    throw new Error(`Missing required field "${field}".`);
+  }
+  return normalized;
+}
+
+function resolveWaitSubagentId(port: SubagentControlPort, value: string | undefined): string {
+  const normalized = value?.trim();
+  if (normalized) {
+    return normalized;
+  }
+
+  const snapshot = port.getRuntimeSnapshot({ taskLimit: 2 });
+  const candidates = new Set<string>();
+  const views = partitionSubagentTaskViews([...snapshot.activeTasks, ...snapshot.recentTasks]).visible;
+  for (const view of views) {
+    const subagentId = view.task.subagentId.trim();
+    if (subagentId) {
+      candidates.add(subagentId);
+    }
+  }
+
+  if (candidates.size === 1) {
+    for (const subagentId of candidates) {
+      return subagentId;
+    }
+  }
+
+  throw new Error(
+    candidates.size > 1
+      ? 'subagent_id is required because multiple automata tasks are visible.'
+      : 'subagent_id is required. Use the subagent_id from the spawn result or run action=status first.',
+  );
+}

@@ -1,296 +1,340 @@
 /**
- * The standalone composition root: open storage, build every core stack,
- * wire the Pi harness as the host of conversation turns, internal turns and
- * workers, and run the scheduler. `createLiteRuntime` is the one entry. When
- * the config names them, it also mounts the governed MCP tool transport and
- * the lifecycle bridge for an external companion host on the same
- * dispatcher and ingress (see transports.ts); internal turns then run in the
- * Pi harness or, delegated, in that host.
+ * The standalone host: a thin wrapper over the extracted companion core's
+ * composition root (`startCompanionRuntime`). It builds the host's ports
+ * (the Pi model runtime, the session keyring from the
+ * environment, the operator's outbound channel), the donor substrate config
+ * and the inner-life owner files, starts the companion, provisions the
+ * configured contacts, and mounts the MCP tool transport and the lifecycle
+ * bridge for an external companion host when the config names them.
  */
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
+  COMPANION_SEED_DIR,
+  HostedAutomataExecutor,
+  createSessionHmacBoundaryService,
+  createTurnId,
+  loadInnerLifeConfig,
+  resolveRuntimePathSnapshotFromConfig,
+  startCompanionRuntime,
+  type AgentResponse,
+  type CompanionRuntime,
+  type EmbeddingRuntimeProvider,
+  type HostedAutomataEvent,
+  type ProviderRuntime,
+  type StartCompanionRuntimeOptions,
+  type TrustLevel,
+} from './companion.ts';
+import type { LiteConfig, LiteSecrets } from './config.ts';
+import { createHostSessionIntegrityProvider } from './session-integrity.ts';
+import {
+  HostMemoryDeletionApprovals,
+  HostTurnBridge,
+  HostTurnRelay,
+  createHostToolPort,
+  startLifecycleBridge,
+  type LifecycleBridge,
+  type LifecycleErrorReport,
+} from './lifecycle.ts';
+import {
+  createMcpSurface,
+  invalid,
+  loadPrincipalBindings,
   ok,
+  startMcpHttpServer,
   unavailable,
-  type Clock,
-  type ContactId,
-  type EmbeddingPort,
-  type IdSource,
-  type InternalPurpose,
-  type InternalTurnPort,
-  type MaintenanceReport,
+  type McpErrorReport,
+  type McpHttpServer,
   type Result,
-  type SchedulerTickReport,
-  type ToolDispatcher,
-  type TrustedIngress,
-  type TrustedTurnScope,
-  type TurnOwner,
-} from './core.ts';
+} from './mcp.ts';
 import {
-  createCompanionHarness,
-  createPiAffectEstimator,
-  createPiModelPort,
-  createPiWorkerHost,
-  type CompanionHarness,
+  companionEmbeddingProviderOf,
+  companionModelRegistryEntryOf,
+  companionProviderRuntimeOf,
+  createCatalogModelRuntime,
+  type EmbeddingPort,
   type PiModelRuntime,
-  type PiWorkerHost,
-  type TurnReport,
-  type WorkerDiagnostic,
-} from './harness.ts';
-import type { LiteConfig } from './config.ts';
-import { createLocalHost, type LocalHost, type OperatorChannel } from './local-host.ts';
-import { createTickLoop, type TickLoop } from './tick-loop.ts';
-import { buildStacks, refusingApprovals, type LiteStacks } from './stacks.ts';
-import { openLiteStorage, type LiteStorage } from './storage.ts';
-import { prepareTransports, type MountedTransports, type TransportReport } from './transports.ts';
+} from './pi.ts';
+import { createModelUsageLedger, type ModelUsageSnapshot } from './model-usage.ts';
+import { buildSubstrateConfig } from './substrate-config.ts';
 
-const OPERATOR_ACTOR = 'standalone:config';
-
-/** What the host supplies: time, ids, the model, embeddings and the operator's channel. */
-export interface LiteHostCapabilities {
-  readonly clock: Clock;
-  readonly ids: IdSource;
-  readonly model: PiModelRuntime;
-  readonly embeddings: EmbeddingPort;
-  readonly channel: OperatorChannel;
-  /** Names this process lifetime in turn and worker leases; a restart takes a new one. */
-  readonly instance: string;
-  /** Anything no durable record carries: idle pool errors, worker host notes, background tick results. */
-  readonly onDiagnostic: (diagnostic: LiteDiagnostic) => void;
-}
+/** The contact key of the configured operator. */
+export const OPERATOR_CONTACT = 'operator';
+/** The contact-store channel a Lite host records its contact keys under. */
+export const LITE_CONTACT_CHANNEL = 'lite';
+/** The registry entry id of the host model (companionModelRegistryEntryOf's default). */
+export const HOST_MODEL_ENTRY = 'host-model';
 
 export type LiteDiagnostic =
-  | { readonly kind: 'pool_idle_error'; readonly message: string }
-  | ({ readonly kind: 'worker_host' } & WorkerDiagnostic)
-  | { readonly kind: 'tick'; readonly report: Result<LiteTickReport> }
-  /** Turn outcomes known at close that storage still refused; each turn stays open until a successor recovers it as interrupted by the host. */
-  | { readonly kind: 'unsettled_turns'; readonly turnIds: readonly string[] }
-  /** A transport failure the client was not shown in full: storage outages, exceptions, failed post-turn work, released internal turns. */
-  | { readonly kind: 'transport'; readonly report: TransportReport };
+  | { readonly kind: 'outbound'; readonly channelId: string; readonly content: string }
+  | { readonly kind: 'mcp'; readonly report: McpErrorReport }
+  | { readonly kind: 'lifecycle'; readonly report: LifecycleErrorReport }
+  | { readonly kind: 'automata'; readonly event: HostedAutomataEvent }
+  | { readonly kind: 'host_turn_timeout'; readonly turnId: string };
 
-export interface LiteTickReport {
-  readonly scheduler: Result<SchedulerTickReport>;
-  /** Null on ticks where maintenance is not due. */
-  readonly maintenance: Result<MaintenanceReport> | null;
+/** Host ports a caller may supply instead of the configured ones (tests, embedding hosts). */
+export interface LiteRuntimeOverrides {
+  readonly model?: PiModelRuntime;
+  /** An embedding port serving `config.embedding.model` at `config.embedding.dimensions`, in place of the configured donor provider. */
+  readonly embeddings?: EmbeddingPort;
+  readonly textEmotionClassifier?: StartCompanionRuntimeOptions['textEmotionClassifier'];
 }
 
 export interface LiteRuntime {
   readonly config: LiteConfig;
-  readonly owner: TurnOwner;
-  readonly storage: LiteStorage;
-  readonly stacks: LiteStacks;
-  readonly harness: CompanionHarness;
-  /** The one governed dispatcher and ingress; a tool transport mounts here. */
-  readonly dispatcher: ToolDispatcher;
-  readonly ingress: TrustedIngress;
-  readonly host: LocalHost;
-  /** Where the configured transports listen; null for one not configured. */
+  readonly companion: CompanionRuntime;
+  /** The companion contact id of each configured contact key (`operator` included). */
+  readonly contactIds: ReadonlyMap<string, string>;
+  /** The host-driven turn bridge; null without a lifecycle config. */
+  readonly bridge: HostTurnBridge | null;
   readonly transports: { readonly mcpUrl: string | null; readonly lifecycleUrl: string | null };
-  /** Registers the configured operator once; an existing contact is left exactly as it is. */
-  ensureOperator(): Promise<Result<{ readonly contactId: ContactId; readonly created: boolean }>>;
-  /** One operator turn in their direct conversation. */
-  converse(input: { readonly text: string; readonly idempotencyKey: string; readonly signal?: AbortSignal }): Promise<Result<TurnReport>>;
-  /** A freshly admitted companion-internal scope. */
-  internalScope(purpose: InternalPurpose): Promise<Result<TrustedTurnScope>>;
-  /** One scheduler pass, plus memory maintenance on every `maintenanceEveryTicks`th tick. */
-  tick(): Promise<Result<LiteTickReport>>;
-  maintain(): Promise<Result<MaintenanceReport>>;
-  /** Runs `tick` every `tickIntervalMs` until `close`. */
-  startScheduler(): void;
-  /**
-   * Refuses new work, interrupts every turn (recorded as shutdown) and every
-   * running worker attempt (cancelled, host_shutdown), stops the scheduler,
-   * waits for all of it to settle and closes storage.
-   */
+  /** One operator turn in the operator's terminal conversation, through the donor SubstrateAgent. */
+  converse(text: string): Promise<AgentResponse>;
+  /** Aborts the operator's running turn (donor SubstrateAgent.abort). */
+  interrupt(): void;
+  /** Model and embedding usage since start, from the host's model-usage recorder (seam 3.1). */
+  modelUsage(): ModelUsageSnapshot;
   close(): Promise<void>;
+}
+
+export function operatorChannelId(config: LiteConfig): string {
+  return `terminal:${config.operator.userId}`;
+}
+
+function buildModel(config: LiteConfig, secrets: LiteSecrets, overrides: LiteRuntimeOverrides): Result<PiModelRuntime> {
+  if (overrides.model !== undefined) return ok(overrides.model);
+  return createCatalogModelRuntime({
+    provider: config.model.provider,
+    modelId: config.model.modelId,
+    apiKey: secrets.modelApiKey,
+    maxOutputTokens: config.model.maxOutputTokens,
+  });
+}
+
+/**
+ * The embedding provider a caller supplies, or none. Without one the donor's
+ * composition builds the configured provider itself from the substrate
+ * config (provider-runtime-factory.ts: `options.embeddingProvider ??
+ * createEmbeddingProviderFromConfig(config, env)`): the donor's
+ * transformers, ollama or api provider (substrate-config.ts embeddingSettings),
+ * checked by its fail-closed startup warmup (`warmupEmbeddingProvider`).
+ */
+function hostEmbeddingProvider(config: LiteConfig, overrides: LiteRuntimeOverrides): { embeddingProvider?: EmbeddingRuntimeProvider } {
+  if (overrides.embeddings === undefined) return {};
+  const identity = { model: config.embedding.model, dimensions: config.embedding.dimensions };
+  return { embeddingProvider: companionEmbeddingProviderOf(overrides.embeddings, identity) as EmbeddingRuntimeProvider };
 }
 
 export async function createLiteRuntime(input: {
   readonly config: LiteConfig;
-  readonly databaseUrl: string;
-  readonly host: LiteHostCapabilities;
-  /** Where the transport credentials the MCP bindings name are read from. */
+  readonly secrets: LiteSecrets;
+  /** The process environment: the keyring and the transport credentials are read from it. */
   readonly env: Readonly<Record<string, string | undefined>>;
+  readonly onDiagnostic: (diagnostic: LiteDiagnostic) => void;
+  readonly overrides?: LiteRuntimeOverrides;
 }): Promise<Result<LiteRuntime>> {
-  const { config, host } = input;
-  const local = createLocalHost({ surface: config.surface, operator: config.operator, channel: host.channel });
-  if (!local.ok) return local;
-  const transports = prepareTransports({
-    config,
-    env: input.env,
-    clock: host.clock,
-    local: local.value.authenticator,
-    onReport: (report) => host.onDiagnostic({ kind: 'transport', report }),
-  });
-  if (!transports.ok) return transports;
-  const storage = await openLiteStorage({
-    storage: config.storage,
-    databaseUrl: input.databaseUrl,
-    space: config.embedding.space,
-    onIdleError: (error) => host.onDiagnostic({ kind: 'pool_idle_error', message: error.message }),
-  });
-  if (!storage.ok) return storage;
+  const { config, secrets, env, onDiagnostic } = input;
+  const overrides = input.overrides ?? {};
+  const model = buildModel(config, secrets, overrides);
+  if (!model.ok) return model;
 
-  const model = createPiModelPort(host.model);
-  const workerHost = createPiWorkerHost({
-    runtime: host.model,
-    maxToolResultChars: config.harness.maxToolResultChars,
-    onDiagnostic: (diagnostic) => host.onDiagnostic({ kind: 'worker_host', ...diagnostic }),
-  });
-  // Core's free time and schedules ask for internal turns through this port; the harness exists once the dispatcher does.
-  let harness: CompanionHarness | null = null;
-  const internalTurns: InternalTurnPort = transports.value.internalTurns ?? {
-    run: (request) => (harness === null ? Promise.resolve(unavailable('internal_turns', 'the harness is not built yet')) : harness.internalTurns.run(request)),
-  };
-  const stacks = buildStacks({
-    config,
-    storage: storage.value,
-    clock: host.clock,
-    ids: host.ids,
-    authenticator: transports.value.authenticator,
-    approvals: refusingApprovals(),
-    model,
-    estimator: createPiAffectEstimator(host.model),
-    embeddings: host.embeddings,
-    workerHost,
-    internalTurns,
-    reminderDelivery: local.value.reminders,
-    instance: host.instance,
-  });
-  if (!stacks.ok) {
-    await storage.value.close();
-    return stacks;
-  }
-  const owner: TurnOwner = { surface: config.surface, instance: host.instance };
-  const built = createCompanionHarness({
-    ingress: stacks.value.ingress,
-    lifecycle: stacks.value.lifecycle,
-    sessions: stacks.value.sessions,
-    ledger: storage.value.state.ledger,
-    context: { orientation: stacks.value.orientation, selfState: stacks.value.selfState, activity: stacks.value.activity.activity, archive: storage.value.archive },
-    dispatcher: stacks.value.activity.dispatcher,
-    emotion: stacks.value.emotion,
-    workers: stacks.value.activity.workers,
-    runtime: host.model,
-    owner,
-    delivery: local.value.replies,
-    limits: config.harness,
-  });
-  if (!built.ok) {
-    await storage.value.close();
-    return built;
-  }
-  harness = built.value;
-  const mounted = await transports.value.mount({ stacks: stacks.value, storage: storage.value });
-  if (!mounted.ok) {
-    await storage.value.close();
-    return mounted;
-  }
-  return ok(assemble({ config, host, local: local.value, storage: storage.value, stacks: stacks.value, harness: built.value, workerHost, owner, mounted: mounted.value }));
-}
+  const contactKeys = new Map<string, { displayName: string; trust: TrustLevel }>([
+    [OPERATOR_CONTACT, { displayName: config.operator.displayName, trust: 'primary' }],
+    ...config.contacts.map((c) => [c.key, { displayName: c.displayName, trust: c.trust }] as const),
+  ]);
+  const bindings = config.mcp === null ? null : loadPrincipalBindings(config.mcp.bindings, env);
+  if (bindings !== null && !bindings.ok) return bindings;
+  const unknownContacts = (bindings?.value.bindings ?? []).filter((b) => !contactKeys.has(b.contact));
+  if (unknownContacts.length > 0) return invalid(...unknownContacts.map((b) => `binding ${b.principal} names an unknown contact ${b.contact}`));
 
-function assemble(parts: {
-  readonly config: LiteConfig;
-  readonly host: LiteHostCapabilities;
-  readonly local: LocalHost;
-  readonly storage: LiteStorage;
-  readonly stacks: LiteStacks;
-  readonly harness: CompanionHarness;
-  readonly workerHost: PiWorkerHost;
-  readonly owner: TurnOwner;
-  readonly mounted: MountedTransports;
-}): LiteRuntime {
-  const { config, host, local, storage, stacks, harness, workerHost } = parts;
-  const inFlight = new Set<Promise<unknown>>();
-  let closed = false;
-  let ticks = 0;
-  let loop: TickLoop | null = null;
+  let sessionIntegrityProvider: StartCompanionRuntimeOptions['sessionIntegrityProvider'] = null;
+  if (config.sessionIntegrity.kind === 'keyring') {
+    // The donor HMAC chain over the env keyring (seam 3.8); a Hermes install's conversations use the keyring scoped to it (Step E2).
+    const keyring = createSessionHmacBoundaryService({ env: { ...env } }).resolveKeyring();
+    if (keyring === null) return invalid('sessionIntegrity keyring: the session HMAC keyring environment variables are not set');
+    sessionIntegrityProvider = createHostSessionIntegrityProvider(keyring, config.lifecycle?.hermesInstallId ?? null);
+  }
 
-  /** Runs work unless the runtime is closing, and keeps it visible to `close`. */
-  const track = <T>(work: () => Promise<Result<T>>): Promise<Result<T>> => {
-    if (closed) return Promise.resolve(unavailable('lite_runtime', 'the runtime is closed'));
-    const running = work();
-    inFlight.add(running);
-    void running.finally(() => inFlight.delete(running));
-    return running;
-  };
-  const internalScope = (purpose: InternalPurpose) => stacks.ingress.admit(local.internalEvidence(purpose));
-  const maintain = () =>
-    track(async () => {
-      const scope = await internalScope('maintenance');
-      if (!scope.ok) return scope;
-      return stacks.memory.maintenance.run(scope.value, {
-        sessionLimit: config.scheduler.maintenanceSessionLimit,
-        maxEntries: config.scheduler.maintenanceMaxEntries,
-      });
+  const seedDir = fileURLToPath(COMPANION_SEED_DIR);
+  // The donor's seed loaders read the process environment's CONFIG_DIR and
+  // fall back to ./config of the working directory (the donor repository
+  // root); a host process that was not given one points them at the
+  // companion's shipped seeds.
+  process.env['CONFIG_DIR'] ??= seedDir;
+  const registry = { models: [companionModelRegistryEntryOf(model.value, HOST_MODEL_ENTRY)] };
+  const relay = config.lifecycle === null ? null : new HostTurnRelay();
+  // Memory deletion in a host-driven turn is approved by the host's human (docs/extraction.md, Step E3).
+  const memoryDeletion = relay === null || config.lifecycle === null
+    ? null
+    : new HostMemoryDeletionApprovals({ relay, approvalWindowMs: config.lifecycle.hostTurnTimeoutMs });
+  const modelUsage = createModelUsageLedger();
+  // Hosted automata: spawned automata run as host subagents, attempt by attempt (docs/extraction.md, operator automata rules).
+  const automata = config.lifecycle?.automata == null
+    ? null
+    : new HostedAutomataExecutor(config.lifecycle.automata, { onEvent: (event) => onDiagnostic({ kind: 'automata', event }) });
+  let companion: CompanionRuntime;
+  try {
+    const innerLife = loadInnerLifeConfig({ dataDir: config.dataDir, seedDir, modelRegistry: registry as never });
+    const substrateConfig = buildSubstrateConfig(config, {
+      databaseUrl: secrets.databaseUrl,
+      model: {
+        modelId: model.value.model.id,
+        provider: model.value.model.provider,
+        maxOutputTokens: model.value.maxOutputTokens,
+        contextWindow: model.value.model.contextWindow,
+        registry,
+      },
     });
-  const tick = () =>
-    track(async (): Promise<Result<LiteTickReport>> => {
-      const scope = await internalScope('free_time');
-      if (!scope.ok) return scope;
-      const scheduler = await stacks.activity.scheduler.tick(scope.value);
-      ticks += 1;
-      const maintenance = ticks % config.scheduler.maintenanceEveryTicks === 0 ? await maintain() : null;
-      return ok({ scheduler, maintenance });
-    });
-
-  return {
-    config,
-    owner: parts.owner,
-    storage,
-    stacks,
-    harness,
-    dispatcher: stacks.activity.dispatcher,
-    ingress: stacks.ingress,
-    host: local,
-    transports: { mcpUrl: parts.mounted.mcpUrl, lifecycleUrl: parts.mounted.lifecycleUrl },
-    ensureOperator: () =>
-      track(async (): Promise<Result<{ readonly contactId: ContactId; readonly created: boolean }>> => {
-        const identity = { channelKind: config.operator.channelKind, externalId: config.operator.externalId };
-        const resolved = await stacks.contactAuthority.resolve(identity);
-        if (!resolved.ok) return resolved;
-        if (resolved.value.kind === 'known') return ok({ contactId: resolved.value.contactId, created: false });
-        if (resolved.value.kind !== 'unknown') {
-          return unavailable('operator_contact', `the operator identity resolves as ${resolved.value.kind}; an operator must change it, not the config`);
-        }
-        const registered = await stacks.contactAdmin.register(OPERATOR_ACTOR, {
-          displayName: config.operator.displayName,
-          identity,
-          trust: config.operator.trust,
-          relationship: config.operator.relationship,
-          consent: 'granted',
-          sensitivity: config.operator.sensitivity,
-        });
-        return registered.ok ? ok({ contactId: registered.value.contactId, created: true }) : registered;
+    companion = await startCompanionRuntime({
+      config: substrateConfig,
+      // The donor read WORKSPACE_PATH (and its logs and temp roots) from the environment of its fleet startup (cut); Lite names them in its config.
+      pathSnapshot: resolveRuntimePathSnapshotFromConfig(substrateConfig, {
+        workspacePath: config.workspaceDir,
+        logsDir: join(config.dataDir, 'logs'),
+        tempDir: join(config.dataDir, 'tmp'),
       }),
-    converse: (request) =>
-      track(() =>
-        harness.converse({
-          evidence: local.operatorEvidence(),
-          text: request.text,
-          idempotencyKey: request.idempotencyKey,
-          ...(request.signal === undefined ? {} : { signal: request.signal }),
-        }),
-      ),
-    internalScope,
-    tick,
-    maintain,
-    startScheduler() {
-      if (closed || loop !== null) return;
-      loop = createTickLoop({ intervalMs: config.scheduler.tickIntervalMs, tick: async () => host.onDiagnostic({ kind: 'tick', report: await tick() }) });
-      loop.start();
-    },
-    async close() {
-      if (closed) return;
-      // Interrupt first: a tick in progress waits on its turn, which waits on the model.
-      closed = true;
-      // No new transport request starts; a delegated internal turn still waiting fails visibly.
-      await parts.mounted.close();
-      harness.shutdown();
-      workerHost.shutdown();
-      await loop?.stop();
-      await Promise.allSettled([...inFlight]);
-      const unsettled = await harness.settleHeld();
-      if (unsettled.length > 0) host.onDiagnostic({ kind: 'unsettled_turns', turnIds: unsettled });
-      await storage.close();
-    },
+      innerLife,
+      providerRuntime: companionProviderRuntimeOf(model.value) as unknown as ProviderRuntime,
+      modelUsageRecorder: modelUsage,
+      ...hostEmbeddingProvider(config, overrides),
+      ...(overrides.textEmotionClassifier === undefined ? {} : { textEmotionClassifier: overrides.textEmotionClassifier }),
+      sessionIntegrityProvider,
+      outboundSender: {
+        send: (channelId, content) => {
+          onDiagnostic({ kind: 'outbound', channelId, content });
+          return Promise.resolve();
+        },
+      },
+      heartbeatChannel: { channelId: operatorChannelId(config), channelType: 'terminal' },
+      env: { ...env, CONFIG_DIR: seedDir },
+      ...(relay === null ? {} : { wrapStreamTransport: relay.wrapTransport }),
+      automataHostExecution: automata,
+      ...(memoryDeletion === null ? {} : { memoryDeletionApprovalPort: memoryDeletion }),
+    });
+    memoryDeletion?.attach(companion.persistence.memoryDeletionProposalStore);
+  } catch (error) {
+    automata?.close();
+    return unavailable('companion_runtime', error instanceof Error ? error.message : 'the companion runtime did not start');
+  }
+
+  const opened: { close(): Promise<void> }[] = [];
+  const closeAll = async (): Promise<void> => {
+    for (const handle of opened.reverse()) await handle.close();
+    // Open hosted attempts end before the companion stops, so their automata settle as failed rather than hang.
+    automata?.close();
+    await companion.stop();
   };
+
+  // Contacts: one per configured key, found again by its key on every start.
+  const contactIds = new Map<string, string>();
+  try {
+    for (const [key, contact] of contactKeys) {
+      const existing = await companion.persistence.contactStore?.getByChannelIdentity(LITE_CONTACT_CHANNEL, key);
+      const record = existing ?? await companion.persistence.contactStore?.upsert(
+        { displayName: contact.displayName, trustLevel: contact.trust, channels: [{ channel: LITE_CONTACT_CHANNEL, userId: key, privacyLevel: 'private' }] },
+        { allowPrimaryTrustAssignment: contact.trust === 'primary' },
+      );
+      if (record === undefined) throw new Error('the companion has no contact store');
+      contactIds.set(key, record.id);
+    }
+  } catch (error) {
+    await closeAll();
+    return unavailable('contacts', error instanceof Error ? error.message : 'contact provisioning failed');
+  }
+
+  let bridge: HostTurnBridge | null = null;
+  let mcpUrl: string | null = null;
+  let lifecycleUrl: string | null = null;
+  if (bindings !== null && config.mcp !== null) {
+    const principals = bindings.value;
+    const primaryPrincipal = (principal: string): boolean => {
+      const key = principals.contactOf(principal);
+      return key !== null && contactKeys.get(key)?.trust === 'primary';
+    };
+    if (relay !== null && config.lifecycle !== null) {
+      relay.attach(companion.agentLoop);
+      bridge = new HostTurnBridge({
+        relay,
+        agent: companion.agentLoop,
+        companionId: config.companionId,
+        hermesInstallId: config.lifecycle.hermesInstallId,
+        contactOf: (principal) => {
+          const key = principals.contactOf(principal);
+          const contactId = key === null ? undefined : contactIds.get(key);
+          const contact = key === null ? undefined : contactKeys.get(key);
+          return contactId === undefined || contact === undefined ? null : { contactId, displayName: contact.displayName };
+        },
+        findRecordedTurn: (channelId, turnId) => companion.sessionManager.findUniqueSourceRecordedTurn(channelId, turnId),
+        maxOpenMs: config.lifecycle.hostTurnTimeoutMs,
+        onTimeout: (turnId) => onDiagnostic({ kind: 'host_turn_timeout', turnId }),
+      });
+    }
+    const port = bridge === null
+      ? { tools: () => [], call: () => Promise.resolve(unavailable<never>('host_turns', 'no lifecycle bridge is configured')) }
+      : createHostToolPort(companion.agentLoop, bridge);
+    const surface = createMcpSurface({ port, identify: (credential) => principals.identify(credential), onError: (report) => onDiagnostic({ kind: 'mcp', report }) });
+    const mcp: Result<McpHttpServer> = await startMcpHttpServer({
+      surface,
+      bindings: principals,
+      port: config.mcp.port,
+      host: config.mcp.host,
+      ...(config.mcp.allowedHosts === null ? {} : { exposeBeyondLoopback: { allowedHosts: config.mcp.allowedHosts } }),
+      onError: (report) => onDiagnostic({ kind: 'mcp', report }),
+    });
+    if (!mcp.ok) {
+      await closeAll();
+      return mcp;
+    }
+    opened.push(mcp.value);
+    mcpUrl = mcp.value.url;
+    if (bridge !== null && config.lifecycle !== null) {
+      const lifecycle: Result<LifecycleBridge> = await startLifecycleBridge({
+        bridge,
+        identify: (credential) => principals.identify(credential),
+        port: config.lifecycle.port,
+        host: config.lifecycle.host,
+        ...(config.lifecycle.allowedHosts === null ? {} : { exposeBeyondLoopback: { allowedHosts: config.lifecycle.allowedHosts } }),
+        onError: (report) => onDiagnostic({ kind: 'lifecycle', report }),
+        automata,
+        // Automata carry the companion's private work: only a principal bound to a primary contact runs them.
+        automataAdmits: primaryPrincipal,
+        memoryDeletion,
+        // The primary contact decides memory deletions, as the donor's Operator validated them.
+        primaryAdmits: primaryPrincipal,
+      });
+      if (!lifecycle.ok) {
+        await closeAll();
+        return lifecycle;
+      }
+      opened.push(lifecycle.value);
+      lifecycleUrl = lifecycle.value.url;
+    }
+  }
+
+  const operatorContact = contactIds.get(OPERATOR_CONTACT) ?? '';
+  let closed: Promise<void> | null = null;
+  return ok({
+    config,
+    companion,
+    contactIds,
+    bridge,
+    transports: { mcpUrl, lifecycleUrl },
+    converse: (text) =>
+      companion.agentLoop.handleMessage({
+        id: `cli:${createTurnId()}`,
+        channelId: operatorChannelId(config),
+        channelType: 'terminal',
+        authorId: config.operator.userId,
+        authorName: config.operator.displayName,
+        content: text,
+        timestamp: new Date(),
+        isDirectMessage: true,
+        routing: { canonicalContactId: operatorContact },
+      }),
+    interrupt: () => {
+      companion.agentLoop.abort();
+    },
+    modelUsage: () => modelUsage.snapshot(),
+    close: () => (closed ??= closeAll()),
+  });
 }

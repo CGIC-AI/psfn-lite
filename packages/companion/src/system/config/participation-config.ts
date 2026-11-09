@@ -1,0 +1,968 @@
+import { isRecord } from '../../shared/utils/types.js';
+import {
+  MESSAGE_AUTHOR_ROOM_ROLES,
+  MESSAGE_AUTHOR_SOURCE_CLASSES,
+  type MessageAuthorRoomRole,
+  type MessageAuthorSourceClass,
+} from '../../shared/contracts/message-addressing.js';
+import { assertNoUnknownKeys, assertPositiveInteger } from './validators.js';
+
+/**
+ * Deterministic pre-gate configuration for room-participation candidate
+ * creation (free-time social autonomy, bible §8.1/§8.4, adjudication S5/S7).
+ *
+ * This owns the passive-name candidate gate tunables only. Speaking leases,
+ * room-episode pressure, the social pot, and the cheap participation appraiser
+ * live behind the gateway arbiter and the Room Participation Coordinator seam
+ * (bible §13.1) and are configured elsewhere. Full companion/fleet/room
+ * autonomy-ladder resolution ("most restrictive wins", §8.4) is a coordinator
+ * concern; this file carries a default level plus per-channel overrides so the
+ * deterministic candidate gate can run today without the coordinator.
+ */
+
+/**
+ * Monotonic autonomy ladder (bible §8.4). A higher level is a strict superset
+ * of the behaviors permitted by the levels below it.
+ *
+ * - `off`        — no autonomous room participation at all.
+ * - `directed`   — explicit mention / reply candidates only.
+ * - `contextual` — directed behavior plus passive-name appraisal and reactions.
+ * - `social`     — contextual behavior plus social-pressure initiation and
+ *                  eligible room-project topics.
+ */
+export const PARTICIPATION_AUTONOMY_LEVELS = [
+  'off',
+  'directed',
+  'contextual',
+  'social',
+] as const;
+
+export type ParticipationAutonomyLevel =
+  typeof PARTICIPATION_AUTONOMY_LEVELS[number];
+
+export interface PassiveNameCandidateSettings {
+  /** Master switch for passive-name candidate creation. */
+  enabled: boolean;
+  /**
+   * Effective autonomy level applied to a channel with no explicit override.
+   * `contextual` enables passive-name candidates; `directed` restricts to
+   * explicit mentions; `off` disables all candidate creation.
+   */
+  defaultAutonomyLevel: ParticipationAutonomyLevel;
+  /**
+   * Per-channel autonomy overrides (channelId → level). The coordinator will
+   * later fold companion/fleet/room policy into this resolution; today the
+   * override, when present, is the effective level for the channel.
+   */
+  channelAutonomyLevels: Record<string, ParticipationAutonomyLevel>;
+  /**
+   * Bounded count of immediately preceding room messages attached to each
+   * candidate for same-name disambiguation (bible §8.2, §11.5 name-collision).
+   */
+  precedingContextMessages: number;
+  /**
+   * A trigger message older than this (relative to observation time) is stale
+   * and never produces a candidate — a backlog-catch-up guard so replayed or
+   * long-delayed observed traffic cannot resurrect old mentions.
+   */
+  stalenessMs: number;
+  /**
+   * Per-channel source-message dedup ring size. Enforces "one candidate per
+   * source message" across redeliveries without unbounded memory growth.
+   */
+  dedupeHistoryPerChannel: number;
+  /**
+   * Name-spam debounce window in milliseconds (bible §8.1, adjudication S7.3).
+   * Once a name-triggered candidate is emitted in a channel, further
+   * name-triggers in that same channel are suppressed (`debounced`) until this
+   * window expires: "repeated name-triggering (one user or several
+   * coordinating) yields at most one optional response, then a ~10-minute
+   * ignore window." Deterministic and pre-model; the window is per-channel so
+   * coordinating spammers across accounts collapse to a single appraisal chain,
+   * and spam in one room never silences another. A non-positive value disables
+   * debounce entirely (every non-duplicate name-trigger creates a candidate).
+   */
+  debounceWindowMs: number;
+  /**
+   * Shortest reviewed biography alias that may act as a passive address cue
+   * (psfn-framework-o61vb.17). A one- or two-character alias such as `V` or
+   * `00` matches far too much ordinary room text to be a safe summons, so
+   * anything shorter than this is dropped before matching. Raising it is
+   * always safe; lowering it widens what counts as being called.
+   */
+  aliasMinLength: number;
+}
+
+export function createDefaultPassiveNameCandidateSettings(): PassiveNameCandidateSettings {
+  return {
+    enabled: true,
+    defaultAutonomyLevel: 'contextual',
+    channelAutonomyLevels: {},
+    precedingContextMessages: 6,
+    stalenessMs: 5 * 60 * 1000,
+    dedupeHistoryPerChannel: 256,
+    debounceWindowMs: 10 * 60 * 1000,
+    aliasMinLength: 3,
+  };
+}
+
+/**
+ * Whether the given autonomy level permits a passive-name (contextual summons)
+ * candidate. Passive-name participation requires `contextual` or higher.
+ */
+export function autonomyLevelPermitsPassiveName(
+  level: ParticipationAutonomyLevel,
+): boolean {
+  return level === 'contextual' || level === 'social';
+}
+
+/**
+ * Whether the given autonomy level permits an explicit-mention / reply
+ * candidate. Any level from `directed` upward permits directed candidates.
+ */
+export function autonomyLevelPermitsDirected(
+  level: ParticipationAutonomyLevel,
+): boolean {
+  return level !== 'off';
+}
+
+/**
+ * Tunables for the cheap, tool-less participation appraiser (bible §8.2). The
+ * appraiser runs a single background-model call per created candidate and
+ * returns a strict ternary (ignore/react/reply). Everything here bounds that
+ * one call so it can never grow into a heavy or unbounded prompt; the appraiser
+ * fails closed to `ignore` on any error, timeout, or malformed output.
+ */
+export interface ParticipationAppraiserSettings {
+  /** Master switch. When false the appraiser fails closed to `ignore`. */
+  enabled: boolean;
+  /**
+   * Hard wall-clock ceiling for the background-model call. On expiry the call
+   * is aborted and the appraiser fails closed to `ignore` — never a
+   * default-respond (bible §18 "Passive-name appraiser unavailable").
+   */
+  appraisalDeadlineMs: number;
+  /** Output-token ceiling for the ternary; the contract needs only a few. */
+  appraisalMaxOutputTokens: number;
+  /**
+   * Bounded count of preceding room messages rendered into the datamarked
+   * transcript, so a long backlog cannot inflate the prompt. The candidate
+   * already carries a bounded window; this is a second belt-and-braces cap.
+   */
+  transcriptMessageCap: number;
+  /** Per-message character cap inside the transcript. */
+  transcriptMessageChars: number;
+  /**
+   * Total character cap for the operator-authored prompt layers the local
+   * appraiser sees as operator guidance (psfn-framework-9iooo).
+   */
+  operatorGuidanceMaxChars: number;
+}
+
+/**
+ * The shipped appraisal deadline before 0eq2x. The scheduler owner migration
+ * moves an owner file still carrying exactly this seeded value to the current
+ * default; it is a migration marker, not a runtime tunable.
+ */
+export const RETIRED_APPRAISAL_DEADLINE_MS = 8_000;
+
+/**
+ * The shipped appraisal output budget before 9z2z9. Reasoning tokens count
+ * against it, so it truncated the verdict on reasoning models; the scheduler
+ * owner migration moves an owner file still carrying exactly this seeded value
+ * to the current default. A migration marker, not a runtime tunable.
+ */
+export const RETIRED_APPRAISAL_MAX_OUTPUT_TOKENS = 200;
+
+/**
+ * Defaults factory (owner-file / settings pattern). All numeric tunables live
+ * inside the function body — never as module-level tuning constants — so the
+ * hardcoded-settings gate stays satisfied and Garden/config can own overrides.
+ */
+export function createDefaultParticipationAppraiserSettings(): ParticipationAppraiserSettings {
+  return {
+    enabled: true,
+    // Sized for a reasoning-class background model under load (0eq2x): 8 s
+    // timed out every ICP DM appraisal on Kimi k3 and fail-closed ignored it.
+    appraisalDeadlineMs: 30_000,
+    // Reasoning tokens count against this budget (9z2z9): 200 cut the JSON
+    // verdict off on Kimi k3; 1500 was validated in the r4 shakedown.
+    appraisalMaxOutputTokens: 1_500,
+    transcriptMessageCap: 8,
+    transcriptMessageChars: 500,
+    operatorGuidanceMaxChars: 2_000,
+  };
+}
+
+/**
+ * Tunables for the speaking-arbiter reservation phase (bible §8.5/§12.2,
+ * §6.10, jp36.5.1.2). The reservation phase is the deterministic gate that runs
+ * BEFORE the participation appraiser's model call ("peek before the model
+ * runs"): it resolves ICP-over-social precedence and the social-pot funding
+ * peek, and only if those admit does it place a non-exclusive candidate
+ * reservation and let the candidate reach appraisal. A gated candidate never
+ * reaches a model call. These tunables bound that gate; the actual pot draw and
+ * the exclusive egress lease bind later at delivery (jp36.5.1.3).
+ */
+export interface ReservationPhaseSettings {
+  /**
+   * Reservation TTL. A candidate reservation not promoted to an egress lease
+   * within this window is swept and can never promote, so a crashed appraisal
+   * leaks neither the reservation nor an appraisal spend beyond it.
+   */
+  reservationTtlMs: number;
+  /**
+   * Minimum social-pot balance (charge-policy units) required for a candidate to
+   * be worth appraising. This is a non-mutating funding PEEK, never a draw — the
+   * draw binds only at egress (§8.5). Below this the candidate is gated
+   * (`fatigue_pot_insufficient`) and the appraiser model never runs.
+   */
+  minReserveDrawUnits: number;
+}
+
+/**
+ * Defaults factory (owner-file / settings pattern). All numeric tunables live
+ * inside the function body — never as module-level tuning constants — so the
+ * hardcoded-settings gate stays satisfied and Garden/config can own overrides.
+ */
+export function createDefaultReservationPhaseSettings(): ReservationPhaseSettings {
+  return {
+    reservationTtlMs: 2 * 60 * 1000,
+    minReserveDrawUnits: 1,
+  };
+}
+
+/**
+ * Tunables for the speaking-arbiter egress-lease phase (bible §8.5/§12.2, §18,
+ * §20.1, jp36.5.1.3). This is phase 2: the exclusive send-once binding at
+ * delivery ("bind only at egress"). It is the ONLY place the social pot is
+ * actually drawn and the fenced egress lease is acquired, after the Law-36
+ * single-probe breaker gate, the lease-threshold-bias confidence bar, and
+ * speak-least fairness admit the turn.
+ */
+interface EgressLeasePhaseSettings {
+  /**
+   * Whether the arbiter actually binds a lease and delivers autonomous room
+   * replies. Defaults to OFF: promoting an observed candidate to a real
+   * autonomous send is a new, CogSec-sensitive surface, so it is opt-in and
+   * fail-closed — with it disabled the observe/appraise path is unchanged and no
+   * autonomous reply is sent.
+   */
+  enabled: boolean;
+  /**
+   * Egress lease deadline window. A crashed holder's lease is reclaimable by
+   * another turn once it lapses (bible §18 "lease expires during generation").
+   */
+  leaseTtlMs: number;
+  /**
+   * The REAL social-pot draw amount bound at egress (charge-policy units) — the
+   * fatigue actually spent to speak (§8.5 "bind only at egress"), distinct from
+   * the phase-1 non-mutating funding peek.
+   */
+  egressDrawUnits: number;
+  /**
+   * Base confidence a `reply` appraisal must clear to bind a lease. Rising
+   * room-episode pressure adds `leaseThresholdBias` on top of this bar, so a
+   * flooding room raises the bar for another autonomous lease (soft wrap-up).
+   */
+  minReplyConfidence: number;
+}
+
+/**
+ * Defaults factory (owner-file / settings pattern). All numeric tunables live
+ * inside the function body — never as module-level tuning constants — so the
+ * hardcoded-settings gate stays satisfied and Garden/config can own overrides.
+ */
+function createDefaultEgressLeasePhaseSettings(): EgressLeasePhaseSettings {
+  return {
+    enabled: false,
+    leaseTtlMs: 60 * 1000,
+    egressDrawUnits: 1,
+    minReplyConfidence: 0.5,
+  };
+}
+
+/** Operator-owned room-egress posture. Public defaults stay fail-closed. */
+type EgressLeaseMode = 'off' | 'shadow' | 'on';
+
+/**
+ * Owner-file-exposed egress-lease policy (jp36.8.2 / jp36.5). `mode` replaces
+ * the never-exposed boolean after qgqw.3 hardened the sender. `shadow` runs the
+ * decision path without delivering; `on` may bind and send through the arbiter.
+ */
+export interface EgressLeaseTunables extends Omit<EgressLeasePhaseSettings, 'enabled'> {
+  mode: EgressLeaseMode;
+}
+
+export function createDefaultEgressLeaseTunables(): EgressLeaseTunables {
+  const { enabled: _enabled, ...tunables } = createDefaultEgressLeasePhaseSettings();
+  return { mode: 'off', ...tunables };
+}
+
+// ── Owner-file parsers (jp36.8.2) ────────────────────────────────────────────
+// Fail-closed parsers that give the participation tunables canonical
+// scheduler.json homes (Garden-editable via the raw owner-file editor). Every
+// default is sourced from the createDefault* factories above so a config that
+// omits a knob is byte-identical to the pre-owner-file behavior. Numeric bounds
+// live inside these function bodies (never module-level tuning constants) so the
+// hardcoded-settings gate stays satisfied.
+
+const PARTICIPATION_ERROR_PREFIX = 'Invalid participation config';
+
+function participationRecord(value: unknown, fieldPath: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be an object`);
+  }
+  return value;
+}
+
+function participationBoolean(value: unknown, fieldPath: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be a boolean`);
+  }
+  return value;
+}
+
+function participationPositiveInteger(value: unknown, fieldPath: string): number {
+  return assertPositiveInteger(value, fieldPath, {
+    min: 1,
+    message: ({ fieldLabel }) => `${PARTICIPATION_ERROR_PREFIX}: ${fieldLabel} must be a finite integer >= 1`,
+  });
+}
+
+function participationNonNegativeInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be a finite integer >= 0`);
+  }
+  return value;
+}
+
+function participationFiniteInteger(value: unknown, fieldPath: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value)) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be a finite integer`);
+  }
+  return value;
+}
+
+function participationPositiveNumber(value: unknown, fieldPath: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be a finite number > 0`);
+  }
+  return value;
+}
+
+function participationNonNegativeNumber(value: unknown, fieldPath: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be a finite number >= 0`);
+  }
+  return value;
+}
+
+function participationUnitInterval(value: unknown, fieldPath: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be a finite number between 0 and 1`);
+  }
+  return value;
+}
+
+function participationAutonomyLevel(value: unknown, fieldPath: string): ParticipationAutonomyLevel {
+  if (
+    typeof value !== 'string'
+    || !(PARTICIPATION_AUTONOMY_LEVELS as readonly string[]).includes(value)
+  ) {
+    throw new Error(
+      `${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be one of `
+      + `${PARTICIPATION_AUTONOMY_LEVELS.map(level => `"${level}"`).join(', ')}`,
+    );
+  }
+  return value as ParticipationAutonomyLevel;
+}
+
+function participationEgressLeaseMode(value: unknown, fieldPath: string): EgressLeaseMode {
+  if (value !== 'off' && value !== 'shadow' && value !== 'on') {
+    throw new Error(
+      `${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be one of "off", "shadow", "on"`,
+    );
+  }
+  return value;
+}
+
+function participationChannelAutonomyLevels(
+  value: unknown,
+  fieldPath: string,
+): Record<string, ParticipationAutonomyLevel> {
+  const record = participationRecord(value, fieldPath);
+  const parsed: Record<string, ParticipationAutonomyLevel> = {};
+  for (const [channelId, level] of Object.entries(record)) {
+    parsed[channelId] = participationAutonomyLevel(level, `${fieldPath}.${channelId}`);
+  }
+  return parsed;
+}
+
+export function parsePassiveNameCandidateSettings(
+  raw: unknown,
+  fieldPath: string,
+): PassiveNameCandidateSettings {
+  const defaults = createDefaultPassiveNameCandidateSettings();
+  if (raw === undefined) {
+    return defaults;
+  }
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    [
+      'enabled',
+      'defaultAutonomyLevel',
+      'channelAutonomyLevels',
+      'precedingContextMessages',
+      'stalenessMs',
+      'dedupeHistoryPerChannel',
+      'debounceWindowMs',
+      'aliasMinLength',
+    ],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    enabled: participationBoolean(record.enabled ?? defaults.enabled, `${fieldPath}.enabled`),
+    defaultAutonomyLevel: participationAutonomyLevel(
+      record.defaultAutonomyLevel ?? defaults.defaultAutonomyLevel,
+      `${fieldPath}.defaultAutonomyLevel`,
+    ),
+    channelAutonomyLevels: participationChannelAutonomyLevels(
+      record.channelAutonomyLevels ?? defaults.channelAutonomyLevels,
+      `${fieldPath}.channelAutonomyLevels`,
+    ),
+    precedingContextMessages: participationNonNegativeInteger(
+      record.precedingContextMessages ?? defaults.precedingContextMessages,
+      `${fieldPath}.precedingContextMessages`,
+    ),
+    stalenessMs: participationPositiveInteger(
+      record.stalenessMs ?? defaults.stalenessMs,
+      `${fieldPath}.stalenessMs`,
+    ),
+    dedupeHistoryPerChannel: participationPositiveInteger(
+      record.dedupeHistoryPerChannel ?? defaults.dedupeHistoryPerChannel,
+      `${fieldPath}.dedupeHistoryPerChannel`,
+    ),
+    // Non-positive disables debounce entirely (see the field doc), so a finite
+    // integer — including <= 0 — is accepted here.
+    debounceWindowMs: participationFiniteInteger(
+      record.debounceWindowMs ?? defaults.debounceWindowMs,
+      `${fieldPath}.debounceWindowMs`,
+    ),
+    aliasMinLength: participationPositiveInteger(
+      record.aliasMinLength ?? defaults.aliasMinLength,
+      `${fieldPath}.aliasMinLength`,
+    ),
+  };
+}
+
+export function parseParticipationAppraiserSettings(
+  raw: unknown,
+  fieldPath: string,
+): ParticipationAppraiserSettings {
+  const defaults = createDefaultParticipationAppraiserSettings();
+  if (raw === undefined) {
+    return defaults;
+  }
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    [
+      'enabled',
+      'appraisalDeadlineMs',
+      'appraisalMaxOutputTokens',
+      'transcriptMessageCap',
+      'transcriptMessageChars',
+      'operatorGuidanceMaxChars',
+    ],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    enabled: participationBoolean(record.enabled ?? defaults.enabled, `${fieldPath}.enabled`),
+    appraisalDeadlineMs: participationPositiveInteger(
+      record.appraisalDeadlineMs ?? defaults.appraisalDeadlineMs,
+      `${fieldPath}.appraisalDeadlineMs`,
+    ),
+    appraisalMaxOutputTokens: participationPositiveInteger(
+      record.appraisalMaxOutputTokens ?? defaults.appraisalMaxOutputTokens,
+      `${fieldPath}.appraisalMaxOutputTokens`,
+    ),
+    transcriptMessageCap: participationPositiveInteger(
+      record.transcriptMessageCap ?? defaults.transcriptMessageCap,
+      `${fieldPath}.transcriptMessageCap`,
+    ),
+    transcriptMessageChars: participationPositiveInteger(
+      record.transcriptMessageChars ?? defaults.transcriptMessageChars,
+      `${fieldPath}.transcriptMessageChars`,
+    ),
+    operatorGuidanceMaxChars: participationPositiveInteger(
+      record.operatorGuidanceMaxChars ?? defaults.operatorGuidanceMaxChars,
+      `${fieldPath}.operatorGuidanceMaxChars`,
+    ),
+  };
+}
+
+export function parseReservationPhaseSettings(
+  raw: unknown,
+  fieldPath: string,
+): ReservationPhaseSettings {
+  const defaults = createDefaultReservationPhaseSettings();
+  if (raw === undefined) {
+    return defaults;
+  }
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    ['reservationTtlMs', 'minReserveDrawUnits'],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    reservationTtlMs: participationPositiveInteger(
+      record.reservationTtlMs ?? defaults.reservationTtlMs,
+      `${fieldPath}.reservationTtlMs`,
+    ),
+    minReserveDrawUnits: participationNonNegativeNumber(
+      record.minReserveDrawUnits ?? defaults.minReserveDrawUnits,
+      `${fieldPath}.minReserveDrawUnits`,
+    ),
+  };
+}
+
+export function parseEgressLeaseTunables(
+  raw: unknown,
+  fieldPath: string,
+): EgressLeaseTunables {
+  const defaults = createDefaultEgressLeaseTunables();
+  if (raw === undefined) {
+    return defaults;
+  }
+  const record = participationRecord(raw, fieldPath);
+  // The legacy boolean stays rejected: explicit tri-state posture prevents an
+  // accidental truthy value from turning shadow evaluation into real egress.
+  assertNoUnknownKeys(
+    record,
+    ['mode', 'leaseTtlMs', 'egressDrawUnits', 'minReplyConfidence'],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    mode: participationEgressLeaseMode(
+      record.mode ?? defaults.mode,
+      `${fieldPath}.mode`,
+    ),
+    leaseTtlMs: participationPositiveInteger(
+      record.leaseTtlMs ?? defaults.leaseTtlMs,
+      `${fieldPath}.leaseTtlMs`,
+    ),
+    egressDrawUnits: participationPositiveNumber(
+      record.egressDrawUnits ?? defaults.egressDrawUnits,
+      `${fieldPath}.egressDrawUnits`,
+    ),
+    minReplyConfidence: participationUnitInterval(
+      record.minReplyConfidence ?? defaults.minReplyConfidence,
+      `${fieldPath}.minReplyConfidence`,
+    ),
+  };
+}
+
+/**
+ * Tunables for the bounded durable room-participation lease (jp36.5.5, bible
+ * §8.1). The lease lets an already-engaged companion keep considering a running
+ * group conversation without the room repeating its name. Everything here is a
+ * deterministic pre-model bound: how long membership lasts, how much of it may
+ * be spent, how fast it may be spent, and which explicit dispositions may open
+ * it. Nothing here can make the companion speak — an admitted continuation
+ * still passes the reservation phase, the cheap appraiser's ternary, CogSec,
+ * fatigue, and the egress lease.
+ *
+ * The public default is OFF: continuation is a new autonomy surface, so it is
+ * opt-in per companion through the scheduler owner file.
+ */
+export interface RoomParticipationLeaseSettings {
+  /** Master switch. Off: ambient room chatter stays observation/context only. */
+  enabled: boolean;
+  /** Bounded membership lifetime, refreshed by each admitted disposition. */
+  leaseTtlMs: number;
+  /** Membership lapses when nothing is considered for this long. */
+  silenceTimeoutMs: number;
+  /** Minimum spacing between admitted continuation candidates in one room. */
+  continuationCooldownMs: number;
+  /** Continuation candidates one lease may admit before it closes. */
+  maxContinuationCandidates: number;
+  /**
+   * Consecutive machine-authored continuations admitted before the bot-loop
+   * fence closes the lease. Only a human turn re-opens the room afterwards.
+   */
+  maxConsecutiveMachineContinuations: number;
+  /** Consecutive `ignore` appraisals treated as withdrawal from the room. */
+  maxConsecutiveIgnores: number;
+  /** Bounded relevance hint: shorter lines are not treated as follow-ups. */
+  minContentChars: number;
+  /**
+   * Which explicit dispositions may OPEN membership. Any disposition refreshes
+   * a lease that is already live; only these may create one. The conservative
+   * default admits the companion's own engagement (a delivered reply, an
+   * appraised reaction, a granted endogenous room entry) but not a bare summons,
+   * so an ignored mention never opens a lease that would spend appraisals.
+   */
+  openOn: RoomParticipationLeaseOpenOnSettings;
+}
+
+interface RoomParticipationLeaseOpenOnSettings {
+  directSummons: boolean;
+  passiveSummons: boolean;
+  reaction: boolean;
+  reply: boolean;
+  endogenousRoomEntry: boolean;
+}
+
+/**
+ * Defaults factory (owner-file / settings pattern). All numeric tunables live
+ * inside the function body — never as module-level tuning constants — so the
+ * hardcoded-settings gate stays satisfied and Garden/config can own overrides.
+ */
+export function createDefaultRoomParticipationLeaseSettings(): RoomParticipationLeaseSettings {
+  return {
+    enabled: false,
+    leaseTtlMs: 15 * 60 * 1000,
+    silenceTimeoutMs: 5 * 60 * 1000,
+    continuationCooldownMs: 20 * 1000,
+    maxContinuationCandidates: 6,
+    maxConsecutiveMachineContinuations: 2,
+    maxConsecutiveIgnores: 3,
+    minContentChars: 8,
+    openOn: {
+      directSummons: false,
+      passiveSummons: false,
+      reaction: true,
+      reply: true,
+      endogenousRoomEntry: true,
+    },
+  };
+}
+
+function participationOpenOnSettings(
+  raw: unknown,
+  fieldPath: string,
+  defaults: RoomParticipationLeaseOpenOnSettings,
+): RoomParticipationLeaseOpenOnSettings {
+  if (raw === undefined) {
+    return { ...defaults };
+  }
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    ['directSummons', 'passiveSummons', 'reaction', 'reply', 'endogenousRoomEntry'],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    directSummons: participationBoolean(
+      record.directSummons ?? defaults.directSummons,
+      `${fieldPath}.directSummons`,
+    ),
+    passiveSummons: participationBoolean(
+      record.passiveSummons ?? defaults.passiveSummons,
+      `${fieldPath}.passiveSummons`,
+    ),
+    reaction: participationBoolean(
+      record.reaction ?? defaults.reaction,
+      `${fieldPath}.reaction`,
+    ),
+    reply: participationBoolean(record.reply ?? defaults.reply, `${fieldPath}.reply`),
+    endogenousRoomEntry: participationBoolean(
+      record.endogenousRoomEntry ?? defaults.endogenousRoomEntry,
+      `${fieldPath}.endogenousRoomEntry`,
+    ),
+  };
+}
+
+export function parseRoomParticipationLeaseSettings(
+  raw: unknown,
+  fieldPath: string,
+): RoomParticipationLeaseSettings {
+  const defaults = createDefaultRoomParticipationLeaseSettings();
+  if (raw === undefined) {
+    return defaults;
+  }
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    [
+      'enabled',
+      'leaseTtlMs',
+      'silenceTimeoutMs',
+      'continuationCooldownMs',
+      'maxContinuationCandidates',
+      'maxConsecutiveMachineContinuations',
+      'maxConsecutiveIgnores',
+      'minContentChars',
+      'openOn',
+    ],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    enabled: participationBoolean(record.enabled ?? defaults.enabled, `${fieldPath}.enabled`),
+    leaseTtlMs: participationPositiveInteger(
+      record.leaseTtlMs ?? defaults.leaseTtlMs,
+      `${fieldPath}.leaseTtlMs`,
+    ),
+    silenceTimeoutMs: participationPositiveInteger(
+      record.silenceTimeoutMs ?? defaults.silenceTimeoutMs,
+      `${fieldPath}.silenceTimeoutMs`,
+    ),
+    continuationCooldownMs: participationNonNegativeInteger(
+      record.continuationCooldownMs ?? defaults.continuationCooldownMs,
+      `${fieldPath}.continuationCooldownMs`,
+    ),
+    maxContinuationCandidates: participationPositiveInteger(
+      record.maxContinuationCandidates ?? defaults.maxContinuationCandidates,
+      `${fieldPath}.maxContinuationCandidates`,
+    ),
+    maxConsecutiveMachineContinuations: participationNonNegativeInteger(
+      record.maxConsecutiveMachineContinuations ?? defaults.maxConsecutiveMachineContinuations,
+      `${fieldPath}.maxConsecutiveMachineContinuations`,
+    ),
+    maxConsecutiveIgnores: participationPositiveInteger(
+      record.maxConsecutiveIgnores ?? defaults.maxConsecutiveIgnores,
+      `${fieldPath}.maxConsecutiveIgnores`,
+    ),
+    minContentChars: participationNonNegativeInteger(
+      record.minContentChars ?? defaults.minContentChars,
+      `${fieldPath}.minContentChars`,
+    ),
+    openOn: participationOpenOnSettings(record.openOn, `${fieldPath}.openOn`, defaults.openOn),
+  };
+}
+
+/**
+ * Tunables for the channel-neutral room signal (jp36.5.6, bible §8.1/§8.4).
+ *
+ * These bound the deterministic stage that runs BEFORE any model call on an
+ * observed room message: which room members may be participated with
+ * contextually at all, how fast a room may be before contextual participation
+ * stops, how much derived state one process keeps, and the reviewed coarse
+ * topic vocabulary a companion-local matcher may compare its interests against.
+ *
+ * The public default is OFF, and every list defaults to its most restrictive
+ * value: with no owner-approved trust class or room role, an untrusted room
+ * member can only ever reach the companion by addressing it directly.
+ *
+ * Cost note: normalization and feature extraction are pure and run once per
+ * physical message per agent process. The optional ambiguity classifier is the
+ * claimed-once stage — it runs only when a claim authority admits it, so in a
+ * fleet runtime it stays inert until a durable cross-process claim exists.
+ */
+export interface RoomSignalSettings {
+  /** Master switch. Off: the deterministic room-signal gate suppresses. */
+  enabled: boolean;
+  /**
+   * Intake trust classes whose members may be participated with CONTEXTUALLY —
+   * that is, without addressing the companion. A direct mention or reply is
+   * always admitted regardless of this list.
+   */
+  contextualEligibleSourceClasses: MessageAuthorSourceClass[];
+  /** Platform room roles admitted contextually; `unknown` is never one. */
+  contextualEligibleRoomRoles: MessageAuthorRoomRole[];
+  /** Trailing window the room-velocity gate counts observed messages over. */
+  velocityWindowMs: number;
+  /** Observed messages in that window above which contextual participation stops. */
+  maxRoomVelocity: number;
+  /** Bounded per-process memo of derived features, velocity, and classifications. */
+  featureCacheSize: number;
+  /**
+   * Reviewed coarse domain/topic vocabulary: tag → keywords that select it.
+   * Owner-curated and deliberately empty by default; it is compared against
+   * `companionInterests`, never against a biography or a private memory.
+   */
+  topicTags: Record<string, string[]>;
+  /** Reviewed room-safe interest/responsibility tags for this companion. */
+  companionInterests: string[];
+  classifier: RoomSignalClassifierSettings;
+}
+
+/**
+ * The optional cheap ambiguity classifier. Bounded and content-minimal: it sees
+ * a truncated excerpt and reviewed tags, answers one boolean, and is shared
+ * across every companion evaluating the same physical message. It is never a
+ * response-capable model call.
+ */
+interface RoomSignalClassifierSettings {
+  /** Master switch; off means ambiguity resolves to suppression. */
+  enabled: boolean;
+  /** Hard wall-clock ceiling for the single bounded call. */
+  deadlineMs: number;
+  /** Output-token ceiling; the contract needs one boolean. */
+  maxOutputTokens: number;
+  /** Per-message excerpt cap applied before the call. */
+  excerptChars: number;
+}
+
+/**
+ * Defaults factory (owner-file / settings pattern). All tuning values live
+ * inside the function body — never as module-level constants — so the
+ * hardcoded-settings gate stays satisfied and Garden/config can own overrides.
+ */
+export function createDefaultRoomSignalSettings(): RoomSignalSettings {
+  return {
+    enabled: false,
+    contextualEligibleSourceClasses: ['operator', 'primary_user'],
+    contextualEligibleRoomRoles: [],
+    velocityWindowMs: 60 * 1000,
+    maxRoomVelocity: 12,
+    featureCacheSize: 256,
+    topicTags: {},
+    companionInterests: [],
+    classifier: {
+      enabled: false,
+      deadlineMs: 4_000,
+      maxOutputTokens: 16,
+      excerptChars: 280,
+    },
+  };
+}
+
+function participationStringList(value: unknown, fieldPath: string): string[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} must be an array of strings`);
+  }
+  return value.map((entry, index) => {
+    if (typeof entry !== 'string' || !entry.trim()) {
+      throw new Error(
+        `${PARTICIPATION_ERROR_PREFIX}: ${fieldPath}[${String(index)}] must be a non-empty string`,
+      );
+    }
+    return entry.trim();
+  });
+}
+
+function participationEnumList<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fieldPath: string,
+): T[] {
+  return participationStringList(value, fieldPath).map((entry, index) => {
+    if (!(allowed as readonly string[]).includes(entry)) {
+      throw new Error(
+        `${PARTICIPATION_ERROR_PREFIX}: ${fieldPath}[${String(index)}] must be one of `
+        + `${allowed.map(item => `"${item}"`).join(', ')}`,
+      );
+    }
+    return entry as T;
+  });
+}
+
+function participationTopicTags(
+  value: unknown,
+  fieldPath: string,
+): Record<string, string[]> {
+  const record = participationRecord(value, fieldPath);
+  const parsed: Record<string, string[]> = {};
+  for (const [tag, keywords] of Object.entries(record)) {
+    if (!tag.trim()) {
+      throw new Error(`${PARTICIPATION_ERROR_PREFIX}: ${fieldPath} tag names must be non-empty`);
+    }
+    parsed[tag.trim()] = participationStringList(keywords, `${fieldPath}.${tag}`);
+  }
+  return parsed;
+}
+
+function parseRoomSignalClassifierSettings(
+  raw: unknown,
+  fieldPath: string,
+  defaults: RoomSignalClassifierSettings,
+): RoomSignalClassifierSettings {
+  if (raw === undefined) return { ...defaults };
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    ['enabled', 'deadlineMs', 'maxOutputTokens', 'excerptChars'],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    enabled: participationBoolean(record.enabled ?? defaults.enabled, `${fieldPath}.enabled`),
+    deadlineMs: participationPositiveInteger(
+      record.deadlineMs ?? defaults.deadlineMs,
+      `${fieldPath}.deadlineMs`,
+    ),
+    maxOutputTokens: participationPositiveInteger(
+      record.maxOutputTokens ?? defaults.maxOutputTokens,
+      `${fieldPath}.maxOutputTokens`,
+    ),
+    excerptChars: participationPositiveInteger(
+      record.excerptChars ?? defaults.excerptChars,
+      `${fieldPath}.excerptChars`,
+    ),
+  };
+}
+
+export function parseRoomSignalSettings(
+  raw: unknown,
+  fieldPath: string,
+): RoomSignalSettings {
+  const defaults = createDefaultRoomSignalSettings();
+  if (raw === undefined) {
+    return defaults;
+  }
+  const record = participationRecord(raw, fieldPath);
+  assertNoUnknownKeys(
+    record,
+    [
+      'enabled',
+      'contextualEligibleSourceClasses',
+      'contextualEligibleRoomRoles',
+      'velocityWindowMs',
+      'maxRoomVelocity',
+      'featureCacheSize',
+      'topicTags',
+      'companionInterests',
+      'classifier',
+    ],
+    fieldPath,
+    { errorPrefix: PARTICIPATION_ERROR_PREFIX },
+  );
+  return {
+    enabled: participationBoolean(record.enabled ?? defaults.enabled, `${fieldPath}.enabled`),
+    contextualEligibleSourceClasses: participationEnumList(
+      record.contextualEligibleSourceClasses ?? defaults.contextualEligibleSourceClasses,
+      MESSAGE_AUTHOR_SOURCE_CLASSES,
+      `${fieldPath}.contextualEligibleSourceClasses`,
+    ),
+    contextualEligibleRoomRoles: participationEnumList(
+      record.contextualEligibleRoomRoles ?? defaults.contextualEligibleRoomRoles,
+      MESSAGE_AUTHOR_ROOM_ROLES,
+      `${fieldPath}.contextualEligibleRoomRoles`,
+    ),
+    velocityWindowMs: participationPositiveInteger(
+      record.velocityWindowMs ?? defaults.velocityWindowMs,
+      `${fieldPath}.velocityWindowMs`,
+    ),
+    maxRoomVelocity: participationPositiveInteger(
+      record.maxRoomVelocity ?? defaults.maxRoomVelocity,
+      `${fieldPath}.maxRoomVelocity`,
+    ),
+    featureCacheSize: participationPositiveInteger(
+      record.featureCacheSize ?? defaults.featureCacheSize,
+      `${fieldPath}.featureCacheSize`,
+    ),
+    topicTags: participationTopicTags(
+      record.topicTags ?? defaults.topicTags,
+      `${fieldPath}.topicTags`,
+    ),
+    companionInterests: participationStringList(
+      record.companionInterests ?? defaults.companionInterests,
+      `${fieldPath}.companionInterests`,
+    ),
+    classifier: parseRoomSignalClassifierSettings(
+      record.classifier,
+      `${fieldPath}.classifier`,
+      defaults.classifier,
+    ),
+  };
+}
