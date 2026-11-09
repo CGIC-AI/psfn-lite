@@ -357,6 +357,16 @@ status`. That is the baseline's 9,485 tests minus 994 deleted (717 before B7,
 277 in B7). The B7 edits (below) are among the 8,491 matched. No
 `lite-companion-*` containers and no `/tmp/lc-*` directories were left.
 
+Step C result (the plain validation command with a JSON reporter,
+2026-11-09 03:52Z, after root tsc, companion tsc and eslint all exited 0):
+exit 0, **693 files and 8,579 tests, all passed** (`lite` 11 files / 83
+tests, `companion` 682 files / 8,496 tests). Comparison: `deleted: 54
+files, 994 tests; matched: 8491; Lite additions: 1 files, 5 tests`,
+`equivalent: every remaining baseline test has its baseline status`. That is
+the same as B7. Step C deleted no donor test and edited none. The only change
+was the boot test's import (Step C, below). The Hermes plugin suite
+(`integrations/hermes/.venv`, Hermes `f0187332`) passed 50 of 50.
+
 ## Deleted and modified tests
 
 Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
