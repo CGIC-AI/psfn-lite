@@ -12,7 +12,7 @@ promoted	src/app/startup/composition/parity.ts
 promoted	src/app/startup/composition/post-turn-action-persistence-migration.ts
 promoted	src/app/startup/composition/post-turn-action-queue-state.ts
 promoted	src/app/startup/composition/post-turn-actions.ts
-scaffolding	src/app/startup/support/shutdown-helpers.ts
+promoted	src/app/startup/support/shutdown-helpers.ts
 scaffolding	src/boundary/custody/credential-vault.ts
 scaffolding	src/boundary/fleet-auth/companion-ui-action.ts
 scaffolding	src/boundary/fleet-auth/discord-evidence-lifecycle-state.ts

@@ -7,8 +7,10 @@
  *
  * Every baseline test must appear in the report with the same status, except
  * the tests listed in extraction/deleted-tests.tsv (whole files with `*`).
- * Tests or files the baseline does not know are reported as additions. Test
- * names can repeat inside a file (it.each), so names are compared as counts.
+ * Tests or files the baseline does not know are reported as additions, except
+ * the Lite test files listed in extraction/added-tests.tsv, which are reported
+ * separately and must run with no failure. Test names can repeat inside a file
+ * (it.each), so names are compared as counts.
  * Exits 1 on any difference.
  */
 import { readFileSync } from 'node:fs';
@@ -30,6 +32,10 @@ const deleted = readFileSync(join(here, 'deleted-tests.tsv'), 'utf8')
   .map(([file, test]) => ({ file, test }));
 const deletedFile = new Set(deleted.filter((d) => d.test === '*').map((d) => d.file));
 const deletedTest = new Set(deleted.filter((d) => d.test !== '*').map((d) => `${d.file}\u0000${d.test}`));
+const added = new Set(readFileSync(join(here, 'added-tests.tsv'), 'utf8')
+  .split('\n')
+  .filter((line) => line.trim() !== '' && !line.startsWith('#'))
+  .map((line) => line.split('\t')[0]));
 
 const report = JSON.parse(readFileSync(reportPath, 'utf8'));
 const marker = '/packages/companion/';
@@ -81,8 +87,18 @@ for (const entry of baseline.files) {
     if (m > n && !want.has(key(name, 'passed')) && !want.has(key(name, 'failed'))) problems.push(`${entry.file}: "${name}" ${status} is not in the baseline (addition)`);
   }
 }
-for (const file of observed.keys()) {
-  if (!baseline.files.some((f) => f.file === file)) problems.push(`${file}: not in the baseline (addition)`);
+let addedTests = 0;
+for (const [file, tests] of observed) {
+  if (baseline.files.some((f) => f.file === file)) continue;
+  if (!added.has(file)) {
+    problems.push(`${file}: not in the baseline (addition)`);
+    continue;
+  }
+  addedTests += tests.length;
+  for (const t of tests) if (t.status !== 'passed') problems.push(`${file}: Lite test "${t.name}" ${t.status}`);
+}
+for (const file of added) {
+  if (!observed.has(file)) problems.push(`${file}: listed in added-tests.tsv but missing from the report`);
 }
 
 function statusesOf(tests, name) {
@@ -90,7 +106,7 @@ function statusesOf(tests, name) {
   return s.length === 0 ? ' (absent)' : ` (observed: ${s.join(', ')})`;
 }
 
-console.log(`baseline: ${baseline.totals.files} files / ${baseline.totals.tests} tests; deleted: ${deletedFile.size} files, ${skippedDeleted} tests; matched: ${compared}`);
+console.log(`baseline: ${baseline.totals.files} files / ${baseline.totals.tests} tests; deleted: ${deletedFile.size} files, ${skippedDeleted} tests; matched: ${compared}; Lite additions: ${added.size} files, ${addedTests} tests`);
 if (problems.length > 0) {
   console.log(`${problems.length} difference(s):`);
   for (const p of problems) console.log(`  ${p}`);

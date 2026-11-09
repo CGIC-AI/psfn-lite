@@ -25,7 +25,8 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | B3 seam cuts (3.2, 3.3, 3.12, 3.15) | Done (Seam cuts, below). |
 | B4 seam cut (3.9) | Done (Seam cuts, below). |
 | B5 seam cuts (3.10, 3.17) | Done (Seam cuts, below): no core import of vendored scaffolding remains. |
-| B6-B7 | Not started. |
+| B6 seam cuts (3.1, 3.11) | Done (Seam cuts, below): the composition root boots over PostgreSQL (boot proof). |
+| B7 | Not started. |
 
 ## Closure (Step A0)
 
@@ -327,6 +328,15 @@ before B5; B5a 52, B5b 518, B5c 43, B5d 34). The B5 fixture and import edits
 are among the 8,768 matched. No `lite-companion-*` containers and no
 `/tmp/lc-*` directories were left.
 
+Step B6 result (the plain validation command with a JSON reporter,
+2026-11-09 01:16Z, after root tsc, companion tsc and eslint all exited
+0): exit 0, **764 files and 9,210 tests, all passed** (`lite` 52 files / 437
+tests, `companion` 712 files / 8,773 tests). Comparison: `deleted: 24 files,
+717 tests; matched: 8768; Lite additions: 1 files, 5 tests`, `equivalent:
+every remaining baseline test has its baseline status`. B6 deleted and edited
+no test; the one added file is the B6 boot proof. No `lite-companion-*`
+containers and no `/tmp/lc-*` directories were left.
+
 ## Deleted and modified tests
 
 Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
@@ -510,7 +520,10 @@ In that mode, read from the code:
 B3 therefore cuts types only. **For B6:** compose exactly that mode. Do not
 compose the agent-facing runtime, the source runtime or their adapters, and
 do not write a placeholder broker. Wire the disabled felt-impulse consumer
-the way the donor does. `self-availability.ts:69` and
+the way the donor does. (B6 correction: donor `main.ts:1118-1123` always
+passes `handleFeltImpulse`, so the donor's own path takes the first branch of
+`wireIcpInitiationSources` and the fail-closed consumer is never installed
+there; B6 composes that, see B6.) `self-availability.ts:69` and
 `notify-companion-handoff.ts:340,492,600` take the runtime as a required
 argument, so nothing may call them without one.
 
@@ -554,7 +567,8 @@ which is `windowStartMs` for ordinal 0 of 1. Every caller also skips it when
 no stagger is passed (`scheduler.ts:173,209`, `free-time.ts:992`,
 `quiet-hours-release-stagger.ts:50`).
 
-**For B6:** donor migration 18 (`fleet-maintenance-process-fencing`) creates
+**For B6** (done, see B6: the shared-schema chain is never applied by a Lite
+boot): donor migration 18 (`fleet-maintenance-process-fencing`) creates
 the lease tables. `migrations.test.ts:416` and two Postgres integration tests
 (`companion-presence`, `schema-tenancy`) assert it in the chain, so it was not
 touched here. It belongs to the migration-chain cut (3.11). The vendored
@@ -621,7 +635,9 @@ needs it). The B2 CogSec ports stay as recorded under B2.
   and profile-synthesis thresholds, compaction, budgets) are applied by the
   donor's `DIRECT_DEFINED_CONFIG_SETTINGS`; they belong to the B6 composition.
 - The vendored `app/agent/startup/free-time-lane.ts` still passes
-  `chargePolicy`; it is a source-text fixture and leaves in B6/B7.
+  `chargePolicy`; it is a source-text fixture and leaves in B6/B7. (B6: it is
+  promoted and compiled; the root passes `config.chargePolicy`, undefined
+  unless the host sets it.)
 
 **For B7:**
 - Deleting `system/config/scaffolding-config-fields.ts` is the compile proof
@@ -631,6 +647,144 @@ needs it). The B2 CogSec ports stay as recorded under B2.
   (`new CapabilityRuntime`), `core/agent/substrate-agent.test.ts` and
   `faculties/shards/manager-capability-launch.test.ts`
   (`deriveShardCapabilityGrant`).
+
+### B6 (3.1, 3.11)
+
+Four commits: 3.1 (provider and embedding adapters), then 3.11 in three
+parts: (a) promote the composition helpers, (b) the runtime-factory subset
+and its stores, (c) the scheduler runtime, the lanes and the composition
+root. Remaining seam statements: **0** after each part
+(`remaining-seams.mjs --summary`). Every changed donor file is recorded in
+`cuts.tsv` with its behaviour change; the donor files the root needs are `promoted`,
+including `shutdown-helpers.ts`, the journal integration and the startup
+lanes. The companion `tsconfig.json` no longer excludes
+`scheduler-runtime.ts`, `free-time-lane.ts` and
+`automata-background-work-lifecycle.ts`: they are core now, not source-text
+fixtures.
+
+| Seam | Cut | Behaviour change |
+|---|---|---|
+| 3.1 provider | `createProviderRuntimeServices` keeps the donor no-model-usage-store branch and takes an optional host `embeddingProvider`. Host adapters in `packages/pi`: `companionProviderRuntimeOf` (a structural `ProviderRuntime` over one `PiModelRuntime`), `companionModelRegistryEntryOf` (one `models.json` registry entry routing the donor's single-model purposes to the host model) and `companionEmbeddingProviderOf` (a donor `EmbeddingRuntimeProvider` over a Lite `EmbeddingPort`). The in-process `LLMProviderPort` is the donor's own `LLMClient`. | No model-usage ledger or embedding usage accounting. The host model and key serve every purpose. |
+| 3.11 composition helpers | `composition.ts` and `parity.ts` promoted and cut (rows in `cuts.tsv`): Redis session tail, CogSec integrity observers, fatigue options, operator hooks and the shard manager are cut. `wireShardAndThinkRuntime` became `wireSubagentRuntime`, which returns the subagent faculty and the fold-review controller. | See `cuts.tsv`. |
+| 3.11 persistence | `createAgentPersistenceRuntime` keeps the donor single-companion path and the kept stores. It drops the fleet, health, escalation, CogSec receipt, custody, partner-affect, ICP-candidate, social-pot, arbiter and participation stores. | The scaffolding tables are never created (boot proof). |
+| 3.11 scheduler runtime | `scheduler-runtime.ts` promoted and cut: the backup lane, health detectors, blind review, the shared-world caretaker, presence and fleet maintenance are cut. The gateway option becomes `llmProvider` + `embeddingDims`. | Those lanes are never scheduled. Biography stages run without a fleet baton. |
+| 3.11 root | New `app/agent/companion-runtime.ts`, `startCompanionRuntime(options)`. It replays donor `main.ts`, `core-bootstrap.ts` and `core-runtime.ts` in order, with donor line citations per block. Lanes and helpers are promoted unchanged where possible. Cut, with a row each: the decision runtime's Jev backend, the model-budget alert, the wishlist doing-mirror source, the wiki startup hydration, the personal-project library (an empty `PersonalProjectsPort`), the optional ICP gateway and the optional memory-deletion approval port. | See below. |
+
+**What the root does.** It follows the donor order:
+
+1. Runs the whole boot under one `PostgresPoolOwner('agent')` (donor
+   `main.ts:2539`).
+2. Applies the inner-life owner files over the host config: the settings
+   policy keys, `setRuntimeTrustPolicy`, subagent roles and the Automata
+   policy (donor `bootstrap-helpers.ts:244,271-272,423-425`).
+3. Builds the fixed `CapabilityAccess` from `config.capabilityTier`, then the
+   eligibility gate and the persistence runtime.
+4. Builds availability, contact approvals, the social graph stores and the
+   tracking gate.
+5. Runs identity, ML warm-up and emotion.
+6. Builds the core runtime on `sanitizeCoreSubstrateConfig(config)` (donor
+   `startup-context.ts:112`, `main.ts:700`): the Automata Bus, the observer
+   sidecar, sessions, letters, retention, `SubstrateAgent`, the alerts, the
+   prompt/card/settings/session tools, contacts, biography, intentions,
+   introspection consent, core memory, concern arcs and memory.
+7. Rehydrates startup continuity and internal state.
+8. Builds the scheduler runtime.
+9. Wires letter memory extraction, episode search and the ICP sources in the
+   donor no-broker mode. It passes `handleFeltImpulse`, as the donor does, so
+   the felt impulse reaches the social-impulse outreach runtime.
+10. Registers the introspection lane, subagents with fold review, the memory
+    writers and tools, the episode semantic index, episodic synthesis, sleep
+    consolidation, arcs, dream meaning and the disabled sleeptime wiki pass.
+11. Registers the journal tools, the long-horizon router, the outreach outbox
+    and the proactive outbound. The outbound is built only with a host
+    heartbeat channel.
+12. Registers the temporal wake-up, free time, weighted thought, social
+    desire, social impulse and EmoSim sampling lanes, and the reflection
+    runtime.
+13. Seals the PostgreSQL readiness, starts the scheduler and emits
+    `system.init` / `system.ready`.
+
+`stop()` runs the donor `control-plane.ts:226-288` sequence minus its cut
+steps. It ends with the donor `closeDatabase` store list and
+`postgresPoolOwner.close()`.
+
+**Host ports.** All are optional except the config and the inner-life config:
+
+- the provider runtime and embedding provider (3.1);
+- the text emotion classifier (default: the donor transformers classifier);
+- the operator notifier (default: log only);
+- the outbound sender (default: refuses);
+- the heartbeat channel;
+- the availability projection (default `unsupported`);
+- the session integrity provider (production session mode only with one);
+- the continuity channel ids and prefixes;
+- the contact-tracking channel labels;
+- the memory-deletion approval port.
+
+The host builds the `SubstrateConfig`. The donor's `load-config.ts` (env) and
+`settings/runtime.ts` `applySettings` (the scalar `settings.json` tunables,
+`DIRECT_DEFINED_CONFIG_SETTINGS`) are scaffolding: they carry every cut
+subsystem's keys. Copying the scalar settings onto the config is therefore
+host work. The boot proof does it from `settings.seed.json`.
+
+**Migration chain.** No central chain runs. Each kept store applies its own
+donor chain on connect, unchanged (the migration golden tests pin them). The
+cut stores' chains are never applied: health/escalation, CogSec, custody,
+partner affect, model usage, wiki projection, analysis workbench, and the
+`shared` schema chain, including migration 18
+`fleet-maintenance-process-fencing`. A kept chain still creates the few
+tables the donor put in it for features that are now cut (for example
+`icp_initiation_candidates` in the intention chain), exactly as the donor
+did.
+
+**Boot proof** (`src/app/agent/companion-runtime.boot.integration.test.ts`, a
+Lite addition listed in `extraction/added-tests.tsv`). It boots over the
+donor harness's pgvector PostgreSQL with:
+
+- a pi-ai faux model through `companionProviderRuntimeOf` /
+  `companionModelRegistryEntryOf`;
+- deterministic 16-dimension vectors through `companionEmbeddingProviderOf`;
+- a scripted text classifier;
+- the shipped seeds as owner files, with the Automata reviewer pointed at the
+  host model.
+
+It asserts:
+
+- `system.init` then `system.ready`;
+- a `handleMessage` turn returns the scripted reply, with the card name in
+  the system prompt;
+- the started scheduler fires the heartbeat by itself (`schedule.healthcheck`
+  with the task count, no manual tick);
+- exactly 18 registered tasks. These are the donor's registrations for these
+  seeds, minus the registrations the cuts removed: the backup tasks, the
+  tool-usage evaluator, world exploration and the drift / second-arrow lanes
+  (compared by registration call against donor `main.ts` and
+  `scheduler-runtime.ts`). The introspection audit, weighted-thought outreach,
+  blind review and EmoSim sampling are off in the seeds, as in the donor;
+- the database holds only the `extensions` and `public` schemas, no table of
+  a cut chain, and a sample of 17 kept-store tables.
+
+`compare-baseline.mjs` now reads `added-tests.tsv`. A listed file is counted
+apart from the baseline and every test in it must pass. An unlisted addition
+still fails the comparison.
+
+**Open after B6** (for the operator or Step C):
+
+- **Contact-lifecycle recovery.** It runs only with a host
+  `contactLifecycleGateway`. The root passes none, because the donor's port
+  was the gateway.
+- **Session integrity.** Without a host `sessionIntegrityProvider` the
+  sessions run in the donor's non-production mode (no journal HMAC chain).
+- **Continuity channels.** No continuity channel ids by default. The donor
+  read them from `channels.json`.
+- **Memory deletion.** Without a host approval port, the companion's memory
+  delete action returns the donor's "not configured" error.
+- **Observed group memory.** `ObservedGroupMemoryScheduler` gets no channel
+  view, because no channel adapter publishes group-memory channels. It serves
+  the reflection runtime as the memory scope classifier only.
+- **Not composed.** The donor's external-memory (memory-deletion RPC)
+  service, the gateway message handlers and the notify / clarify tools are
+  not composed. A host calls `agentLoop.handleMessage` directly.
 
 ## Package changes
 
@@ -655,7 +809,10 @@ the core set, `packages/companion/package.json`:
 | `tsup` (dev) | 8.5.1 | donor test `persistence/sessions/turn-records.test.ts` compiles the recovery worker |
 | `@types/ws` (dev) | 8.18.1 | temporary, vendored scaffolding |
 
-`@character-foundry/character-foundry` was not added (not allowed).
+`@character-foundry/character-foundry` was not added (not allowed). B6 added
+no package: the boot proof uses `@earendil-works/pi-ai` (already a root
+dependency through `packages/pi`) and imports `packages/pi/src` by relative
+path.
 
 Overrides copied from the donor's `package.json`, only for packages that were
 new to Lite's tree: `sharp` 0.35.5 (the transformers dependency; without it

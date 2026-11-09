@@ -31,7 +31,8 @@ import {
   sanitizeCoreSubstrateConfig,
   type SubstrateConfig,
 } from '../../system/config/runtime-config-contracts.js';
-import type { SchedulerRuntimeConfig } from '../../system/config/scheduler-config.js';
+import type { InnerLifeConfig } from '../../system/config/inner-life-config.js';
+import { setRuntimeTrustPolicy } from '../../system/trust/runtime-policy.js';
 import { DEFAULT_BACKGROUND_WORK_WELFARE_CONFIG } from '../../system/config/scheduler-config.js';
 import { EventBus } from '../../shared/event-bus.js';
 import { createComponentLogger } from '../../shared/logger.js';
@@ -79,6 +80,7 @@ import {
   type AgentPersistenceRuntime,
 } from '../../persistence/runtime-factory.js';
 import { createPostgresPool } from '../../persistence/postgres.js';
+import { PostgresPoolOwner, runWithPostgresPoolOwner } from '../../persistence/postgres/pool-owner.js';
 import { awaitPostgresStoreReadiness, sealPostgresStoreReadinessBeforeReady } from '../../persistence/postgres/runtime-readiness.js';
 import { resolveConfigTenantPoolScope } from '../../persistence/postgres/tenant-pool-scope.js';
 import { assertBackgroundWorkFitsTurnRecordFenceLane } from '../../persistence/postgres/turn-record-eligibility-fence.js';
@@ -233,6 +235,11 @@ import {
 } from '../startup/support/operator-alerts.js';
 import { createRuntimeSafeguardSurfaces } from '../startup/support/safeguard-surfaces.js';
 import {
+  createRetryableShutdown,
+  runShutdownSequence,
+  runShutdownStep,
+} from '../startup/support/shutdown-helpers.js';
+import {
   createStartupTextEmotionClassifier,
   warmRuntimeMlServices,
   type StartupTextEmotionClassifier,
@@ -246,10 +253,13 @@ const DAY_MS = 24 * HOUR_MS;
 
 /** What the host supplies. Everything else is composed from config, as the donor did. */
 export interface StartCompanionRuntimeOptions {
-  /** Host-built substrate config (donor: loadAgentConfig); persistenceBackend must be postgres. */
+  /**
+   * Host-built substrate config (donor: loadAgentConfig, env and settings.json
+   * scalars). The root applies the inner-life owner files over it.
+   */
   config: SubstrateConfig;
-  /** scheduler.json (loadInnerLifeConfig). */
-  schedulerConfig: SchedulerRuntimeConfig;
+  /** The inner-life owner files (loadInnerLifeConfig, seam 3.10). */
+  innerLife: InnerLifeConfig;
   /** Defaults to the layout resolved from config.dataDir / companionDataDir. */
   pathSnapshot?: RuntimePathSnapshot;
   /**
@@ -341,7 +351,38 @@ function createFixedCapabilityAccess(config: SubstrateConfig): CapabilityAccess 
 export async function startCompanionRuntime(
   options: StartCompanionRuntimeOptions,
 ): Promise<CompanionRuntime> {
-  const { config, schedulerConfig } = options;
+  // donor main.ts:2539-2543: the whole agent runs under one PostgreSQL pool
+  // owner, closed as the last shutdown step.
+  const postgresPoolOwner = new PostgresPoolOwner('agent');
+  try {
+    return await runWithPostgresPoolOwner(
+      postgresPoolOwner,
+      () => composeCompanionRuntime(options, postgresPoolOwner),
+    );
+  } catch (error) {
+    await postgresPoolOwner.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+/**
+ * donor bootstrap-helpers.ts:244 (the inner-life policy keys of settings.json),
+ * :271-272 (trust policy) and :423-425 (subagent roles, Automata policy).
+ */
+function applyInnerLifeConfig(config: SubstrateConfig, innerLife: InnerLifeConfig): void {
+  Object.assign(config, innerLife.settings);
+  setRuntimeTrustPolicy(innerLife.trustPolicy);
+  config.subagentRoles = innerLife.subagentRoles;
+  config.automataPolicy = innerLife.automataPolicy;
+}
+
+async function composeCompanionRuntime(
+  options: StartCompanionRuntimeOptions,
+  postgresPoolOwner: PostgresPoolOwner,
+): Promise<CompanionRuntime> {
+  const { config, innerLife } = options;
+  const schedulerConfig = innerLife.scheduler;
+  applyInnerLifeConfig(config, innerLife);
   const env = options.env ?? process.env;
   const pathSnapshot = options.pathSnapshot ?? resolveRuntimePathSnapshotFromConfig(config);
   // donor startup-context.ts:162-174 (EventBus, capability runtime, eligibility gate)
@@ -1524,7 +1565,77 @@ export async function startCompanionRuntime(
   await eventBus.emit('system.ready', {});
   log.info('Ready — waiting for messages');
 
-  let stopped = false;
+  // donor main.ts:2114-2128 (stopFn) and control-plane.ts:226-288 (the
+  // shutdown sequence) minus the cut steps: gateway, debug observer, health
+  // watchdog, module loader, API / admin servers, charge ledger, fatigue
+  // reservations, session tail cache, skill telemetry and the observed-group
+  // drain (registered only by the cut gateway message handlers).
+  const stopSequence = createRetryableShutdown(async () => {
+    unregisterIcpFeltImpulseAdapter();
+    await stopIcpCandidateLifecycleSupervisor();
+    const timeoutMs = 10_000;
+    await runShutdownSequence([
+      { step: 'emit system.shutdown event', action: () => eventBus.emit('system.shutdown', {}) },
+      {
+        step: 'abort background work recovery',
+        action: () => agentLoop.abortBackgroundWorkRecovery(),
+        failClosed: true,
+      },
+      { step: 'stop scheduler', action: () => scheduler.stop() },
+      {
+        step: 'stop durable background work supervisor',
+        action: () => runShutdownStep(
+          'stop durable background work supervisor',
+          () => agentLoop.stopBackgroundWork(),
+          log,
+          2,
+          true,
+        ),
+        maxAttempts: 1,
+        failClosed: true,
+      },
+      {
+        step: 'drain memory extractor',
+        action: async () => {
+          const drained = await memoryExtractor.stop({ timeoutMs });
+          if (!drained) {
+            log.warn('Proceeding with shutdown before extraction drain completed', { timeoutMs });
+          }
+        },
+      },
+      {
+        step: 'write graceful shutdown markers',
+        action: () => {
+          const markedChannels = sessionStore.markGracefulShutdownForActiveChannels();
+          if (markedChannels.length > 0) {
+            log.info('Wrote graceful shutdown markers', { channels: markedChannels });
+          }
+        },
+      },
+      {
+        // donor main.ts:2050-2084 (closeDatabase), the kept stores in donor order.
+        step: 'close database',
+        action: async () => {
+          await detachToolAvailability();
+          await companionAvailability.stop();
+          await persistenceRuntime.contactLifecycleRecovery?.stop();
+          await biographicalPool.end();
+          await persistenceRuntime.icpFeltImpulseFunnelStore.close();
+          await persistenceRuntime.emosimProactivityStateStore.close();
+          await persistenceRuntime.socialImpulseOutreachStore.close();
+          await persistenceRuntime.backgroundWorkStore.close();
+          await persistenceRuntime.automataBusStore.close();
+          await persistenceRuntime.automataRunRegistry.close();
+          await persistenceRuntime.introspectionLandmarkStore.close();
+          await persistenceRuntime.companionAvailabilityStore.close();
+          await persistenceRuntime.letterStore.close();
+          await persistenceRuntime.doingMirrorStore.close();
+          await postgresPoolOwner.close();
+        },
+      },
+    ], log);
+    log.info('Stopped');
+  });
   return {
     agentLoop,
     eventBus,
@@ -1532,19 +1643,6 @@ export async function startCompanionRuntime(
     llmProvider,
     persistence: persistenceRuntime,
     sessionManager,
-    stop: async () => {
-      if (stopped) return;
-      stopped = true;
-      scheduler.stop();
-      unregisterIcpFeltImpulseAdapter();
-      await stopIcpCandidateLifecycleSupervisor();
-      await detachToolAvailability();
-      await companionAvailability.stop();
-      await biographicalPool.end();
-      await persistenceRuntime.icpFeltImpulseFunnelStore.close?.();
-      await persistenceRuntime.emosimProactivityStateStore.close();
-      await persistenceRuntime.socialImpulseOutreachStore.close();
-      await persistenceRuntime.companionAvailabilityStore.close();
-    },
+    stop: stopSequence,
   };
 }
