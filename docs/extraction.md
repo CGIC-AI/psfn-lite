@@ -1664,8 +1664,10 @@ still held to those tokens (fail closed).
 Behaviour change: none for any served tool. A host tool named like a cut
 surface would now be an ordinary unknown tool: last in presentation order,
 not viewer-gated, and its old alias names are not refused or corrected.
-No Lite host registers one. Tests: 13 deleted (their subject is a cut
-surface or the cut class) and 22 rows edited. Where the subject is a kept
+No Lite host registers one. Tests: 16 deleted (their subject is a cut
+surface or the cut class; three are the `shard.long_horizon` cases of an
+`it.each` over the seed's Bus-eligible classes in
+`worker-execution.test.ts`, whose file is unchanged) and 22 rows edited. Where the subject is a kept
 mechanism (alias correction, presentation rank, viewer ceiling), the
 fixture is re-pointed from the cut surface to a kept one, and the
 assertions keep their shape. `tests/conformance/absence.test.ts` now also
@@ -1888,6 +1890,12 @@ exports stay cut (B7 charge, 3.11 operator-alerts). The recorder exists so
 the donor `LLMClient` accountability guard admits the autonomous lanes.
 This is the decided design, not an open item. There is no code change in
 this step.
+
+Step E result (the plain validation command with a JSON reporter, both
+projects): 774 files and 9,190 tests passed. `compare-baseline.mjs`:
+"baseline: 807 files / 10107 tests; deleted: 54 files, 1041 tests; matched:
+9066; Lite additions: 4 files, 27 tests" and "equivalent: every remaining
+baseline test has its baseline status". The Hermes plugin suite: 70 passed.
 
 ## Measured size
 
