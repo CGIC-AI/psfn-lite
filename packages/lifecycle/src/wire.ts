@@ -31,6 +31,14 @@ export interface SettleBody {
   readonly errorMessage: string | null;
 }
 
+/** The host's human approved the memory delete call that requested this proposal (Step E3). */
+export interface MemoryDeletionApproveBody {
+  readonly hostInstance: string;
+  readonly hermesInstallId: string;
+  readonly proposalId: string;
+  readonly memoryId: string;
+}
+
 export interface CheckpointBody {
   readonly hermesInstallId: string;
   readonly sessionId: string;
@@ -156,6 +164,19 @@ function parseOutcome(raw: unknown): Result<{ outcome: HostOutcome; errorMessage
     return done(f, () => ({ outcome: { kind: 'failed', code }, errorMessage: message }));
   }
   return invalid('outcome.kind must be completed, interrupted or failed');
+}
+
+/** Donor proposal and memory ids (randomUUID; memories keep their store id). */
+const RECORD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,127}$/;
+
+export function parseMemoryDeletionApprove(raw: unknown): Result<MemoryDeletionApproveBody> {
+  const f = fields(raw, '', ['hostInstance', 'hermesInstallId', 'proposalId', 'memoryId']);
+  if (!f.ok) return f;
+  const hostInstance = f.value.pattern('hostInstance', INSTANCE_PATTERN, '1-64 characters of [A-Za-z0-9._-]');
+  const hermesInstallId = f.value.pattern('hermesInstallId', HERMES_INSTALL_ID_PATTERN, INSTALL_DESCRIPTION);
+  const proposalId = f.value.pattern('proposalId', RECORD_ID_PATTERN, 'a proposal id');
+  const memoryId = f.value.pattern('memoryId', RECORD_ID_PATTERN, 'a memory id');
+  return done(f.value, () => ({ hostInstance, hermesInstallId, proposalId, memoryId }));
 }
 
 export function parseCheckpoint(raw: unknown): Result<CheckpointBody> {

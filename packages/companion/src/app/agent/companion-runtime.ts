@@ -94,6 +94,7 @@ import type { SubstrateStreamTransport } from '../../core/agent/stream-adapter.j
 import { CompanionAvailabilityRuntime, attachToolAvailability } from '../../core/agent/companion-availability.js';
 import { createMemoryStorePort } from '../../faculties/memory/memory-store-port.js';
 import type { MemoryDeletionApprovalPort } from '../../faculties/memory/deletion-proposals.js';
+import { recoverPendingMemoryDeletionProposals } from '../../faculties/memory/deletion-proposal-recovery.js';
 import { EmotionObserver, type TextEmotionClassifierLike } from '../../core/emotion/observer.js';
 import { EmotionState } from '../../core/emotion/state.js';
 import type { EmoSimProactivityImpulse } from '../../core/emotion/emosim-proactivity-port.js';
@@ -1377,6 +1378,14 @@ async function composeCompanionRuntime(
     memoryDeletionPolicy: () => config.memoryDeletionPolicy,
     memoryRetrievalPolicy: () => config.memoryRetrievalPolicy,
   });
+  // donor main.ts:603: the host's confirmation surface is volatile, so the
+  // pending proposals are offered to it again at start.
+  if (options.memoryDeletionApprovalPort) {
+    await recoverPendingMemoryDeletionProposals(
+      persistenceRuntime.memoryDeletionProposalStore,
+      options.memoryDeletionApprovalPort,
+    );
+  }
   // main.ts:1691 (markdown journal tool)
   registerMarkdownJournalTools(agentLoop, pathSnapshot.workspaceRoot);
   // main.ts:1710-1717 (long-horizon follow-ups; sender is the host port)

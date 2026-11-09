@@ -23,7 +23,8 @@ other revision.
 | Hermes hook | What the plugin does |
 | --- | --- |
 | `pre_llm_call` | First settles, as failed (`hermes_turn_unfinished`), any turn of the same conversation that is still open: several Hermes failure paths return without `on_session_end`. Then it prepares the Lite turn in the conversation's Lite session. That session is the Hermes session id the conversation started with, kept across compressions. The idempotency key comes from the Hermes session and turn ids, so a retried call resumes the same Lite turn, and a prepare whose answer was lost is sent once more under the same key. The plugin then injects the donor's context into the user message as labelled blocks. |
-| `pre_tool_call` | Blocks every `mcp__psfn_lite__*` call that is not inside an open Lite turn of this process. Hermes's MCP client sends the standing credential on every call, whoever the turn is for. This gate is what keeps unbound senders, subagents, the background review, and cron or flush agents out of Lite. |
+| `pre_tool_call` | Blocks every `mcp__psfn_lite__*` call that is not inside an open Lite turn of this process. Hermes's MCP client sends the standing credential on every call, whoever the turn is for. This gate is what keeps unbound senders, subagents, the background review, and cron or flush agents out of Lite. A companion memory delete (`memory`, `action: delete`) inside the turn goes to Hermes's human approval gate (`approve`): once, session, always or deny. A denial or a timeout blocks the call, and the memory stays. |
+| `post_tool_call` | After an approved memory delete ran, approves in Lite the deletion proposal that call created (`memory-deletion/approve`). Lite accepts it once, only from the turn that made the call. If the call changed, the turn ended or Lite refused, the memory is kept and the next turn's context says so. |
 | `post_llm_call` | Keeps the turn's final reply. |
 | `on_session_end` | Settles the turn with what actually happened: `completed` with the reply; `interrupted`; `failed` with Hermes's exit reason; or `failed` / `hermes_no_reply` when Hermes completed without a reply. Open turns are keyed by Hermes's turn id, so a compression that rotates the session id mid-turn does not lose the turn. |
 | `on_session_finalize` | Settles, as failed (`hermes_turn_unfinished`), any turn still open in the session Hermes closed (exit, `/new`, expiry). |
@@ -206,7 +207,9 @@ exact commands, see `docs/development.md`.
   a scripted bridge. It covers discovery through the memory slot, hooks
   registered once, labelled context, every outcome, review and subagent
   guards, unbound senders, undeliverable events, compaction refusal and
-  ownership checks.
+  ownership checks, and the memory delete approval (the `approve`
+  directive, the resolve after an approved call, nothing after a blocked
+  one).
 - `test_turn_integrity.py` also runs inside the pinned Hermes against the
   scripted bridge. It covers:
   - a real `AIAgent.run_conversation` that fails with HTTP 403 and never
@@ -226,7 +229,9 @@ exact commands, see `docs/development.md`.
     hidden from a contact it is not disclosed to;
   - settled outcomes in the donor's history;
   - a turn Hermes never ended, a rotated session, a lost prepare answer,
-    and compaction.
+    and compaction;
+  - a memory delete through Hermes's CLI approval prompt: a denial keeps
+    the memory, an approval deletes it.
 
   It needs Docker and Node, like the TypeScript integration suites.
   `LITE_SKIP_DOCKER_TESTS=1` opts out explicitly.

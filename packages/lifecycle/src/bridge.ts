@@ -106,7 +106,8 @@ export class HostTurnBridge {
     return turn.owner.startsWith(`${principal}/`);
   }
 
-  private boundInstall(hermesInstallId: string): Result<null> {
+  /** Whether a request names the Hermes install this bridge serves. */
+  boundInstall(hermesInstallId: string): Result<null> {
     return hermesInstallId === this.options.hermesInstallId
       ? ok(null)
       : denied('wrong_install', 'this companion is bound to another Hermes install');

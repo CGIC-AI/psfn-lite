@@ -22,6 +22,17 @@ Lite turn, because Hermes's MCP client sends the profile's standing
 credential whoever the turn is for. Before Hermes compacts, ``checkpoint``
 proves every Lite turn of the session is in Lite's canonical history.
 
+The companion's memory deletions are decided by Hermes's human. The donor
+``memory`` tool never deletes on its own: ``action=delete`` records a pending
+proposal. ``pre_tool_call`` escalates that call to Hermes's approval gate
+(``{"action": "approve"}``, which Hermes resolves in
+``tools.approval.request_tool_approval``: once, session, always or deny, and a
+timeout or a gate failure blocks the call). The model cannot skip it: Hermes
+asks before the call runs. A denied call never reaches Lite, so no proposal is
+made and the memory stays. After an approved call, ``post_tool_call`` tells
+Lite to approve the proposal that call created (``memory-deletion/approve``);
+Lite accepts that once, only from the turn that made the call.
+
 A Hermes install (its desktop, gateway, mobile, messaging and CLI surfaces)
 is one source serving one user, and Lite binds its sessions to the install:
 prepare and checkpoint name the install id Hermes keeps in its root, and a
@@ -34,8 +45,10 @@ callback, and named in the next turn's context.
 """
 
 import hashlib
+import json
 import logging
 import os
+import re
 import secrets
 import threading
 
@@ -50,6 +63,10 @@ from .render import block, render_context
 logger = logging.getLogger(__name__)
 
 _SWEPT_KEPT = 256
+#: The donor memory tool's name on the Lite MCP server, and the text its delete returns (faculties/memory/tools.ts).
+_MEMORY_TOOL = "memory"
+_PROPOSAL = re.compile(r"Memory deletion proposal ([A-Za-z0-9:._-]{1,128}) is pending")
+_EXPLANATION_SHOWN = 400
 _NOTE = "system note: psfn_lite"
 TOOL_BLOCKED = (
     "PSFN Lite tools work only inside a turn recorded in the companion's Lite continuity: not in a subagent, "
@@ -86,6 +103,8 @@ class Driver:
         #: Hermes turn ids settled as unfinished, so a late on_session_end is reported, not ignored.
         self._swept = {}
         self._subagents = set()
+        #: Memory delete calls sent to Hermes's approval gate: tool call key -> the memory id the human was asked about.
+        self._deletions = {}
         #: Warnings to show in the next turn's context, per Hermes session.
         self._carry = {}
         self.delivery = Delivery(client, ledger, instance=instance, fail=self._fail, notice=self._notice)
@@ -171,15 +190,67 @@ class Driver:
         text = render_context(prepared["context"], warnings=warnings, limit=self.config.max_context_chars)
         return {"context": text}
 
-    def pre_tool_call(self, tool_name="", session_id="", turn_id="", **_):
-        """Lite's governed tools run only inside an open Lite turn; Hermes sends the standing credential for every caller."""
+    def pre_tool_call(self, tool_name="", session_id="", turn_id="", args=None, tool_call_id="", **_):
+        """Lite's governed tools run only inside an open Lite turn; Hermes sends the standing credential for every caller.
+
+        A memory delete inside the turn goes to Hermes's human approval gate first.
+        """
         if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
             return None
         entry = self._entry(turn_id, session_id)
-        if entry is not None:
+        if entry is None:
+            logger.warning("psfn_lite blocked %s outside a Lite turn (session %s, turn %s)", tool_name, session_id, turn_id)
+            return {"action": "block", "message": TOOL_BLOCKED}
+        if not self._is_memory_delete(tool_name, args):
             return None
-        logger.warning("psfn_lite blocked %s outside a Lite turn (session %s, turn %s)", tool_name, session_id, turn_id)
-        return {"action": "block", "message": TOOL_BLOCKED}
+        memory_id = args.get("memory_id")
+        memory_id = memory_id.strip() if isinstance(memory_id, str) else ""
+        category = args.get("justification_category")
+        category = category if isinstance(category, str) else ""
+        explanation = args.get("explanation")
+        explanation = explanation if isinstance(explanation, str) else ""
+        shown = explanation if len(explanation) <= _EXPLANATION_SHOWN else explanation[:_EXPLANATION_SHOWN] + "..."
+        digest = hashlib.sha256(f"{memory_id}\n{category}\n{explanation}".encode("utf-8")).hexdigest()[:12]
+        with self._lock:
+            self._deletions[self._call_key(turn_id, tool_call_id)] = memory_id
+        return {
+            "action": "approve",
+            "message": (
+                f"The companion asks to delete one of its memories (memory {memory_id or '(no id)'}; "
+                f"reason {category or '(none)'}: {shown or '(no explanation)'}). "
+                "Approve only if this memory should be deleted; deny to keep it."
+            ),
+            # The [a]lways and session grain: this memory, for this reason; never every memory delete.
+            "rule_key": f"psfn_lite_memory_delete:{digest}",
+        }
+
+    def post_tool_call(self, tool_name="", args=None, result=None, session_id="", turn_id="", tool_call_id="", status="", **_):
+        """After Hermes's human approved a memory delete and it ran, Lite approves the proposal that call created."""
+        if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
+            return
+        with self._lock:
+            asked = self._deletions.pop(self._call_key(turn_id, tool_call_id), None)
+        if asked is None:
+            return  # not a delete this plugin sent to the gate
+        if status != "ok":
+            return  # blocked (denied, timed out, gate failure) or refused by the tool: no proposal to approve
+        entry = self._entry(turn_id, session_id)
+        memory_id = args.get("memory_id").strip() if isinstance(args, dict) and isinstance(args.get("memory_id"), str) else ""
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+        found = _PROPOSAL.search(text or "")
+        if entry is None or not self._is_memory_delete(tool_name, args) or not asked or memory_id != asked or found is None:
+            # Another plugin changed the call, the turn ended, or the result names no proposal: it stays pending.
+            self._notice(session_id, f"The memory deletion approved in Hermes was not applied: the call that ran was not the one approved (memory {asked or '(no id)'} is kept).")
+            return
+        try:
+            self.client.call("memory-deletion/approve", {
+                "hostInstance": self.instance,
+                "hermesInstallId": self.install,
+                "proposalId": found.group(1),
+                "memoryId": memory_id,
+            })
+        except BridgeError as error:
+            self._notice(session_id, f"The memory deletion approved in Hermes did not reach Lite ({error}); memory {memory_id} is kept and its proposal stays pending.")
 
     def post_llm_call(self, session_id="", turn_id="", assistant_response=None, **_):
         entry = self._entry(turn_id, session_id)
@@ -278,6 +349,13 @@ class Driver:
             warnings.append(message)
             self._finish(entry, unfinished(why))
         return warnings
+
+    def _is_memory_delete(self, tool_name, args) -> bool:
+        return tool_name == self.config.tool_prefix + _MEMORY_TOOL and isinstance(args, dict) and args.get("action") == "delete"
+
+    @staticmethod
+    def _call_key(turn_id, tool_call_id) -> str:
+        return f"{turn_id if isinstance(turn_id, str) else ''}\n{tool_call_id if isinstance(tool_call_id, str) else ''}"
 
     def _entry(self, turn_id, session_id):
         """The open turn for a Hermes turn id, following the turn when a compression rotated its session id."""

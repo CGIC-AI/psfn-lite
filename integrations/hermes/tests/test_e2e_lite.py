@@ -14,6 +14,7 @@ LITE_SKIP_DOCKER_TESTS=1 opts out explicitly and says so.
 
 import json
 import os
+import re
 import select
 import shutil
 import subprocess
@@ -104,6 +105,24 @@ def hermes_turn(session, turn_id, message, *, reply=None, interrupted=False, fai
 
 
 SEED_THREAD = "Robin is sorting the seed packets for spring"
+
+
+@pytest.fixture
+def human(monkeypatch):
+    """Hermes's interactive CLI approval prompt, answered by the test as its human would."""
+    from tools.terminal_tool import set_approval_callback
+
+    prompts = []
+    answer = {"choice": "deny"}
+
+    def prompt(command, description, **_):
+        prompts.append(description)
+        return answer["choice"]
+
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    set_approval_callback(prompt)
+    yield prompts, answer
+    set_approval_callback(None)
 
 
 def test_hermes_reaches_the_companion_tools_over_its_own_mcp_client(operator):
@@ -208,3 +227,26 @@ def test_a_contact_the_operator_thread_is_not_disclosed_to_does_not_see_it(lite,
     while plugin_module("runtime").driver().ledger.pending() and time.monotonic() < deadline:
         time.sleep(0.1)
     assert plugin_module("runtime").driver().ledger.pending() == []
+
+
+def test_a_memory_delete_is_decided_by_the_hermes_human_and_a_denial_keeps_the_memory(operator, human):
+    prompts, answer = human
+    session, turn_id = "e2e-delete", "e2e-delete:t"
+    begin(session, turn_id, "forget the wrong locker code")
+    written = call_tool("memory", "write", session=session, turn_id=turn_id, text="Robin's locker code is 4471.", type="semantic", sensitivity="personal")
+    memory_id = re.search(r"id: ([0-9a-f-]{36})", written).group(1)
+    delete = dict(memory_id=memory_id, justification_category="factually_incorrect", explanation="The locker code changed.")
+
+    # The human denies: Hermes blocks the call before it runs, so Lite makes no proposal and the memory stays.
+    denied = dispatch("memory", "delete", session=session, turn_id=turn_id, **delete)
+    assert len(prompts) == 1 and memory_id in prompts[0] and "The locker code changed." in prompts[0]
+    assert "BLOCKED" in denied and "Memory deletion proposal" not in denied
+    assert "4471" in call_tool("memory", "search", session=session, turn_id=turn_id, query="locker code")
+
+    # The human approves once: the call runs, and the proposal it created is approved, so the memory is deleted.
+    answer["choice"] = "once"
+    approved = dispatch("memory", "delete", session=session, turn_id=turn_id, **delete)
+    assert len(prompts) == 2
+    assert "Memory deletion proposal" in approved
+    assert "4471" not in call_tool("memory", "search", session=session, turn_id=turn_id, query="locker code")
+    finish(session, turn_id, reply="Forgotten.")

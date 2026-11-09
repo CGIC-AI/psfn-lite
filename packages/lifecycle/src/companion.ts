@@ -18,6 +18,13 @@ export type { TurnRecord } from '../../companion/src/shared/contracts/runtime.js
 export { NonRecoverableFallbackError } from '../../companion/src/primitives/llm/fallback.js';
 export { createTurnId } from '../../companion/src/core/turns/id.js';
 export { externalMemorySessionId } from '../../companion/src/shared/contracts/external-memory.js';
+export { getRequestContext } from '../../companion/src/primitives/llm/request-context.js';
+export type {
+  MemoryDeletionApprovalPort,
+  MemoryDeletionApprovalRequest,
+  MemoryDeletionApprovalResult,
+  MemoryDeletionProposalStorePort,
+} from '../../companion/src/faculties/memory/deletion-proposals.js';
 export {
   HostedAutomataExecutor,
   type HostedAttemptClaim,

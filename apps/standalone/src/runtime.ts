@@ -28,6 +28,7 @@ import {
 import type { LiteConfig, LiteSecrets } from './config.ts';
 import { createHostSessionIntegrityProvider } from './session-integrity.ts';
 import {
+  HostMemoryDeletionApprovals,
   HostTurnBridge,
   HostTurnRelay,
   createHostToolPort,
@@ -163,6 +164,10 @@ export async function createLiteRuntime(input: {
   process.env['CONFIG_DIR'] ??= seedDir;
   const registry = { models: [companionModelRegistryEntryOf(model.value, HOST_MODEL_ENTRY)] };
   const relay = config.lifecycle === null ? null : new HostTurnRelay();
+  // Memory deletion in a host-driven turn is approved by the host's human (docs/extraction.md, Step E3).
+  const memoryDeletion = relay === null || config.lifecycle === null
+    ? null
+    : new HostMemoryDeletionApprovals({ relay, approvalWindowMs: config.lifecycle.hostTurnTimeoutMs });
   const modelUsage = createModelUsageLedger();
   // Hosted automata: spawned automata run as host subagents, attempt by attempt (docs/extraction.md, operator automata rules).
   const automata = config.lifecycle?.automata == null
@@ -205,7 +210,9 @@ export async function createLiteRuntime(input: {
       env: { ...env, CONFIG_DIR: seedDir },
       ...(relay === null ? {} : { wrapStreamTransport: relay.wrapTransport }),
       automataHostExecution: automata,
+      ...(memoryDeletion === null ? {} : { memoryDeletionApprovalPort: memoryDeletion }),
     });
+    memoryDeletion?.attach(companion.persistence.memoryDeletionProposalStore);
   } catch (error) {
     automata?.close();
     return unavailable('companion_runtime', error instanceof Error ? error.message : 'the companion runtime did not start');
@@ -241,6 +248,10 @@ export async function createLiteRuntime(input: {
   let lifecycleUrl: string | null = null;
   if (bindings !== null && config.mcp !== null) {
     const principals = bindings.value;
+    const primaryPrincipal = (principal: string): boolean => {
+      const key = principals.contactOf(principal);
+      return key !== null && contactKeys.get(key)?.trust === 'primary';
+    };
     if (relay !== null && config.lifecycle !== null) {
       relay.attach(companion.agentLoop);
       bridge = new HostTurnBridge({
@@ -287,10 +298,10 @@ export async function createLiteRuntime(input: {
         onError: (report) => onDiagnostic({ kind: 'lifecycle', report }),
         automata,
         // Automata carry the companion's private work: only a principal bound to a primary contact runs them.
-        automataAdmits: (principal) => {
-          const key = principals.contactOf(principal);
-          return key !== null && contactKeys.get(key)?.trust === 'primary';
-        },
+        automataAdmits: primaryPrincipal,
+        memoryDeletion,
+        // The primary contact decides memory deletions, as the donor's Operator validated them.
+        primaryAdmits: primaryPrincipal,
       });
       if (!lifecycle.ok) {
         await closeAll();

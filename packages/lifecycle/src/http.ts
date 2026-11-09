@@ -13,7 +13,9 @@ import type { AddressInfo } from 'node:net';
 import { bearerCredential, invalid, ok, publicError, unavailable, type HostError, type Result } from './mcp.ts';
 import type { HostTurnBridge } from './bridge.ts';
 import type { HostedAttemptRefusal, HostedAutomataExecutor, HostedResult } from './companion.ts';
+import type { HostMemoryDeletionApprovals } from './memory-deletion.ts';
 import {
+  parseMemoryDeletionApprove,
   parseAutomataAttempt,
   parseAutomataBus,
   parseAutomataClaim,
@@ -55,6 +57,14 @@ export interface LifecycleBridgeOptions {
    * admits only principals bound to its primary contact. Required with `automata`.
    */
   readonly automataAdmits?: (principal: string) => boolean;
+  /**
+   * Memory deletion approved by the host's human (Step E3): the route
+   * `memory-deletion/approve` exists only when it is set. Only principals
+   * `primaryAdmits` admits (bound to the primary contact, who decides
+   * deletions as the donor's Operator did) approve.
+   */
+  readonly memoryDeletion?: HostMemoryDeletionApprovals | null;
+  readonly primaryAdmits?: (principal: string) => boolean;
 }
 
 export interface LifecycleBridge {
@@ -111,6 +121,7 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
 
   return {
     ...(options.automata ? createAutomataRoutes(options.automata, options.automataAdmits ?? (() => false), fail) : {}),
+    ...(options.memoryDeletion ? { 'memory-deletion/approve': memoryDeletionRoute(options.memoryDeletion, bridge, options.primaryAdmits ?? (() => false), fail) } : {}),
     async prepare(request) {
       const body = parsePrepare(request.body);
       if (!body.ok) return fail(request, body.error);
@@ -152,6 +163,26 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
 }
 
 const STATUS: Readonly<Record<HostError['kind'], number>> = { denied: 403, not_found: 404, conflict: 409, invalid: 400, unavailable: 503 };
+
+function memoryDeletionRoute(
+  approvals: HostMemoryDeletionApprovals,
+  bridge: HostTurnBridge,
+  admits: (principal: string) => boolean,
+  fail: (request: Request, error: HostError) => Reply,
+): (request: Request) => Promise<Reply> {
+  return async (request) => {
+    if (!admits(request.principal)) {
+      return fail(request, { kind: 'denied', reason: 'deletion_not_admitted', detail: 'only the primary contact approves memory deletion' });
+    }
+    const body = parseMemoryDeletionApprove(request.body);
+    if (!body.ok) return fail(request, body.error);
+    const bound = bridge.boundInstall(body.value.hermesInstallId);
+    if (!bound.ok) return fail(request, bound.error);
+    const owner = `${request.principal}/${body.value.hostInstance}`;
+    const approved = await approvals.approve(owner, body.value.proposalId, body.value.memoryId, `host:${request.principal}`);
+    return approved.ok ? { status: 200, body: { ...approved.value } } : fail(request, approved.error);
+  };
+}
 
 /** An attempt refusal as HTTP: an ended attempt is gone (410), a stranger's is forbidden. */
 const REFUSAL_STATUS: Readonly<Record<HostedAttemptRefusal, number>> = {

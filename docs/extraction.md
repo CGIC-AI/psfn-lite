@@ -961,7 +961,9 @@ still fails the comparison.
 - **Continuity channels.** No continuity channel ids by default. The donor
   read them from `channels.json`.
 - **Memory deletion.** Without a host approval port, the companion's memory
-  delete action returns the donor's "not configured" error.
+  delete action returns the donor's "not configured" error. (Step E3: the
+  standalone host passes a port when the lifecycle bridge is configured, and
+  Hermes's human approval gate decides.)
 - **Observed group memory.** `ObservedGroupMemoryScheduler` gets no channel
   view, because no channel adapter publishes group-memory channels. It serves
   the reflection runtime as the memory scope classifier only.
@@ -1732,6 +1734,94 @@ edit. The bridge refuses another install. The test installs now use
 suite runs with the chain on. In the plugin suite, `test_host_contract.py`
 covers the missing or malformed id and a `wrong_install` refusal.
 
+### E3: memory deletion is approved through the host
+
+The donor never lets the model delete a memory. The `memory` tool's
+`action=delete` (`faculties/memory/tools.ts:1579-1623`) needs the proposal
+store and a `MemoryDeletionApprovalPort`. It records a pending proposal
+(`pending_partner_alert`), calls the port, and answers "Memory deletion
+proposal <id> is pending Operator validation ... the memory remains
+active". The memory is deleted only when the proposal is approved
+(`approveMemoryDeletionProposal`). In the donor, the port was the gateway's
+confirmation surface: its resolve approved or denied the proposal
+(`app/agent/main.ts:583-602`), and at boot the pending proposals were sent
+to the port again (`main.ts:603`). The capability tier does not change this
+(E4).
+
+Lite now passes a host port:
+
+- **Hermes.** The human decision is Hermes's own approval gate, taken
+  before the call runs:
+  - The plugin's `pre_tool_call` returns
+    `{"action": "approve", "message": ..., "rule_key": ...}` for a
+    `mcp__psfn_lite__memory` call with `action: delete` inside an open Lite
+    turn (`integrations/hermes/psfn_lite/lifecycle.py:193-225`). The message
+    names the memory, the reason category and the explanation (truncated at
+    400 characters). The `rule_key` is a digest of the memory id, category
+    and explanation, so an `[a]lways` or session answer covers only that
+    memory for that reason, never every delete.
+  - Hermes sends that directive to `tools.approval.request_tool_approval`
+    (`hermes_cli/plugins.py` `_resolve_block_from_details`): the CLI prompt
+    or the gateway's approval message, with once, session, always and deny.
+    A denial, a timeout, or a failure of the gate blocks the call. The model
+    cannot skip it, because Hermes asks before it dispatches the call. In
+    an unattended context with no human (not cron, not the gateway, no
+    `HERMES_INTERACTIVE`) the gate fails closed.
+  - A denied call never reaches Lite. No proposal is made, and the memory
+    stays.
+  - After an approved call ran, the plugin's `post_tool_call`
+    (`lifecycle.py:227-252`) reads the proposal id from the result and calls
+    the bridge route `memory-deletion/approve` with the install id, the
+    proposal and the memory. It does this only when the call ran (`status`
+    `ok`), is still a delete of the memory the human was asked about (another
+    plugin's `modify` directive can change the arguments), and its turn is
+    still open. Otherwise, or when Lite refuses, the memory is kept, the
+    proposal stays pending, and the plugin reports it in the next turn's
+    context.
+  - Operator choices that approve without a prompt are Hermes's, not Lite's:
+    `--yolo`, a prior `[a]lways` or session answer for the same rule key,
+    `approvals.cron_mode: approve` and `approvals.single_query_mode: approve`.
+- **Lite.** `HostMemoryDeletionApprovals`
+  (`packages/lifecycle/src/memory-deletion.ts`) is the port. When the donor
+  tool calls it from inside a host-driven turn (the request context's
+  channel is an open host turn), it records the turn, its owner and the
+  memory. The bridge route (`packages/lifecycle/src/http.ts:124, 167-185`)
+  accepts the approval only:
+  - from a principal bound to the primary contact (who decides deletions,
+    as the donor's Operator did), else 403 `deletion_not_admitted`;
+  - for the bound Hermes install (E2), else 403 `wrong_install`;
+  - once per proposal, from the owner of the turn that requested it, else
+    404;
+  - for the same memory, else 409 `memory_mismatch`;
+  - within the host-turn timeout and while that turn is open, else 409
+    `approval_expired` or `turn_ended`.
+
+  A refused approval uses up the request, so the proposal stays pending.
+  An accepted one marks the partner alert and approves the proposal, as
+  the donor's gateway did, and the memory is deleted.
+- **Pending proposals.** A proposal made outside a host turn (the operator's
+  own Pi turn, or the boot replay) stays pending, as the donor leaves a
+  proposal until a decision arrives. `startCompanionRuntime` replays the
+  pending proposals to the port at boot, as the donor did
+  (`app/agent/companion-runtime.ts:1383-1388`, donor `main.ts:603`).
+- **Standalone without the lifecycle bridge, the operator's own Pi turns
+  and an embedding host.** The standalone host passes the port only when
+  `lifecycle` is configured (`apps/standalone/src/runtime.ts:166-170, 213-215`).
+  Without it, and in a host that passes no port, the donor tool answers
+  "memory deletion proposal persistence and confirmation are not
+  configured" and deletes nothing.
+
+Tests: `tests/lifecycle/memory-deletion.integration.test.ts` (the donor
+tool only proposes; only the primary contact, the bound install, the
+requesting turn, the same memory and one answer approve; a settled turn and
+a Pi-direct proposal stay pending), `tests/standalone/memory-deletion.integration.test.ts`
+("not configured" with no port, at the `autonomous` default), and in the
+plugin suite `test_host_contract.py` (the approve directive and its rule
+key, the resolve after `ok`, nothing after `blocked`, a changed call and a
+refusal reported) and `test_e2e_lite.py` (Hermes's real dispatch and CLI
+approval prompt against a real Lite: a denial blocks the call and keeps the
+memory, an approval deletes it).
+
 ### E4: the capability tier is an owner file, default `autonomous`
 
 Lite had fixed the tier at `nursery` (seam 3.17,
@@ -1765,7 +1855,7 @@ Without a port it returns "memory deletion proposal persistence and
 confirmation are not configured" and deletes nothing. With a port it only
 creates a pending proposal. The memory is deleted only when a person
 approves (`approveMemoryDeletionProposal`). So the tier does not let the
-model skip approval (E3, below).
+model skip approval (E3, above).
 
 Tests: the donor `capability-tier-config.test.ts` and the subsystem-config
 round trip are back unchanged, and their deleted rows are removed.
