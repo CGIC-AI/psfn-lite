@@ -889,3 +889,4 @@ cut	src/persistence/postgres/retired-fleet-grantees.ts
 cut	src/shared/utils/postgres-credential.ts
 cut	src/shared/contracts/cogsec-persona-conformance.ts
 cut	src/system/capabilities/shard-derivation.ts
+promoted	src/system/config/provider-runtime-factory.ts

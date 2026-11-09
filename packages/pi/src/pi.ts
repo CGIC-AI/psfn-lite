@@ -8,5 +8,5 @@
 export { runAgentLoop } from '@earendil-works/pi-agent-core';
 export type { AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, AgentToolResult, StreamFn } from '@earendil-works/pi-agent-core';
 export { Type, createModels } from '@earendil-works/pi-ai';
-export type { Api, AssistantMessage, AuthContext, Context, Message, Model, Models, SimpleStreamOptions, TextContent, Usage, UserMessage } from '@earendil-works/pi-ai';
+export type { Api, AssistantMessage, AssistantMessageEvent, AuthContext, AuthResult, Context, Message, Model, Models, SimpleStreamOptions, TextContent, Usage, UserMessage } from '@earendil-works/pi-ai';
 export { builtinProviders } from '@earendil-works/pi-ai/providers/all';
