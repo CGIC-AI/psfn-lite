@@ -19,7 +19,7 @@ from .lifecycle import Driver, host_instance
 
 logger = logging.getLogger(__name__)
 
-HOOKS = ("pre_llm_call", "pre_tool_call", "post_llm_call", "on_session_end", "on_session_finalize", "subagent_start")
+HOOKS = ("pre_llm_call", "pre_tool_call", "post_tool_call", "post_llm_call", "on_session_end", "on_session_finalize", "subagent_start")
 
 _lock = threading.RLock()
 _drivers = {}

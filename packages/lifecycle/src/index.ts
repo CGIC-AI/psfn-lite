@@ -32,3 +32,4 @@ export {
 } from './host-turns.ts';
 export { LIFECYCLE_PATH, startLifecycleBridge, type LifecycleBridge, type LifecycleBridgeOptions, type LifecycleErrorReport } from './http.ts';
 export { createHostToolPort, donorToolDefinitions, type DonorTool, type DonorToolCatalog } from './tools.ts';
+export { HostMemoryDeletionApprovals, type HostMemoryDeletionOptions, type MemoryDeletionResolution } from './memory-deletion.ts';

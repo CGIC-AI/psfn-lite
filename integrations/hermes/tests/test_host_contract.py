@@ -63,7 +63,7 @@ def test_lifecycle_hooks_are_valid_and_registered_once_however_often_hermes_load
         load_provider()
     hooks, valid = our_hooks()
     registered = {name for name, callbacks in hooks.items() if callbacks}
-    assert registered == {"pre_llm_call", "pre_tool_call", "post_llm_call", "on_session_end", "on_session_finalize", "subagent_start"}
+    assert registered == {"pre_llm_call", "pre_tool_call", "post_tool_call", "post_llm_call", "on_session_end", "on_session_finalize", "subagent_start"}
     assert registered <= valid
     assert all(len(hooks[name]) == 1 for name in registered)
 
@@ -269,3 +269,51 @@ def test_a_subagent_is_recognised_by_its_platform_even_without_subagent_start(pr
     load_provider()
     assert fire("pre_llm_call", **turn(session="child-x", turn_id="c-x", platform="subagent", parent="sess-1")) == []
     assert bridge.requests == []
+
+
+MEMORY_TOOL = "mcp__psfn_lite__memory"
+DELETE = {"action": "delete", "memory_id": "mem-1", "justification_category": "factually_incorrect", "explanation": "The stored number is wrong."}
+PENDING = '{"result": "Memory deletion proposal prop-1 is pending Operator validation. The memory remains active."}'
+
+
+def test_a_memory_delete_in_a_lite_turn_goes_to_the_hermes_human_and_its_approval_resolves_the_proposal(profile, bridge):
+    bridge.handlers["memory-deletion/approve"] = lambda route, body: (200, {"proposalId": body["proposalId"], "status": "approved", "deleteId": "del-1"})
+    load_provider().initialize("sess-1", hermes_home=str(profile), platform="cli")
+    fire("pre_llm_call", **turn())
+    # Other memory actions are not escalated.
+    assert fire("pre_tool_call", tool_name=MEMORY_TOOL, args={"action": "search", "query": "x"}, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-0") == []
+    [directive] = fire("pre_tool_call", tool_name=MEMORY_TOOL, args=dict(DELETE), session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-1")
+    # Hermes's human approval gate (tools.approval.request_tool_approval), not a plugin decision.
+    assert directive["action"] == "approve"
+    assert "mem-1" in directive["message"] and "factually_incorrect" in directive["message"] and "The stored number is wrong." in directive["message"]
+    # The [a]lways grain is this memory for this reason, never every delete.
+    assert directive["rule_key"].startswith("psfn_lite_memory_delete:") and directive["rule_key"] != "psfn_lite_memory_delete:"
+    [other] = fire("pre_tool_call", tool_name=MEMORY_TOOL, args={**DELETE, "memory_id": "mem-2"}, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-2")
+    assert other["rule_key"] != directive["rule_key"]
+    fire("post_tool_call", tool_name=MEMORY_TOOL, args={**DELETE, "memory_id": "mem-2"}, result='{"error": "denied"}', session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-2", status="blocked")
+    assert bridge.bodies("memory-deletion/approve") == []
+    # Approved and run: Lite approves the proposal that call created, for the bound install.
+    fire("post_tool_call", tool_name=MEMORY_TOOL, args=dict(DELETE), result=PENDING, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-1", status="ok")
+    assert bridge.bodies("memory-deletion/approve") == [{"hostInstance": bridge.bodies("prepare")[0]["hostInstance"], "hermesInstallId": INSTALL_ID, "proposalId": "prop-1", "memoryId": "mem-1"}]
+    # A second post for the same call resolves nothing more.
+    fire("post_tool_call", tool_name=MEMORY_TOOL, args=dict(DELETE), result=PENDING, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-1", status="ok")
+    assert len(bridge.bodies("memory-deletion/approve")) == 1
+    fire("on_session_end", **end())
+
+
+def test_a_memory_delete_whose_call_was_changed_or_did_not_reach_lite_is_kept_and_reported(profile, bridge):
+    bridge.handlers["memory-deletion/approve"] = lambda route, body: (409, {"error": {"kind": "conflict", "reason": "turn_ended", "detail": "the turn ended"}})
+    warnings = []
+    load_provider().initialize("sess-1", hermes_home=str(profile), platform="cli", warning_callback=warnings.append)
+    fire("pre_llm_call", **turn())
+    # Another plugin's modify directive changed the memory after the human was asked: nothing is approved.
+    fire("pre_tool_call", tool_name=MEMORY_TOOL, args=dict(DELETE), session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-1")
+    fire("post_tool_call", tool_name=MEMORY_TOOL, args={**DELETE, "memory_id": "mem-9"}, result=PENDING.replace("prop-1", "prop-9"), session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-1", status="ok")
+    assert bridge.bodies("memory-deletion/approve") == []
+    assert any("not the one approved" in w and "mem-1" in w for w in warnings)
+    # Lite refused the approval: the memory is kept and the refusal is reported.
+    fire("pre_tool_call", tool_name=MEMORY_TOOL, args=dict(DELETE), session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-2")
+    fire("post_tool_call", tool_name=MEMORY_TOOL, args=dict(DELETE), result=PENDING, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-2", status="ok")
+    assert len(bridge.bodies("memory-deletion/approve")) == 1
+    assert any("did not reach Lite" in w and "stays pending" in w for w in warnings)
+    fire("on_session_end", **end())
