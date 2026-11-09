@@ -28,6 +28,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | B6 seam cuts (3.1, 3.11) | Done (Seam cuts, below): the composition root boots over PostgreSQL (boot proof). |
 | B7 delete the vendored scaffolding | Done (Seam cuts, below): every vendored scaffolding file is deleted, nothing in `packages/companion` imports, mocks or reads one, and the packages only scaffolding used are removed. |
 | C swap Lite onto the extracted core | Done (Step C, below): `apps/standalone` wraps `startCompanionRuntime`, MCP serves the donor tool catalog, the lifecycle bridge and the Hermes plugin drive host-driven donor turns, `packages/pi` keeps only the model and embedding adapters, `packages/core` and `packages/adapters` are deleted, and conformance runs on donor behaviour. |
+| Operator automata rules | Done (Operator automata rules, below): stable worker write keys; hosted automata as Hermes subagents. |
 
 ## Closure (Step A0)
 
@@ -1252,6 +1253,170 @@ B7; they are left as they were.
   typecheck as in the donor). Root eslint ignores `packages/companion/**`.
 - Root `vitest.config.ts` runs two projects: `lite` (unchanged settings) and
   `companion` (`packages/companion/vitest.config.ts`).
+
+## Operator automata rules
+
+The operator's four automata rules, applied only where the extracted donor
+code differed. Evidence is file:line at the donor revision unless it names
+Lite (`packages/companion/...` after this step) or Hermes at
+`f0187332d13679e2ace74d1f0eb399eb91a90571`.
+
+| Rule | Donor | Lite change |
+|---|---|---|
+| 1. Every worker write is exactly-once across attempts, via a stable write key | **Differed.** The worker port minted `randomUUID()` event ids for every finding, relation and handoff write (`faculties/automata/bus/production-worker-adapter.ts:266, 308, 330`), so the same write repeated by the model or by a later attempt became a second Bus event. The store already replays an incumbent id only for byte-identical content. | Stable write keys (below). |
+| 2. The worker turn budget resets per attempt, with a hard, terminal attempt cap | **Kept where the donor does it.** A subagent run gets its own `maxTurns` (`faculties/subagents/faculty.ts:132`, default 1) and is one attempt: a failed or cancelled run cannot run again (`faculties/automata/bus/class-lifecycle.ts:98-106`); a retry is a new run (`workerGeneration + 1`, `sourceRunId`; `faculties/memory/extraction/memory-extraction-automata-run.ts:104-107`). Durable background work has a terminal attempt cap (`persistence/postgres/background-work-store.ts:1497-1498`; test `core/agent/background-work/supervisor.test.ts:1260` "retries failures with bounded attempts and never hides the terminal state"). | None for those paths. Hosted attempts (rule 4) get a fresh budget each and a terminal `maxAttempts`. |
+| 3. Many automata run concurrently; exclusivity only per declared key | **Kept: the donor already does it.** The background supervisor runs up to `maxConcurrentSessions` jobs at once with one active job per `logicalSessionId` (`core/agent/background-work/supervisor.ts:239, 275`; test `supervisor.test.ts:765` "runs different sessions concurrently while preserving one active job per session"); its claim passes are serialized (`supervisor.ts:446`), the jobs they claim are not. The subagent faculty runs up to `subagentMaxConcurrent` workers (`faculty.ts:131`, default 8) plus per-role caps, each launched on its own microtask (`faculty.ts:606`). The scheduler tick is serial by design ("Ticks stay serial — lanes such as free time rely on one handler finishing before the next due task starts", `core/scheduler/scheduler.ts:714`); it orders scheduler lanes, not automata, and is kept. The Bus writer serializes appends per companion in process and the Postgres store takes a per-companion advisory transaction lock: that is the sequence allocator, not a worker lock. | None. The hosted executor has no global lock: the only exclusivity is one live attempt per task. |
+| 4. Automata are ephemeral shared workers whose task and scope core derives from their source, runnable as Hermes subagents | **Differed.** Every automaton ran in core (`faculty.ts`, `runHandle`). | Hosted automata (below). |
+
+### Stable write keys (rule 1)
+
+- `worker-access-tool.ts` derives a write key from the validated operation
+  (`automataBusWorkerWriteKey`, canonical JSON of the normalized operation:
+  for a note, `{action, text}`) and passes it with every note, append,
+  correct and handoff.
+- `production-worker-adapter.ts` derives the event id as
+  `stableId(namespace, [companionId, automatonClass, taskId, writeKey])`.
+  The task, not the run, scopes it, so every attempt of a task maps the same
+  write to the same event. A port call without a key derives one from its
+  own input the same way.
+- The stored body names its run (`context.runId`, the note's
+  `automata-run:<runId>` evidence), which differs between attempts, so the
+  writer does not rely on the store's byte comparison: for these writes it
+  reads the incumbent first (`replayIncumbent`) and answers it with
+  `inserted: false`. The first attempt's event stands.
+- Behaviour change: identical repeated worker writes of one task now
+  coalesce into one event (the donor stored each). Distinct text, action or
+  task still give distinct events.
+
+### Hosted automata (rule 4)
+
+- Core: `faculties/subagents/host-execution.ts` (`HostedAutomataExecutor`).
+  `SubagentFaculty` gets an optional `hostExecution` port; without it the
+  donor path is unchanged. With it, a spawned automaton still opens its
+  governed run, role and bound `automata_bus` tool in core (so
+  `subagent.bounded` keeps opening from `faculty.ts`), and then runs as a
+  sequence of host attempts instead of `runHandle`:
+  - an attempt is claimed by one host instance (the bound principal plus
+    the body's `hostInstance`) and gets a fresh per-attempt credential
+    (32 random bytes; core keeps only its SHA-256) and a fresh budget: the
+    host's declared iteration budget, refused (`budget_exceeds_policy`)
+    above the policy's `maxIterations`;
+  - core ingress binds the credential to that attempt only: another host
+    instance or principal is refused (`not_attempt_owner`), and an ended
+    attempt's credential is refused (`attempt_ended`, HTTP 410);
+  - an attempt the host does not renew (heartbeat or Bus call) within
+    `leaseMs`, or reports `lost` or `failed`, ends; the task gets its next
+    attempt until `maxAttempts`, which ends it failed
+    (`attempt_cap_exhausted`). That is terminal: no further claim, and every
+    credential of the task is refused;
+  - the child persists only through `automata/bus`, which runs core's
+    governed tool for the run, so its writes carry stable write keys;
+  - a cancel from core is answered at the next heartbeat
+    (`cancel_requested`); a waiting task is cancelled at once.
+- Lifecycle bridge: `automata/claim`, `automata/heartbeat`, `automata/bus`
+  and `automata/report` (`packages/lifecycle/src/http.ts`, strict bodies in
+  `wire.ts`), mounted only when the standalone config sets
+  `lifecycle.automata` (`{maxAttempts, leaseMs, maxIterations}` or `null`).
+  An automaton's goal and context are the companion's own work, so only a
+  principal bound to the primary contact may use them (`denied:
+  automata_not_admitted` otherwise).
+- Hermes plugin: `integrations/hermes/psfn_lite/automata.py`, on when
+  `psfn-lite.json` sets `automata: {claim_limit}`. At the start of each
+  bound root turn it claims attempts, declaring
+  `tools.delegate_tool.DEFAULT_MAX_ITERATIONS` (it claims nothing if Hermes
+  no longer has it). It launches one child per attempt through
+  `ctx.subagent_lifecycle` and binds the child's session from
+  `subagent_start` (which Hermes fires inside `launch`,
+  `tools/delegate_tool.py:2083`) to the attempt credential. It watches the
+  child on its own thread, under the turn's `contextvars` context, which
+  holds the parent Hermes bound. The watcher renews the lease, stops the
+  child when core asks or when core ended the attempt, and reports
+  SUCCEEDED as `succeeded` (with `api_calls`), FAILED as `failed`,
+  CANCELLED as `cancelled`, and INTERRUPTED or UNKNOWN as `lost`. A Hermes
+  process that exits stops renewing, so its attempts end as lost at their
+  lease. The child's `automata_bus` tool (registered with
+  `ctx.register_tool` in toolset `psfn_lite`; schema
+  `automata_bus_tool.json`, checked against the donor tool by
+  `tests/hermes/automata-bus-tool.test.ts`) forwards each call as the
+  attempt; any other session is refused.
+- `CompanionRuntime` exposes `subagentFaculty`, the control port the
+  `subagent` tool drives.
+
+What the hosted path cannot do, from the Hermes public API at the tested
+revision:
+
+- **The budget is Hermes's, not core's.** `SubagentLaunchRequest` has no
+  iteration field, and `launch` builds every child with
+  `max_iterations=DEFAULT_MAX_ITERATIONS` (250;
+  `agent/subagent_lifecycle.py:218-234`, `tools/delegate_tool.py:1092`).
+  The host declares that number and core checks it against its policy;
+  `delegation.max_iterations` applies to `delegate_task` only. A policy
+  `maxIterations` below 250 therefore refuses Hermes claims.
+- **A child that used its whole budget looks completed.** The public result
+  reports SUCCEEDED and `usage_metadata.api_calls`; the delegate's
+  `truncated` flag (`delegate_tool.py:3125`) is not exposed.
+- **The memory-provider context has no `subagent_lifecycle`.** Hermes's
+  `_ProviderCollector` forwards only `register_*`
+  (`plugins/memory/__init__.py:594-627`), so the plugin builds a
+  `PluginContext` for itself as Hermes does for a memory provider
+  (`:629-641`).
+- **The child's tools are its parent's.** With no `allowed_toolsets`, a
+  lifecycle child inherits the parent's enabled toolsets
+  (`delegate_tool.py:1664-1699`), so the profile must enable the
+  `psfn_lite` toolset for the child to have `automata_bus`. Lifecycle
+  validation rejects toolset names outside Hermes's static `TOOLSETS`, so
+  the plugin cannot name it explicitly.
+- **No follow-up messages and no reconnect.** A hosted automaton takes its
+  task once (`message` throws), and a restarted Hermes cannot reconnect a
+  child (`RECONNECT_UNAVAILABLE`); its attempt ends at its lease and the
+  task retries.
+- **Claims ride on root turns.** The plugin claims only inside a bound root
+  turn, where Hermes binds the lifecycle parent; a waiting automaton waits
+  for the next such turn.
+- **No spawn from a Lite turn today.** Lite fixes the capability tier at
+  the donor seed's `nursery` (seam 3.17), which does not grant
+  `shard.spawn`, so the donor `subagent` tool is denied in every turn.
+  Hosted execution is reachable from turns only when the tier grants it,
+  which is an owner decision this step does not take. The integration
+  test spawns through `CompanionRuntime.subagentFaculty`.
+
+Tests added. No donor test was deleted or modified; the companion-project
+files are listed in `packages/companion/extraction/added-tests.tsv`.
+
+- `faculties/automata/bus/worker-write-keys.test.ts` (5): a note repeated
+  in one attempt, the same note from the next attempt, distinct writes stay
+  distinct, a handoff and a correction repeated across attempts, a direct
+  port write. With random ids restored, 4 of the 5 fail.
+- `faculties/automata/bus/worker-write-keys.integration.test.ts`: the same
+  over the real Postgres store across a process restart.
+- `faculties/subagents/host-execution.test.ts` (13): a fresh budget and
+  credential per attempt and a terminal cap, a budget above the policy
+  refused, completion on a later attempt, two tasks running at once with
+  one live attempt per task, several host instances, the credential bound
+  to its attempt and owner, lease expiry as a lost child, Bus calls through
+  the governed tool, cancel, malformed reports, close. Through the real
+  `SubagentFaculty`: a lost child retried with its Bus write stored once,
+  the cap failing the automaton, and cancel through the heartbeat.
+- `tests/lifecycle/hosted-automata.integration.test.ts` (2): the routes
+  over the real standalone runtime and Postgres, from spawn to completion.
+- `tests/hermes/automata-bus-tool.test.ts`: the plugin's tool schema is the
+  donor tool's.
+- `integrations/hermes/tests/test_hosted_automata.py` (10): inside the
+  pinned Hermes with its real lifecycle service, hooks and tool dispatch.
+  Only the child's model loop is replaced, as Hermes's own lifecycle tests
+  do. Cases: credential and budget per child, `automata_bus` refused
+  outside an attempt, lost and failed children, cancel through the
+  heartbeat, a child whose attempt core ended, two children at once, no
+  claim without `DEFAULT_MAX_ITERATIONS`, no claim from subagent or cron
+  turns, and two reads of Hermes's source (the `launch` budget and the
+  `subagent_start` call).
+
+Lite tests changed for the new required config fields (these are not donor
+tests): `tests/standalone/config.test.ts` (two lifecycle documents gain
+`automata: null`; one new case), `tests/conformance/host/host.ts` and
+`tests/lifecycle/bridge-world.ts` (`automata: null` by default), and
+`integrations/hermes/tests/conftest.py` and `test_config.py`
+(`automata: null`; new cases).
 
 ## Measured size
 

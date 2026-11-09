@@ -153,9 +153,39 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
      "mcp_server": "psfn_lite",
      "senders": [{ "platform": "cli", "sender_id": "" }],
      "timeout_seconds": 30,
-     "max_context_chars": 9000
+     "max_context_chars": 9000,
+     "automata": null
    }
    ```
+
+## Hosted automata
+
+The companion's automata (bounded workers it spawns) normally run in Lite's
+core. With hosted automata they run as this Hermes's own subagents:
+
+1. In the standalone config, set `lifecycle.automata` to
+   `{"maxAttempts": 3, "leaseMs": 60000, "maxIterations": 250}` (the
+   attempts a task gets, how long an attempt lives without a heartbeat, and
+   the largest per-attempt iteration budget a host may declare). Hermes
+   gives every lifecycle child 250 iterations and has no per-launch budget,
+   so a `maxIterations` below 250 refuses Hermes's claims.
+2. In `psfn-lite.json`, set `"automata": {"claim_limit": 2}` (attempts
+   claimed per root turn, 1 to 8). The credential must belong to a
+   principal bound to Lite's primary contact; only it runs automata.
+3. Enable the `psfn_lite` toolset for the profile's agents (or leave
+   toolsets unrestricted). A child inherits its parent's toolsets, and the
+   `automata_bus` tool, the child's only way to persist, is in that toolset.
+
+At the start of each bound root turn, the plugin claims the waiting
+attempts and launches one child per attempt through Hermes's
+`ctx.subagent_lifecycle`. Each attempt has its own credential, which the
+plugin holds in memory only. The child's `automata_bus` calls go to Lite
+under that credential. The plugin renews the attempt while the child runs,
+stops the child when Lite asks, and reports how it ended. If Hermes loses
+the child, or the process exits, the attempt ends as lost and Lite queues
+the next attempt, up to `maxAttempts`. A write the next attempt repeats is
+the same Bus event. Limits are listed in `docs/extraction.md` (Operator
+automata rules).
 
 ## Tests
 
@@ -194,6 +224,12 @@ exact commands, see `docs/development.md`.
   `LITE_SKIP_DOCKER_TESTS=1` opts out explicitly.
 - `test_conformance.py` runs the continuity conformance scenarios on the
   real plugin (`docs/conformance.md`).
+- `test_hosted_automata.py` runs hosted automata inside the pinned Hermes
+  with its real lifecycle service, hooks and tool dispatch, against the
+  scripted bridge. Only the child's model loop is replaced. It covers a
+  credential and budget per child, lost, failed and cancelled children,
+  children running at once, and the Hermes source facts the plugin relies
+  on.
 
 ## Known limits
 

@@ -57,7 +57,11 @@ subsystems out ([conformance](conformance.md)).
    provider runtime and the embedding provider, the session keyring, an
    outbound sender (the operator's channel), the path snapshot (workspace
    `workspaceDir`, and logs and temp under `dataDir`) and, when a lifecycle
-   bridge is configured, the relay's `wrapStreamTransport`.
+   bridge is configured, the relay's `wrapStreamTransport`. When
+   `lifecycle.automata` is set, it also passes a `HostedAutomataExecutor`
+   (`packages/companion/src/faculties/subagents/host-execution.ts`), so
+   spawned automata run as host attempts that the bridge's `automata/*`
+   routes serve.
 5. It provisions the configured contacts in the donor contact store, keyed
    by the host's contact key, and finds them again on every start.
 6. It mounts the MCP transport and the lifecycle bridge on loopback, unless
@@ -153,6 +157,17 @@ credential.
 | `prepare` | `hostInstance`, `idempotencyKey`, `sessionId`, `message` | `{kind: "prepared", turnId, resumed, context}`. `{kind: "replayed"}` when the donor already recorded the key. `{kind: "answered", turnId, reply}` when the donor ended the turn without a model call. |
 | `settle` | `hostInstance`, `turnId`, `outcome`: `{kind: "completed", reply}`, `{kind: "interrupted"}` or `{kind: "failed", error: {code, message}}` | `{turnId, status, reply}`: what the donor recorded. A repeated settle gets the same answer. |
 | `checkpoint` | `sessionId`, `turnIds` | `{settled, open}` |
+| `automata/claim` | `hostInstance`, `maxIterations` (the host's per-attempt budget), `limit` | `{attempts: [{attemptId, subagentId, name, attempt, maxAttempts, goal, context, budget, credential, leaseMs, busAccess}]}` |
+| `automata/heartbeat` | `hostInstance`, `attemptCredential` | `{status: "active" \| "cancel_requested", attempt}` |
+| `automata/bus` | `hostInstance`, `attemptCredential`, `arguments` (the child's `automata_bus` call) | `{text, isError}`: core's governed tool result |
+| `automata/report` | `hostInstance`, `attemptCredential`, `outcome`: `{kind: "succeeded", summary, model, apiCalls}`, `{kind: "failed" \| "lost", code}` or `{kind: "cancelled"}` | `{attempt, next: "retry" \| "completed" \| "failed" \| "cancelled"}` |
+
+The `automata/*` routes exist only when the standalone config sets
+`lifecycle.automata`, and only a principal bound to the primary contact may
+use them. An attempt credential acts only for its attempt and the host
+instance that claimed it, and is refused (HTTP 410) once the attempt ends:
+reported, lost at its lease, or at the task's attempt cap
+([extraction](extraction.md#operator-automata-rules)).
 
 A repeated `prepare` with the key of an open turn answers that turn again
 (`resumed: true`). Only the host instance that prepared a turn may settle it
@@ -175,7 +190,11 @@ Hermes plugin follows that split:
 - its `pre_tool_call` gate blocks Lite's MCP tools outside a Lite turn;
 - it settles every outcome, including the failure paths where Hermes never
   fires `on_session_end`;
-- it refuses compaction until `checkpoint` proves the session's turns.
+- it refuses compaction until `checkpoint` proves the session's turns;
+- with hosted automata, it runs the companion's automaton attempts as its
+  own subagents through `ctx.subagent_lifecycle`, one child per attempt,
+  with the attempt's credential and the Automata Bus as the child's only
+  persistence.
 
 Undelivered lifecycle events are kept in a local ledger, retried, and named
 in the next turn's context. See the
