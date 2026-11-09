@@ -31,6 +31,8 @@ export interface BridgeWorldOptions {
   readonly hostTurnTimeoutMs?: number;
   /** The lifecycle config's hosted automata policy; default null (automata run in core). */
   readonly automata?: { readonly maxAttempts: number; readonly leaseMs: number; readonly maxIterations: number } | null;
+  /** The pi-ai API the world's faux model reports (tests/support/faux-model.ts FauxModelOptions). */
+  readonly modelApi?: string;
 }
 
 /** The test Hermes install every bridge world serves; prepare and checkpoint bodies name it. */
@@ -63,7 +65,7 @@ export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {})
       };
     });
     Object.assign(install.env, Object.fromEntries(Object.entries(credentials).map(([p, c]) => [envName(p), c])));
-    const { runtime, model } = await lite.start(install, script);
+    const { runtime, model } = await lite.start(install, script, options.modelApi === undefined ? {} : { api: options.modelApi });
     const { mcpUrl, lifecycleUrl } = runtime.transports;
     if (mcpUrl === null || lifecycleUrl === null) throw new Error('transports were not mounted');
     return { runtime, credentials, mcpUrl, lifecycleUrl, model, install: { dataDir: install.dataDir, env: install.env } };

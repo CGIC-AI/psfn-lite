@@ -50,7 +50,7 @@ function chainVerifies(provider: SessionIntegrityProvider, entries: readonly Jou
 
 describe.skipIf(dockerTestsOptedOut('lifecycle host-driven turns'))('host-driven turns', () => {
   // One runtime per process (donor readiness ledger); the timeout case needs a short host-turn timeout.
-  const world = useBridgeWorld(() => null, { hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS });
+  const world = useBridgeWorld(() => null, { hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS, modelApi: 'openai-completions' });
 
   it('prepares the donor context, runs a donor tool in the turn and archives the settled turn', async () => {
     const w = world();
@@ -64,6 +64,8 @@ describe.skipIf(dockerTestsOptedOut('lifecycle host-driven turns'))('host-driven
     expect(context.systemPrompt).toContain(COMPANION_NAME);
     expect(context.messages.filter((m) => m.role === 'user').at(-1)?.text).toContain(HOST_MESSAGE);
     expect(context.tools).toContain('orient');
+    // No explicit tool request: the host's model chooses.
+    expect((prepared.body['context'] as { toolChoice: unknown }).toolChoice).toBeNull();
 
     // The MCP surface is the donor catalog, one tool per donor tool.
     const client = await mcpClient(w, operator);
@@ -111,6 +113,33 @@ describe.skipIf(dockerTestsOptedOut('lifecycle host-driven turns'))('host-driven
     expect(history.some((m) => m.role === 'assistant' && m.text.includes(HOST_REPLY))).toBe(true);
     const done = await bridge(w, 'settle', operator, { hostInstance: 'hermes-1', turnId: next.body['turnId'], outcome: { kind: 'completed', reply: 'Then we rest.' } });
     expect(done.body['status']).toBe('completed');
+  }, RUNTIME_TIMEOUT_MS);
+
+  it('hands the host the donor\'s explicit tool contract for each model call, and the turn completes when the host follows it', async () => {
+    const w = world();
+    const operator = w.credentials['hermes-operator'];
+    const prepared = await bridge(w, 'prepare', operator, { hostInstance: 'hermes-1', hermesInstallId: INSTALL, idempotencyKey: 'x-1', sessionId: 'session-x', message: 'Call the orient tool to list my values, then tell me the first one.' });
+    expect(prepared.body).toMatchObject({ kind: 'prepared' });
+    const turnId = prepared.body['turnId'] as string;
+    // The first model call must be exactly one orient call, as the donor's provider client forced it.
+    expect((prepared.body['context'] as { toolChoice: unknown }).toolChoice).toEqual({ kind: 'tool', name: 'orient' });
+    const choice = (hostInstance: string, id: string) => bridge(w, 'tool-choice', operator, { hostInstance, turnId: id });
+    expect((await choice('hermes-1', turnId)).body).toEqual({ toolChoice: { kind: 'tool', name: 'orient' } });
+    expect((await choice('hermes-9', turnId)).status).toBe(403);
+    expect((await bridge(w, 'tool-choice', w.credentials['hermes-friend'], { hostInstance: 'hermes-1', turnId })).status).toBe(404);
+
+    const client = await mcpClient(w, operator);
+    try {
+      const called = await client.callTool({ name: 'orient', arguments: { action: 'values_list' } });
+      expect(called.isError ?? false).toBe(false);
+    } finally {
+      await client.close();
+    }
+    // The sequence ran: the next model call must not call a tool (the donor's 'none').
+    expect((await choice('hermes-1', turnId)).body).toEqual({ toolChoice: { kind: 'none' } });
+    const settled = await bridge(w, 'settle', operator, { hostInstance: 'hermes-1', turnId, outcome: { kind: 'completed', reply: 'Your first value is curiosity.' } });
+    expect(settled.body).toMatchObject({ turnId, status: 'completed' });
+    expect((await choice('hermes-1', turnId)).status).toBe(404);
   }, RUNTIME_TIMEOUT_MS);
 
   it('records an interrupted and a failed host turn as the donor ends them, and refuses tools outside an open turn', async () => {

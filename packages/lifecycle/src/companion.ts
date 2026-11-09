@@ -16,6 +16,7 @@ export type {
 } from '../../companion/src/shared/contracts/runtime-base.js';
 export type { TurnRecord } from '../../companion/src/shared/contracts/runtime.js';
 export { NonRecoverableFallbackError } from '../../companion/src/primitives/llm/fallback.js';
+export { resolveExplicitToolContract } from '../../companion/src/primitives/llm/explicit-tool-request.js';
 export { createTurnId } from '../../companion/src/core/turns/id.js';
 export { externalMemorySessionId } from '../../companion/src/shared/contracts/external-memory.js';
 export { getRequestContext } from '../../companion/src/primitives/llm/request-context.js';
