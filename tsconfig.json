@@ -6,14 +6,16 @@
     "strict": true,
     "noImplicitOverride": true,
     "noUncheckedIndexedAccess": true,
-    "exactOptionalPropertyTypes": true,
     "verbatimModuleSyntax": true,
+    "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "allowImportingTsExtensions": true,
     "noEmit": true,
-    "types": ["node"]
+    "types": [
+      "node"
+    ]
   },
   "include": [
     "packages/*/src/**/*.ts",
@@ -22,5 +24,9 @@
     "scripts/**/*.ts",
     "vitest.config.ts"
   ],
-  "exclude": ["node_modules", "dist", "packages/companion"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "packages/companion"
+  ]
 }

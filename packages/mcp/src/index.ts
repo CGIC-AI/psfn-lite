@@ -1,18 +1,33 @@
 /**
- * PSFN Lite governed tool transport over MCP. It exposes the core tool
- * inventory as one MCP tool per domain tool, binds the caller from the
- * transport credential through operator bindings and core ingress, and
- * calls the shared dispatcher. It holds no business logic or authorization
- * of its own; core imports nothing from here.
+ * PSFN Lite tool transport over MCP. It exposes the extracted companion's
+ * donor tool catalog as one MCP tool per donor tool, binds the caller from the
+ * transport credential through operator bindings, and hands each call to the
+ * host's tool port, which runs it inside the caller's open host-driven turn.
+ * It holds no tool logic or authorization of its own.
  */
-export { ACTION_ARGUMENTS } from './arguments/index.ts';
-export { loadPrincipalBindings, type McpCredentialEvidence, type McpPrincipalBindings } from './bindings.ts';
-export { combineCallers, type McpCallers } from './callers.ts';
-export { ACTIONS_META_KEY, buildToolCatalog, type ActionCatalogEntry, type McpToolDefinition } from './catalog.ts';
-export { MIN_CREDENTIAL_LENGTH, bearerCredential, type CredentialEnvironment, type CredentialSource } from './credentials.ts';
+export { loadPrincipalBindings, type McpPrincipalBindings, type PrincipalBinding } from './bindings.ts';
+export { MIN_CREDENTIAL_LENGTH, bearerCredential, readCredential, type CredentialEnvironment, type CredentialSource } from './credentials.ts';
 export { startMcpHttpServer, type McpHttpOptions, type McpHttpServer } from './http.ts';
-export { createMcpInternalTurns, type InternalTurnLauncher, type McpInternalTurnOptions, type McpInternalTurns } from './internal-turns.ts';
-export { publicError } from './results.ts';
-export type { ActionArguments, ArgumentSpec, JsonSchema, ToolArguments } from './schema.ts';
+export {
+  conflict,
+  denied,
+  invalid,
+  isNonEmptyString,
+  isRecord,
+  notFound,
+  ok,
+  publicError,
+  unavailable,
+  type HostError,
+  type Result,
+} from './result.ts';
 export { startMcpStdioServer, type McpStdioOptions, type McpStdioServer } from './stdio.ts';
-export { createMcpSurface, type McpErrorReport, type McpSurface, type McpSurfaceDeps } from './surface.ts';
+export {
+  createMcpSurface,
+  type HostToolPort,
+  type McpErrorReport,
+  type McpSurface,
+  type McpSurfaceDeps,
+  type McpToolDefinition,
+  type ToolCallOutput,
+} from './surface.ts';

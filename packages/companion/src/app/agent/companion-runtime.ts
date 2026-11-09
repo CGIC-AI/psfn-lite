@@ -88,6 +88,7 @@ import { ReflectionJournalStore } from '../../persistence/journals/reflection-jo
 import type { SessionIntegrityProvider } from '../../persistence/sessions/store.js';
 import { createLLMProviderPort, type LLMProviderPort } from '../../core/agent/contracts.js';
 import type { SubstrateAgent } from '../../core/agent/substrate-agent.js';
+import type { SubstrateStreamTransport } from '../../core/agent/stream-adapter.js';
 import { CompanionAvailabilityRuntime, attachToolAvailability } from '../../core/agent/companion-availability.js';
 import { createMemoryStorePort } from '../../faculties/memory/memory-store-port.js';
 import type { MemoryDeletionApprovalPort } from '../../faculties/memory/deletion-proposals.js';
@@ -297,6 +298,14 @@ export interface StartCompanionRuntimeOptions {
   primaryUserId?: string;
   eventBus?: EventBus;
   env?: NodeJS.ProcessEnv;
+  /**
+   * The foreground turn's stream transport (donor core-runtime.ts:724-726
+   * passed gateway.stream as SubstrateAgentOptions.streamTransport). It
+   * receives the default in-process transport (the LLM provider port's
+   * stream, the SubstrateAgent default) and returns the one the agent uses, so a host can answer the model calls of its own
+   * host-driven turns and delegate every other call. Default: that port's stream.
+   */
+  wrapStreamTransport?: (base: SubstrateStreamTransport) => SubstrateStreamTransport;
 }
 
 export interface CompanionRuntime {
@@ -712,7 +721,11 @@ async function composeCompanionRuntime(
     characterPromptVariablesProvider,
     config: coreConfig,
     // Lite: in-process provider; the donor's 'gateway' wiring mode named the
-    // gateway transport. The stream transport defaults to llmClient.stream.
+    // gateway transport. The stream transport defaults to llmClient.stream;
+    // a host may wrap it (wrapStreamTransport) to serve host-driven turns.
+    ...(options.wrapStreamTransport
+      ? { streamTransport: options.wrapStreamTransport({ stream: llmProvider.stream.bind(llmProvider) }) }
+      : {}),
     streamRuntimeOptions: {
       onTerminalFailure: createPromptGenerationFailureAlertHandler(operatorNotifier, card.data.name),
     },

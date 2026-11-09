@@ -7,15 +7,14 @@
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createMcpHandler } from '@modelcontextprotocol/server';
-import type { McpCallers } from './callers.ts';
-import { invalid, ok, unavailable, type Result } from './core.ts';
+import { invalid, ok, unavailable, type Result } from './result.ts';
 import { bearerCredential } from './credentials.ts';
 import type { McpErrorReport, McpSurface } from './surface.ts';
 
 export interface McpHttpOptions {
   readonly surface: McpSurface;
-  /** The operator bindings, or `combineCallers(bindings, internalTurns)` when the host runs internal turns over this transport. */
-  readonly bindings: Pick<McpCallers, 'identify'>;
+  /** The operator bindings: a request whose bearer credential is not bound is refused before its body is read. */
+  readonly bindings: { identify(credential: string): string | null };
   /** Port to listen on; 0 picks a free one. */
   readonly port: number;
   /** Default 127.0.0.1. Anything that is not loopback needs `exposeBeyondLoopback`. */
@@ -94,7 +93,7 @@ async function serve(options: ServeOptions, req: IncomingMessage, res: ServerRes
       if (value !== undefined && !STRIPPED_HEADERS.has(name)) headers.set(name, Array.isArray(value) ? value.join(', ') : value);
     }
     const handler = createMcpHandler(() => options.surface.createServer(credential), {
-      onerror: (error) => options.onError({ stage: 'transport', tool: null, action: null, error: { kind: 'exception', message: error.message } }),
+      onerror: (error) => options.onError({ stage: 'transport', tool: null, principal: null, error: { kind: 'exception', message: error.message } }),
     });
     try {
       const response = await handler.fetch(new Request(`http://mcp.invalid${options.path}`, { method: 'POST', headers, body: new Uint8Array(body) }));
@@ -105,7 +104,7 @@ async function serve(options: ServeOptions, req: IncomingMessage, res: ServerRes
       await handler.close();
     }
   } catch (error) {
-    options.onError({ stage: 'transport', tool: null, action: null, error: { kind: 'exception', message: error instanceof Error ? error.message : 'non-error thrown' } });
+    options.onError({ stage: 'transport', tool: null, principal: null, error: { kind: 'exception', message: error instanceof Error ? error.message : 'non-error thrown' } });
     if (!res.headersSent) reply(res, 500, 'transport failure');
     else res.destroy();
   }
