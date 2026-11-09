@@ -10,6 +10,8 @@ Hermes's own ``apply_llm_request_middleware``, the call its agent loop makes
 before every provider call, with the request shapes Hermes builds per API mode.
 """
 
+import json
+
 import pytest
 
 from test_host_contract import end, fire, load_provider, turn
@@ -222,3 +224,113 @@ def test_a_deferred_lite_tool_is_forced_through_the_tool_call_bridge_in_every_ap
     # A bridge for a tool Hermes does not have is refused, not forced.
     with pytest.raises(toolchoice.ChoiceError, match="not offered"):
         toolchoice.apply(bridged["chat_completions"], "chat_completions", {"kind": "tool", "name": "journal", "parameters": None}, "mcp__psfn_lite__", lookup=known)
+
+
+# -- the forced step's call, checked before Lite sees it (shakedown r3, R3-2), and a turn Lite has ended (R3-3) --------
+
+SESSION_TOOL = "mcp__psfn_lite__session"
+TOOL_FIELDS = {"tools", "tool_choice", "parallel_tool_calls"}
+#: What Hermes's MCP client returns for Lite's refusal of a call in an ended turn (shakedown r3 agent.log:576).
+TURN_ENDED = json.dumps({"error": json.dumps({"error": {"kind": "conflict", "reason": "turn_ended", "detail": "the companion turn ended before the call ran"}})})
+
+
+def tool_call(tool, args, call_id="c1"):
+    """Hermes's pre_tool_call for one model call of the turn; [] when no hook blocked it."""
+    return fire("pre_tool_call", tool_name=tool, args=args, session_id="sess-1", turn_id=TURN, tool_call_id=call_id)
+
+
+def tool_done(tool, args, result, status, call_id="c1"):
+    fire("post_tool_call", tool_name=tool, args=args, result=result, session_id="sess-1", turn_id=TURN, tool_call_id=call_id, status=status)
+
+
+def blocked(answers):
+    [answer] = answers
+    assert answer["action"] == "block"
+    return answer["message"]
+
+
+def test_a_call_that_misses_the_forced_step_is_blocked_once_and_a_second_miss_fails_the_turn_with_the_donors_violation(profile, bridge):
+    explicit_turn(bridge)
+    first = blocked(tool_call(SESSION_TOOL, {"action": "list"}))
+    assert ORIENT in first and "another call" in first
+    tool_done(SESSION_TOOL, {"action": "list"}, json.dumps({"error": first}), "blocked")
+    # The blocked call never reached Lite and moved nothing: Lite is not asked, and the retry is forced the same way.
+    assert bridge.bodies("tool-choice") == [] and bridge.bodies("settle") == []
+    assert names(model_call(chat_request()).payload["tools"]) == [ORIENT]
+
+    second = blocked(tool_call("terminal", {"command": "ls"}, "c2"))
+    assert "tool_contract_incompatible" in second
+    [settled] = bridge.bodies("settle")
+    assert settled["turnId"] == "turn-1" and settled["outcome"] == {"kind": "failed", "error": {
+        "code": "tool_contract_incompatible",
+        "message": 'Provider violated explicit tool contract: expected exactly one "orient" call, received ["terminal"]'}}
+
+    # The companion's turn is over: its tools are blocked (Hermes never counts a block toward its MCP breaker),
+    # Hermes's own tools are left alone, and the model's next call carries no tools, so it answers and the turn ends.
+    assert "tool_contract_incompatible" in blocked(tool_call(ORIENT, {"action": "values_list"}, "c3"))
+    assert tool_call("terminal", {"command": "ls"}, "c4") == []
+    after = model_call(chat_request())
+    assert not TOOL_FIELDS & set(after.payload) and bridge.bodies("tool-choice") == []
+    fire("on_session_end", **end())
+    assert len(bridge.bodies("settle")) == 1  # Lite already has the outcome
+
+
+def test_each_forced_step_gets_one_retry_and_exact_arguments_are_held_as_the_donor_holds_them(profile, bridge):
+    explicit_turn(bridge)
+    blocked(tool_call(SESSION_TOOL, {"action": "list"}))
+    tool_done(SESSION_TOOL, {"action": "list"}, "{}", "blocked")
+    assert tool_call(ORIENT, {"action": "values_list"}) == []  # the retry makes the required call: it runs
+    exact = {"type": "object", "properties": {"action": {"type": "string", "enum": ["search"]}, "limit": {"type": "integer", "enum": [5]},
+                                              "filter": {"type": "object", "properties": {"tags": {"type": "array", "enum": [["a"]]}, "since": {"type": "null"}},
+                                                         "required": ["tags", "since"], "additionalProperties": False}},
+             "required": ["action", "limit", "filter"], "additionalProperties": False}
+    bridge.next_choices.append({"kind": "tool", "name": "memory", "parameters": exact})
+    tool_done(ORIENT, {"action": "values_list"}, "{}", "ok")
+    model_call(chat_request())
+    # The next step starts with its own retry; the donor's exact match: same keys, same JSON values and types.
+    wanted = {"action": "search", "limit": 5, "filter": {"tags": ["a"], "since": None}}
+    message = blocked(tool_call(MEMORY, {**wanted, "limit": True}, "c2"))
+    assert json.dumps(wanted) in message and "other arguments" in message
+    tool_done(MEMORY, {**wanted, "limit": True}, "{}", "blocked", "c2")
+    assert bridge.bodies("settle") == []
+    assert tool_call(MEMORY, {**wanted, "extra": 1}, "c3")[0]["action"] == "block"
+    [settled] = bridge.bodies("settle")
+    assert settled["outcome"]["error"] == {"code": "tool_contract_incompatible", "message": "Provider changed exact requested arguments for required tool call: memory"}
+
+
+def test_once_lite_refuses_a_call_because_the_turn_ended_its_tools_are_blocked_and_the_model_gets_no_tools(profile, bridge):
+    load_provider()
+    fire("pre_llm_call", **turn())
+    assert tool_call(ORIENT, {"action": "values_list"}) == []
+    tool_done(ORIENT, {"action": "values_list"}, TURN_ENDED, "error")  # e.g. Lite's host-turn timeout ended the turn
+    assert "turn_ended" in blocked(tool_call(ORIENT, {"action": "values_list"}, "c2"))
+    assert tool_call("terminal", {"command": "ls"}, "c3") == []
+    assert not TOOL_FIELDS & set(model_call(chat_request()).payload)
+    fire("on_session_end", **end())
+    assert len(bridge.bodies("settle")) == 1  # settled once, at the end; Lite answers with the outcome it recorded
+
+
+def test_a_tool_choice_lite_no_longer_has_ends_the_turn_for_the_plugin_too(profile, bridge):
+    explicit_turn(bridge)
+    bridge.handlers["tool-choice"] = lambda route, body: (404, {"error": {"kind": "not_found", "subject": "turn"}})
+    assert tool_call(ORIENT, {"action": "values_list"}) == []
+    tool_done(ORIENT, {"action": "values_list"}, "{}", "ok")
+    assert not TOOL_FIELDS & set(model_call(chat_request()).payload)
+    assert "turn_ended" in blocked(tool_call(ORIENT, {"action": "values_list"}, "c2"))
+    assert len(bridge.bodies("tool-choice")) == 1  # asked once; an ended turn is not asked again
+    model_call(chat_request())
+    assert len(bridge.bodies("tool-choice")) == 1
+
+
+def test_a_turn_the_plugin_failed_is_not_settled_again_or_reported_unfinished_when_hermes_never_ends_it(profile, bridge):
+    explicit_turn(bridge)
+    blocked(tool_call(SESSION_TOOL, {"action": "list"}))
+    blocked(tool_call(SESSION_TOOL, {"action": "list"}, "c2"))
+    # Hermes starts the next turn without on_session_end for this one (one of its failure paths).
+    [nxt] = fire("pre_llm_call", **turn(turn_id="sess-1:task:bb", message="and now?"))
+    assert "did not report how it ended" not in nxt["context"]
+    fire("on_session_end", **end())  # a late report of the failed turn
+    fire("on_session_end", **end(turn_id="sess-1:task:bb"))
+    [third] = fire("pre_llm_call", **turn(turn_id="sess-1:task:cc", message="ok"))
+    assert "recorded in your continuity as unfinished" not in third["context"]
+    assert [b["turnId"] for b in bridge.bodies("settle")] == ["turn-1", "turn-2"]

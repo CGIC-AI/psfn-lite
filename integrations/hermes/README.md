@@ -90,6 +90,32 @@ the Hermes provider id or the provider's host, `toolchoice.py`
 `FORCED_CHOICE_WITHOUT_THINKING`), and no `thinking` block for Anthropic.
 The next, unforced call goes with the thinking Hermes configured.
 
+**A forced call that misses the step.** Through the `tool_call` bridge the
+provider holds the model only to `tool_call`; the Lite tool's name and
+arguments are held by the narrowed schema, which a model can ignore
+(DeepSeek did once in 60 forced steps in the 2026-11-09 r3 shakedown). The
+donor's provider held the name itself, and the donor failed the turn on any
+other call. So `pre_tool_call` checks each call of a forced step before
+Lite sees it: the name must be the requested Lite tool and, when the
+participant gave exact arguments, the arguments must be exactly those (the
+donor's `exactToolArgumentsMatch`). The first call that misses is blocked
+with a message naming the required call, and the model calls again; Lite
+never sees the blocked call. A second miss of the same step is blocked too,
+and the plugin settles the turn as failed with the donor's code
+`tool_contract_incompatible` and the donor's violation text. This one retry
+is the plugin's, not the donor's: the donor retried only a response with no
+call at all.
+
+**After the companion's turn is over.** Once the plugin has failed the
+turn, or Lite refused a call with `turn_ended` or `no_open_turn` (or no
+longer has the turn's tool choice), the plugin blocks every further Lite
+call in that Hermes turn with a message saying the turn is over, and the
+model's next request carries no tools, so it answers and Hermes's turn
+ends. Hermes gives a plugin no way to stop a turn in progress. A blocked
+call never reaches Hermes's MCP client, so it is never counted toward
+Hermes's MCP circuit breaker (3 failures pause the server for 60 seconds,
+which in r3 broke the next turn); Hermes's own tools are not blocked.
+
 Lite can also end a turn itself before asking Hermes's model, for example
 when the donor decides on no reply. `prepare` then answers `answered`. The
 turn is recorded with the donor's own outcome, and the context tells the
@@ -317,7 +343,10 @@ exact commands, see `docs/development.md`.
   each supported API mode, the exact-arguments schema, the `tool_call`
   bridge form of each mode and revision, thinking turned off on DeepSeek
   and Kimi requests built by Hermes's own provider profiles, and the
-  requests it must leave alone.
+  requests it must leave alone. It also covers a forced call that misses
+  its step (blocked once, then the turn failed with the donor's violation
+  text), the exact-arguments match, and a turn Lite has ended (Lite's tools
+  blocked, no tools on the next request).
 - `test_tool_search_wire.py` runs a real `AIAgent` turn with Tool Search
   at Hermes's default, the Lite tool registered as Hermes registers an MCP
   tool, and Hermes's DeepSeek provider, against a loopback
@@ -325,7 +354,10 @@ exact commands, see `docs/development.md`.
   HTTP: the forced step offers only the narrowed `tool_call`, required,
   with thinking disabled; the Lite tool runs; the next step carries no
   tools, thinks again and replays the tool-call turn with the
-  `reasoning_content` DeepSeek requires.
+  `reasoning_content` DeepSeek requires. A model that calls another Lite
+  tool through the bridge is blocked before the tool runs and its retry
+  makes the step; two misses fail the turn, and the next request carries no
+  tools.
 - `test_profiles.py` runs two Lite profiles and one non-Lite profile in one
   process, as the 2bd378e gateway does (home override and profile secret
   scope per turn, multiplexing on): hooks, host instance and credential per
@@ -347,7 +379,13 @@ exact commands, see `docs/development.md`.
   - a memory delete through Hermes's CLI approval prompt: a denial keeps
     the memory, an approval deletes it;
   - an explicit tool request: the middleware forces the requested tool,
-    then no tool, and Lite records the turn as completed.
+    then no tool, and Lite records the turn as completed;
+  - a forced step missed twice, and a turn Lite ended on its own: further
+    Lite calls are blocked, and Hermes's MCP circuit-breaker count for the
+    Lite server stays below its threshold (0 when the plugin failed the
+    turn, 1 for Lite's own refusal);
+  - a forced step with exact arguments, read back from the schema the real
+    Lite hands over.
 
   It needs Docker and Node, like the TypeScript integration suites.
   `LITE_SKIP_DOCKER_TESTS=1` opts out explicitly.
@@ -381,8 +419,14 @@ Hermes:
   none is recorded.
 - An explicit tool request is enforced only on the API modes listed above.
   The donor re-asked its model once when a forced call was missing; a host
-  turn cannot be re-asked, so a model that ignores the forced choice fails
-  the turn.
+  turn cannot be re-asked, so a model that answers a forced step without
+  any call fails the turn. A wrong call gets one retry, and the model sees
+  the blocked call in its history, which the donor's fresh retry did not
+  have.
+- The forced-step check covers one call per model response, as forced
+  steps ask (`parallel_tool_calls: false`). Calls Hermes rejects before its
+  plugin hooks (a tool outside the session's scope, arguments that fail
+  Tool Search's schema probe) are not counted as misses.
 - The donor context includes the conversation's earlier turns, and Hermes
   also sends its own transcript, so the model sees earlier turns twice.
 - If Hermes reports a turn's end only after the next turn of the

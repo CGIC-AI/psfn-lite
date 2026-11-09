@@ -49,8 +49,8 @@ Lite.
 The tables below are generated from the Git blobs of
 `packages/companion/{src,config}` at `HEAD` and the donor commit by
 `python3 -I packages/companion/extraction/provenance-tables.py <donor git
-dir>`, after Step E; the 2026-11-09 shakedown fixes (seams S1-S4, and S6
-for round r2) and the restored donor embedding providers (seam S5)
+dir>`, after Step E; the 2026-11-09 shakedown fixes (seams S1-S4, S6
+for round r2 and S7 for round r3) and the restored donor embedding providers (seam S5)
 changed no file here. The tree has 2,003 files: 1,772 extracted unchanged,
 200 extracted with cuts, and 31 Lite. Seam D is the operator
 automata rules ([extraction](extraction.md), "Operator automata rules").
@@ -576,7 +576,15 @@ otherwise:
     (`hermes_cli/plugins.py` `_resolve_block_from_details`,
     `tools/approval.py` `request_tool_approval`: once, session, always or
     deny; a denial, a timeout or a gate failure blocks the call). The plugin
-    uses it for the companion's memory delete;
+    uses it for the companion's memory delete. A blocked call returns before
+    dispatch (`model_tools.py` `_pre_dispatch_guards`;
+    `agent/tool_executor.py` `_dispatch_authorized_once`), so Hermes's MCP
+    circuit breaker (`tools/mcp_tool.py` `_server_error_counts`, counted
+    only in `tools/mcp_tool_handlers.py`) never counts it; the plugin relies
+    on that to check a forced step's call and to block Lite's tools after
+    the companion's turn ended (seam S7). Hermes has no hook result that
+    stops a turn in progress (`pre_llm_call`'s block applies only before the
+    turn's loop);
   - `post_tool_call`: with `args`, `result`, `tool_call_id` and `status`
     (`ok`, `error` or `blocked`), also fired for a blocked call;
   - `on_session_end`: with `completed`, `failed`, `interrupted` and

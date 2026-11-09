@@ -271,3 +271,86 @@ def test_an_explicit_tool_request_is_held_to_the_donor_contract_and_the_turn_com
     context = begin(session, f"{turn_id}2", "and the next one?")
     assert "[your own earlier reply]\nYour first concern is the seed packets." in context
     finish(session, f"{turn_id}2", reply="That is the only one.")
+
+
+def mcp_failures() -> int:
+    """Hermes's MCP circuit-breaker count for the Lite server (tools/mcp_tool.py _server_error_counts; 3 opens it)."""
+    import tools.mcp_tool as core
+
+    try:
+        from tools.mcp_tool_scope import _resolve_server_key  # 2bd378e keys the count by the resolved server
+        key = _resolve_server_key(SERVER)
+    except ImportError:  # f0187332 keys it by name
+        key = SERVER
+    return core._server_error_counts.get(key, 0)
+
+
+def breaker_threshold() -> int:
+    import tools.mcp_tool as core
+
+    return core._CIRCUIT_BREAKER_THRESHOLD
+
+
+def test_a_forced_step_missed_twice_fails_the_turn_and_hermess_mcp_breaker_stays_closed(operator):
+    """Shakedown r3: a wrong forced call reached Lite, which ended the turn; Hermes kept calling Lite, and three refusals opened its breaker."""
+    session, turn_id = "e2e-contract", "e2e-contract:t"
+    begin(session, turn_id, "what is on my mind?")
+    call_tool("orient", "list_concerns", session=session, turn_id=turn_id)  # a call that succeeds resets the breaker count
+    finish(session, turn_id, reply="The seed packets.")
+    assert mcp_failures() == 0
+
+    begin(session, f"{turn_id}2", "Call the orient tool to list my concerns, then tell me the first one.")
+    first = dispatch("session", "list", session=session, turn_id=f"{turn_id}2")
+    assert "PSFN Lite did not run this call" in first and f"mcp__{SERVER}__orient" in first
+    second = dispatch("session", "list", session=session, turn_id=f"{turn_id}2")
+    assert "tool_contract_incompatible" in second
+    for _ in range(breaker_threshold() + 1):
+        assert "PSFN Lite has ended the companion's turn" in dispatch("orient", "list_concerns", session=session, turn_id=f"{turn_id}2")
+    # Nothing of this reached Lite's MCP server, so Hermes counted nothing.
+    assert mcp_failures() == 0
+    finish(session, f"{turn_id}2", reply="I could not list them.")
+    assert plugin_module("runtime").driver().ledger.pending() == []
+
+    # Lite recorded the failed turn without Hermes's reply, and the next turn's tools reach Lite.
+    context = begin(session, f"{turn_id}3", "and now?")
+    assert "I could not list them." not in context
+    assert SEED_THREAD in call_tool("orient", "list_concerns", session=session, turn_id=f"{turn_id}3")
+    finish(session, f"{turn_id}3", reply="Still the seed packets.")
+
+
+def test_after_lite_ends_a_turn_itself_hermes_counts_one_refusal_and_the_breaker_stays_closed(operator):
+    session, turn_id = "e2e-ended", "e2e-ended:t"
+    begin(session, turn_id, "what is on my mind?")
+    call_tool("orient", "list_concerns", session=session, turn_id=turn_id)
+    assert mcp_failures() == 0
+    # Lite ends the turn without the plugin's knowledge, as its host-turn timeout does (bridge.ts armTimeout).
+    driver = plugin_module("runtime").driver()
+    [row] = [r for r in driver.ledger.turns() if r["session_id"] == session]
+    driver.client.call("settle", {"hostInstance": driver.instance, "turnId": row["turn_id"],
+                                  "outcome": {"kind": "failed", "error": {"code": "host_turn_timeout", "message": "the test ended the turn"}}})
+
+    refused = dispatch("orient", "list_concerns", session=session, turn_id=turn_id)
+    assert "no_open_turn" in refused or "turn_ended" in refused
+    assert mcp_failures() == 1  # Lite's refusal: one strike
+    for _ in range(breaker_threshold() + 1):
+        assert "PSFN Lite has ended the companion's turn" in dispatch("orient", "list_concerns", session=session, turn_id=turn_id)
+    assert mcp_failures() == 1 < breaker_threshold()
+    finish(session, turn_id, reply="Hm.")
+
+    begin(session, f"{turn_id}2", "and now?")
+    assert SEED_THREAD in call_tool("orient", "list_concerns", session=session, turn_id=f"{turn_id}2")
+    assert mcp_failures() == 0
+    finish(session, f"{turn_id}2", reply="The seed packets.")
+
+
+def test_a_forced_step_with_exact_arguments_is_held_to_the_arguments_lite_hands_over(operator):
+    """The exact-arguments schema comes from Lite (the donor's buildExactToolArgumentsModelSchema); the plugin reads the arguments back from it."""
+    session, turn_id = "e2e-exact", "e2e-exact:t"
+    begin(session, turn_id, 'Call orient exactly once with arguments {"action": "list_concerns"}, then tell me the first concern.')
+    wrong = json.loads(dispatch("orient", "values_list", session=session, turn_id=turn_id))["error"]
+    assert "other arguments" in wrong and '{"action": "list_concerns"}' in wrong
+    assert SEED_THREAD in call_tool("orient", "list_concerns", session=session, turn_id=turn_id)
+    finish(session, turn_id, reply="The seed packets.")
+    context = begin(session, f"{turn_id}2", "thanks")
+    assert "[your own earlier reply]\nThe seed packets." in context
+    finish(session, f"{turn_id}2", reply="You are welcome.")

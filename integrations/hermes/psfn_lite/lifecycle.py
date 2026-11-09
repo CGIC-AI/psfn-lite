@@ -28,6 +28,12 @@ requested tool while the sequence runs, then no tool. Prepare's context
 carries the first call's choice; after each Lite tool call the plugin asks
 the bridge (``tool-choice``) for the next one, and the ``llm_request``
 middleware rewrites Hermes's provider request with it (toolchoice.py).
+``pre_tool_call`` checks a forced step's call before Lite sees it: the
+first miss is blocked so the model calls again, a second fails the turn
+(``_contract_miss``). Once the companion's turn is over (the plugin failed
+it, or Lite refused a call because it ended), Lite's tools are blocked and
+the model gets no tools for the rest of the Hermes turn, so Hermes's MCP
+circuit breaker never counts a refusal for a turn Lite already ended.
 
 The companion's memory deletions are decided by Hermes's human. The donor
 ``memory`` tool never deletes on its own: ``action=delete`` records a pending
@@ -65,7 +71,7 @@ from .bridge import BridgeClient, BridgeError
 from .config import NON_INTERACTIVE_PLATFORMS, Config
 from .delivery import Delivery
 from .ledger import Ledger
-from .outcomes import outcome, unfinished
+from .outcomes import failure, outcome, unfinished
 from .render import block, render_context
 
 logger = logging.getLogger(__name__)
@@ -100,6 +106,76 @@ TOOL_BLOCKED = (
     "PSFN Lite tools work only inside a turn recorded in the companion's Lite continuity: not in a subagent, "
     "the background review, a cron or flush run, a conversation not bound to Lite, or a turn Lite refused."
 )
+#: The Lite refusals of a tool call (packages/lifecycle/src/bridge.ts callTool) that mean the companion's turn is over.
+_TURN_OVER = ("turn_ended", "no_open_turn")
+#: Calls of a forced step that may miss the required call before the turn fails (the plugin's own retry; see _contract_miss).
+_STEP_RETRIES = 1
+#: The donor's failure category for a model that does not make the required call (error-classify.ts tool_contract_incompatible).
+CONTRACT_FAILURE = "tool_contract_incompatible"
+
+
+def turn_over_text(reason: str) -> str:
+    return (
+        f"PSFN Lite has ended the companion's turn ({reason}), so its tools do not run again in this turn. "
+        "Do not call them again; answer the participant without tools."
+    )
+
+
+def _exact_value(schema):
+    """The one value the donor's exact-arguments schema admits (explicit-tool-arguments.ts exactValueSchema)."""
+    if not isinstance(schema, dict):
+        raise ValueError("not a schema")
+    if schema.get("type") == "null":
+        return None
+    if schema.get("type") == "object" and isinstance(schema.get("properties"), dict):
+        return {key: _exact_value(value) for key, value in schema["properties"].items()}
+    enum = schema.get("enum")
+    if isinstance(enum, list) and len(enum) == 1:
+        return enum[0]
+    raise ValueError("not an exact-value schema")
+
+
+def expected_arguments(parameters):
+    """The arguments a forced step requires, from the schema Lite hands over (buildExactToolArgumentsModelSchema), or None."""
+    if not isinstance(parameters, dict):
+        return None
+    try:
+        value = _exact_value(parameters)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def exact_match(actual, expected) -> bool:
+    """The donor's exactToolArgumentsMatch (explicit-tool-arguments.ts): the same keys, the same JSON values, nothing else."""
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and sorted(actual) == sorted(expected) and all(exact_match(actual[k], expected[k]) for k in expected)
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(actual) == len(expected) and all(exact_match(a, e) for a, e in zip(actual, expected))
+    if isinstance(expected, bool) or isinstance(actual, bool):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(expected, (int, float)):
+        return isinstance(actual, (int, float)) and actual == expected
+    return type(actual) is type(expected) and actual == expected
+
+
+def _turn_over_reason(result):
+    """``turn_ended`` or ``no_open_turn`` when a Lite tool result is that refusal (Hermes wraps the MCP error text once)."""
+    value = result
+    for _ in range(3):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                return None
+        if not isinstance(value, dict):
+            return None
+        error = value.get("error")
+        if isinstance(error, dict):
+            reason = error.get("reason")
+            return reason if reason in _TURN_OVER else None
+        value = error
+    return None
 
 
 def idempotency_key(session_id: str, turn_id: str) -> str:
@@ -124,7 +200,7 @@ class Driver:
         self._lock = threading.RLock()
         #: Hermes session id -> Lite turn ids prepared in it (inherited across a compression's session rotation).
         self._turns = {}
-        #: Hermes turn id -> the open Lite turn ({turn, session, reply, prepare, row, choice, choice_fresh}).
+        #: Hermes turn id -> the open Lite turn ({turn, session, reply, prepare, row, choice, choice_fresh, misses, ended, settled}).
         self._open = {}
         #: Hermes session id -> the session it continues after a compression.
         self._parents = {}
@@ -225,15 +301,28 @@ class Driver:
     def pre_tool_call(self, tool_name="", session_id="", turn_id="", args=None, tool_call_id="", **_):
         """Lite's governed tools run only inside an open Lite turn; Hermes sends the standing credential for every caller.
 
-        A memory delete inside the turn goes to Hermes's human approval gate first.
+        A forced step's call is checked against the donor's contract before it runs (_contract_miss); once the
+        companion's turn is over, Lite's tools are blocked for the rest of the Hermes turn. A memory delete inside
+        the turn goes to Hermes's human approval gate first.
         """
-        if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
+        if not isinstance(tool_name, str):
             return None
+        lite = tool_name.startswith(self.config.tool_prefix)
         entry = self._entry(turn_id, session_id)
         if entry is None:
+            if not lite:
+                return None
             logger.warning("psfn_lite blocked %s outside a Lite turn (session %s, turn %s)", tool_name, session_id, turn_id)
             return {"action": "block", "message": TOOL_BLOCKED}
-        if not self._is_memory_delete(tool_name, args):
+        with self._lock:
+            over = entry.get("ended")
+        if over is not None:
+            # Hermes's MCP client counts each Lite refusal toward its circuit breaker; a block is never counted.
+            return {"action": "block", "message": turn_over_text(over)} if lite else None
+        miss = self._contract_miss(entry, tool_name, args)
+        if miss is not None:
+            return {"action": "block", "message": miss}
+        if not lite or not self._is_memory_delete(tool_name, args):
             return None
         memory_id = _memory_id(args)
         category = args.get("justification_category")
@@ -258,15 +347,21 @@ class Driver:
     def post_tool_call(self, tool_name="", args=None, result=None, session_id="", turn_id="", tool_call_id="", status="", **_):
         """After Hermes's human approved a memory delete and it ran, Lite approves the proposal that call created.
 
-        Any Lite tool call moves an explicit tool sequence on, so the next model call's choice is asked again.
+        A Lite tool call that ran moves an explicit tool sequence on, so the next model call's choice is asked again;
+        a blocked call never reached Lite and moves nothing. A call Lite refused because the companion's turn is over
+        ends the plugin's side of the turn too.
         """
         if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
             return
         current = self._entry(turn_id, session_id)
-        if current is not None:
+        if current is not None and status != "blocked":
+            reason = _turn_over_reason(result)
             with self._lock:
                 if current.get("choice") is not None:
                     current["choice_fresh"] = False
+                current["misses"] = 0
+            if reason is not None:
+                self._end_turn(current, reason, f"PSFN Lite refused a companion tool call because the companion's turn is over ({reason}); its tools are blocked for the rest of this Hermes turn.")
         with self._lock:
             asked = self._deletions.pop(self._call_key(turn_id, tool_call_id), None)
         if asked is None:
@@ -297,13 +392,19 @@ class Driver:
         if entry is None or not isinstance(request, dict):
             return None
         with self._lock:
-            lite_turn, choice, fresh = entry.get("turn"), entry.get("choice"), entry.get("choice_fresh", True)
+            lite_turn, choice, fresh, over = entry.get("turn"), entry.get("choice"), entry.get("choice_fresh", True), entry.get("ended")
+        if over is not None:
+            return self._without_tools(entry, request, api_mode, provider, base_url, over)
         if lite_turn is None or choice is None:
             return None
         if not fresh:
             try:
                 answer = self.client.call("tool-choice", {"hostInstance": self.instance, "turnId": lite_turn})
             except BridgeError as error:
+                if error.kind == "not_found":
+                    # Lite answers an ended turn's choice as not found (bridge.ts toolChoice): the companion's turn is over.
+                    self._end_turn(entry, "turn_ended", "PSFN Lite has no open turn for the companion's next step; its tools are blocked for the rest of this Hermes turn.")
+                    return self._without_tools(entry, request, api_mode, provider, base_url, "turn_ended")
                 self._notice(entry["session"], f"PSFN Lite did not say which tool the companion's next step must call ({error}); the model call goes as Hermes built it.")
                 return None
             choice = answer.get("toolChoice") if isinstance(answer, dict) else None
@@ -336,6 +437,10 @@ class Driver:
                 kind = "interrupted" if interrupted else ("completed" if completed and not failed else "failed")
                 self._notice(session_id, f"Hermes reported a turn as {kind} after it was recorded in your continuity as unfinished; Lite keeps the failure.")
             return
+        with self._lock:
+            settled = entry.get("settled", False)
+        if settled:
+            return  # the plugin failed the turn at the contract violation; Lite already has its outcome
         self._finish(entry, outcome(entry["reply"], completed=completed, failed=failed, interrupted=interrupted, reason=turn_exit_reason))
 
     def on_session_finalize(self, session_id="", **_):
@@ -380,7 +485,9 @@ class Driver:
         if entry is not None:
             return entry  # Hermes prepared the same turn again; Lite resumes its key
         row = self.ledger.open_turn(session_id=session_id, host_instance=self.instance, pid=os.getpid(), hermes_turn=turn_id, prepare=body)
-        entry = {"turn": None, "session": session_id, "reply": None, "prepare": body, "row": row, "choice": None, "choice_fresh": True}
+        entry = {"turn": None, "session": session_id, "reply": None, "prepare": body, "row": row, "choice": None, "choice_fresh": True,
+                 # Calls of the current forced step that missed it; why the companion's turn is over; whether the plugin settled it.
+                 "misses": 0, "ended": None, "settled": False}
         with self._lock:
             self._open[turn_id] = entry
         return entry
@@ -398,18 +505,86 @@ class Driver:
             with self._lock:
                 self._remember(entry["session"], answer["turnId"])
 
+    def _contract_miss(self, entry: dict, tool_name: str, args):
+        """The block message for a call that is not the forced step's required call, or None when it is (or no step is forced).
+
+        The donor offered a forced step's one tool with a required choice, so the provider itself held the model to
+        the tool's name; its stream adapter failed the turn on any other call (explicit-tool-request.ts
+        assertExplicitToolContractSatisfied, mismatched_tool_call and invalid_arguments) and retried one fresh
+        completion only when the model made no call at all (stream-adapter.ts missing_required_call). Through
+        Hermes's Tool Search bridge the provider holds only ``tool_call``; the Lite tool's name is held by the
+        narrowed schema alone, which a model can ignore (shakedown r3: DeepSeek, 1 of 60 forced steps). So the plugin
+        checks the call before it reaches Lite: the first miss of a step is blocked with a corrective message and
+        the model calls again; a second miss of the same step fails the turn as the donor fails it
+        (``tool_contract_incompatible``, with the donor's own violation text). A blocked call never reaches Lite.
+        """
+        prefix = self.config.tool_prefix
+        with self._lock:
+            choice = entry.get("choice")
+            if not (isinstance(choice, dict) and choice.get("kind") == "tool" and isinstance(choice.get("name"), str)
+                    and entry.get("choice_fresh", True) and entry.get("turn") is not None):
+                return None
+            required = choice["name"]
+            wanted = prefix + required
+            expected = expected_arguments(choice.get("parameters"))
+            if tool_name == wanted and (expected is None or exact_match(args, expected)):
+                return None
+            entry["misses"] = entry.get("misses", 0) + 1
+            last = entry["misses"] > _STEP_RETRIES
+            if last:
+                entry["ended"], entry["settled"] = CONTRACT_FAILURE, True
+        if tool_name == wanted:
+            violation = f"Provider changed exact requested arguments for required tool call: {required}"
+            made = f"a {wanted} call with other arguments"
+        else:
+            shown = tool_name[len(prefix):] if tool_name.startswith(prefix) else tool_name
+            violation = f"Provider violated explicit tool contract: expected exactly one {json.dumps(required)} call, received {json.dumps([shown])}"
+            made = f"a {tool_name} call"
+        need = f"exactly one {wanted} call" + ("" if expected is None else f" with exactly these arguments: {json.dumps(expected, ensure_ascii=False)}")
+        if not last:
+            logger.warning("psfn_lite blocked %s: the forced step of turn %s requires %s", tool_name, entry["turn"], wanted)
+            return (f"PSFN Lite did not run this call: this step of the companion's turn requires {need}, and this was {made}. "
+                    "Make that call now; another call that is not exactly it fails the companion's turn.")
+        logger.error("psfn_lite fails turn %s: the model missed its forced step (%s) twice", entry["turn"], wanted)
+        self._notice(entry["session"], f"The companion's turn is recorded as failed ({CONTRACT_FAILURE}): the model twice made another call than the {wanted} call the participant asked for.")
+        self._finish(entry, failure(CONTRACT_FAILURE, violation))
+        return (f"PSFN Lite did not run this call and has ended the companion's turn ({CONTRACT_FAILURE}): this step required {need}, "
+                f"and this was again {made}. The companion's tools do not run again in this turn; answer the participant without tools.")
+
+    def _end_turn(self, entry: dict, reason: str, message: str) -> None:
+        """The companion's turn is over (Lite ended it): Lite's tools are blocked and the model gets no tools for the rest of the Hermes turn."""
+        with self._lock:
+            if entry.get("ended") is not None:
+                return
+            entry["ended"] = reason
+        self._notice(entry["session"], message)
+
+    def _without_tools(self, entry: dict, request: dict, api_mode: str, provider: str, base_url: str, reason: str):
+        """The provider request with no tools, so the model answers and Hermes's turn ends: Hermes gives a plugin no way to stop it."""
+        try:
+            rewritten = toolchoice.apply(request, api_mode, {"kind": "none"}, self.config.tool_prefix, provider=provider, base_url=base_url)
+        except toolchoice.ChoiceError as error:
+            self._notice(entry["session"], f"PSFN Lite could not take the tools out of the model call after the companion's turn ended ({error}); its tools stay blocked.")
+            return None
+        if rewritten == request:
+            return None
+        return {"request": rewritten, "source": "psfn_lite", "reason": f"the companion's turn is over ({reason})", "name": "psfn_lite_tool_choice"}
+
     def _sweep(self, session_id: str, *, keep, why: str) -> list:
         """Settles as failed the open turns of this conversation Hermes never reported the end of; returns warnings."""
         with self._lock:
             lineage = self._related(session_id)
             stale = [(t, e) for t, e in self._open.items() if t != keep and e["session"] in lineage]
-            for hermes_turn, _ in stale:
+            for hermes_turn, entry in stale:
                 del self._open[hermes_turn]
-                self._swept[hermes_turn] = True
+                if not entry.get("settled"):
+                    self._swept[hermes_turn] = True  # a late on_session_end is reported; a turn already failed needs no report
             while len(self._swept) > _SWEPT_KEPT:
                 del self._swept[next(iter(self._swept))]
         warnings = []
         for _, entry in stale:
+            if entry.get("settled"):
+                continue  # failed at a contract violation; Lite already has the outcome
             message = f"An earlier turn is recorded in your continuity as failed: Hermes did not report how it ended ({why})."
             logger.error("psfn_lite settles an unfinished turn of session %s as failed: %s", entry["session"], why)
             self._notify(message)

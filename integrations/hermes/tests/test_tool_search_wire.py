@@ -197,3 +197,79 @@ def test_a_forced_step_forces_the_bridge_to_the_lite_tool_without_thinking_and_t
     assert result["final_response"] == "Your first value is Kindness."
     [settled] = bridge.bodies("settle")
     assert settled["outcome"]["kind"] == "completed" and settled["outcome"]["reply"] == "Your first value is Kindness."
+
+
+SESSION = "mcp__psfn_lite__session"
+
+
+@pytest.fixture
+def session_tool():
+    """A second Lite tool, the one DeepSeek called in place of orient in shakedown r3 (tsv:67, lite-serve.log:519)."""
+    from tools.registry import registry
+
+    calls = []
+
+    def handler(args, **_):
+        calls.append(args)
+        return json.dumps({"sessions": []})
+
+    registry.register(name=SESSION, toolset="mcp-psfn_lite", schema={"name": SESSION, "description": "The companion's sessions.",
+                      "parameters": {"type": "object", "properties": {"action": {"type": "string"}}, "required": ["action"]}}, handler=handler)
+    yield calls
+    registry.deregister(SESSION)
+
+
+def bridged_as(name, arguments):
+    """A model that ignores the narrowed ``name`` enum and calls another tool through the forced bridge."""
+    def answer(body):
+        [bridge_tool] = body["tools"]
+        _, batched = one_call(bridge_tool)
+        call = {"name": name, "arguments": arguments}
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_x", "type": "function", "function": {"name": "tool_call", "arguments": json.dumps({"calls": [call]} if batched else call)}}]}
+    return answer
+
+
+def tool_messages(body):
+    return [m.get("content") or "" for m in body["messages"] if m.get("role") == "tool"]
+
+
+def test_a_forced_call_of_another_tool_is_blocked_before_it_runs_and_the_models_retry_makes_the_step(profile, bridge, model, lite_tool, session_tool):
+    bridge.first_choice = {"kind": "tool", "name": "orient", "parameters": None}
+    bridge.next_choices.append({"kind": "none"})
+    model.replies += [bridged_as(SESSION, {"action": "list"}), bridged({"action": "values_list"}), {"role": "assistant", "content": "Kindness."}]
+    load_provider()
+
+    result = agent_turn(model, "Call the orient tool, then tell me my first value.")
+    forced, retry, last = model.bodies
+
+    # The wrong call never ran and Lite never saw it; the retry was forced exactly as the first call, with the
+    # plugin's correction as the blocked call's result.
+    assert session_tool == [] and lite_tool == [{"action": "values_list"}]
+    assert retry["tools"] == forced["tools"] and retry["tool_choice"] == "required" and retry["thinking"] == {"type": "disabled"}
+    assert any("PSFN Lite did not run this call" in text and ORIENT in text for text in tool_messages(retry))
+    assert len(bridge.bodies("tool-choice")) == 1  # the step moved on once, after the call that ran
+    assert not TOOL_FIELDS & set(last)
+    assert result["final_response"] == "Kindness."
+    [settled] = bridge.bodies("settle")
+    assert settled["outcome"] == {"kind": "completed", "reply": "Kindness."}
+
+
+def test_a_second_miss_of_the_step_fails_the_turn_as_the_donor_does_and_the_model_answers_without_tools(profile, bridge, model, lite_tool, session_tool):
+    bridge.first_choice = {"kind": "tool", "name": "orient", "parameters": None}
+    model.replies += [bridged_as(SESSION, {"action": "list"}), bridged_as(SESSION, {"action": "list"}),
+                      {"role": "assistant", "content": "I could not do that."}]
+    load_provider()
+
+    result = agent_turn(model, "Call the orient tool, then tell me my first value.")
+    forced, retry, last = model.bodies
+
+    assert session_tool == [] and lite_tool == []
+    assert retry["tools"] == forced["tools"]
+    [settled] = bridge.bodies("settle")  # at the violation, once; on_session_end does not settle it again
+    assert settled["outcome"] == {"kind": "failed", "error": {"code": "tool_contract_incompatible",
+                                  "message": 'Provider violated explicit tool contract: expected exactly one "orient" call, received ["session"]'}}
+    # Hermes gives a plugin no way to stop its turn; the request carries no tools, so the model answers and the turn ends.
+    assert not TOOL_FIELDS & set(last) and bridge.bodies("tool-choice") == []
+    assert any("tool_contract_incompatible" in text for text in tool_messages(last))
+    assert result["final_response"] == "I could not do that."
