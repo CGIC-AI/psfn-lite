@@ -142,4 +142,35 @@ describe('Lite operator automata rule 1 over Postgres', () => {
       await second.close();
     });
   }, INTEGRATION_TIMEOUT_MS);
+
+  it('replays a correction repeated by the next attempt after the first removed its target from the current findings', async () => {
+    await withDatabase(async databaseUrl => {
+      const text = (result: { content: Array<{ type: string }> }) => result.content
+        .map(block => ('text' in block ? String(block.text) : '')).join('');
+      const first = await startProcess(databaseUrl);
+      const attempt1 = await first.attempt('subagent-attempt-1', 1);
+      const attempt2 = await first.attempt('subagent-attempt-2', 2, 'subagent-attempt-1');
+      const note = JSON.parse(text(await attempt1.execute('call-1', { action: 'note', text: 'The cache is warm by default.' })));
+      for (const relation of ['supersedes', 'retracts'] as const) {
+        const target = relation === 'supersedes'
+          ? note.result.event.eventId as string
+          : JSON.parse(text(await attempt1.execute('call-2', { action: 'note', text: 'The index is rebuilt nightly.' }))).result.event.eventId as string;
+        const correction = {
+          action: 'correct',
+          target_event_id: target,
+          relation,
+          reason: 'Measured it.',
+          ...(relation === 'supersedes' ? { replacement_claim: 'The cache starts cold after a deploy.' } : {}),
+        };
+        const stored = JSON.parse(text(await attempt1.execute(`call-${relation}`, correction)));
+        expect(stored.result.inserted).toBe(true);
+        const replayed = text(await attempt2.execute(`call-${relation}`, correction));
+        expect(replayed).not.toContain('failed safely');
+        expect(JSON.parse(replayed).result).toMatchObject({ inserted: false, event: { eventId: stored.result.event.eventId } });
+      }
+      const events = await first.history();
+      expect(events.map(event => event.type)).toEqual(['finding', 'relation', 'finding', 'relation']);
+      await first.close();
+    });
+  }, INTEGRATION_TIMEOUT_MS);
 });

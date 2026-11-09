@@ -146,19 +146,36 @@ export class CanonicalAutomataBusWriter {
     return operation;
   }
 
+  /**
+   * Lite (operator automata rule 1): replays the stored event with this id, or
+   * returns null when there is none. A write whose body depends on current
+   * state (a correction reads its target, which the first correction removed
+   * from the current projection) asks this before it reads that state.
+   */
+  replayExisting(eventId: string): Promise<CanonicalAppendResult | null> {
+    const operation = this.appendTail.then(() => this.replaySerialized(eventId));
+    this.appendTail = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private async replaySerialized(eventId: string): Promise<CanonicalAppendResult | null> {
+    const incumbent = await this.options.store.readEventById({
+      companionId: this.options.companionId,
+      audience: 'eligible-automata',
+      maxSensitivity: SENSITIVITY_LEVELS.at(-1)!,
+      eventId: requiredText(eventId, 'eventId'),
+    });
+    return incumbent ? await this.indexPersisted(incumbent, false) : null;
+  }
+
   private async appendSerialized(input: CanonicalAppendInput): Promise<CanonicalAppendResult> {
     if (input.replayIncumbent === true) {
       // Read inside the in-process append serialization, so two calls of one
       // write in this process cannot both miss it. A concurrent writer in
       // another process that wins the race makes this append fail the store's
       // reused-id check: the write still exists exactly once.
-      const incumbent = await this.options.store.readEventById({
-        companionId: this.options.companionId,
-        audience: 'eligible-automata',
-        maxSensitivity: SENSITIVITY_LEVELS.at(-1)!,
-        eventId: requiredText(input.eventId, 'eventId'),
-      });
-      if (incumbent) return await this.indexPersisted(incumbent, false);
+      const replayed = await this.replaySerialized(input.eventId);
+      if (replayed) return replayed;
     }
     const persisted = await this.options.store.appendAllocated({
       companionId: this.options.companionId,
@@ -320,6 +337,12 @@ export function createProductionAutomataBusWorkerAccess(options: {
     },
     correct: async input => {
       const run = exactRunForScope(options.registry, companionId, input.scope);
+      const eventId = workerWriteEventId('automata-bus-relation', companionId, run, derivedWriteKey('correct', input));
+      // Rule 1: a repeated correction replays the stored relation. Its target
+      // left the current projection with the first correction, so this runs
+      // before the target read below.
+      const replayed = await options.writer.replayExisting(eventId);
+      if (replayed) return replayed;
       const [target] = await options.store.readCurrentFindingsByEventIds({
         companionId,
         audience: input.scope.audience,
@@ -351,7 +374,7 @@ export function createProductionAutomataBusWorkerAccess(options: {
               : {}),
           };
       return await options.writer.append({
-        eventId: workerWriteEventId('automata-bus-relation', companionId, run, derivedWriteKey('correct', input)),
+        eventId,
         occurredAt: new Date().toISOString(),
         run,
         type: 'relation',

@@ -148,6 +148,26 @@ describe('Lite operator automata rule 1: worker writes are exactly-once across a
     expect(types).toEqual(['finding', 'finding', 'relation']);
   });
 
+  it('replays a repeated supersede as the stored relation after its target left the current set', async () => {
+    const world = await createWorld();
+    const first = world.toolFor('subagent-attempt-1');
+    const later = world.toolFor('subagent-attempt-2');
+    const note = JSON.parse(textOf(await first.execute('n', { action: 'note', text: 'The cache is warm by default.' })));
+    const correction = {
+      action: 'correct',
+      target_event_id: note.result.event.eventId as string,
+      relation: 'supersedes',
+      reason: 'The cache starts cold.',
+      replacement_claim: 'The cache starts cold after a deploy.',
+    };
+    const stored = JSON.parse(textOf(await first.execute('c', correction)));
+    expect(stored.result.inserted).toBe(true);
+    const replayed = JSON.parse(textOf(await later.execute('c', correction)));
+    expect(replayed.result.inserted).toBe(false);
+    expect(replayed.result.event.eventId).toBe(stored.result.event.eventId);
+    expect([...world.events.values()].map(entry => entry.event.type).sort()).toEqual(['finding', 'relation']);
+  });
+
   it('derives the same key from a direct port write without a tool-supplied key', async () => {
     const world = await createWorld();
     const scope = (runId: string) => buildAutomataBusWorkerScope(world.access, {
