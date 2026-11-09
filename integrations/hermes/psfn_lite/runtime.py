@@ -11,6 +11,7 @@ import logging
 import sqlite3
 import threading
 
+from . import automata
 from .bridge import BridgeClient
 from .config import Config, ConfigError, ownership_issues
 from .ledger import Ledger
@@ -119,6 +120,40 @@ def register_hooks(ctx) -> None:
             if handle is not None and getattr(handle, "active", False):
                 continue
             _handles[name] = ctx.register_hook(name, _hook(name))
+
+
+def bus_tool(args, **kwargs) -> str:
+    """The ``automata_bus`` tool of hosted automaton children; any other caller is refused."""
+    import json
+
+    try:
+        host = driver().automata
+    except (ConfigError, ValueError, OSError, sqlite3.Error) as error:
+        return json.dumps({"error": f"PSFN Lite is not usable in this profile: {error}"})
+    if host is None:
+        return json.dumps({"error": automata.OUTSIDE_ATTEMPT})
+    return host.bus_tool(args, **kwargs)
+
+
+def register_tools(ctx) -> None:
+    """Registers ``automata_bus`` once per process when the profile runs hosted automata."""
+    try:
+        enabled = Config.load(hermes_home()).automata is not None
+    except (ConfigError, OSError):
+        return  # the hooks report the unusable profile on its first turn
+    if not enabled:
+        return
+    with _lock:
+        handle = _handles.get("tool:" + automata.TOOL_NAME)
+        if handle is not None and getattr(handle, "active", False):
+            return
+        _handles["tool:" + automata.TOOL_NAME] = ctx.register_tool(
+            name=automata.TOOL_NAME,
+            toolset=automata.TOOLSET,
+            schema=automata.TOOL_SCHEMA,
+            handler=bus_tool,
+            description=automata.TOOL_SCHEMA["description"],
+        )
 
 
 def reset_for_tests() -> None:

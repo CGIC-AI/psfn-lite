@@ -49,6 +49,12 @@ export interface LifecycleBridgeOptions {
    * the bound principal and the body's hostInstance.
    */
   readonly automata?: Pick<HostedAutomataExecutor, 'claim' | 'heartbeat' | 'callBus' | 'report'> | null;
+  /**
+   * Which principals may run automata. An automaton's goal and context are
+   * the companion's own work at its private trust, so the standalone host
+   * admits only principals bound to its primary contact. Required with `automata`.
+   */
+  readonly automataAdmits?: (principal: string) => boolean;
 }
 
 export interface LifecycleBridge {
@@ -104,7 +110,7 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
   };
 
   return {
-    ...(options.automata ? createAutomataRoutes(options.automata, fail) : {}),
+    ...(options.automata ? createAutomataRoutes(options.automata, options.automataAdmits ?? (() => false), fail) : {}),
     async prepare(request) {
       const body = parsePrepare(request.body);
       if (!body.ok) return fail(request, body.error);
@@ -160,40 +166,44 @@ const REFUSAL_STATUS: Readonly<Record<HostedAttemptRefusal, number>> = {
 
 function createAutomataRoutes(
   automata: NonNullable<LifecycleBridgeOptions['automata']>,
+  admits: (principal: string) => boolean,
   fail: (request: Request, error: HostError) => Reply,
 ): Routes {
   const owner = (request: Request, hostInstance: string) => `${request.principal}/${hostInstance}`;
+  const admitted = (route: (request: Request) => Promise<Reply>) => async (request: Request): Promise<Reply> => (admits(request.principal)
+    ? await route(request)
+    : fail(request, { kind: 'denied', reason: 'automata_not_admitted', detail: 'this principal does not run the companion\'s automata' }));
   const answer = <T>(result: HostedResult<T>, render: (value: T) => Readonly<Record<string, unknown>>): Reply => (result.ok
     ? { status: 200, body: render(result.value) }
     : { status: REFUSAL_STATUS[result.refusal], body: { error: { kind: result.refusal, detail: result.message } } });
   return {
-    async 'automata/claim'(request) {
+    'automata/claim': admitted(async (request) => {
       const body = parseAutomataClaim(request.body);
       if (!body.ok) return fail(request, body.error);
       return answer(
         automata.claim(owner(request, body.value.hostInstance), { maxIterations: body.value.maxIterations, limit: body.value.limit }),
         (claims) => ({ attempts: claims }),
       );
-    },
-    async 'automata/heartbeat'(request) {
+    }),
+    'automata/heartbeat': admitted(async (request) => {
       const body = parseAutomataAttempt(request.body);
       if (!body.ok) return fail(request, body.error);
       return answer(automata.heartbeat(owner(request, body.value.hostInstance), body.value.attemptCredential), (status) => ({ ...status }));
-    },
-    async 'automata/bus'(request) {
+    }),
+    'automata/bus': admitted(async (request) => {
       const body = parseAutomataBus(request.body);
       if (!body.ok) return fail(request, body.error);
       const result = await automata.callBus(owner(request, body.value.hostInstance), body.value.attemptCredential, body.value.arguments);
       return answer(result, (value) => ({ ...value }));
-    },
-    async 'automata/report'(request) {
+    }),
+    'automata/report': admitted(async (request) => {
       const body = parseAutomataReport(request.body);
       if (!body.ok) return fail(request, body.error);
       return answer(
         automata.report(owner(request, body.value.hostInstance), body.value.attemptCredential, body.value.outcome),
         (value) => ({ ...value }),
       );
-    },
+    }),
   };
 }
 

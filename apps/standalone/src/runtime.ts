@@ -277,6 +277,11 @@ export async function createLiteRuntime(input: {
         ...(config.lifecycle.allowedHosts === null ? {} : { exposeBeyondLoopback: { allowedHosts: config.lifecycle.allowedHosts } }),
         onError: (report) => onDiagnostic({ kind: 'lifecycle', report }),
         automata,
+        // Automata carry the companion's private work: only a principal bound to a primary contact runs them.
+        automataAdmits: (principal) => {
+          const key = principals.contactOf(principal);
+          return key !== null && contactKeys.get(key)?.trust === 'primary';
+        },
       });
       if (!lifecycle.ok) {
         await closeAll();

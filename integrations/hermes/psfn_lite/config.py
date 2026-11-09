@@ -35,6 +35,12 @@ class Sender:
 
 
 @dataclass(frozen=True)
+class Automata:
+    #: Attempts claimed at the start of one bound root turn (Hermes runs at most 8 lifecycle children at once).
+    claim_limit: int
+
+
+@dataclass(frozen=True)
 class Config:
     bridge_url: str
     credential_env: str
@@ -42,6 +48,8 @@ class Config:
     senders: tuple
     timeout_seconds: float
     max_context_chars: int
+    #: Hosted automata (operator automata rule 4), or None to leave the companion's automata to Lite's core.
+    automata: "Automata | None"
 
     def credential(self) -> str:
         value = os.environ.get(self.credential_env, "")
@@ -58,7 +66,7 @@ class Config:
 
     @classmethod
     def parse(cls, values) -> "Config":
-        fields = ("bridge_url", "credential_env", "mcp_server", "senders", "timeout_seconds", "max_context_chars")
+        fields = ("bridge_url", "credential_env", "mcp_server", "senders", "timeout_seconds", "max_context_chars", "automata")
         _exact(values, fields, "config")
         url = values["bridge_url"]
         if not isinstance(url, str) or not re.match(r"^https?://[^\s/]+(/[^\s]*)?$", url) or not url.rstrip("/").endswith("/lifecycle/v1"):
@@ -87,7 +95,14 @@ class Config:
         limit = values["max_context_chars"]
         if type(limit) is not int or not 1_000 <= limit <= 1_000_000:
             raise ConfigError("max_context_chars must be an integer from 1000 to 1000000")
-        return cls(url.rstrip("/"), env, server, tuple(parsed), float(timeout), limit)
+        automata = values["automata"]
+        if automata is not None:
+            _exact(automata, ("claim_limit",), "automata")
+            claim_limit = automata["claim_limit"]
+            if type(claim_limit) is not int or not 1 <= claim_limit <= 8:
+                raise ConfigError("automata.claim_limit must be an integer from 1 to 8")
+            automata = Automata(claim_limit)
+        return cls(url.rstrip("/"), env, server, tuple(parsed), float(timeout), limit, automata)
 
     @classmethod
     def load(cls, hermes_home) -> "Config":

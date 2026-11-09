@@ -11,6 +11,7 @@ VALID = {
     "senders": [{"platform": "cli", "sender_id": ""}],
     "timeout_seconds": 30,
     "max_context_chars": 9000,
+    "automata": None,
 }
 
 
@@ -30,11 +31,23 @@ def test_a_complete_config_parses():
         ({"senders": [{"platform": "cron", "sender_id": ""}]}, "interactive"),
         ({"timeout_seconds": 0}, "timeout_seconds"),
         ({"internal_turns": None}, "unknown fields: internal_turns"),
+        ({"automata": {}}, "automata is missing required fields: claim_limit"),
+        ({"automata": {"claim_limit": 9}}, "claim_limit"),
+        ({"automata": {"claim_limit": 2, "max_iterations": 250}}, "automata has unknown fields: max_iterations"),
     ],
 )
 def test_a_malformed_config_is_refused_by_field(change, message):
     with pytest.raises(ConfigError, match=message):
         Config.parse({**VALID, **change})
+
+
+def test_hosted_automata_are_off_unless_configured():
+    assert Config.parse(VALID).automata is None
+    assert Config.parse({**VALID, "automata": {"claim_limit": 2}}).automata.claim_limit == 2
+    values = dict(VALID)
+    del values["automata"]
+    with pytest.raises(ConfigError, match="missing required fields: automata"):
+        Config.parse(values)
 
 
 def test_a_missing_field_is_named():
