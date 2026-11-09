@@ -1,10 +1,10 @@
 /**
- * The model capability the host supplies to the harness: a Pi model
- * collection, the one model every companion, worker and inference call uses,
- * and the API key the host read from its environment at start. The key is
- * held in memory only and never appears in an error or a record.
+ * The model capability the host supplies to the companion core: a Pi model
+ * collection, the one model every companion purpose uses, and the API key the
+ * host read from its environment at start. The key is held in memory only and
+ * never appears in an error or a record.
  */
-import { invalid, ok, type Result } from './core.ts';
+import { invalid, ok, type Result } from './result.ts';
 import {
   builtinProviders,
   createModels,
@@ -17,7 +17,6 @@ import {
   type Model,
   type Models,
   type SimpleStreamOptions,
-  type StreamFn,
 } from './pi.ts';
 
 export interface PiModelRuntime {
@@ -73,30 +72,6 @@ export function createCatalogModelRuntime(input: {
   return createPiModelRuntime({ models, model, apiKey: input.apiKey, maxOutputTokens: input.maxOutputTokens });
 }
 
-/** Per-request options: the host key (when it has one), the output ceiling and the caller's signal. */
-export function requestOptions(runtime: PiModelRuntime, signal: AbortSignal | undefined): SimpleStreamOptions {
-  return {
-    maxTokens: runtime.maxOutputTokens,
-    ...(runtime.apiKey === null ? {} : { apiKey: runtime.apiKey }),
-    ...(signal === undefined ? {} : { signal }),
-  };
-}
-
-/** The stream function the agent loop calls, routed through the collection so auth is applied per request. */
-export function streamFnOf(runtime: PiModelRuntime): StreamFn {
-  return (model, context, options) =>
-    runtime.models.streamSimple(model, context, {
-      ...options,
-      maxTokens: runtime.maxOutputTokens,
-      ...(runtime.apiKey === null ? {} : { apiKey: runtime.apiKey }),
-    });
-}
-
-/** Who produced a machine reading, as core records it. */
-export function producerOf(runtime: PiModelRuntime): string {
-  return `pi:${runtime.model.provider}/${runtime.model.id}`;
-}
-
 /**
  * The extracted companion core's provider seam (docs/extraction.md, seam 3.1).
  *
@@ -108,9 +83,9 @@ export function producerOf(runtime: PiModelRuntime): string {
  * that reaches pi-ai. This is that runtime over a host `PiModelRuntime`, so the
  * same host-built model collection and key serve Lite and the companion core.
  *
- * Structurally typed: this package never imports the companion tree (its
- * compiler settings differ); the companion composition accepts any value of
- * this shape as its `ProviderRuntime`, which its typecheck proves.
+ * Structurally typed: this package never imports the companion tree; the
+ * companion composition accepts any value of this shape as its
+ * `ProviderRuntime`, which the standalone host's typecheck proves.
  *
  * Differences from the donor's `PiProviderRuntime`, all host-side: the
  * collection is the host's (no built-in catalogue, no `local_endpoint` or

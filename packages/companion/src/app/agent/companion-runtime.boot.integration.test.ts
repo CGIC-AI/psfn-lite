@@ -25,7 +25,7 @@ import {
   companionProviderRuntimeOf,
   createPiModelRuntime,
 } from '../../../../pi/src/index.ts';
-import { ok } from '../../../../pi/src/core.ts';
+import { ok } from '../../../../pi/src/result.ts';
 import { createPostgresPool } from '../../persistence/postgres.js';
 import {
   PGVECTOR_POSTGRES_TEST_IMAGE,

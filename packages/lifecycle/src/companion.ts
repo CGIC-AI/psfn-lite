@@ -1,0 +1,20 @@
+/**
+ * The single place the lifecycle bridge reaches the extracted companion core
+ * (packages/companion). Every bridge module imports donor types and values from
+ * here, so the boundary test can list exactly which donor modules a host
+ * adapter depends on.
+ */
+export type { SubstrateStreamTransport } from '../../companion/src/core/agent/stream-adapter.js';
+export type { LLMProviderStreamOptions } from '../../companion/src/core/agent/contracts.js';
+export type {
+  AgentResponse,
+  LLMContext,
+  LLMResponse,
+  StreamCallbacks,
+  SubstrateMessage,
+  ToolCall,
+} from '../../companion/src/shared/contracts/runtime-base.js';
+export type { TurnRecord } from '../../companion/src/shared/contracts/runtime.js';
+export { NonRecoverableFallbackError } from '../../companion/src/primitives/llm/fallback.js';
+export { createTurnId } from '../../companion/src/core/turns/id.js';
+export { externalMemorySessionId } from '../../companion/src/shared/contracts/external-memory.js';

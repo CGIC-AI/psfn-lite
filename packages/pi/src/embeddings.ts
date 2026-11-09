@@ -5,7 +5,7 @@
  * and the maintenance backfill embeds them once a provider is configured.
  * Nothing is ever embedded with a stand-in vector.
  */
-import { isRecord, ok, unavailable, type EmbeddingPort, type Result } from './core.ts';
+import { isRecord, ok, unavailable, type EmbeddingPort, type Result } from './result.ts';
 
 const CAPABILITY = 'embeddings';
 
@@ -93,10 +93,10 @@ export interface CompanionEmbeddingProvider {
 export function companionEmbeddingProviderOf(port: EmbeddingPort, identity: { readonly model: string; readonly dimensions: number }): CompanionEmbeddingProvider {
   const embedBatch = async (texts: string[], options?: { readonly signal?: AbortSignal }): Promise<Float32Array[]> => {
     options?.signal?.throwIfAborted();
-    const result = await port.embed(texts, { purpose: 'companion_embedding', turnId: null, output: 'machine_inference' });
+    const result = await port.embed(texts);
     options?.signal?.throwIfAborted();
     if (!result.ok) {
-      const detail = result.error.kind === 'unavailable' ? result.error.detail : result.error.kind;
+      const detail = result.error.kind === 'unavailable' ? result.error.detail : result.error.issues.join('; ');
       throw new Error(`Embedding provider unavailable: ${detail}`);
     }
     return result.value.map((vector, index) => {
