@@ -2235,8 +2235,11 @@ the branch at :198-206) offers only that bridge, with
 (`minItems`/`maxItems` 1 in 2bd378e's `{calls: [...]}` form; the single
 `{name, arguments}` form at f0187332), `name` an enum of the Lite tool
 alone, and `arguments` the tool's own schema from Hermes's registry
-(`registered_tool`, :125-138, the lookup Hermes's own validator uses) or
-the donor's exact-arguments schema. Hermes unwraps the call before its
+(`registered_tool`, :125-138) or the donor's exact-arguments schema. The
+lookup is the one Hermes's own validator makes (`registry.get_schema`,
+`tools/tool_search_validation.py:86-87`), so under a multiplexing gateway it
+resolves the turn's profile scope first and then the global layer
+(`tools/registry.py` `get_entry` / `_lookup`, :563-579). Hermes unwraps the call before its
 hooks, approvals and dispatch (`agent/tool_executor.py`
 `_unwrap_tool_search_call`, :389-432; `model_tools.py` :745-765), so the
 plugin's `pre_tool_call` gate and `post_tool_call` (which asks Lite for the
@@ -2278,7 +2281,10 @@ On a forced request only, `_without_thinking` (:114-122) sets
 :245-246), or drops Anthropic's `thinking`. The middleware gets the
 provider and base URL from Hermes's call (`agent/turn_api_request.py:158-162`;
 `Driver.llm_request`, `lifecycle.py:294`, :316). The next, unforced
-request keeps Hermes's thinking fields. The donor TypeScript is unchanged:
+request keeps Hermes's thinking fields; its earlier tool-call turn, made
+without thinking, gets the `reasoning_content` pad Hermes adds for DeepSeek
+and Kimi (`agent/message_sanitization.py` `reapply_reasoning_echo`), which
+DeepSeek requires in thinking mode. The donor TypeScript is unchanged:
 Lite's own model calls already follow it.
 
 ### R2-1: the CLI sender binds as platform `cli`
@@ -2311,14 +2317,33 @@ local surfaces' platforms (`tui`, `desktop`), untested here.
   `thinking: {"type": "disabled"}` and no `reasoning_effort` (own schema
   and exact-arguments variants); the Lite tool runs with the model's
   arguments and Lite is asked for the next step once; the next request
-  carries no `tools`, `tool_choice` or `parallel_tool_calls` and thinks
-  again; the turn settles with the reply. It runs at both revisions.
+  carries no `tools`, `tool_choice` or `parallel_tool_calls`, thinks
+  again and replays the forced tool-call turn with a non-empty
+  `reasoning_content`; the turn settles with the reply. It runs at both
+  revisions.
 - `tests/test_tool_choice.py`: the `none` step without tools in all three
   API modes; thinking off on a forced step for DeepSeek and Kimi requests
   built by Hermes's own provider profiles (and by host), restored on the
   next step, and left alone for an aggregator; the bridge narrowed in each
   API mode and in both bridge forms.
-- `tests/test_profiles.py`: the CLI pair from the gateway's own mapping.
+- `tests/test_profiles.py`: the CLI pair from the gateway's own mapping;
+  at 2bd378e, a Lite tool registered in one profile's registry scope is
+  forced through the bridge from that profile's turn.
+- `tests/test_e2e_lite.py`: the explicit request against the real Lite now
+  expects no tools on the step after the call.
+
+Result (the plain validation command with a JSON reporter, `TMPDIR` under
+a scratch directory in the worktrees folder; the companion project's global
+setup still roots its own run directory at `/tmp/lc-<pid>-*`,
+`packages/companion/vitest.global-setup.ts:23`, :65-67, and removes it):
+778 files and 9,201 tests passed, none failed (`lite` 21 files / 108 tests,
+`companion` 757 files / 9,093 tests). `compare-baseline.mjs`: "baseline:
+807 files / 10107 tests; deleted: 54 files, 1041 tests; matched: 9066; Lite
+additions: 4 files, 27 tests" and "equivalent: every remaining baseline
+test has its baseline status". The Hermes plugin suite: 88 passed and 2
+skipped at f0187332, 88 passed and 2 skipped at 2bd378e (a fresh clone and
+venv). No test container, `/tmp/lc-*` directory or scratch directory was
+left.
 
 ## Measured size
 
