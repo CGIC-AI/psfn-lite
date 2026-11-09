@@ -25,7 +25,13 @@ export interface BridgeWorld {
 }
 
 /** Registers the file's one bridge world: started before the file's tests, closed after them. */
-export function useBridgeWorld(script: Script, options: { readonly hostTurnTimeoutMs?: number } = {}): () => BridgeWorld {
+export interface BridgeWorldOptions {
+  readonly hostTurnTimeoutMs?: number;
+  /** The lifecycle config's hosted automata policy; default null (automata run in core). */
+  readonly automata?: { readonly maxAttempts: number; readonly leaseMs: number; readonly maxIterations: number } | null;
+}
+
+export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {}): () => BridgeWorld {
   const lite = useLiteWorld();
   let world: BridgeWorld | null = null;
   beforeAll(async () => {
@@ -45,7 +51,10 @@ export function useBridgeWorld(script: Script, options: { readonly hostTurnTimeo
         allowedHosts: null,
         bindings: Object.entries(HERMES_PRINCIPALS).map(([principal, contact]) => ({ principal, credential: { env: envName(principal) }, contact })),
       };
-      document.lifecycle = { host: '127.0.0.1', port: 0, allowedHosts: null, hostTurnTimeoutMs: options.hostTurnTimeoutMs ?? 60_000 };
+      document.lifecycle = { host: '127.0.0.1', port: 0, allowedHosts: null,
+        hostTurnTimeoutMs: options.hostTurnTimeoutMs ?? 60_000,
+        automata: options.automata ?? null,
+      };
     });
     Object.assign(install.env, Object.fromEntries(Object.entries(credentials).map(([p, c]) => [envName(p), c])));
     const { runtime, model } = await lite.start(install, script);

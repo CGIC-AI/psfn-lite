@@ -217,6 +217,7 @@ import {
   wireSubagentRuntime,
 } from '../startup/composition/composition.js';
 import type { SubagentHostExecutionPort } from '../../faculties/subagents/host-execution.js';
+import type { SubagentControlPort } from '../../faculties/subagents/port.js';
 import {
   buildCharacterPromptVariablesProvider,
   wireCharacterCardRuntime,
@@ -321,6 +322,13 @@ export interface CompanionRuntime {
   readonly llmProvider: LLMProviderPort;
   readonly persistence: AgentPersistenceRuntime;
   readonly sessionManager: SubstrateAgentSessionManager;
+  /**
+   * Lite: the automata control port the `subagent` tool drives, for hosts
+   * that start automata outside a model turn (and for their tests). With a
+   * fixed tier that lacks shard.spawn the tool is denied in turns
+   * (docs/extraction.md, seam 3.17).
+   */
+  readonly subagentFaculty: SubagentControlPort;
   /** Stops the scheduler, the availability runtime and the database pools. */
   stop(): Promise<void>;
 }
@@ -1124,7 +1132,7 @@ async function composeCompanionRuntime(
     companionDataDir: pathSnapshot.companionDataDir,
   });
   // main.ts:1184-1229 (Lite: subagents and fold review without the shard manager)
-  const { foldReviewController } = wireSubagentRuntime({
+  const { foldReviewController, subagentFaculty } = wireSubagentRuntime({
     agentLoop,
     eventBus,
     llmProvider,
@@ -1659,6 +1667,7 @@ async function composeCompanionRuntime(
     llmProvider,
     persistence: persistenceRuntime,
     sessionManager,
+    subagentFaculty,
     stop: stopSequence,
   };
 }

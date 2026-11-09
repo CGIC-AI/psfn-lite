@@ -10,6 +10,7 @@
 import { invalid, isRecord, ok, type Result } from './mcp.ts';
 import type { HostOutcome } from './bridge.ts';
 import type { HostTurnContext } from './host-turns.ts';
+import type { HostedAttemptReport } from './companion.ts';
 
 export interface PrepareBody {
   /** The host process's own instance name; it narrows turn ownership within one credential, never widens it. */
@@ -39,6 +40,10 @@ const SESSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;
 /** The donor's turn ids are UUIDv7 (core/turns/id.ts). */
 const TURN_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const CODE_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+/** A per-attempt credential as core mints it (32 random bytes, base64url). */
+const ATTEMPT_CREDENTIAL_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
+const MAX_CLAIM_LIMIT = 64;
+const MAX_ITERATIONS_DECLARED = 1_000_000;
 const MAX_MESSAGE_CHARS = 200_000;
 const MAX_CHECKPOINT_TURNS = 1_000;
 
@@ -66,6 +71,12 @@ class Fields {
     if (typeof value === 'string' && value.trim().length > 0 && value.length <= max) return value;
     if (this.has(key)) this.issues.push(`${this.name(key)} must be a non-empty string of at most ${max} characters`);
     return '';
+  }
+  integer(key: string, min: number, max: number): number {
+    const value = this.raw[key];
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= min && value <= max) return value;
+    if (this.has(key)) this.issues.push(`${this.name(key)} must be an integer from ${min} to ${max}`);
+    return 0;
   }
   pattern(key: string, pattern: RegExp, description: string): string {
     const value = this.raw[key];
@@ -169,4 +180,96 @@ export function renderContext(context: HostTurnContext): Readonly<Record<string,
     })),
     tools: context.tools.map((t) => t.name),
   };
+}
+
+// -- hosted automata (operator automata rule 4) ------------------------------
+
+export interface AutomataClaimBody {
+  readonly hostInstance: string;
+  /** The per-attempt iteration budget the host gives each child it launches. */
+  readonly maxIterations: number;
+  readonly limit: number;
+}
+
+export interface AutomataAttemptBody {
+  readonly hostInstance: string;
+  /** The attempt's own credential from its claim; the bearer stays the host's standing credential. */
+  readonly attemptCredential: string;
+}
+
+export interface AutomataBusBody extends AutomataAttemptBody {
+  /** The child's `automata_bus` arguments, validated by the governed tool core formed for the run. */
+  readonly arguments: Readonly<Record<string, unknown>>;
+}
+
+export interface AutomataReportBody extends AutomataAttemptBody {
+  readonly outcome: HostedAttemptReport;
+}
+
+function attemptFields(f: Fields): AutomataAttemptBody {
+  const hostInstance = f.pattern('hostInstance', INSTANCE_PATTERN, '1-64 characters of [A-Za-z0-9._-]');
+  const attemptCredential = f.pattern('attemptCredential', ATTEMPT_CREDENTIAL_PATTERN, 'an attempt credential');
+  return { hostInstance, attemptCredential };
+}
+
+export function parseAutomataClaim(raw: unknown): Result<AutomataClaimBody> {
+  const f = fields(raw, '', ['hostInstance', 'maxIterations', 'limit']);
+  if (!f.ok) return f;
+  const hostInstance = f.value.pattern('hostInstance', INSTANCE_PATTERN, '1-64 characters of [A-Za-z0-9._-]');
+  const maxIterations = f.value.integer('maxIterations', 1, MAX_ITERATIONS_DECLARED);
+  const limit = f.value.integer('limit', 1, MAX_CLAIM_LIMIT);
+  return done(f.value, () => ({ hostInstance, maxIterations, limit }));
+}
+
+export function parseAutomataAttempt(raw: unknown): Result<AutomataAttemptBody> {
+  const f = fields(raw, '', ['hostInstance', 'attemptCredential']);
+  if (!f.ok) return f;
+  const attempt = attemptFields(f.value);
+  return done(f.value, () => attempt);
+}
+
+export function parseAutomataBus(raw: unknown): Result<AutomataBusBody> {
+  const f = fields(raw, '', ['hostInstance', 'attemptCredential', 'arguments']);
+  if (!f.ok) return f;
+  const attempt = attemptFields(f.value);
+  const args = f.value.get('arguments');
+  if (f.value.has('arguments') && !isRecord(args)) f.value.issues.push('arguments must be a JSON object');
+  return done(f.value, () => ({ ...attempt, arguments: args as Readonly<Record<string, unknown>> }));
+}
+
+export function parseAutomataReport(raw: unknown): Result<AutomataReportBody> {
+  const f = fields(raw, '', ['hostInstance', 'attemptCredential', 'outcome']);
+  if (!f.ok) return f;
+  const attempt = attemptFields(f.value);
+  let outcome: Result<HostedAttemptReport> | null = null;
+  if (f.value.has('outcome')) {
+    outcome = parseAttemptOutcome(f.value.get('outcome'));
+    if (!outcome.ok) f.value.issues.push(...(outcome.error.kind === 'invalid' ? outcome.error.issues : ['outcome is invalid']));
+  }
+  return done(f.value, () => ({ ...attempt, outcome: (outcome as { value: HostedAttemptReport }).value }));
+}
+
+function parseAttemptOutcome(raw: unknown): Result<HostedAttemptReport> {
+  if (!isRecord(raw)) return invalid('outcome must be an object');
+  const kind = raw['kind'];
+  if (kind === 'succeeded') {
+    const f = new Fields(raw, 'outcome', ['kind', 'summary', 'model', 'apiCalls']);
+    const summary = f.text('summary', MAX_MESSAGE_CHARS);
+    const model = f.get('model');
+    if (f.has('model') && model !== null && !(typeof model === 'string' && model.length > 0 && model.length <= 256)) {
+      f.issues.push('outcome.model must be null or a string of 1-256 characters');
+    }
+    const apiCalls = f.integer('apiCalls', 0, MAX_ITERATIONS_DECLARED);
+    return done(f, () => ({ kind: 'succeeded', summary, model: (model as string | null) ?? null, apiCalls }));
+  }
+  if (kind === 'failed' || kind === 'lost') {
+    const f = new Fields(raw, 'outcome', ['kind', 'code']);
+    const code = f.pattern('code', CODE_PATTERN, '1-64 characters of [a-z0-9_] starting with a letter');
+    return done(f, () => ({ kind, code }));
+  }
+  if (kind === 'cancelled') {
+    const f = new Fields(raw, 'outcome', ['kind']);
+    return done(f, () => ({ kind: 'cancelled' }));
+  }
+  return invalid('outcome.kind must be succeeded, failed, lost or cancelled');
 }

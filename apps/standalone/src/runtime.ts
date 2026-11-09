@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   COMPANION_SEED_DIR,
+  HostedAutomataExecutor,
   createSessionHmacBoundaryService,
   createTurnId,
   loadInnerLifeConfig,
@@ -19,6 +20,7 @@ import {
   type AgentResponse,
   type CompanionRuntime,
   type EmbeddingRuntimeProvider,
+  type HostedAutomataEvent,
   type ProviderRuntime,
   type StartCompanionRuntimeOptions,
   type TrustLevel,
@@ -66,6 +68,7 @@ export type LiteDiagnostic =
   | { readonly kind: 'outbound'; readonly channelId: string; readonly content: string }
   | { readonly kind: 'mcp'; readonly report: McpErrorReport }
   | { readonly kind: 'lifecycle'; readonly report: LifecycleErrorReport }
+  | { readonly kind: 'automata'; readonly event: HostedAutomataEvent }
   | { readonly kind: 'host_turn_timeout'; readonly turnId: string };
 
 /** Host ports a caller may supply instead of the configured ones (tests, embedding hosts). */
@@ -154,6 +157,10 @@ export async function createLiteRuntime(input: {
   process.env['CONFIG_DIR'] ??= seedDir;
   const registry = { models: [companionModelRegistryEntryOf(model.value, HOST_MODEL_ENTRY)] };
   const relay = config.lifecycle === null ? null : new HostTurnRelay();
+  // Hosted automata: spawned automata run as host subagents, attempt by attempt (docs/extraction.md, operator automata rules).
+  const automata = config.lifecycle?.automata == null
+    ? null
+    : new HostedAutomataExecutor(config.lifecycle.automata, { onEvent: (event) => onDiagnostic({ kind: 'automata', event }) });
   let companion: CompanionRuntime;
   try {
     const innerLife = loadInnerLifeConfig({ dataDir: config.dataDir, seedDir, modelRegistry: registry as never });
@@ -189,14 +196,18 @@ export async function createLiteRuntime(input: {
       heartbeatChannel: { channelId: operatorChannelId(config), channelType: 'terminal' },
       env: { ...env, CONFIG_DIR: seedDir },
       ...(relay === null ? {} : { wrapStreamTransport: relay.wrapTransport }),
+      automataHostExecution: automata,
     });
   } catch (error) {
+    automata?.close();
     return unavailable('companion_runtime', error instanceof Error ? error.message : 'the companion runtime did not start');
   }
 
   const opened: { close(): Promise<void> }[] = [];
   const closeAll = async (): Promise<void> => {
     for (const handle of opened.reverse()) await handle.close();
+    // Open hosted attempts end before the companion stops, so their automata settle as failed rather than hang.
+    automata?.close();
     await companion.stop();
   };
 
@@ -265,6 +276,7 @@ export async function createLiteRuntime(input: {
         host: config.lifecycle.host,
         ...(config.lifecycle.allowedHosts === null ? {} : { exposeBeyondLoopback: { allowedHosts: config.lifecycle.allowedHosts } }),
         onError: (report) => onDiagnostic({ kind: 'lifecycle', report }),
+        automata,
       });
       if (!lifecycle.ok) {
         await closeAll();

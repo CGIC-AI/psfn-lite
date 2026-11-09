@@ -73,10 +73,24 @@ describe('standalone configuration', () => {
     expect(issuesOf({ ...document(), mcp: { ...listen, bindings: [{ principal: 'p', credential: { env: 'P' }, contact: 'operator' }] } })).toEqual([
       'mcp needs lifecycle: companion tools run only inside host-driven turns',
     ]);
-    expect(issuesOf({ ...document(), lifecycle: { ...listen, hostTurnTimeoutMs: 60_000 } })).toEqual(['lifecycle needs mcp: the bridge shares its principal bindings']);
-    expect(issuesOf({ ...document(), mcp: { ...listen, bindings: [] }, lifecycle: { ...listen, hostTurnTimeoutMs: 10 } })).toEqual([
+    expect(issuesOf({ ...document(), lifecycle: { ...listen, hostTurnTimeoutMs: 60_000, automata: null } })).toEqual(['lifecycle needs mcp: the bridge shares its principal bindings']);
+    expect(issuesOf({ ...document(), mcp: { ...listen, bindings: [] }, lifecycle: { ...listen, hostTurnTimeoutMs: 10, automata: null } })).toEqual([
       'mcp.bindings must be a non-empty list of principal bindings',
       'lifecycle.hostTurnTimeoutMs must be an integer from 1000 to 86400000',
+    ]);
+  });
+
+  it('reads the hosted automata policy strictly: every field, in range, or null', () => {
+    const listen = { host: '127.0.0.1', port: 0, allowedHosts: null };
+    const mcp = { ...listen, bindings: [{ principal: 'p', credential: { env: 'P' }, contact: 'operator' }] };
+    const policy = { maxAttempts: 3, leaseMs: 60_000, maxIterations: 250 };
+    const parsed = parseLiteConfig({ ...document(), mcp, lifecycle: { ...listen, hostTurnTimeoutMs: 60_000, automata: policy } });
+    if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
+    expect(parsed.value.lifecycle?.automata).toEqual(policy);
+    expect(issuesOf({ ...document(), mcp, lifecycle: { ...listen, hostTurnTimeoutMs: 60_000 } })).toEqual(['lifecycle.automata is required']);
+    expect(issuesOf({ ...document(), mcp, lifecycle: { ...listen, hostTurnTimeoutMs: 60_000, automata: { maxAttempts: 0, leaseMs: 60_000 } } })).toEqual([
+      'lifecycle.automata.maxIterations is required',
+      'lifecycle.automata.maxAttempts must be an integer from 1 to 100',
     ]);
   });
 

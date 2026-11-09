@@ -74,6 +74,19 @@ export interface LiteConfig {
     readonly allowedHosts: readonly string[] | null;
     /** A host-driven turn the host neither continues nor settles within this time is failed. */
     readonly hostTurnTimeoutMs: number;
+    /**
+     * Hosted automata (docs/extraction.md, operator automata rules), or null
+     * to run every spawned automaton in core as the donor does. When set, the
+     * host claims each spawned automaton's attempts over the bridge and runs
+     * them as its own subagents: a task gets at most `maxAttempts` attempts,
+     * an attempt the host does not renew within `leaseMs` is lost, and the
+     * host's per-attempt iteration budget may not exceed `maxIterations`.
+     */
+    readonly automata: {
+      readonly maxAttempts: number;
+      readonly leaseMs: number;
+      readonly maxIterations: number;
+    } | null;
   } | null;
 }
 
@@ -224,8 +237,22 @@ function parseMcp(root: Reader, issues: string[]): LiteConfig['mcp'] {
 
 function parseLifecycle(root: Reader, issues: string[]): LiteConfig['lifecycle'] {
   if (root.value('lifecycle') === null) return null;
-  const r = root.child('lifecycle', ['host', 'port', 'allowedHosts', 'hostTurnTimeoutMs']);
-  return { ...listen(r, issues, 'lifecycle'), hostTurnTimeoutMs: r.integer('hostTurnTimeoutMs', 1_000, DAY_MS) };
+  const r = root.child('lifecycle', ['host', 'port', 'allowedHosts', 'hostTurnTimeoutMs', 'automata']);
+  return {
+    ...listen(r, issues, 'lifecycle'),
+    hostTurnTimeoutMs: r.integer('hostTurnTimeoutMs', 1_000, DAY_MS),
+    automata: parseHostedAutomata(r),
+  };
+}
+
+function parseHostedAutomata(lifecycle: Reader): NonNullable<LiteConfig['lifecycle']>['automata'] {
+  if (lifecycle.value('automata') === null) return null;
+  const r = lifecycle.child('automata', ['maxAttempts', 'leaseMs', 'maxIterations']);
+  return {
+    maxAttempts: r.integer('maxAttempts', 1, 100),
+    leaseMs: r.integer('leaseMs', 1_000, DAY_MS),
+    maxIterations: r.integer('maxIterations', 1, 100_000),
+  };
 }
 
 /** The secrets the config names, read from the environment. A missing one is named, its value never shown. */
