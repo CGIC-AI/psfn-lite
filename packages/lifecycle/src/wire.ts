@@ -52,7 +52,7 @@ export interface CheckpointBody {
 }
 
 const INSTANCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
-/** A Hermes install id as Hermes mints it (hermes_cli/web_server.py `_INSTALL_ID_RE`: uuid4 hex). */
+/** A Hermes install id as Hermes mints it (hermes_cli/install_identity.py `_INSTALL_ID_RE` at 2bd378e, hermes_cli/web_server.py at f0187332: uuid4 hex). */
 export const HERMES_INSTALL_ID_PATTERN = /^[0-9a-f]{32}$/;
 const INSTALL_DESCRIPTION = 'a Hermes install id (32 lowercase hex characters)';
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;

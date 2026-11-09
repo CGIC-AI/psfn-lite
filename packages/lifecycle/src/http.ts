@@ -159,7 +159,7 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
     'tool-choice': async (request) => {
       const body = parseToolChoice(request.body);
       if (!body.ok) return fail(request, body.error);
-      const answer = bridge.toolChoice(request.principal, body.value.hostInstance, body.value.turnId);
+      const answer = await bridge.toolChoice(request.principal, body.value.hostInstance, body.value.turnId);
       return answer.ok ? { status: 200, body: { toolChoice: renderToolChoice(answer.value.toolChoice) } } : fail(request, answer.error);
     },
 

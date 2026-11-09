@@ -102,7 +102,7 @@ export const TRUST_LEVELS: readonly TrustLevel[] = ['primary', 'trusted', 'regul
 const KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DAY_MS = 86_400_000;
-/** A Hermes install id as Hermes mints it (hermes_cli/web_server.py `_INSTALL_ID_RE`). */
+/** A Hermes install id as Hermes mints it (hermes_cli/install_identity.py `_INSTALL_ID_RE` at 2bd378e; hermes_cli/web_server.py at f0187332). */
 const HERMES_INSTALL_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 class Reader {

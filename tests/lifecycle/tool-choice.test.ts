@@ -26,16 +26,25 @@ function context(text: string, ran: readonly string[] = []): LLMContext {
 describe('host tool choice', () => {
   it('names each requested tool in order, then no tool once the sequence ran', () => {
     const request = 'Call tool_search for weather, then call orient.';
-    expect(hostToolChoiceOf(context(request))).toEqual({ kind: 'tool', name: 'tool_search' });
-    expect(hostToolChoiceOf(context(request, ['tool_search']))).toEqual({ kind: 'tool', name: 'orient' });
+    expect(hostToolChoiceOf(context(request))).toEqual({ kind: 'tool', name: 'tool_search', parameters: null });
+    expect(hostToolChoiceOf(context(request, ['tool_search']))).toEqual({ kind: 'tool', name: 'orient', parameters: null });
     expect(hostToolChoiceOf(context(request, ['tool_search', 'orient']))).toEqual({ kind: 'none' });
   });
 
   it('leaves the choice to the model when the participant asked for no tool, and prepare carries the first call\'s choice', () => {
     expect(hostToolChoiceOf(context('What are my values?'))).toBeNull();
     expect(hostToolChoiceOf(context('Do not call orient, just tell me.'))).toBeNull();
-    expect(hostContextOf(context('Use orient to list my values.')).toolChoice).toEqual({ kind: 'tool', name: 'orient' });
+    expect(hostContextOf(context('Use orient to list my values.')).toolChoice).toEqual({ kind: 'tool', name: 'orient', parameters: null });
     expect(hostContextOf(context('What are my values?')).toolChoice).toBeNull();
+  });
+
+  it('carries the donor\'s exact-arguments schema when the participant gave the call\'s arguments', () => {
+    const choice = hostToolChoiceOf(context('Call orient exactly once with arguments {"action":"values_list"} and then summarize.'));
+    expect(choice).toEqual({
+      kind: 'tool',
+      name: 'orient',
+      parameters: { type: 'object', properties: { action: { type: 'string', enum: ['values_list'] } }, required: ['action'], additionalProperties: false },
+    });
   });
 
   it('a runtime-authored system note is never a participant request', () => {

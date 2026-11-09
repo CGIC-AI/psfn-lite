@@ -32,6 +32,7 @@
  */
 import {
   NonRecoverableFallbackError,
+  buildExactToolArgumentsModelSchema,
   resolveExplicitToolContract,
   type AgentResponse,
   type LLMContext,
@@ -67,9 +68,15 @@ export interface HostToolSchema {
 /**
  * The donor's tool choice for one model call of the turn: exactly one call of
  * the named donor tool (`tool`), no tool call at all (`none`, an explicit
- * sequence is done), or null (no explicit request: the model chooses).
+ * sequence is done), or null (no explicit request: the model chooses). When
+ * the participant gave the call's exact arguments, `parameters` is the
+ * schema the donor offered the model in place of the tool's own
+ * (buildPiContext, buildExactToolArgumentsModelSchema); otherwise null.
  */
-export type HostToolChoice = { readonly kind: 'tool'; readonly name: string } | { readonly kind: 'none' } | null;
+export type HostToolChoice =
+  | { readonly kind: 'tool'; readonly name: string; readonly parameters: Readonly<Record<string, unknown>> | null }
+  | { readonly kind: 'none' }
+  | null;
 
 /** The donor's assembled model request for the turn. */
 export interface HostTurnContext {
@@ -93,7 +100,10 @@ const HOST_TOOL_CHOICE_API = 'openai-completions';
 export function hostToolChoiceOf(context: LLMContext): HostToolChoice {
   const contract = resolveExplicitToolContract({ context, originStage: 'agent.turn.prompt', modelApi: HOST_TOOL_CHOICE_API });
   if (contract === undefined) return null;
-  if (contract.requiredToolName !== undefined) return { kind: 'tool', name: contract.requiredToolName };
+  if (contract.requiredToolName !== undefined) {
+    const expected = contract.expectedArguments;
+    return { kind: 'tool', name: contract.requiredToolName, parameters: expected === undefined ? null : buildExactToolArgumentsModelSchema(expected) };
+  }
   return contract.choice === 'none' ? { kind: 'none' } : null;
 }
 
@@ -208,13 +218,19 @@ export class HostTurn {
   }
 
   /**
-   * The donor's tool choice for the call the host answers next: the pending
-   * call's, once the donor made it (after prepare, and after each tool call
-   * the relay answered); null once the turn is answered or ended.
+   * The donor's tool choice for the call the host answers next. Serialized
+   * with the host's other actions, so it is the choice of the call the donor
+   * makes after the host's last tool call ran; null once the turn is
+   * answered or ended.
    */
-  get toolChoice(): HostToolChoice {
-    if (this.answered || this.ended || this.pending === null) return null;
-    return hostToolChoiceOf(this.pending.context);
+  toolChoice(): Promise<HostToolChoice> {
+    return this.serial(async () => {
+      const call = this.answered ? null : await this.nextCall();
+      if (call === null) return null;
+      // The call stays the donor's pending one; asking for its choice answers nothing.
+      this.pending = call;
+      return hostToolChoiceOf(call.context);
+    });
   }
 
   /** @internal */

@@ -76,11 +76,13 @@ export class ConformanceHost {
   private runtime: LiteRuntime | null = null;
   private plan: PiPlan | null = null;
   private lastOffered: readonly string[] = [];
-  private readonly model = fauxModel((call) => this.answer(call));
+  private readonly model: ReturnType<typeof fauxModel>;
   private state: HostState;
 
-  constructor(state: HostState) {
+  /** `options.modelApi`: the pi-ai API the faux model reports (tests/support/faux-model.ts FauxModelOptions). */
+  constructor(state: HostState, options: { readonly modelApi?: string } = {}) {
     this.state = state;
+    this.model = fauxModel((call) => this.answer(call), options.modelApi === undefined ? {} : { api: options.modelApi });
   }
 
   snapshot(): HostState {

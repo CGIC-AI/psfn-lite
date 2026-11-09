@@ -30,7 +30,12 @@ async function main(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'lite-hermes-e2e-'));
   const base = join(root, 'data');
   try {
-    const host = new ConformanceHost({ databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, sessionKeys: null, ports: null, generation: 0 });
+    // An openai-completions model, as a deployed Lite routes (the donor enforces a participant's explicit tool request only on
+    // that API and pi-messages, explicit-tool-request.ts providerToolChoice), so the plugin's tool-choice middleware is exercised.
+    const host = new ConformanceHost(
+      { databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, sessionKeys: null, ports: null, generation: 0 },
+      { modelApi: 'openai-completions' },
+    );
     const ready = await host.open();
     try {
       const seed = await host.piTurn({
