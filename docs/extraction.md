@@ -1895,7 +1895,7 @@ Step E result (the plain validation command with a JSON reporter, both
 projects): 774 files and 9,190 tests passed. `compare-baseline.mjs`:
 "baseline: 807 files / 10107 tests; deleted: 54 files, 1041 tests; matched:
 9066; Lite additions: 4 files, 27 tests" and "equivalent: every remaining
-baseline test has its baseline status". The Hermes plugin suite: 70 passed.
+baseline test has its baseline status". The Hermes plugin suite: 69 passed.
 
 ## Measured size
 
