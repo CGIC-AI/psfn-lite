@@ -55,7 +55,9 @@ def lite():
 def operator(lite, profile, monkeypatch):
     """The operator's Hermes profile: the plugin on the real bridge and the Lite MCP server from config.yaml."""
     from plugins.memory import load_memory_provider
-    from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
+    from conformance_runner import hermes_mcp
+
+    discover_mcp_tools, shutdown_mcp_servers = hermes_mcp()
 
     write_profile(profile, bridge_url=lite["lifecycleUrl"], mcp_url=lite["mcpUrl"], install_id=lite["hermesInstallId"])
     monkeypatch.setenv(CREDENTIAL_ENV, lite["credentials"]["hermes-operator"])
@@ -250,3 +252,22 @@ def test_a_memory_delete_is_decided_by_the_hermes_human_and_a_denial_keeps_the_m
     assert "Memory deletion proposal" in approved
     assert "4471" not in call_tool("memory", "search", session=session, turn_id=turn_id, query="locker code")
     finish(session, turn_id, reply="Forgotten.")
+
+
+def test_an_explicit_tool_request_is_held_to_the_donor_contract_and_the_turn_completes(operator):
+    """The shakedown's tool_contract_incompatible turns: Lite's choice reaches Hermes's request through the plugin's middleware."""
+    from test_tool_choice import chat_request, model_call, names
+
+    session, turn_id = "e2e-explicit", "e2e-explicit:t"
+    begin(session, turn_id, "Call the orient tool to list my concerns, then tell me the first one.")
+    forced = model_call(chat_request(), turn_id=turn_id, session=session).payload
+    assert names(forced["tools"]) == [f"mcp__{SERVER}__orient"] and forced["tool_choice"] == "required"
+    assert SEED_THREAD in call_tool("orient", "list_concerns", session=session, turn_id=turn_id)
+    after = model_call(chat_request(), turn_id=turn_id, session=session).payload
+    assert after["tool_choice"] == "none"
+    finish(session, turn_id, reply="Your first concern is the seed packets.")
+    assert plugin_module("runtime").driver().ledger.pending() == []
+    # Lite recorded the turn as completed: its reply is the session's history in the next turn.
+    context = begin(session, f"{turn_id}2", "and the next one?")
+    assert "[your own earlier reply]\nYour first concern is the seed packets." in context
+    finish(session, f"{turn_id}2", reply="That is the only one.")

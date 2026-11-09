@@ -1,23 +1,27 @@
 """Profile-owned plugin configuration, parsed strictly.
 
-The file names where the bridge credential lives (an environment variable),
-never the credential. Every field is required; unknown fields are refused,
+The file names where the bridge credential lives (an environment variable,
+read through Hermes's profile secret scope, so in a multi-profile gateway it
+comes from this profile's ``.env``), never the credential. Every field is required; unknown fields are refused,
 so a typo cannot silently fall back to anything. Pattern kept from the donor
 PSFN Hermes memory adapter (integrations/hermes-memory/psfn_memory/config.py).
 """
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 
 CONFIG_FILE = "psfn-lite.json"
-#: The Hermes revision this plugin's host contract tests ran against.
-HERMES_REVISION = "f0187332d13679e2ace74d1f0eb399eb91a90571"
+#: The Hermes revisions this plugin's host contract tests ran against (docs/development.md).
+HERMES_REVISIONS = (
+    "f0187332d13679e2ace74d1f0eb399eb91a90571",
+    "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19",
+)
 
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-#: Hermes's install id file in the Hermes root and its format (hermes_cli/web_server.py _INSTALL_ID_FILENAME, _INSTALL_ID_RE).
+#: Hermes's install id file in the Hermes root and its format (hermes_cli/install_identity.py _INSTALL_ID_FILENAME,
+#: _INSTALL_ID_RE; at f0187332 hermes_cli/web_server.py).
 INSTALL_ID_FILE = "install_id"
 _INSTALL_ID = re.compile(r"^[0-9a-f]{32}$")
 _SERVER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
@@ -33,7 +37,9 @@ class ConfigError(ValueError):
 @dataclass(frozen=True)
 class Sender:
     platform: str
-    #: The platform's sender id; "" for the local CLI, which has none.
+    #: The platform's sender id. The local CLI is platform "cli" with sender "" when it runs its own agent (f0187332),
+    #: and platform "local" with sender "uid:<uid>" when ``hermes chat`` runs through the gateway (2bd378e
+    #: gateway/control_socket.py _posix_peer_subject: the OS user the gateway itself runs as).
     sender_id: str
 
 
@@ -55,7 +61,13 @@ class Config:
     automata: "Automata | None"
 
     def credential(self) -> str:
-        value = os.environ.get(self.credential_env, "")
+        """The bridge credential from this profile's secret scope (agent.secret_scope.get_secret, fail-closed in a multiplexing gateway)."""
+        from agent.secret_scope import UnscopedSecretError, get_secret
+
+        try:
+            value = get_secret(self.credential_env) or ""
+        except UnscopedSecretError:
+            raise ConfigError(f"Hermes has no profile secret scope for {self.credential_env} here (a multiplexing gateway reads it only inside a profile's turn)") from None
         if len(value) < _MIN_CREDENTIAL or any(c.isspace() for c in value):
             raise ConfigError(f"environment variable {self.credential_env} must hold the Lite bridge credential ({_MIN_CREDENTIAL}+ characters)")
         return value
@@ -90,7 +102,7 @@ class Config:
             if not isinstance(platform, str) or not platform.strip() or platform in NON_INTERACTIVE_PLATFORMS:
                 raise ConfigError(f"senders[{index}].platform must name an interactive Hermes platform")
             if not isinstance(sender, str):
-                raise ConfigError(f"senders[{index}].sender_id must be a string (\"\" for the local CLI)")
+                raise ConfigError(f"senders[{index}].sender_id must be a string (\"\" for the cli platform, \"uid:<uid>\" for the local platform)")
             parsed.append(Sender(platform, sender))
         timeout = values["timeout_seconds"]
         if type(timeout) not in (int, float) or not 0 < timeout <= 300:
@@ -120,11 +132,23 @@ class Config:
 
 
 def hermes_install_id() -> str:
-    """The Hermes install this process belongs to: the id Hermes keeps in its root, shared by every profile and surface.
+    """The Hermes install this process belongs to: one id in the Hermes root, shared by every profile and surface.
 
-    Read as Hermes reads it (hermes_cli/web_server.py _read_or_create_install_id), never minted here: Hermes
-    owns the file. A missing or malformed id is a configuration error, so no turn is driven unbound.
+    Read through Hermes's own install identity (hermes_cli/install_identity.py get_install_id, which reads the
+    id or mints it once, atomically, under its lock). Hermes f0187332 has no such module; its only reader is
+    the dashboard server's (hermes_cli/web_server.py get_install_id), so there the file is read as that reader
+    reads it and never minted here. A missing or malformed id is a configuration error, so no turn is driven
+    unbound.
     """
+    try:
+        from hermes_cli.install_identity import get_install_id
+    except ImportError:
+        get_install_id = None
+    if get_install_id is not None:
+        value = get_install_id()
+        if value is None or not _INSTALL_ID.match(value):
+            raise ConfigError("Hermes could neither read nor create its install id in the Hermes root")
+        return value
     from hermes_constants import get_default_hermes_root
 
     path = Path(get_default_hermes_root()) / INSTALL_ID_FILE

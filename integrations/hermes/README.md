@@ -13,10 +13,16 @@ schedule, north_star, toolset, tool_search, response_control). They come
 from the Lite MCP server through Hermes's own MCP client. Hermes's built-in
 memory files are switched off.
 
-Tested against Hermes revision `f0187332d13679e2ace74d1f0eb399eb91a90571`
-(recorded in `psfn_lite/config.py` as `HERMES_REVISION` and in
-`docs/provenance.md`). The host contract tests refuse to run against any
-other revision.
+Tested against two Hermes revisions, recorded in `psfn_lite/config.py` as
+`HERMES_REVISIONS` and in `docs/provenance.md`:
+
+- `f0187332d13679e2ace74d1f0eb399eb91a90571`, where every Hermes process
+  serves one profile;
+- `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`, where `hermes chat` runs
+  through a gateway process and one gateway can serve several profiles
+  (see [Hermes with a gateway](#hermes-with-a-gateway-2bd378e)).
+
+The host contract tests refuse to run against any other revision.
 
 ## What happens on a turn
 
@@ -24,7 +30,8 @@ other revision.
 | --- | --- |
 | `pre_llm_call` | First settles, as failed (`hermes_turn_unfinished`), any turn of the same conversation that is still open: several Hermes failure paths return without `on_session_end`. Then it prepares the Lite turn in the conversation's Lite session. That session is the Hermes session id the conversation started with, kept across compressions. The idempotency key comes from the Hermes session and turn ids, so a retried call resumes the same Lite turn, and a prepare whose answer was lost is sent once more under the same key. The plugin then injects the donor's context into the user message as labelled blocks. |
 | `pre_tool_call` | Blocks every `mcp__psfn_lite__*` call that is not inside an open Lite turn of this process. Hermes's MCP client sends the standing credential on every call, whoever the turn is for. This gate is what keeps unbound senders, subagents, the background review, and cron or flush agents out of Lite. A companion memory delete (`memory`, `action: delete`) inside the turn goes to Hermes's human approval gate (`approve`): once, session, always or deny. A denial or a timeout blocks the call, and the memory stays. |
-| `post_tool_call` | After an approved memory delete ran, approves in Lite the deletion proposal that call created (`memory-deletion/approve`). Lite accepts it once, only from the turn that made the call. If the call changed, the turn ended or Lite refused, the memory is kept and the next turn's context says so. |
+| `llm_request` middleware | Holds Hermes's model to the companion's explicit tool request (below). |
+| `post_tool_call` | After any Lite tool call, marks the turn's tool choice for asking again (below). After an approved memory delete ran, approves in Lite the deletion proposal that call created (`memory-deletion/approve`). Lite accepts it once, only from the turn that made the call. If the call changed, the turn ended or Lite refused, the memory is kept and the next turn's context says so. |
 | `post_llm_call` | Keeps the turn's final reply. |
 | `on_session_end` | Settles the turn with what actually happened: `completed` with the reply; `interrupted`; `failed` with Hermes's exit reason; or `failed` / `hermes_no_reply` when Hermes completed without a reply. Open turns are keyed by Hermes's turn id, so a compression that rotates the session id mid-turn does not lose the turn. |
 | `on_session_finalize` | Settles, as failed (`hermes_turn_unfinished`), any turn still open in the session Hermes closed (exit, `/new`, expiry). |
@@ -41,6 +48,24 @@ conversation starts or the session is closed. The settlement is logged,
 reported through the warning callback and named in the next turn's
 context. If Hermes reports the turn's end later, the late report is logged
 and reported too, and Lite keeps the failure.
+
+When the participant asks for tools by name ("call tool_search for the
+weather, then orient"), the donor holds every model call of the turn to that
+request: exactly the next requested tool while the sequence runs, then no
+tool at all. Its stream adapter fails the turn on any other answer
+(`tool_contract_incompatible`). Lite hands the choice over: `prepare`'s
+context carries the first call's `toolChoice`, and after each Lite tool call
+the plugin asks the bridge (`tool-choice`) for the next one. The plugin's
+`llm_request` middleware rewrites Hermes's provider request with it, as the
+donor's provider client did: only the requested tool, with a required
+choice (and, when the participant gave the call's exact arguments, the
+donor's exact-arguments schema), or no tool. It does this for the
+`chat_completions`, `codex_responses` and `anthropic_messages` API modes;
+for an Anthropic forced step it also drops extended thinking, which
+Anthropic refuses with a forced tool. On any other API mode, or when the
+requested tool is not in Hermes's request, the request goes unchanged and
+the next turn's context says so. Hermes's own tools are not offered on a
+forced step, as the donor offered only the one tool.
 
 Lite can also end a turn itself before asking Hermes's model, for example
 when the donor decides on no reply. `prepare` then answers `answered`. The
@@ -112,15 +137,21 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
    credential) and `lifecycle`. Set `lifecycle.hermesInstallId` to this
    Hermes install's id: the content of the file `install_id` in the Hermes
    root (`~/.hermes/install_id` by default). Hermes creates that file when
-   its dashboard first starts. Use `"sessionIntegrity": {"kind": "keyring"}`
+   its dashboard first starts (f0187332) or when anything first asks for its
+   install identity (2bd378e). Use `"sessionIntegrity": {"kind": "keyring"}`
    with the session keyring in the environment
    (`GATEWAY_SESSION_HMAC_KEYS`), so the journals are signed. Then run
    `npm run standalone -- serve --config <file>`.
 2. Copy `psfn_lite/` to `$HERMES_HOME/plugins/psfn_lite/`. The plugin uses
    only the standard library and Hermes itself.
-3. Put the credential in an environment variable that Hermes inherits, for
-   example `PSFN_LITE_TOKEN`. The credential is never written to a file in
-   the profile.
+3. Put the credential in the profile's `.env` (`$HERMES_HOME/.env`), for
+   example `PSFN_LITE_TOKEN=...`. The plugin and Hermes's MCP client read it
+   through Hermes's profile secret scope. A Hermes gateway clears the
+   environment it inherited and loads each profile's `.env` on its own, and
+   a multiplexing gateway refuses a secret read outside a profile's scope,
+   so a variable exported in the shell does not reach a gateway-run turn.
+   Keep the `.env` owner-only; the credential is never written to any other
+   file in the profile.
 4. Add to `$HERMES_HOME/config.yaml`:
 
    ```yaml
@@ -149,8 +180,14 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
    this themselves. While the plugin is not usable, `pre_tool_call` blocks
    the Lite MCP tools. If `psfn-lite.json` itself cannot be read, the plugin
    cannot tell which MCP server is Lite's, so it blocks every MCP tool.
-   The plugin also needs the Hermes install id. It reads the id and never
-   creates it. Without the id, or when Lite is bound to another install
+   A profile that does not select `psfn_lite` is never touched: the hooks
+   leave its turns and its MCP tools alone, even in a gateway process that
+   also serves a Lite profile.
+   The plugin also needs the Hermes install id, one per Hermes install and
+   shared by every profile. At 2bd378e it is read through Hermes's own
+   `hermes_cli.install_identity.get_install_id`, which creates the id once
+   if it is missing. At f0187332 the plugin reads the file and never creates
+   it. Without the id, or when Lite is bound to another install
    (`wrong_install`), no Lite turn is driven and the Lite tools are blocked.
 5. Write `$HERMES_HOME/psfn-lite.json`. Every field is required, and unknown
    fields are refused:
@@ -166,6 +203,33 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
      "automata": null
    }
    ```
+
+   `senders` names the Hermes `(platform, sender_id)` pairs this credential
+   speaks for. The local CLI is `{"platform": "cli", "sender_id": ""}` when
+   `hermes chat` runs its own agent (f0187332). Through the gateway
+   (2bd378e) it is `{"platform": "local", "sender_id": "uid:<uid>"}`, where
+   `<uid>` is the numeric id of the OS user the gateway runs as (`id -u`);
+   the gateway accepts local connections only from that user.
+
+## Hermes with a gateway (2bd378e)
+
+At 2bd378e `hermes chat` connects to a gateway process instead of running
+the agent itself, and the root gateway can serve several profiles at once.
+The plugin keeps everything per profile home: each profile's hooks and
+middleware sit in that profile's Hermes plugin manager, and each profile has
+its own driver, ledger, host instance, credential and warning callback.
+
+- **The credential comes from the profile's `.env`**, as step 3 says.
+- **A new profile is adopted by the root gateway.** The root multiplexing
+  gateway serves every profile that does not set `gateway.standalone: true`
+  in its `config.yaml` (`hermes_cli/profiles.py`). A Lite profile served
+  that way shares the gateway process with the others; that is supported.
+  Set `gateway.standalone: true` to give the profile its own gateway
+  instead.
+- **Plugin isolation.** The plugin is tested in process
+  (`plugins.isolation: in_process`, Hermes's default). Hermes's
+  `plugins.isolation: host` mode, which runs plugin code in a separate host
+  process, is not tested.
 
 ## Hosted automata
 
@@ -219,6 +283,15 @@ exact commands, see `docs/development.md`.
   - a lost prepare answer, and a prepare Lite never answered;
   - restart recovery;
   - the `pre_tool_call` gate, through Hermes's `resolve_pre_tool_block`.
+- `test_tool_choice.py` runs the `llm_request` middleware through Hermes's
+  own `apply_llm_request_middleware`: the forced step, the step after it,
+  each supported API mode, the exact-arguments schema, and the requests it
+  must leave alone.
+- `test_profiles.py` runs two Lite profiles and one non-Lite profile in one
+  process, as the 2bd378e gateway does (home override and profile secret
+  scope per turn, multiplexing on): hooks, host instance and credential per
+  profile, one install id, the gateway's `local` / `uid:<uid>` sender, and
+  a non-Lite profile left alone.
 - `test_e2e_lite.py` runs Hermes's real MCP client and the plugin against
   a real Lite runtime over a throwaway Postgres
   (`tests/hermes/fixtures/lite-host.ts`, the conformance host). It covers:
@@ -231,7 +304,9 @@ exact commands, see `docs/development.md`.
   - a turn Hermes never ended, a rotated session, a lost prepare answer,
     and compaction;
   - a memory delete through Hermes's CLI approval prompt: a denial keeps
-    the memory, an approval deletes it.
+    the memory, an approval deletes it;
+  - an explicit tool request: the middleware forces the requested tool,
+    then no tool, and Lite records the turn as completed.
 
   It needs Docker and Node, like the TypeScript integration suites.
   `LITE_SKIP_DOCKER_TESTS=1` opts out explicitly.
@@ -263,6 +338,10 @@ Hermes:
   another completion after Hermes's final reply, the turn ends failed.
 - Hermes reports no partial reply for an interrupted or failed turn, so
   none is recorded.
+- An explicit tool request is enforced only on the API modes listed above.
+  The donor re-asked its model once when a forced call was missing; a host
+  turn cannot be re-asked, so a model that ignores the forced choice fails
+  the turn.
 - The donor context includes the conversation's earlier turns, and Hermes
   also sends its own transcript, so the model sees earlier turns twice.
 - If Hermes reports a turn's end only after the next turn of the

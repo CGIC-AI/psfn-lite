@@ -22,6 +22,13 @@ Lite turn, because Hermes's MCP client sends the profile's standing
 credential whoever the turn is for. Before Hermes compacts, ``checkpoint``
 proves every Lite turn of the session is in Lite's canonical history.
 
+A participant's explicit tool request ("call tool_search, then orient") is
+the donor's own contract on each model call of the turn: exactly the
+requested tool while the sequence runs, then no tool. Prepare's context
+carries the first call's choice; after each Lite tool call the plugin asks
+the bridge (``tool-choice``) for the next one, and the ``llm_request``
+middleware rewrites Hermes's provider request with it (toolchoice.py).
+
 The companion's memory deletions are decided by Hermes's human. The donor
 ``memory`` tool never deletes on its own: ``action=delete`` records a pending
 proposal. ``pre_tool_call`` escalates that call to Hermes's approval gate
@@ -53,6 +60,7 @@ import secrets
 import threading
 
 from .automata import AutomataHost
+from . import toolchoice
 from .bridge import BridgeClient, BridgeError
 from .config import NON_INTERACTIVE_PLATFORMS, Config
 from .delivery import Delivery
@@ -116,7 +124,7 @@ class Driver:
         self._lock = threading.RLock()
         #: Hermes session id -> Lite turn ids prepared in it (inherited across a compression's session rotation).
         self._turns = {}
-        #: Hermes turn id -> the open Lite turn ({turn, session, reply, prepare, row}).
+        #: Hermes turn id -> the open Lite turn ({turn, session, reply, prepare, row, choice, choice_fresh}).
         self._open = {}
         #: Hermes session id -> the session it continues after a compression.
         self._parents = {}
@@ -200,8 +208,12 @@ class Driver:
         if prepared.get("kind") != "prepared" or not isinstance(lite_turn, str) or not isinstance(prepared.get("context"), dict):
             self._fail("prepare", session_id, None, "Lite answered prepare with an unexpected shape", record=False)
             return {"context": block(_NOTE, "Your PSFN Lite continuity answered unexpectedly; you have no fresh continuity context for this turn.")}
+        choice = prepared["context"].get("toolChoice")
         with self._lock:
             entry["turn"] = lite_turn
+            # The donor's tool choice for the first model call; null means the model chooses for the whole turn.
+            entry["choice"] = choice if isinstance(choice, dict) else None
+            entry["choice_fresh"] = True
             self._remember(session_id, lite_turn)
         self.ledger.bind_turn(entry["row"], lite_turn)
         if self.automata is not None:
@@ -244,9 +256,17 @@ class Driver:
         }
 
     def post_tool_call(self, tool_name="", args=None, result=None, session_id="", turn_id="", tool_call_id="", status="", **_):
-        """After Hermes's human approved a memory delete and it ran, Lite approves the proposal that call created."""
+        """After Hermes's human approved a memory delete and it ran, Lite approves the proposal that call created.
+
+        Any Lite tool call moves an explicit tool sequence on, so the next model call's choice is asked again.
+        """
         if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix):
             return
+        current = self._entry(turn_id, session_id)
+        if current is not None:
+            with self._lock:
+                if current.get("choice") is not None:
+                    current["choice_fresh"] = False
         with self._lock:
             asked = self._deletions.pop(self._call_key(turn_id, tool_call_id), None)
         if asked is None:
@@ -270,6 +290,34 @@ class Driver:
             })
         except BridgeError as error:
             self._notice(session_id, f"The memory deletion approved in Hermes did not reach Lite ({error}); memory {memory_id} is kept and its proposal stays pending.")
+
+    def llm_request(self, request=None, turn_id="", session_id="", api_mode="", **_):
+        """Hermes's llm_request middleware: the provider request rewritten for the donor's tool choice of this model call."""
+        entry = self._entry(turn_id, session_id)
+        if entry is None or not isinstance(request, dict):
+            return None
+        with self._lock:
+            lite_turn, choice, fresh = entry.get("turn"), entry.get("choice"), entry.get("choice_fresh", True)
+        if lite_turn is None or choice is None:
+            return None
+        if not fresh:
+            try:
+                answer = self.client.call("tool-choice", {"hostInstance": self.instance, "turnId": lite_turn})
+            except BridgeError as error:
+                self._notice(entry["session"], f"PSFN Lite did not say which tool the companion's next step must call ({error}); the model call goes as Hermes built it.")
+                return None
+            choice = answer.get("toolChoice") if isinstance(answer, dict) else None
+            choice = choice if isinstance(choice, dict) else None
+            with self._lock:
+                entry["choice"], entry["choice_fresh"] = choice, True
+            if choice is None:
+                return None
+        try:
+            rewritten = toolchoice.apply(request, api_mode, choice, self.config.tool_prefix)
+        except toolchoice.ChoiceError as error:
+            self._notice(entry["session"], f"PSFN Lite could not hold the model to the companion's requested tool step ({error}); Lite may fail the turn.")
+            return None
+        return {"request": rewritten, "source": "psfn_lite", "reason": "the companion's explicit tool request", "name": "psfn_lite_tool_choice"}
 
     def post_llm_call(self, session_id="", turn_id="", assistant_response=None, **_):
         entry = self._entry(turn_id, session_id)
@@ -332,7 +380,7 @@ class Driver:
         if entry is not None:
             return entry  # Hermes prepared the same turn again; Lite resumes its key
         row = self.ledger.open_turn(session_id=session_id, host_instance=self.instance, pid=os.getpid(), hermes_turn=turn_id, prepare=body)
-        entry = {"turn": None, "session": session_id, "reply": None, "prepare": body, "row": row}
+        entry = {"turn": None, "session": session_id, "reply": None, "prepare": body, "row": row, "choice": None, "choice_fresh": True}
         with self._lock:
             self._open[turn_id] = entry
         return entry

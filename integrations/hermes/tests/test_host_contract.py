@@ -11,7 +11,7 @@ import stat
 
 import pytest
 
-from conftest import CREDENTIAL, INSTALL_ID, plugin_module, write_profile
+from conftest import CREDENTIAL, INSTALL_ID, gateway_line, plugin_module, write_profile
 
 
 def load_provider():
@@ -66,6 +66,26 @@ def test_lifecycle_hooks_are_valid_and_registered_once_however_often_hermes_load
     assert registered == {"pre_llm_call", "pre_tool_call", "post_tool_call", "post_llm_call", "on_session_end", "on_session_finalize", "subagent_start"}
     assert registered <= valid
     assert all(len(hooks[name]) == 1 for name in registered)
+
+
+def test_the_manifest_declares_every_hook_and_middleware_the_plugin_registers(profile):
+    from hermes_cli.plugins import get_plugin_manager
+
+    load_provider()
+    # The manifest's list fields (PyYAML is not a dependency of every tested Hermes): "key:" then "  - item" lines.
+    manifest, key = {}, None
+    for line in (profile / "plugins" / "psfn_lite" / "plugin.yaml").read_text().splitlines():
+        if line.startswith("  - ") and key is not None:
+            manifest[key].append(line[4:].strip())
+        elif line.endswith(":") and not line.startswith(" "):
+            key = line[:-1]
+            manifest[key] = []
+        else:
+            key = None
+    hooks, _ = our_hooks()
+    assert sorted(manifest["hooks"]) == sorted(name for name, callbacks in hooks.items() if callbacks)
+    middleware = {kind for kind, callbacks in get_plugin_manager()._middleware.items() if any(getattr(cb, "__name__", "").startswith("psfn_lite_") for cb in callbacks)}
+    assert sorted(manifest["provides_middleware"]) == sorted(middleware)
 
 
 def test_a_root_turn_is_prepared_with_labelled_context_and_settled_with_its_reply(profile, bridge):
@@ -237,6 +257,8 @@ def test_the_hooks_drive_no_lite_turn_while_the_profile_keeps_a_second_memory(pr
 @pytest.mark.parametrize("content, issue", [(None, "does not exist yet"), ("not-an-install-id\n", "not 32 lowercase hex characters")])
 def test_no_turn_is_driven_and_no_tool_runs_without_the_hermes_install_id(profile, bridge, content, issue):
     # The install id names the binding Lite serves; the plugin reads it from the Hermes root and never mints it.
+    if gateway_line():
+        pytest.skip("Hermes 2bd378e mints its own install id (hermes_cli/install_identity.py); see the test below")
     path = profile / "install_id"
     path.unlink()
     if content is not None:
@@ -250,6 +272,37 @@ def test_no_turn_is_driven_and_no_tool_runs_without_the_hermes_install_id(profil
     [blocked] = fire("pre_tool_call", tool_name="mcp__psfn_lite__memory", args={"action": "list"}, session_id="sess-1", turn_id="sess-1:task:aa")
     assert blocked["action"] == "block" and issue in blocked["message"]
     assert not path.exists() or path.read_text() == content
+
+
+def test_the_install_id_comes_from_hermes_install_identity_and_an_unreadable_one_drives_no_turn(profile, bridge):
+    """Hermes 2bd378e: one id per install, read or minted by Hermes itself (get_install_id), shared by every profile."""
+    if not gateway_line():
+        pytest.skip("Hermes f0187332 has no hermes_cli/install_identity.py")
+    from hermes_cli.install_identity import get_install_id
+
+    path = profile / "install_id"
+    path.unlink()
+    load_provider().initialize("sess-1", hermes_home=str(profile), platform="cli")
+    fire("pre_llm_call", **turn())
+    minted = path.read_text().strip()
+    assert minted == get_install_id() and minted != INSTALL_ID
+    assert bridge.bodies("prepare")[0]["hermesInstallId"] == minted
+
+    # A root whose id Hermes can neither read nor replace: refused by name, no turn, no tool.
+    plugin_module("runtime").reset_for_tests()
+    import hermes_cli.install_identity as identity
+
+    identity._INSTALL_ID_CACHE.update(root=None, value=None)
+    path.chmod(0)
+    try:
+        before = len(bridge.requests)
+        with pytest.raises(ValueError, match="could neither read nor create its install id"):
+            load_provider().initialize("sess-2", hermes_home=str(profile), platform="cli")
+        [result] = fire("pre_llm_call", **turn(session="sess-2", turn_id="sess-2:task:aa"))
+        assert len(bridge.requests) == before
+        assert "could neither read nor create its install id" in result["context"]
+    finally:
+        path.chmod(0o600)
 
 
 def test_a_prepare_refused_for_another_install_is_reported_and_drives_no_turn(profile, bridge):

@@ -2,8 +2,8 @@
 
 HERMES_HOME points at a throwaway directory before anything imports
 Hermes, so no test ever reads or writes an operator's profile. The run
-refuses to start unless the importable Hermes is a git checkout at the
-revision this plugin records as tested.
+refuses to start unless the importable Hermes is a git checkout at one of
+the revisions this plugin records as tested (config.HERMES_REVISIONS).
 """
 
 import json
@@ -23,7 +23,7 @@ os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="psfn-lite-hermes-home-")
 PLUGIN_SOURCE = Path(__file__).resolve().parents[1] / "psfn_lite"
 sys.path.insert(0, str(PLUGIN_SOURCE.parent))
 
-from psfn_lite.config import HERMES_REVISION  # noqa: E402
+from psfn_lite.config import HERMES_REVISIONS  # noqa: E402
 
 USER_NAMESPACE = "_hermes_user_memory"
 CREDENTIAL_ENV = "PSFN_LITE_TEST_TOKEN"
@@ -33,6 +33,12 @@ CREDENTIAL = "test-credential-" + "x" * 32
 INSTALL_ID = "5e1f0c2d9a8b47e6b3c4d5e6f7a8b9c0"
 
 
+#: The revision of the Hermes under test, set when the run starts.
+HERMES = {"revision": None}
+#: The Hermes 2bd378e line: hermes chat through the gateway, multi-profile processes, hermes_cli/install_identity.py.
+GATEWAY_REVISION = "2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19"
+
+
 def pytest_configure(config):
     import hermes_cli
 
@@ -40,14 +46,34 @@ def pytest_configure(config):
     try:
         revision = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
-        pytest.exit(f"Hermes at {root} is not a git checkout; install the pinned revision {HERMES_REVISION} (see docs/development.md)", returncode=2)
-    if revision != HERMES_REVISION:
-        pytest.exit(f"Hermes at {root} is at {revision}, not the tested revision {HERMES_REVISION}", returncode=2)
+        pytest.exit(f"Hermes at {root} is not a git checkout; install a tested revision {', '.join(HERMES_REVISIONS)} (see docs/development.md)", returncode=2)
+    if revision not in HERMES_REVISIONS:
+        pytest.exit(f"Hermes at {root} is at {revision}, not a tested revision ({', '.join(HERMES_REVISIONS)})", returncode=2)
+    HERMES["revision"] = revision
 
 
-def plugin_module(name: str):
-    """A module of the plugin as Hermes loaded it (its own namespace, not the test's import)."""
-    return sys.modules[f"{USER_NAMESPACE}.psfn_lite.{name}" if name else f"{USER_NAMESPACE}.psfn_lite"]
+def gateway_line() -> bool:
+    """True on the Hermes 2bd378e line."""
+    return HERMES["revision"] == GATEWAY_REVISION
+
+
+def _plugin_package(name: str) -> bool:
+    """Hermes's module name for a user memory provider: ``<ns>.psfn_lite`` (f0187332) or ``<ns>.psfn_lite__source_<digest>`` (2bd378e)."""
+    prefix = f"{USER_NAMESPACE}.psfn_lite"
+    return name == prefix or (name.startswith(prefix + "__source_") and "." not in name[len(prefix):])
+
+
+def plugin_packages() -> list:
+    return [name for name in sys.modules if _plugin_package(name)]
+
+
+def plugin_module(name: str, package: str = None):
+    """A module of the plugin as Hermes loaded it (its own namespace, not the test's import); the only loaded copy unless named."""
+    if package is None:
+        packages = plugin_packages()
+        assert len(packages) == 1, f"expected one loaded psfn_lite package, found {packages}"
+        package = packages[0]
+    return sys.modules[f"{package}.{name}" if name else package]
 
 
 def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None, automata=None, install_id=INSTALL_ID) -> None:
@@ -82,6 +108,9 @@ class FakeBridge:
         self.handlers = {}
         self._closed = False
         self._turns = 0
+        #: The donor tool choice prepare hands out, and what each tool-choice call answers next (wire.ts renderToolChoice).
+        self.first_choice = None
+        self.next_choices = []
         bridge = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -122,8 +151,11 @@ class FakeBridge:
                         {"role": "user", "text": body.get("message", ""), "messageClass": "conversation"},
                     ],
                     "tools": ["orient", "memory", "journal"],
+                    "toolChoice": self.first_choice,
                 },
             }
+        if route == "tool-choice":
+            return 200, {"toolChoice": self.next_choices.pop(0) if self.next_choices else None}
         if route == "settle":
             outcome = body["outcome"]
             status = outcome["kind"]
@@ -158,8 +190,9 @@ def profile(tmp_path, monkeypatch, bridge):
     monkeypatch.setenv(CREDENTIAL_ENV, CREDENTIAL)
     write_profile(home, bridge_url=bridge.url)
     yield home
-    runtime = sys.modules.get(f"{USER_NAMESPACE}.psfn_lite.runtime")
-    if runtime is not None:
-        runtime.reset_for_tests()
-    for name in [m for m in sys.modules if m == f"{USER_NAMESPACE}.psfn_lite" or m.startswith(f"{USER_NAMESPACE}.psfn_lite.")]:
+    for package in plugin_packages():
+        runtime = sys.modules.get(f"{package}.runtime")
+        if runtime is not None:
+            runtime.reset_for_tests()
+    for name in [m for m in sys.modules if _plugin_package(".".join(m.split(".")[:2]))]:
         del sys.modules[name]

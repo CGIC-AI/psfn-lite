@@ -25,10 +25,16 @@ def gate(tool, *, session="sess-1", turn_id="sess-1:task:aa"):
 
 
 def failing_agent():
-    import run_agent  # noqa: F401  (patch targets)
+    import run_agent
     from run_agent import AIAgent
 
-    with patch("run_agent.get_tool_definitions", return_value=[]), patch("run_agent.check_toolset_requirements", return_value={}), patch("run_agent.OpenAI"):
+    # The patch targets Hermes's own tests use: run_agent.* at f0187332; model_tools.* and the bootstrap client at 2bd378e
+    # (tests/tools/test_delegate_fallback_matrix.py).
+    if hasattr(run_agent, "get_tool_definitions"):
+        targets = ("run_agent.get_tool_definitions", "run_agent.check_toolset_requirements", "run_agent.OpenAI")
+    else:
+        targets = ("model_tools.get_tool_definitions", "model_tools.check_toolset_requirements", "agent.process_bootstrap.OpenAI")
+    with patch(targets[0], return_value=[]), patch(targets[1], return_value={}), patch(targets[2]):
         agent = AIAgent(api_key="test-key-1234567890", base_url="https://api.openai.com/v1", provider="openai", api_mode="chat_completions",
                         model="gpt-5.5", quiet_mode=True, skip_context_files=True, skip_memory=True, platform="cli", session_id="real-1")
     agent.client = MagicMock()
