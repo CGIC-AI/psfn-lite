@@ -290,6 +290,11 @@ def test_a_memory_delete_in_a_lite_turn_goes_to_the_hermes_human_and_its_approva
     assert directive["rule_key"].startswith("psfn_lite_memory_delete:") and directive["rule_key"] != "psfn_lite_memory_delete:"
     [other] = fire("pre_tool_call", tool_name=MEMORY_TOOL, args={**DELETE, "memory_id": "mem-2"}, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-2")
     assert other["rule_key"] != directive["rule_key"]
+    # The donor resolves the memory from its aliases too (id, memoryId); the human is asked about that memory.
+    aliased = {k: v for k, v in DELETE.items() if k != "memory_id"} | {"memoryId": "mem-3"}
+    [named] = fire("pre_tool_call", tool_name=MEMORY_TOOL, args=aliased, session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-3")
+    assert "mem-3" in named["message"]
+    fire("post_tool_call", tool_name=MEMORY_TOOL, args=aliased, result='{"error": "denied"}', session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-3", status="blocked")
     fire("post_tool_call", tool_name=MEMORY_TOOL, args={**DELETE, "memory_id": "mem-2"}, result='{"error": "denied"}', session_id="sess-1", turn_id="sess-1:task:aa", tool_call_id="c-2", status="blocked")
     assert bridge.bodies("memory-deletion/approve") == []
     # Approved and run: Lite approves the proposal that call created, for the bound install.

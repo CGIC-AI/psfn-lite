@@ -1757,7 +1757,7 @@ Lite now passes a host port:
   - The plugin's `pre_tool_call` returns
     `{"action": "approve", "message": ..., "rule_key": ...}` for a
     `mcp__psfn_lite__memory` call with `action: delete` inside an open Lite
-    turn (`integrations/hermes/psfn_lite/lifecycle.py:193-225`). The message
+    turn (`integrations/hermes/psfn_lite/lifecycle.py:213-244`). The message
     names the memory, the reason category and the explanation (truncated at
     400 characters). The `rule_key` is a digest of the memory id, category
     and explanation, so an `[a]lways` or session answer covers only that
@@ -1772,7 +1772,7 @@ Lite now passes a host port:
   - A denied call never reaches Lite. No proposal is made, and the memory
     stays.
   - After an approved call ran, the plugin's `post_tool_call`
-    (`lifecycle.py:227-252`) reads the proposal id from the result and calls
+    (`lifecycle.py:246-272`) reads the proposal id from the result and calls
     the bridge route `memory-deletion/approve` with the install id, the
     proposal and the memory. It does this only when the call ran (`status`
     `ok`), is still a delete of the memory the human was asked about (another
@@ -1782,7 +1782,13 @@ Lite now passes a host port:
     context.
   - Operator choices that approve without a prompt are Hermes's, not Lite's:
     `--yolo`, a prior `[a]lways` or session answer for the same rule key,
-    `approvals.cron_mode: approve` and `approvals.single_query_mode: approve`.
+    and `approvals.single_query_mode: approve`. (`approvals.cron_mode` does
+    not apply: a cron run is never a Lite turn, so its Lite tools are
+    blocked outright.)
+  - The plugin finds the memory as the donor tool does: `memory_id`, else
+    its aliases `id` and `memoryId` (`shared/tool-argument-normalization.ts`
+    `normalizeUnifiedMemoryArguments`), so the human is asked about the
+    memory the call would delete.
 - **Lite.** `HostMemoryDeletionApprovals`
   (`packages/lifecycle/src/memory-deletion.ts`) is the port. When the donor
   tool calls it from inside a host-driven turn (the request context's
