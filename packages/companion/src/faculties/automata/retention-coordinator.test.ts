@@ -125,17 +125,6 @@ describe('evaluateAutomataRetentionEligibility', () => {
       .toMatchObject({ eligible: false, reason: 'retention_window_open' });
   });
 
-  it('retains an unfolded shard session', () => {
-    const shard = { ...classification, automatonClass: 'shard.long_horizon' as const };
-    const shardProof = {
-      ...proof,
-      automatonClass: 'shard.long_horizon',
-      foldState: 'pending' as const,
-    };
-    expect(evaluateAutomataRetentionEligibility(shard, shardProof, 200))
-      .toMatchObject({ eligible: false, reason: 'shard_unfolded' });
-  });
-
   it('accepts an explicit nothing-to-promote receipt as durable promotion proof', () => {
     expect(evaluateAutomataRetentionEligibility(classification, {
       ...proof,

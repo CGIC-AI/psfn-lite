@@ -256,7 +256,7 @@ describe('SubagentFaculty', () => {
 
   describe('viewer ceiling (psfn-framework-mzytp)', () => {
     function makeWikiFaculty() {
-      const wiki = makeCatalogTool('wiki', 'identity.read');
+      const wiki = makeCatalogTool('letter', 'identity.read');
       const faculty = new SubagentFaculty({
         eventBus,
         llmProvider: mockLLM(),
@@ -279,8 +279,8 @@ describe('SubagentFaculty', () => {
       mockPromptHook = async (tools) => {
         seen.trust = getRequestContext()?.viewerTrustLevel;
         seen.privacy = getRequestContext()?.viewerChannelPrivacy;
-        const tool = tools.find(candidate => candidate.name === 'wiki');
-        const result = await tool!.execute('call-wiki', { action: 'read', path: 'people/partner.md' });
+        const tool = tools.find(candidate => candidate.name === 'letter');
+        const result = await tool!.execute('call-wiki', { action: 'disposition_read', path: 'people/partner.md' });
         seen.text = result.content.map((block: { text?: string }) => block.text ?? '').join('');
       };
       await runWithRequestContext({
@@ -305,7 +305,7 @@ describe('SubagentFaculty', () => {
 
     it('an owner spawn from a private room keeps its access', async () => {
       const { seen, wiki } = await spawnAndReadWiki({ viewerTrustLevel: 'primary', viewerChannelPrivacy: 'private' });
-      expect(seen.text).toBe('wiki ok');
+      expect(seen.text).toBe('letter ok');
       expect(wiki.execute).toHaveBeenCalledTimes(1);
     });
 

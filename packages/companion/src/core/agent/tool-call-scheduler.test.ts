@@ -1160,7 +1160,7 @@ describe('tool-call-scheduler', () => {
 
   it('reprompts a retired first-party tool alias toward its canonical replacement', async () => {
     const fs = makeTool(
-      'fs',
+      'toolset',
       async () => ({ content: [{ type: 'text', text: 'ok' }], details: {} }),
       { concurrency: makeConcurrencyMeta('exclusive') },
     );
@@ -1168,7 +1168,7 @@ describe('tool-call-scheduler', () => {
 
     const result = await executeToolCallsWithScheduler(
       [fs],
-      makeAssistantMessage(['fs_read']),
+      makeAssistantMessage(['load_tools']),
       undefined,
       { stream: { push: () => undefined } },
       { maxParallelToolCalls: 1, onTelemetry: telemetry },
@@ -1176,10 +1176,10 @@ describe('tool-call-scheduler', () => {
 
     const message = result.toolResults[0] as ToolResultMessage;
     expect(message.isError).toBe(true);
-    expect(message.content[0]?.text).toContain('Call "fs" with action="read"');
+    expect(message.content[0]?.text).toContain('Call "toolset" with action="list"');
     expect(telemetry).toHaveBeenCalledWith(
       'agent.tools.correction.reprompt',
-      expect.objectContaining({ defectClass: 'unknown_tool', suggestedTool: 'fs' }),
+      expect.objectContaining({ defectClass: 'unknown_tool', suggestedTool: 'toolset' }),
     );
   });
 

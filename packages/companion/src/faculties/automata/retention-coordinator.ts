@@ -91,9 +91,6 @@ export function evaluateAutomataRetentionEligibility(
   if (proof.reviewState === 'pending') {
     return { eligible: false, reason: 'review_pending', preserveReferences: [] };
   }
-  if (classification.automatonClass === 'shard.long_horizon' && proof.foldState !== 'folded') {
-    return { eligible: false, reason: 'shard_unfolded', preserveReferences: [] };
-  }
   if (nowMs < classification.retentionDeadlineMs) {
     return { eligible: false, reason: 'retention_window_open', preserveReferences: [] };
   }

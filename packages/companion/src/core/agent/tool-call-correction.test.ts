@@ -10,11 +10,11 @@ import {
 describe('tool-call-correction', () => {
   describe('unknown_tool', () => {
     it('resolves a retired first-party alias to its canonical replacement + action', () => {
-      const correction = buildUnknownToolCorrection('fs_read', ['fs', 'web', 'memory']);
+      const correction = buildUnknownToolCorrection('load_tools', ['toolset', 'web', 'memory']);
       expect(correction.defectClass).toBe('unknown_tool');
-      expect(correction.suggestion).toBe('fs');
-      expect(correction.text).toContain('"fs_read" is not callable');
-      expect(correction.text).toContain('Call "fs" with action="read"');
+      expect(correction.suggestion).toBe('toolset');
+      expect(correction.text).toContain('"load_tools" is not callable');
+      expect(correction.text).toContain('Call "toolset" with action="list"');
     });
 
     it('suggests the nearest catalog name for a near-miss and echoes availability', () => {

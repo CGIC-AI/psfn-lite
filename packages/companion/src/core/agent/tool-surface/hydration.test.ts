@@ -28,21 +28,6 @@ function makeBeadsTool(
 }
 
 describe('policy tool hydration reconciliation', () => {
-  it('accepts an exact policy-to-schema action match', () => {
-    const tool = makeBeadsTool(['ready', 'show']);
-    expect(() => assertPolicyToolHydration(
-      { core: [], extended: [tool] },
-      [{ toolName: 'beads', enabled: true, allowedActions: ['ready', 'show'], source: 'test-policy' }],
-    )).not.toThrow();
-  });
-
-  it('fails closed on a declared-versus-hydrated action divergence', () => {
-    const tool = makeBeadsTool(['ready', 'show', 'close'], ['ready', 'show']);
-    expect(() => assertPolicyToolHydration(
-      { core: [], extended: [tool] },
-      [{ toolName: 'beads', enabled: true, allowedActions: ['ready', 'show'], source: 'test-policy' }],
-    )).toThrow(/hydration.*beads.*close/iu);
-  });
 
   it('fails closed when policy enablement and tool registration diverge', () => {
     expect(() => assertPolicyToolHydration(

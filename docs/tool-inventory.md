@@ -56,14 +56,21 @@ not a contract.
 
 ## Donor surfaces Lite does not serve
 
-The donor registry (`src/core/agent/tool-surface/registry.ts`) still
-describes 17 surfaces whose factories were scaffolding. They were deleted in
-extraction Step B7, so no factory builds them and they are never in the
-catalog: `fs`, `repo`, `shell`, `web`, `mcp`, `world`,
-`analysis_workbench`, `self_status`, `system`, `skill`, `wiki`, `beads`,
-`notify`, `generate_image`, `selfie_create`, `publication` and `vault`
-(`SCAFFOLDING_HOSTED_TOOL_SURFACES` in
-`canonical-tool-catalog.test-support.ts`). Host practical tools
-(filesystem, shell, web, repositories) belong to the host. The
+The donor rebuilt practical tools inside its own deployment. Native Pi and
+Hermes tools do that work, so 17 donor surfaces whose factories were
+scaffolding are cut and stay cut (operator ruling 2026-11-08): `fs`,
+`repo`, `shell`, `web`, `mcp`, `world`, `analysis_workbench`,
+`self_status`, `system`, `skill`, `wiki`, `beads`, `notify`,
+`generate_image`, `selfie_create`, `publication` and `vault`. B7 deleted
+their factories, and Step E1 deleted their entries from the donor registry
+(`src/core/agent/tool-surface/registry.ts`), their description contracts
+and their viewer-gate rows ([extraction](extraction.md#step-e-operator-rulings-2026-11-0809)).
+The registry now lists exactly the 15 surfaces above. Two donor pieces
+keep a cut name on purpose: the `notify` description contract, which the
+kept ICP candidate projection renders its narrowed description from, and
+the per-tool capability requirements in
+`src/system/capabilities/requirements.ts`, which still hold a host tool of
+one of those names to the donor's tokens. `tests/conformance/absence.test.ts`
+fails if the registry lists one of the 17 again. The
 `automata_bus` tool is built for bounded workers inside their own runs, not
 for the companion's turns.

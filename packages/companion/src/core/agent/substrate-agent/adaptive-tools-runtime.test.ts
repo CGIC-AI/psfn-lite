@@ -131,7 +131,7 @@ describe('createToolSearchTool', () => {
 
   it('never returns retired first-party aliases', async () => {
     const retired = {
-      name: 'image_create',
+      name: 'spawn_subagent',
       description: 'Retired image helper.',
       parameters: Type.Object({}),
       execute: vi.fn(),
@@ -292,33 +292,6 @@ describe('createToolsetTool', () => {
     expect(payload.recommendations.map((r: { toolName: string }) => r.toolName)).not.toContain('analysis_workbench');
   });
 
-  it('describes canonical actions and identifies lookup as documentation-only', async () => {
-    const toolset = createToolset();
-    const result = await (fromAny(toolset)).execute('describe-1', {
-      action: 'describe',
-      tool: 'generate_image',
-    });
-    const payload = JSON.parse(result.content?.[0]?.text as string);
-
-    expect(payload).toMatchObject({
-      action: 'describe',
-      total: 1,
-      callabilityChanged: false,
-    });
-    expect(payload.tools[0]).toMatchObject({
-      name: 'generate_image',
-      scope: 'extended',
-      schema: {
-        actions: [
-          { name: 'generate', requiredCapabilities: [] },
-          { name: 'edit', requiredCapabilities: [] },
-          { name: 'analyze', requiredCapabilities: [] },
-        ],
-        bundleMembership: expect.arrayContaining(['extended', 'toolset.extended', 'domain:media']),
-      },
-    });
-  });
-
   it('pins and unpins presentation order without an availability result', async () => {
     const addPromotedExtendedTool = vi.fn(async toolName => ({
       ok: true,
@@ -363,15 +336,15 @@ describe('createToolsetTool', () => {
 
     const pin = await (fromAny(toolset)).execute('pin-retired', {
       action: 'pin',
-      tool: 'media',
+      tool: 'spawn_subagent',
     });
     const describe = await (fromAny(toolset)).execute('describe-retired', {
       action: 'describe',
-      tool: 'media',
+      tool: 'spawn_subagent',
     });
 
     expect(pin.details?.isError).toBe(true);
     expect(addPromotedExtendedTool).not.toHaveBeenCalled();
-    expect(JSON.parse(describe.content?.[0]?.text as string).message).toContain('generate_image');
+    expect(JSON.parse(describe.content?.[0]?.text as string).message).toContain('subagent');
   });
 });

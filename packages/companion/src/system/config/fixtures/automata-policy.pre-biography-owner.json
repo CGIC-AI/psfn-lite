@@ -3,7 +3,6 @@
   "bus": {
     "eligibleClasses": [
       "subagent.bounded",
-      "shard.long_horizon",
       "memory.extraction",
       "memory.sleeptime",
       "memory.social_graph_builder",

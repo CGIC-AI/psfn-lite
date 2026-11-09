@@ -1,69 +1,6 @@
 import { action, type CanonicalToolSurfaceContract } from './contracts.js';
 
 export const OPERATIONS_TOOL_CONTRACTS = {
-  self_status: {
-    purpose: 'Read this companion\'s capability grant and bounded runtime state, and manage this companion\'s coarse availability lease.',
-    actions: [
-      action('capabilities'), action('snapshot', [], ['recentChannelLimit']), action('diagnose'),
-      action('logs', [], ['windowMs', 'sinceMs', 'limit', 'includeFileLogs']), action('conformance'),
-      action('availability_read'), action('availability_publish', ['state', 'expires_at_ms', 'revision']),
-      action('availability_clear', ['expected_revision']), action('availability_list_peers'),
-    ],
-    output: 'It returns the current tier and effective granted capability tokens, bounded operational state, or already-known peer state; it never returns message content or lifecycle controls.',
-    guidance: 'Do not use it to change settings, restart, or rebuild; use system.',
-    example: { action: 'capabilities' },
-  },
-  system: {
-    purpose: 'Read safe runtime settings and request guarded lifecycle operations; under Kubernetes it also reports deployment mode and routes restart/rebuild through the approval-gated kube pipeline.',
-    actions: [
-      action('read', [], ['key', 'keys', 'list']),
-      action('restart', ['reason']), action('rebuild', ['reason']),
-    ],
-    output: 'It returns settings (plus kube deployment status when applicable) or a lifecycle acknowledgement; on Kubernetes restart requires operator approval and rebuild refuses in-pod builds, and it never bypasses supervisor safeguards.',
-    guidance: 'Do not use it for diagnosis; use self_status.',
-    example: { action: 'read', list: true },
-  },
-  skill: {
-    purpose: 'Discover, inspect, measure, and author reusable workflow guidance.',
-    actions: [
-      action('list', [], ['includeSkipped', 'includeContent']), action('view', ['name']),
-      action('stats', [], ['name']), action('create', ['name', 'category', 'content'], ['description', 'reason']),
-      action('update', ['name', 'content'], ['description', 'reason']),
-      action('history', ['name'], ['version']),
-      action('rollback', ['name', 'version'], ['reason']),
-    ],
-    output: 'It returns managed skill metadata and writes only personal skills with journaled version history; destructive updates queue for operator confirmation, and it never executes the skill body.',
-    guidance: 'Do not use skills as executable capabilities or durable reference documents; use a tool or wiki.',
-    example: { action: 'view', name: 'incident-response' },
-  },
-  wiki: {
-    purpose: 'Manage runtime-owned durable reference documents and personal knowledge notes.',
-    actions: [
-      action('list'), action('read', ['id']), action('search', ['query'], ['limit']),
-      action('semantic_search', ['query'], ['limit']),
-      action('write', ['title', 'body'], ['id', 'tags', 'source_class', 'provenance_refs', 'sensitivity', 'summary']),
-      action('import', ['title', 'body', 'source_class', 'provenance_refs'], ['id', 'tags', 'sensitivity', 'summary']),
-      action('propose_shared_world', ['site_id', 'title', 'body', 'source_ref', 'provenance_refs', 'sensitivity'], ['id', 'tags']),
-      action('wish_list'),
-      action('wish_read', ['wish_ref']),
-      action('wish_create', ['wish_text'], ['wish_context']),
-      action('project_list'),
-      action('project_read', ['project_ref']),
-      action('project_create', ['title', 'next_step'], ['project_id', 'visibility']),
-      action('project_update', ['project_ref'], ['next_step', 'project_status', 'visibility']),
-      action('project_add_artifact', ['project_ref', 'artifact_ref', 'artifact_label', 'sensitivity'], ['audience']),
-      action('project_share', ['project_ref', 'artifact_ref', 'audience']),
-      action('wardrobe_list'),
-      action('wardrobe_read', ['look_ref']),
-      action('wardrobe_save', ['look_name', 'look_prompt'], ['look_id', 'visibility', 'supersedes_ref']),
-      action('wardrobe_revise', ['look_ref', 'look_prompt'], ['visibility']),
-      action('world_notes_read', [], ['world']),
-      action('world_note', ['world', 'note_text'], ['note_about']),
-    ],
-    output: 'It returns documents, matches, wish/project/wardrobe manifests, or queues a public shared-world proposal for operator review; semantic search fails closed when unwired.',
-    guidance: 'Do not use wiki for lived memory or journal reflection; use memory or journal. When you notice something you genuinely want, wish_create is a zero-social-cost way to save it for asynchronous review: it never pushes or interrupts the operator. Use wish_list to see acknowledgement, response, planning, and completion state. Wishes, projects, and named looks remain in the personal wiki tier. Shared-world proposals and project share intent never publish directly.',
-    example: { action: 'search', query: 'greenhouse watering protocol' },
-  },
   schedule: {
     purpose: 'Manage durable follow-ups, reminders, heartbeat templates, and one-shot scheduled prompts.',
     actions: [
@@ -93,17 +30,5 @@ export const OPERATIONS_TOOL_CONTRACTS = {
     output: 'It returns exact item IDs and ordered state.',
     guidance: 'Do not use it for current open threads or persona changes; use orient or identity.',
     example: { action: 'create', title: 'Protect time for art', content: 'Keep a weekly block for self-directed drawing.' },
-  },
-  beads: {
-    purpose: 'Read and update the canonical tracked-work database when work must survive the current conversation.',
-    actions: [
-      action('ready', [], ['limit']), action('show', ['id']),
-      action('create', ['title'], ['issue_type', 'priority', 'deps', 'parent', 'actor']),
-      action('update', ['id'], ['status', 'priority', 'actor'], { id: 'update', rule: 'include status or priority' }),
-      action('close', ['id', 'reason'], ['actor']), action('sync'),
-    ],
-    output: 'It returns plain issue IDs and structured tracker state; later calls require the exact ID string.',
-    guidance: 'Do not create throwaway tracked work for temporary notes; use scratchpad.',
-    example: { action: 'show', id: 'psfn-framework-123' },
   },
 } as const satisfies Record<string, CanonicalToolSurfaceContract>;

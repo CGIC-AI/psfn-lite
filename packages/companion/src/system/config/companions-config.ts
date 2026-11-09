@@ -29,9 +29,8 @@ export const COMPANIONS_SEED_FILE_NAME = 'companions.seed.json';
 const COMPANIONS_ERROR_PREFIX = 'Invalid companions config';
 
 /**
- * Canonical companion-id format. Mirrors the UUID validation used elsewhere in
- * the codebase (`src/core/cogsec/forensic-archive.ts` artifact ids), i.e. a
- * lowercase RFC-4122 UUID (versions 1-5, which covers `randomUUID()` v4 ids).
+ * Canonical companion-id format: a lowercase RFC-4122 UUID (versions 1-5,
+ * which covers `randomUUID()` v4 ids).
  */
 /**
  * Postgres schema identifier: strict lowercase identifier so it can be dropped

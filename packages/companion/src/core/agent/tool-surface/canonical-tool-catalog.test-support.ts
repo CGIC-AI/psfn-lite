@@ -24,18 +24,6 @@ function testSensitivity(value: SensitivityLevel): SensitivityLevel {
   return value;
 }
 
-/**
- * Registry surfaces whose donor factories were vendored scaffolding and were
- * deleted in Lite Step B7 (the host owns or excludes these tools; see
- * docs/tool-inventory.md "Deliberately excluded donor surfaces"). The core
- * registry still describes them; no Lite factory builds them.
- */
-export const SCAFFOLDING_HOSTED_TOOL_SURFACES: ReadonlySet<string> = new Set([
-  'fs', 'repo', 'shell', 'web', 'mcp', 'world', 'analysis_workbench', 'self_status',
-  'system', 'skill', 'wiki', 'beads', 'notify', 'generate_image', 'selfie_create',
-  'publication', 'vault',
-]);
-
 export function createProviderFactoryToolCatalog(): AgentTool<any>[] {
   const inert = {} as never;
   const automataBus = createAutomataBusTool({

@@ -295,15 +295,6 @@ describe('central viewer read gate (o5wf5)', () => {
     viewerTrustLevel: trust, viewerChannelPrivacy: 'private',
   }, fn);
 
-  it('withholds wiki records from a public-trust room and allows a trusted room', async () => {
-    const { tool, calls } = fakeTool('wiki');
-    const publicResult = await asViewer('public', () => tool.execute('c1', { action: 'list' }));
-    expect(publicResult.content[0]?.text).toContain('withheld by visibility gating');
-    expect(calls).toHaveLength(0);
-    const trustedResult = await asViewer('trusted', () => tool.execute('c2', { action: 'lookup' }));
-    expect(trustedResult.content[0]?.text).toBe('contact records');
-  });
-
   it('keeps private letters to primary trust and holds an unknown action to the strictest level', async () => {
     const { tool, calls } = fakeTool('letter');
     expect((await asViewer('trusted', () => tool.execute('l1', { action: 'read' }))).content[0]?.text)

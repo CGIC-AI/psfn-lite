@@ -116,13 +116,6 @@ function indexEntry(channelId: string, filename: string): ChannelIndexEntry {
   };
 }
 
-// Lite Step B7: the shard manager (faculties/shards/manager.ts) was vendored
-// scaffolding and is deleted; the shard.long_horizon registry entry keeps its
-// donor adapterModule path. The two source checks below read every other
-// adapter module and prove this one is absent, so the exemption cannot hide a
-// kept module.
-const DELETED_SCAFFOLDING_ADAPTER_CLASSES: ReadonlySet<string> = new Set(['shard.long_horizon']);
-
 describe('Automata governed-class coverage certification', () => {
   const policy = loadAutomataPolicySeedDefaults();
 
@@ -140,10 +133,6 @@ describe('Automata governed-class coverage certification', () => {
   it('proves each registered adapter module actually opens the governed lifecycle', () => {
     const repoRoot = join(SRC_DIR, '..', '..', '..');
     for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
-      if (DELETED_SCAFFOLDING_ADAPTER_CLASSES.has(adapter.automatonClass)) {
-        expect(existsSync(join(repoRoot, adapter.adapterModule)), adapter.adapterModule).toBe(false);
-        continue;
-      }
       const source = readFileSync(join(repoRoot, adapter.adapterModule), 'utf8');
       const opensLifecycle = AUTOMATA_GOVERNED_LIFECYCLE_ENTRYPOINTS.some(
         entrypoint => source.includes(entrypoint),
@@ -156,10 +145,6 @@ describe('Automata governed-class coverage certification', () => {
   it('binds each Bus mode to the lifecycle entrypoint that actually forms it', () => {
     const repoRoot = join(SRC_DIR, '..', '..', '..');
     for (const adapter of AUTOMATA_CLASS_GOVERNED_ADAPTERS) {
-      if (DELETED_SCAFFOLDING_ADAPTER_CLASSES.has(adapter.automatonClass)) {
-        expect(existsSync(join(repoRoot, adapter.adapterModule)), adapter.adapterModule).toBe(false);
-        continue;
-      }
       const source = readFileSync(join(repoRoot, adapter.adapterModule), 'utf8');
       // bounded_loop classes form the briefing and tool through the worker
       // run; single_pass classes go through the handoff-only class wrapper.
