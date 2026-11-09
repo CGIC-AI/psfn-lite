@@ -2,15 +2,22 @@
  * The standalone host over a throwaway Postgres and a temporary data
  * directory: the extracted companion core exactly as the CLI starts it, with
  * a faux model, deterministic embeddings and a fixed text-emotion classifier
- * as the only host-port fakes. Runtimes opened here are closed after each
- * test, the data directories removed, and the container after the file.
+ * as the only host-port fakes.
+ *
+ * The donor runs one companion runtime per process: its PostgreSQL store
+ * readiness ledger is process-lifetime and sealed at Ready
+ * (persistence/postgres/runtime-readiness.ts:375-380), so a second
+ * `startCompanionRuntime` in the same process is refused. A test file
+ * therefore starts at most one runtime (vitest runs each file in its own
+ * module graph); the runtime, the data directories and the container are
+ * removed after the file.
  */
 import { randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import pg from 'pg';
-import { afterAll, afterEach, beforeAll } from 'vitest';
+import { afterAll, beforeAll } from 'vitest';
 import {
   createLiteRuntime,
   parseLiteConfig,
@@ -20,25 +27,15 @@ import {
   type LiteRuntime,
   type LiteRuntimeOverrides,
 } from '../../apps/standalone/src/index.ts';
-import { ok, type EmbeddingPort } from '../../packages/pi/src/index.ts';
+import { EMBEDDING_DIMS, deterministicEmbeddings } from './embeddings.ts';
 import { fauxModel, type Script } from './faux-model.ts';
 import { HARNESS_START_TIMEOUT_MS, startPostgresHarness, type PostgresHarness } from './postgres-harness.ts';
 
 export const DATABASE_URL_ENV = 'LITE_TEST_DATABASE_URL';
 export const COMPANION_NAME = 'Lumen';
-export const EMBEDDING_DIMS = 16;
+export { EMBEDDING_DIMS, deterministicEmbeddings, vectorFor } from './embeddings.ts';
 /** Starting the companion core (migrations of every kept store) takes a while. */
 export const RUNTIME_TIMEOUT_MS = 180_000;
-
-/** Deterministic vectors: a fixed function of the text, never a stand-in for a missing provider. */
-export function vectorFor(text: string): number[] {
-  const vector = new Array<number>(EMBEDDING_DIMS).fill(0);
-  for (let index = 0; index < text.length; index += 1) vector[index % EMBEDDING_DIMS]! += text.charCodeAt(index) / 1000;
-  vector[0]! += 1;
-  return vector;
-}
-
-export const deterministicEmbeddings: EmbeddingPort = { embed: (texts) => Promise.resolve(ok(texts.map(vectorFor))) };
 
 export function liteConfigDocument(dataDir: string, companionId: string) {
   return {
@@ -73,13 +70,11 @@ export function useLiteWorld() {
   beforeAll(async () => {
     harness = await startPostgresHarness();
   }, HARNESS_START_TIMEOUT_MS);
-  afterEach(async () => {
+  afterAll(async () => {
     for (const runtime of opened.splice(0)) await runtime.close();
     for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
-  }, RUNTIME_TIMEOUT_MS);
-  afterAll(() => {
     harness?.stop();
-  });
+  }, RUNTIME_TIMEOUT_MS);
 
   /** The data directory the core's PostgreSQL stores expect: the donor's extension schema provisioned (as the donor's test harness did). */
   const database = async (): Promise<string> => {
@@ -126,7 +121,7 @@ export function useLiteWorld() {
     };
   };
 
-  /** A runtime built exactly as the CLI builds it, closed after the test unless closed earlier. */
+  /** The file's one runtime, built exactly as the CLI builds it, closed after the file unless closed earlier. */
   const start = async (install: Install, script: Script) => {
     const { overrides, model } = overridesFor(script);
     const config = parseLiteConfig(install.document);

@@ -1,58 +1,74 @@
 /**
  * Standalone configuration is explicit: every setting is required, unknown
- * keys are refused, policies are the core baseline only when named so, and
- * secrets come from named environment variables whose values are never
- * echoed.
+ * keys are refused, and secrets come from named environment variables whose
+ * values are never echoed.
  */
 import { describe, expect, it } from 'vitest';
-import { BASELINE_FREE_TIME_POLICY } from '../../packages/core/src/index.ts';
 import { parseLiteConfig, readSecrets } from '../../apps/standalone/src/index.ts';
-import { DATABASE_URL_ENV, liteConfigDocument } from './lite-config.ts';
+import { DATABASE_URL_ENV, liteConfigDocument } from '../support/lite-world.ts';
 
-const document = () => liteConfigDocument({ history: '/srv/lite/history', workspace: '/srv/lite/workspace', backups: null });
+const COMPANION_ID = '5e1f0c3a-7b2d-4c8e-9a10-2b3c4d5e6f70';
+const document = () => liteConfigDocument('/srv/lite/data', COMPANION_ID);
 const issuesOf = (raw: unknown) => {
   const parsed = parseLiteConfig(raw);
   return parsed.ok ? [] : parsed.error.kind === 'invalid' ? parsed.error.issues : [parsed.error.kind];
 };
 
 describe('standalone configuration', () => {
-  it('accepts a complete document and names the baseline policies explicitly', () => {
+  it('accepts a complete document', () => {
     const parsed = parseLiteConfig(document());
     if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
-    expect(parsed.value.policies.freeTime).toBe(BASELINE_FREE_TIME_POLICY);
-    expect(parsed.value.storage.backupRoot).toBeNull();
-    expect(parsed.value.embedding.provider).toEqual({ kind: 'disabled' });
+    expect(parsed.value).toMatchObject({
+      companionId: COMPANION_ID,
+      operator: { userId: 'robin', displayName: 'Robin' },
+      contacts: [{ key: 'sam', displayName: 'Sam', trust: 'regular' }],
+      embedding: { model: 'test-embedding', dimensions: 16, provider: { kind: 'disabled' } },
+      sessionIntegrity: { kind: 'unsigned' },
+      mcp: null,
+      lifecycle: null,
+    });
   });
 
   it('refuses unknown keys and missing settings instead of falling back', () => {
-    const raw = document() as Record<string, unknown>;
-    const { harness, ...withoutHarness } = raw;
-    expect(issuesOf({ ...withoutHarness, harnes: harness })).toEqual(['harnes is not a known setting', 'harness is required']);
-    const noLease = { ...document(), workers: { maxAttempts: 2, resumeGraceMs: 60_000 } };
-    expect(issuesOf(noLease)).toEqual(['workers.leaseMs is required']);
-    const noPolicy = { ...document(), policies: { disclosure: 'baseline', emotion: 'baseline' } };
-    expect(issuesOf(noPolicy)).toEqual(['policies.freeTime is required']);
+    const { sessionIntegrity, ...without } = document();
+    expect(issuesOf({ ...without, sessionIntegrety: sessionIntegrity })).toEqual(['sessionIntegrety is not a known setting', 'sessionIntegrity is required']);
+    expect(issuesOf({ ...document(), operator: { userId: 'robin' } })).toEqual(['operator.displayName is required']);
   });
 
   it('refuses out-of-range and malformed values with their paths', () => {
-    const raw = {
+    const issues = issuesOf({
       ...document(),
-      operator: { ...document().operator, trust: 'owner' },
-      harness: { ...document().harness, maxModelCalls: 0 },
+      companionId: 'companion-test',
+      contacts: [{ key: 'operator', displayName: 'Again', trust: 'primary' }, { key: 'sam', displayName: 'Sam', trust: 'regular' }, { key: 'sam', displayName: 'Sam', trust: 'regular' }],
+      model: { ...document().model, maxOutputTokens: 0 },
       postgres: { urlEnv: 'postgres://user:pw@host/db' },
-      embedding: { space: { name: 's', dimensions: 3 }, provider: { kind: 'openai_compatible', baseUrl: 'ftp://x', model: 'm', apiKeyEnv: 'EMBED_KEY', timeoutMs: 1_000 } },
-      policies: { ...document().policies, freeTime: { version: 1 } },
-    };
-    const issues = issuesOf(raw);
+      embedding: { model: 'm', dimensions: 3, provider: { kind: 'openai_compatible', baseUrl: 'ftp://x', apiKeyEnv: 'EMBED_KEY', timeoutMs: 1_000 } },
+      sessionIntegrity: { kind: 'hmac' },
+    });
     expect(issues).toEqual(
       expect.arrayContaining([
-        'operator.trust must be one of public, regular, trusted, primary',
-        'harness.maxModelCalls must be an integer from 1 to 100',
-        'postgres.urlEnv must name an environment variable',
+        'companionId must be a UUID',
+        'contacts[0].key "operator" is the configured operator',
+        'contacts[0].trust must be one of trusted, regular, public',
+        'contacts[2].key sam is named twice',
+        'model.maxOutputTokens must be an integer from 1 to 1000000',
+        'postgres.urlEnv must be an environment variable name',
         'embedding.provider.baseUrl must be an http(s) URL',
+        'sessionIntegrity.kind must be one of keyring, unsigned',
       ]),
     );
-    expect(issues.some((issue) => issue.startsWith('policies.freeTime: '))).toBe(true);
+  });
+
+  it('mounts the MCP transport and the lifecycle bridge only together', () => {
+    const listen = { host: '127.0.0.1', port: 0, allowedHosts: null };
+    expect(issuesOf({ ...document(), mcp: { ...listen, bindings: [{ principal: 'p', credential: { env: 'P' }, contact: 'operator' }] } })).toEqual([
+      'mcp needs lifecycle: companion tools run only inside host-driven turns',
+    ]);
+    expect(issuesOf({ ...document(), lifecycle: { ...listen, hostTurnTimeoutMs: 60_000 } })).toEqual(['lifecycle needs mcp: the bridge shares its principal bindings']);
+    expect(issuesOf({ ...document(), mcp: { ...listen, bindings: [] }, lifecycle: { ...listen, hostTurnTimeoutMs: 10 } })).toEqual([
+      'mcp.bindings must be a non-empty list of principal bindings',
+      'lifecycle.hostTurnTimeoutMs must be an integer from 1000 to 86400000',
+    ]);
   });
 
   it('reads secrets from the named environment variables and names a missing one without its value', () => {

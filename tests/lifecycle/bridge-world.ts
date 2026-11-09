@@ -7,7 +7,8 @@
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { LiteRuntime } from '../../apps/standalone/src/index.ts';
 import type { Script } from '../support/faux-model.ts';
-import { newCredential, useLiteWorld } from '../support/lite-world.ts';
+import { beforeAll } from 'vitest';
+import { RUNTIME_TIMEOUT_MS, newCredential, useLiteWorld } from '../support/lite-world.ts';
 
 /** The operator through Hermes, and a regular friend through Hermes. */
 export const HERMES_PRINCIPALS = { 'hermes-operator': 'operator', 'hermes-friend': 'sam' } as const;
@@ -23,9 +24,19 @@ export interface BridgeWorld {
   readonly model: { readonly calls: readonly { readonly lastUser: string }[] };
 }
 
-export function useBridgeWorld() {
+/** Registers the file's one bridge world: started before the file's tests, closed after them. */
+export function useBridgeWorld(script: Script, options: { readonly hostTurnTimeoutMs?: number } = {}): () => BridgeWorld {
   const lite = useLiteWorld();
-  return async (script: Script, options: { readonly hostTurnTimeoutMs?: number } = {}): Promise<BridgeWorld> => {
+  let world: BridgeWorld | null = null;
+  beforeAll(async () => {
+    world = await startWorld();
+  }, RUNTIME_TIMEOUT_MS);
+  return () => {
+    if (world === null) throw new Error('the bridge world did not start');
+    return world;
+  };
+
+  async function startWorld(): Promise<BridgeWorld> {
     const credentials = Object.fromEntries(Object.keys(HERMES_PRINCIPALS).map((p) => [p, newCredential()])) as Record<HermesPrincipal, string>;
     const install = await lite.install((document) => {
       document.mcp = {
@@ -41,7 +52,7 @@ export function useBridgeWorld() {
     const { mcpUrl, lifecycleUrl } = runtime.transports;
     if (mcpUrl === null || lifecycleUrl === null) throw new Error('transports were not mounted');
     return { runtime, credentials, mcpUrl, lifecycleUrl, model };
-  };
+  }
 }
 
 export interface BridgeReply {

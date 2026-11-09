@@ -51,7 +51,7 @@ export interface LiteConfig {
    * (docs/extraction.md, seam 3.8); `unsigned` keeps journals unsigned.
    */
   readonly sessionIntegrity: { readonly kind: 'keyring' } | { readonly kind: 'unsigned' };
-  /** The donor tool catalog over MCP streamable HTTP, or null for none. */
+  /** The donor tool catalog over MCP streamable HTTP, or null for none. It needs `lifecycle`: the tools run only inside host-driven turns. */
   readonly mcp: {
     readonly host: string;
     readonly port: number;
@@ -189,6 +189,7 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   const mcp = parseMcp(root, issues);
   const lifecycle = parseLifecycle(root, issues);
   if (lifecycle !== null && mcp === null) issues.push('lifecycle needs mcp: the bridge shares its principal bindings');
+  if (mcp !== null && lifecycle === null) issues.push('mcp needs lifecycle: companion tools run only inside host-driven turns');
 
   if (issues.length > 0) return invalid(...issues);
   return ok({ companionId, dataDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle });

@@ -137,7 +137,7 @@ export class HostTurnBridge {
     }
     const turn = outcome.turn;
     this.armTimeout(turn);
-    void turn.end().then((end) => this.remember(turn.owner, turn.turnId, end, false));
+    void turn.end().then((end) => this.remember(turn.owner, turn.turnId, end, turn.wasInterrupted));
     return ok({ kind: 'prepared', turnId: turn.turnId, resumed: false, context: turn.context });
   }
 
@@ -176,18 +176,13 @@ export class HostTurnBridge {
       return ok(known.answer);
     }
     if (turn.owner !== owner) return denied('not_turn_owner', 'only the host instance that prepared the turn settles it');
-    let end: HostTurnEnd;
-    switch (input.outcome.kind) {
-      case 'completed':
-        end = await turn.complete(input.outcome.reply);
-        return ok(this.remember(owner, turn.turnId, end, false));
-      case 'interrupted':
-        end = await turn.interrupt(this.options.agent);
-        return ok(this.remember(owner, turn.turnId, end, true));
-      case 'failed':
-        end = await turn.fail(input.outcome.code);
-        return ok(this.remember(owner, turn.turnId, end, false));
-    }
+    const outcome = input.outcome;
+    const end = await (outcome.kind === 'completed'
+      ? turn.complete(outcome.reply)
+      : outcome.kind === 'interrupted'
+        ? turn.interrupt(this.options.agent)
+        : turn.fail(outcome.code));
+    return ok(this.remember(owner, turn.turnId, end, turn.wasInterrupted));
   }
 
   /** Which of the session's turns the donor recorded (settled) and which are still open. */
