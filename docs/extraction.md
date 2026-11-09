@@ -1181,7 +1181,29 @@ one was found in the donor code or in a run:
   What it cannot reproduce:
   - the donor re-asked its model once when a required call was missing
     (`missing_required_call`). A host turn cannot be re-asked; a host model
-    that ignores the forced choice fails the turn;
+    that answers a forced step without any call fails the turn;
+  - the donor failed a turn at once on a call of another tool or with
+    other exact arguments; its provider held the name, so this did not
+    happen. Under Hermes's `tool_call` bridge only the narrowed schema holds
+    it, so the plugin blocks the first miss of a step and lets the model
+    call again, and fails the turn on the second (round r3, below). That
+    retry is the plugin's own. The model sees the blocked call and the
+    plugin's correction in its history, which the donor's fresh retry did
+    not have. The check covers one call per model response (forced steps ask
+    for `parallel_tool_calls: false`). A call Hermes rejects before its
+    plugin hooks (outside the session's tool scope, or failing Tool
+    Search's schema probe) is not counted as a miss;
+  - the donor ended the turn at a contract violation: no further model
+    call. Hermes gives a plugin no supported way to stop a turn in progress
+    (round r3, below), so after the companion's turn is over the plugin
+    blocks Lite's tools and sends the model's next request without tools.
+    Hermes's model then writes one more reply, which is not recorded;
+  - DeepSeek's `deepseek-flash` as Hermes's chat model sometimes writes its
+    tool-call markup (DSML, text of the form `<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke ...`) as reply
+    content on a step that offers no tools (round r3 R3-1). The plugin does
+    not strip or rewrite model output, and Lite records the reply as
+    given. This is model-specific behaviour: the donor never ran DeepSeek
+    as its chat model, and the live companion chats on GLM;
   - the plugin forces only Hermes's `chat_completions`, `codex_responses`
     and `anthropic_messages` request shapes. On another API mode, or when
     Hermes's request has neither the requested tool nor Tool Search's
@@ -2344,6 +2366,232 @@ test has its baseline status". The Hermes plugin suite: 88 passed and 2
 skipped at f0187332, 88 passed and 2 skipped at 2bd378e (a fresh clone and
 venv). No test container, `/tmp/lc-*` directory or scratch directory was
 left.
+
+## Shakedown fixes (2026-11-09, Lite with Hermes, round r3)
+
+Round `lite-hermes-companion-20261109-r3` ran Lite at `a0a8840` with the live
+Hermes `2bd378e` and DeepSeek `deepseek-flash` as Hermes's model (evidence
+outside the repository: its `ROUND-NOTES.md` and `comparison-table.md`).
+20 of 23 core cases were ok on the first run, and the live DeepSeek API
+accepted every forced step. Three findings; two are fixed in the Hermes
+plugin and one is recorded. No donor file and no Lite TypeScript changed.
+The `cuts.tsv` row `S7` records them and amends `S3` and `S6`.
+
+### R3-2: a forced call of another tool
+
+In 1 of 60 forced steps DeepSeek ignored the narrowed `tool_call` `name`
+enum and called `mcp__psfn_lite__session` where the step required `orient`
+(the round's `tsv:67`; `lite-serve.log:519`). The call reached Lite, whose
+donor check failed the turn (`tool_contract_incompatible`).
+
+What the donor does, read from its code:
+
+- It retries once, and only when the model made no call at all. In
+  `src/core/agent/stream-adapter.ts:401-413`, a `missing_required_call`
+  with `missingRequiredCallRetries < 1` (a counter per model call, :337)
+  throws `SemanticToolRetrySignal`. The catch at :466-478 logs "LLM
+  semantic tool response failed, retrying at caller boundary" and runs a
+  fresh completion of the same request, with no corrective text.
+  `src/primitives/llm/empty-tool-argument-retry.ts:63-67` states the rule:
+  "Retry one fresh physical completion when the provider returns no call
+  at all; every other contract violation remains immediately fatal."
+- A call of another tool is `mismatched_tool_call`, and changed exact
+  arguments are `invalid_arguments`. Both are thrown by
+  `src/primitives/llm/explicit-tool-request.ts`:
+  `assertExplicitToolContractSatisfied` (:120-152) and
+  `assertExplicitToolArgumentsValid` (:180-187). Their text is
+  ``Provider violated explicit tool contract: expected exactly one "<name>"
+  call, received [...]`` and ``Provider changed exact requested arguments
+  for required tool call: <name>``.
+- `src/primitives/llm/error-classify.ts:173-178` classifies every
+  `ExplicitToolContractError` as `tool_contract_incompatible`.
+  `src/primitives/llm/fallback.ts:154` then moves to the next model
+  candidate. With one candidate, the turn fails.
+- The donor never met this case. It offered exactly one tool with a
+  required choice, so the provider itself held the model to the name.
+
+So the coordinator's premise, that the donor gives a model one retry after
+an incorrect call, does not hold. Its one retry covers a missing call only.
+The fix is a plugin decision, not donor behaviour. It restores the
+guarantee the bridge lost: under Hermes Tool Search the provider holds the
+model only to `tool_call`, and only the schema holds the inner name. The
+block text is the plugin's own; the donor has none.
+
+Fix, in `integrations/hermes/psfn_lite/lifecycle.py`:
+
+- `pre_tool_call` (:301-345) checks each call of a forced step before
+  Lite sees it, in `_contract_miss` (:508-552). A step is forced while the
+  choice is a `tool` choice that has not moved on yet.
+- The call must name the requested Lite tool. When the participant gave
+  exact arguments, they must match exactly. The plugin reads them back
+  from the schema Lite hands over (`expected_arguments` and `_exact_value`,
+  :124-146, the inverse of the donor's
+  `buildExactToolArgumentsModelSchema`). It compares them as the donor's
+  `exactToolArgumentsMatch` does (`exact_match`, :149-159: the same keys
+  and the same JSON values, with a boolean never equal to a number).
+- Any other call counts as a miss, whether it names another Lite tool,
+  one of Hermes's own tools, or `tool_call` itself.
+- The first miss of a step is blocked with a message naming the required
+  call (and its exact arguments). `choice_fresh` stays set, so the retry
+  is forced exactly as before.
+- `post_tool_call` (:347-387) no longer moves the sequence on for a
+  `blocked` call (:357), and a call that ran resets the step's count. Lite
+  never sees a blocked call.
+- A second miss of the same step (`_STEP_RETRIES = 1`, :112) is blocked.
+  The plugin then settles the turn at once as `failed` with the donor's
+  code `tool_contract_incompatible` (:114) and the donor's violation text
+  as the message.
+- Lite's bridge records that as the donor's failure
+  (`packages/lifecycle/src/host-turns.ts:311-318`: the pending model call
+  is rejected with `NonRecoverableFallbackError`, "host-driven turn
+  failed: tool_contract_incompatible").
+- `on_session_end` (:429-446) and the sweep (:573-595) do not settle it a
+  second time or report it as unfinished.
+
+DeepSeek strict mode was checked and is not used:
+
+- DeepSeek documents strict function calling as a Beta feature
+  (`api-docs.deepseek.com/guides/tool_calls`). It needs
+  `base_url="https://api.deepseek.com/beta"` and `strict: true` on every
+  function. Every property of every object must be `required`, with
+  `additionalProperties: false`, and arrays may not use
+  `minItems`/`maxItems`.
+- Hermes `2bd378e` has no path to it. Its DeepSeek provider sets
+  `base_url="https://api.deepseek.com/v1"`
+  (`plugins/model-providers/deepseek/__init__.py:57`). Nothing in Hermes
+  names `api.deepseek.com/beta`, and only its Codex Responses adapter
+  passes a function's `strict` (`agent/codex_responses_adapter.py:446`,
+  :1016).
+- The base URL is a client setting, not part of the request the
+  `llm_request` middleware rewrites.
+- The bridge schema could not comply anyway. The narrowed `calls` array
+  uses `minItems`/`maxItems` 1, and Lite's own tool schemas have optional
+  properties.
+
+### R3-3: Hermes kept calling Lite after the turn ended
+
+After Lite failed the r3 turn, Hermes's model went on calling Lite tools.
+The `session` call answered `turn_ended` and two `orient` calls answered
+`no_open_turn` (the round's `logs/hermes-profile/agent.log:576`, :580,
+:584). Each is an MCP error result, and Hermes counts it toward its MCP
+circuit breaker:
+
+- `_record_call_outcome` and `_result_is_error` are at
+  `tools/mcp_tool_handlers.py:265-280`.
+- The threshold and cooldown are 3 and 60 seconds
+  (`_CIRCUIT_BREAKER_THRESHOLD, _CIRCUIT_BREAKER_COOLDOWN_SEC = 3, 60.0`,
+  `tools/mcp_tool.py:516`).
+- `_check_circuit_breaker` (`tools/mcp_tool_handlers.py:211-229`) then
+  refused the next case's Lite calls.
+
+The donor ends the turn at the violation. Hermes `2bd378e` gives a plugin
+no supported way to stop the current turn:
+
+- `pre_llm_call`'s block directive takes effect only before the turn's
+  loop (`agent/conversation_loop.py` `_turn_without_loop`, :1611, applied
+  at :1739; `PRE_LLM_BLOCK_EXIT_REASON`, `agent/turn_context.py:808`).
+- No hook in `VALID_HOOKS` (`hermes_cli/plugins.py:109`) returns a stop.
+- The agent's interrupt (`agent/interrupt_control.py:163`) needs the agent
+  object, which hooks do not receive.
+- `llm_request` middleware could only replace the provider call with a
+  made-up reply.
+
+A `pre_tool_call` block, on the other hand, is never counted:
+
+- It returns before dispatch: `model_tools.py:801` returns
+  `(tool_error(block_message), "plugin_block", ...)`, and :957 emits
+  `post_tool_call` with `status="blocked"`.
+- The agent loop's path is `agent/tool_executor.py`
+  `_dispatch_authorized_once` (:678) and `_blocked_tool_result` (:647).
+- `_bump_server_error` is called only inside the MCP handlers
+  (`tools/mcp_tool_handlers.py:258`, :277, :285, :369, :738).
+
+Fix, in `lifecycle.py`:
+
+- Each open turn carries `ended` (:490). It is set when the plugin fails
+  the turn (R3-2). It is also set when a Lite tool result is Lite's
+  `turn_ended` or `no_open_turn` refusal, in `post_tool_call` (:357-364)
+  through `_turn_over_reason` (:162-178), and when the `tool-choice` route
+  answers `not_found` for the turn (:404-407; `bridge.ts` `toolChoice`
+  answers an ended turn that way).
+- Once `ended` is set, `pre_tool_call` blocks every further Lite call in
+  that Hermes turn with a message that the companion's turn is over
+  (:317-321, `turn_over_text` :117). Hermes's own tools are not blocked.
+- Also once `ended` is set, the `llm_request` middleware does not ask Lite
+  again and sends the request without `tools`, `tool_choice` or
+  `parallel_tool_calls` (:396-397, `_without_tools` :562-571). The model
+  then answers, and Hermes's turn ends.
+- After a plugin failure Hermes counts nothing. After Lite ended a turn on
+  its own (its host-turn timeout, say), Hermes counts the one refusal
+  that told the plugin, and nothing after it.
+
+### R3-1: DSML markup as reply content
+
+On a step with no tools, `deepseek-flash` sometimes wrote its tool-call
+markup as the reply. This is not fixed: the plugin does not strip or
+rewrite model output. It is recorded under "What a host-driven turn cannot
+reproduce" (above) as model-specific behaviour of `deepseek-flash` as the
+chat model. The donor never ran DeepSeek for chat, and the live companion
+chats on GLM.
+
+### Guards (round r3)
+
+- `integrations/hermes/tests/test_tool_search_wire.py`, a real `AIAgent`
+  turn over HTTP with Tool Search at its default:
+  - A model that calls `mcp__psfn_lite__session` through the forced
+    bridge is blocked before the tool runs (its handler is never called).
+    The retry request is forced exactly as the first and carries the
+    plugin's correction, the retry's `orient` runs, and Lite is asked for
+    the next step once
+    (`test_a_forced_call_of_another_tool_is_blocked_before_it_runs_and_the_models_retry_makes_the_step`,
+    :237).
+  - Two misses settle the turn once as `failed` with the donor's
+    violation text, and the next request carries no tools (:258).
+- `tests/test_tool_choice.py`, through Hermes's own hook and middleware
+  dispatch:
+  - one retry per step, and the second miss failing the turn with
+    Hermes's own tools left alone (:252);
+  - the exact-arguments match, covering a boolean in place of a number and
+    an extra key (:278);
+  - a Lite `turn_ended` result blocking Lite's tools and removing the
+    request's tools (:301);
+  - a `tool-choice` answered `not_found` (:313);
+  - a failed turn Hermes never ended: the next turn's sweep does not settle
+    it again or report it unfinished, nor does a late `on_session_end`
+    (:325).
+- `tests/test_e2e_lite.py`, through Hermes's real MCP client
+  (`handle_function_call`) against the real Lite. The breaker count is read
+  from `tools.mcp_tool._server_error_counts`:
+  - A forced step missed twice, then more Lite calls than the breaker's
+    threshold: every call is blocked, the count stays 0, Lite records the
+    failed turn without Hermes's reply, and the next turn's tools reach
+    Lite (:294).
+  - Lite ending the turn itself (a bridge settle the plugin does not know
+    of, standing in for the host-turn timeout): its refusal counts 1,
+    every later call is blocked, the count stays 1, and the next turn's
+    call resets it to 0 (:321).
+  - A forced step with exact arguments read back from the schema the real
+    Lite produced (:346).
+
+Result (`TMPDIR` under a scratch directory in the worktrees folder):
+
+- No TypeScript changed in this round. `tsc --noEmit` for the root and the
+  companion projects passed, and so did `eslint .`.
+- The Hermes plugin suite: 98 passed and 2 skipped at f0187332, and 98
+  passed and 2 skipped at 2bd378e (a fresh clone and venv).
+- The full Vitest run could not finish clean, so equivalence is not
+  established for this round. The companion project's global setup roots
+  its run directory at `/tmp/lc-<pid>-*`
+  (`packages/companion/vitest.global-setup.ts:23`). The shared `/tmp`
+  tmpfs was at the user's quota from other work on the machine, so file
+  writes failed with `EDQUOT` (error -122).
+- Four full runs failed 97, 9, 35 and 35 tests. In the last, 9,166 of 9,201
+  tests passed, and each of the 35 failures was a write refused by the
+  quota.
+- `compare-baseline.mjs` on that run: "baseline: 807 files / 10107 tests;
+  deleted: 54 files, 1041 tests; matched: 9032; Lite additions: 4 files,
+  27 tests", with 34 differences, all of them those tests.
+- A rerun of the nine affected files alone also hit the quota.
 
 ## Measured size
 
