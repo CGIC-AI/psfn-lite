@@ -37,6 +37,7 @@ type Command = (typeof COMMANDS)[number];
 /** The companion's shipped owner-file seeds (packages/companion/config), copied as `<name>.json`. */
 export const SEED_FILES = [
   'automata-policy',
+  'capability-tier',
   'companions',
   'intake-policy',
   'runtime-prompt-layers',

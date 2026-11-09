@@ -31,6 +31,7 @@ import {
   sanitizeCoreSubstrateConfig,
   type SubstrateConfig,
 } from '../../system/config/runtime-config-contracts.js';
+import type { CapabilityTierConfig } from '../../system/config/capability-tier-config.js';
 import type { InnerLifeConfig } from '../../system/config/inner-life-config.js';
 import { setRuntimeTrustPolicy } from '../../system/trust/runtime-policy.js';
 import { DEFAULT_BACKGROUND_WORK_WELFARE_CONFIG } from '../../system/config/scheduler-config.js';
@@ -50,7 +51,7 @@ import type { MessageSender } from '../../system/lifecycle/notifications.js';
 import { OutboundReplyDeduper } from '../../system/lifecycle/outbound-reply-dedupe.js';
 import type { CapabilityAccess, CapabilityGrantSnapshot } from '../../system/capabilities/access.js';
 import { createEligibilityGate } from '../../system/capabilities/eligibility.js';
-import { normalizeCapabilityTier, resolveTierCapabilityTokens } from '../../system/capabilities/tiers.js';
+import { resolveTierCapabilityTokens } from '../../system/capabilities/tiers.js';
 import type { CapabilityToken } from '../../system/capabilities/tokens.js';
 import { ConfirmationQueue } from '../../system/capabilities/confirmation-queue.js';
 import { createApprovalQueuePortFromConfirmationQueue } from '../../system/capabilities/approval-queue-port.js';
@@ -358,22 +359,25 @@ function createLoggingOperatorNotifier(): NotificationPort {
 }
 
 /**
- * The fixed capability access a Lite host runs with (seam 3.17): the tier from
- * config.capabilityTier (default nursery) and its default tokens, the same
- * access SubstrateAgent derives when no access is injected.
+ * The capability access a Lite host runs with (seam 3.17, Step E4): the tier
+ * and custom tokens of the owner's capability-tier.json, loaded once at start
+ * with the other inner-life owner files, resolved as the donor CapabilityRuntime
+ * resolved them (system/capabilities/runtime.ts:88-92 at e6a9546). Owner edits
+ * take effect at the next start.
  */
-function createFixedCapabilityAccess(config: SubstrateConfig): CapabilityAccess & {
+function createFixedCapabilityAccess(owner: CapabilityTierConfig): CapabilityAccess & {
   snapshotOwnerGrant(): CapabilityGrantSnapshot;
 } {
-  const tier = normalizeCapabilityTier(config.capabilityTier);
-  const granted = new Set<CapabilityToken>(resolveTierCapabilityTokens(tier));
+  const tier = owner.tier;
+  const customTokens = Object.freeze([...owner.customTokens]);
+  const granted = new Set<CapabilityToken>(resolveTierCapabilityTokens(tier, customTokens));
   return {
     getTier: () => tier,
     getGrantedTokens: () => granted,
     has: token => granted.has(token),
     snapshotOwnerGrant: () => Object.freeze({
       tier,
-      customTokens: Object.freeze([]),
+      customTokens,
       grantedTokens: Object.freeze([...granted]),
     }),
   };
@@ -418,7 +422,7 @@ async function composeCompanionRuntime(
   const pathSnapshot = options.pathSnapshot ?? resolveRuntimePathSnapshotFromConfig(config);
   // donor startup-context.ts:162-174 (EventBus, capability runtime, eligibility gate)
   const eventBus = options.eventBus ?? new EventBus();
-  const capabilityAccess = createFixedCapabilityAccess(config);
+  const capabilityAccess = createFixedCapabilityAccess(innerLife.capabilityTier);
   config.capabilityTier = capabilityAccess.getTier();
   const eligibilityGate = createEligibilityGate(() => capabilityAccess);
 

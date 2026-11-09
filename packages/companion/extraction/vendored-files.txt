@@ -4,8 +4,8 @@
 # Kind `source-text`: donor process entrypoints (app/gateway/main.ts, app/operator/main.ts) only read as text by source-scan tests. Deleted in B7.
 # Kind `promoted`: a donor file outside the Step A0 closure that a seam cut kept as core (it is self-contained and serves a kept path); it stays at its donor path and is no longer scaffolding. Unchanged unless a cut in extraction/cuts.tsv edits it (B2: core/cogsec/intake/derived-content.ts imports redirected to the ports; core/cogsec/memory-candidacy.ts split, seam 3.5).
 # Kinds `test-support` and `asset`: donor test helpers and non-TS fixtures the kept tests use. `test-support-deleted` and `asset-deleted`: ones whose only readers were deleted (B7); src/test-support/integration-timeout-registry.json was never copied (docs/extraction.md, Step A).
-# Kind `seed-deleted`: donor seed config (packages/companion/config) whose only readers were deleted scaffolding (B7). The 8 seeds kept (automata-policy, companions, intake-policy, runtime-prompt-layers, scheduler, settings, subagent-roles, trust-policy) are read by core loaders and are not listed.
-# Counts: asset 23, asset-deleted 23, cut 26, promoted 99, scaffolding 732, seed-deleted 11, source-text 2, test-support 20, test-support-deleted 1.
+# Kind `seed-deleted`: donor seed config (packages/companion/config) whose only readers were deleted scaffolding (B7). The 9 seeds kept (automata-policy, capability-tier, companions, intake-policy, runtime-prompt-layers, scheduler, settings, subagent-roles, trust-policy) are read by core loaders and are not listed; capability-tier came back in Step E4 (docs/extraction.md).
+# Counts: asset 23, asset-deleted 23, cut 25, promoted 99, scaffolding 732, seed-deleted 10, source-text 2, test-support 20, test-support-deleted 1.
 # kind	file
 scaffolding	src/app/agent/control-plane.ts
 scaffolding	src/app/agent/icp-autonomy-candidate-dispatcher.ts
@@ -889,7 +889,6 @@ cut	src/core/session/icp-recovery-fatigue-binding.ts
 cut	src/core/session/icp-recovery-fatigue-metadata.ts
 cut	src/system/capabilities/runtime.ts
 cut	src/system/config/charge-policy-config.ts
-cut	src/system/config/capability-tier-config.ts
 cut	src/persistence/postgres/retired-fleet-grantees.ts
 cut	src/shared/utils/postgres-credential.ts
 cut	src/shared/contracts/cogsec-persona-conformance.ts
@@ -934,7 +933,6 @@ promoted	src/core/doing-mirror/sources.ts
 promoted	src/core/letters/memory-extraction.ts
 promoted	src/shared/garden-queue-change.ts
 seed-deleted	config/backup.seed.json
-seed-deleted	config/capability-tier.seed.json
 seed-deleted	config/charge-policy.seed.json
 seed-deleted	config/fleet-auth.seed.json
 seed-deleted	config/intake-l1-rules.json
