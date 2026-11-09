@@ -689,11 +689,11 @@ loaders, `settings/io.ts` `loadSettings`, then the load-config default where
 a key is absent): deep-equal for `scheduler.json`, `trust-policy.json`,
 `subagent-roles.json`, `automata-policy.json` and all 11 settings values.
 Without a registry it throws the donor message (`automata-policy.json.bus.reviewer.model references slot "gpt-5.4-nano", which is not an enabled models.json registry entry. ...`).
-Rerun it with `npx tsx packages/companion/extraction/inner-life-loader-probe.mts`
-(exit 0, one `equal` line per value). It is a probe, not a test: it compares
-against vendored scaffolding that B7 deletes (the probe leaves with it), and a
-new test in the companion project is an addition that `compare-baseline.mjs`
-rejects.
+It ran as `npx tsx packages/companion/extraction/inner-life-loader-probe.mts`
+(exit 0, one `equal` line per value). It was a probe, not a test: it compared
+against vendored scaffolding, and a new test in the companion project is an
+addition that `compare-baseline.mjs` rejects. B7 deleted it together with the
+loaders it compared against, so it can no longer be rerun.
 
 **Exemptions kept from earlier batches.** `faculties/shards/context-text.ts`
 is a Lite file inside a scaffolding directory (the promoted `output-review.ts`
