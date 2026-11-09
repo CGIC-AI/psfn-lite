@@ -20,7 +20,9 @@ import { join } from 'node:path';
 
 const PROFILE_LABEL = 'io.test-harness.postgres.profile';
 const PROFILE_PATTERN = /^lite-companion-(\d+)-[0-9a-f]+$/u;
-const TMP_ROOT = '/tmp';
+// The caller's TMPDIR when set (e.g. a disk-backed /var/tmp when /tmp is a full
+// tmpfs), else /tmp. Keep it short: see the length note above.
+const TMP_ROOT = process.env['TMPDIR'] !== undefined && process.env['TMPDIR'] !== '' ? process.env['TMPDIR'] : '/tmp';
 const TMP_PATTERN = /^lc-(\d+)-/u;
 
 function running(pid: number): boolean {
