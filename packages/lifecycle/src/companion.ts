@@ -18,3 +18,11 @@ export type { TurnRecord } from '../../companion/src/shared/contracts/runtime.js
 export { NonRecoverableFallbackError } from '../../companion/src/primitives/llm/fallback.js';
 export { createTurnId } from '../../companion/src/core/turns/id.js';
 export { externalMemorySessionId } from '../../companion/src/shared/contracts/external-memory.js';
+export {
+  HostedAutomataExecutor,
+  type HostedAttemptClaim,
+  type HostedAttemptRefusal,
+  type HostedAttemptReport,
+  type HostedAutomataPolicy,
+  type HostedResult,
+} from '../../companion/src/faculties/subagents/host-execution.js';

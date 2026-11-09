@@ -3,7 +3,8 @@
  * external companion host (Hermes) drives host-driven companion turns. Every
  * request carries a bearer credential; the principal is identified from it
  * before the body is read, never from the body. Each route calls one bridge
- * use case (prepare, settle, checkpoint) and holds no business logic. It
+ * use case (prepare, settle, checkpoint, and with hosted automata the
+ * attempt routes under `automata/`) and holds no business logic. It
  * binds loopback unless the operator explicitly opts out and names the Host
  * values it serves.
  */
@@ -11,7 +12,17 @@ import { createServer, type IncomingMessage, type Server as HttpServer, type Ser
 import type { AddressInfo } from 'node:net';
 import { bearerCredential, invalid, ok, publicError, unavailable, type HostError, type Result } from './mcp.ts';
 import type { HostTurnBridge } from './bridge.ts';
-import { parseCheckpoint, parsePrepare, parseSettle, renderContext } from './wire.ts';
+import type { HostedAttemptRefusal, HostedAutomataExecutor, HostedResult } from './companion.ts';
+import {
+  parseAutomataAttempt,
+  parseAutomataBus,
+  parseAutomataClaim,
+  parseAutomataReport,
+  parseCheckpoint,
+  parsePrepare,
+  parseSettle,
+  renderContext,
+} from './wire.ts';
 
 export interface LifecycleErrorReport {
   readonly route: string;
@@ -30,6 +41,14 @@ export interface LifecycleBridgeOptions {
   readonly exposeBeyondLoopback?: { readonly allowedHosts: readonly string[] };
   readonly maxBodyBytes?: number;
   readonly onError: (report: LifecycleErrorReport) => void;
+  /**
+   * Hosted automata (operator automata rule 4): the core executor whose
+   * attempts the host claims, runs as its own subagents and reports. The
+   * routes `automata/claim`, `automata/heartbeat`, `automata/bus` and
+   * `automata/report` exist only when it is set. The owner of an attempt is
+   * the bound principal and the body's hostInstance.
+   */
+  readonly automata?: Pick<HostedAutomataExecutor, 'claim' | 'heartbeat' | 'callBus' | 'report'> | null;
 }
 
 export interface LifecycleBridge {
@@ -85,6 +104,7 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
   };
 
   return {
+    ...(options.automata ? createAutomataRoutes(options.automata, fail) : {}),
     async prepare(request) {
       const body = parsePrepare(request.body);
       if (!body.ok) return fail(request, body.error);
@@ -126,6 +146,56 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
 }
 
 const STATUS: Readonly<Record<HostError['kind'], number>> = { denied: 403, not_found: 404, conflict: 409, invalid: 400, unavailable: 503 };
+
+/** An attempt refusal as HTTP: an ended attempt is gone (410), a stranger's is forbidden. */
+const REFUSAL_STATUS: Readonly<Record<HostedAttemptRefusal, number>> = {
+  unknown_attempt: 404,
+  attempt_ended: 410,
+  not_attempt_owner: 403,
+  budget_exceeds_policy: 409,
+  invalid: 400,
+  no_bus_access: 403,
+  cancel_requested: 409,
+};
+
+function createAutomataRoutes(
+  automata: NonNullable<LifecycleBridgeOptions['automata']>,
+  fail: (request: Request, error: HostError) => Reply,
+): Routes {
+  const owner = (request: Request, hostInstance: string) => `${request.principal}/${hostInstance}`;
+  const answer = <T>(result: HostedResult<T>, render: (value: T) => Readonly<Record<string, unknown>>): Reply => (result.ok
+    ? { status: 200, body: render(result.value) }
+    : { status: REFUSAL_STATUS[result.refusal], body: { error: { kind: result.refusal, detail: result.message } } });
+  return {
+    async 'automata/claim'(request) {
+      const body = parseAutomataClaim(request.body);
+      if (!body.ok) return fail(request, body.error);
+      return answer(
+        automata.claim(owner(request, body.value.hostInstance), { maxIterations: body.value.maxIterations, limit: body.value.limit }),
+        (claims) => ({ attempts: claims }),
+      );
+    },
+    async 'automata/heartbeat'(request) {
+      const body = parseAutomataAttempt(request.body);
+      if (!body.ok) return fail(request, body.error);
+      return answer(automata.heartbeat(owner(request, body.value.hostInstance), body.value.attemptCredential), (status) => ({ ...status }));
+    },
+    async 'automata/bus'(request) {
+      const body = parseAutomataBus(request.body);
+      if (!body.ok) return fail(request, body.error);
+      const result = await automata.callBus(owner(request, body.value.hostInstance), body.value.attemptCredential, body.value.arguments);
+      return answer(result, (value) => ({ ...value }));
+    },
+    async 'automata/report'(request) {
+      const body = parseAutomataReport(request.body);
+      if (!body.ok) return fail(request, body.error);
+      return answer(
+        automata.report(owner(request, body.value.hostInstance), body.value.attemptCredential, body.value.outcome),
+        (value) => ({ ...value }),
+      );
+    },
+  };
+}
 
 interface ServeContext {
   readonly options: LifecycleBridgeOptions;

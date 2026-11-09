@@ -29,6 +29,7 @@ export type { SubstrateMessage, AgentResponse } from '../../../packages/companio
 export type { TrustLevel } from '../../../packages/companion/src/shared/contracts/trust-contracts.js';
 export { createTurnId } from '../../../packages/companion/src/core/turns/id.js';
 export { resolveRuntimePathSnapshotFromConfig } from '../../../packages/companion/src/persistence/layout.js';
+export { HostedAutomataExecutor, type HostedAutomataEvent } from '../../../packages/companion/src/faculties/subagents/host-execution.js';
 
 /** The seed owner files the companion ships (packages/companion/config); `init` copies them into the data directory. */
 export const COMPANION_SEED_DIR = new URL('../../../packages/companion/config/', import.meta.url);

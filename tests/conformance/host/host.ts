@@ -101,7 +101,7 @@ export class ConformanceHost {
       allowedHosts: null,
       bindings: Object.entries(PRINCIPALS).map(([principal, contact]) => ({ principal, credential: { env: envName(principal) }, contact })),
     };
-    document.lifecycle = { host: '127.0.0.1', port: this.state.ports?.lifecycle ?? 0, allowedHosts: null, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS };
+    document.lifecycle = { host: '127.0.0.1', port: this.state.ports?.lifecycle ?? 0, allowedHosts: null, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS, automata: null };
     const env: Record<string, string> = {
       [DATABASE_URL_ENV]: this.state.databaseUrl,
       ...Object.fromEntries(Object.entries(credentials).map(([p, c]) => [envName(p), c])),
