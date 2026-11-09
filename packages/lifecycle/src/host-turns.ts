@@ -19,9 +19,20 @@
  * post-turn work (the donor records and schedules them when the host's final
  * reply ends its loop). What a host-driven turn cannot reproduce is recorded
  * in docs/extraction.md (Step C).
+ *
+ * An explicit tool request ("call tool_search, then ...") is the donor's own
+ * contract on each model call of the turn: the donor's provider client forced
+ * the step's tool (or no tool once the sequence is done) with tool_choice
+ * (primitives/llm/client-request-capability.ts applyExplicitToolChoice,
+ * buildPiContext) and its stream adapter fails the turn on any other answer
+ * (core/agent/stream-adapter.ts, explicit-tool-request.ts). The relay serves
+ * no provider, so it hands the host that same choice for the pending call
+ * (`HostToolChoice`, computed by the donor's resolveExplicitToolContract from
+ * that call's context), and the host forces its own model with it.
  */
 import {
   NonRecoverableFallbackError,
+  resolveExplicitToolContract,
   type AgentResponse,
   type LLMContext,
   type LLMProviderStreamOptions,
@@ -53,11 +64,37 @@ export interface HostToolSchema {
   readonly inputSchema: Record<string, unknown>;
 }
 
+/**
+ * The donor's tool choice for one model call of the turn: exactly one call of
+ * the named donor tool (`tool`), no tool call at all (`none`, an explicit
+ * sequence is done), or null (no explicit request: the model chooses).
+ */
+export type HostToolChoice = { readonly kind: 'tool'; readonly name: string } | { readonly kind: 'none' } | null;
+
 /** The donor's assembled model request for the turn. */
 export interface HostTurnContext {
   readonly systemPrompt: string;
   readonly messages: readonly HostContextMessage[];
   readonly tools: readonly HostToolSchema[];
+  /** The tool choice of the first model call. */
+  readonly toolChoice: HostToolChoice;
+}
+
+/**
+ * The model API the donor contract is resolved for. The donor resolved it
+ * for the routed model's API and refused APIs it could not force
+ * (explicit-tool-request.ts providerToolChoice); the host is asked through a
+ * named-function or no-tool choice, the openai-completions form, and maps it
+ * onto its own provider.
+ */
+const HOST_TOOL_CHOICE_API = 'openai-completions';
+
+/** The donor's tool choice for a model call with this context (its stream adapter's agent.turn.prompt contract). */
+export function hostToolChoiceOf(context: LLMContext): HostToolChoice {
+  const contract = resolveExplicitToolContract({ context, originStage: 'agent.turn.prompt', modelApi: HOST_TOOL_CHOICE_API });
+  if (contract === undefined) return null;
+  if (contract.requiredToolName !== undefined) return { kind: 'tool', name: contract.requiredToolName };
+  return contract.choice === 'none' ? { kind: 'none' } : null;
 }
 
 export type HostTurnEnd =
@@ -111,7 +148,7 @@ export function hostContextOf(context: LLMContext): HostTurnContext {
     const schema = (tool.inputSchema ?? tool.parameters ?? {}) as Record<string, unknown>;
     return { name: String(tool.name), description: typeof tool.description === 'string' ? tool.description : '', inputSchema: schema };
   });
-  return { systemPrompt: context.systemPrompt, messages, tools };
+  return { systemPrompt: context.systemPrompt, messages, tools, toolChoice: hostToolChoiceOf(context) };
 }
 
 function toolResultOf(context: LLMContext, toolCallId: string): { text: string; isError: boolean } | null {
@@ -168,6 +205,16 @@ export class HostTurn {
     }
     this.pending = call;
     this.wake();
+  }
+
+  /**
+   * The donor's tool choice for the call the host answers next: the pending
+   * call's, once the donor made it (after prepare, and after each tool call
+   * the relay answered); null once the turn is answered or ended.
+   */
+  get toolChoice(): HostToolChoice {
+    if (this.answered || this.ended || this.pending === null) return null;
+    return hostToolChoiceOf(this.pending.context);
   }
 
   /** @internal */

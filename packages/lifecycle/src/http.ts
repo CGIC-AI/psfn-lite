@@ -3,8 +3,8 @@
  * external companion host (Hermes) drives host-driven companion turns. Every
  * request carries a bearer credential; the principal is identified from it
  * before the body is read, never from the body. Each route calls one bridge
- * use case (prepare, settle, checkpoint, and with hosted automata the
- * attempt routes under `automata/`) and holds no business logic. It
+ * use case (prepare, settle, checkpoint, tool-choice, and with hosted
+ * automata the attempt routes under `automata/`) and holds no business logic. It
  * binds loopback unless the operator explicitly opts out and names the Host
  * values it serves.
  */
@@ -23,7 +23,9 @@ import {
   parseCheckpoint,
   parsePrepare,
   parseSettle,
+  parseToolChoice,
   renderContext,
+  renderToolChoice,
 } from './wire.ts';
 
 export interface LifecycleErrorReport {
@@ -151,6 +153,14 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
       const settled = await bridge.settle(request.principal, { hostInstance: body.value.hostInstance, turnId: body.value.turnId, outcome: body.value.outcome });
       if (!settled.ok) return fail(request, settled.error);
       return { status: 200, body: { turnId: settled.value.turnId, status: settled.value.status, reply: settled.value.reply } };
+    },
+
+    // The explicit tool contract of the open turn's pending model call (host-turns.ts HostToolChoice).
+    'tool-choice': async (request) => {
+      const body = parseToolChoice(request.body);
+      if (!body.ok) return fail(request, body.error);
+      const answer = bridge.toolChoice(request.principal, body.value.hostInstance, body.value.turnId);
+      return answer.ok ? { status: 200, body: { toolChoice: renderToolChoice(answer.value.toolChoice) } } : fail(request, answer.error);
     },
 
     async checkpoint(request) {

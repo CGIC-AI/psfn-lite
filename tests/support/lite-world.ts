@@ -27,7 +27,7 @@ import {
 } from '../../apps/standalone/src/index.ts';
 import { deterministicEmbeddings } from './embeddings.ts';
 import { DATABASE_URL_ENV, SESSION_KEYS_ENV, liteConfigDocument, newSessionKeys, provisionDatabase, writeCharacterCard, type LiteConfigDocument } from './lite-install.ts';
-import { fauxModel, type Script } from './faux-model.ts';
+import { fauxModel, type FauxModelOptions, type Script } from './faux-model.ts';
 import { HARNESS_START_TIMEOUT_MS, startPostgresHarness, type PostgresHarness } from './postgres-harness.ts';
 
 export { COMPANION_NAME, DATABASE_URL_ENV, HERMES_TEST_INSTALL_ID, SESSION_KEYS_ENV, liteConfigDocument, newCredential, type LiteConfigDocument } from './lite-install.ts';
@@ -77,8 +77,8 @@ export function useLiteWorld() {
     return { dataDir, configPath, document, env };
   };
 
-  const overridesFor = (script: Script): { readonly overrides: LiteRuntimeOverrides; readonly model: ReturnType<typeof fauxModel> } => {
-    const model = fauxModel(script);
+  const overridesFor = (script: Script, modelOptions: FauxModelOptions = {}): { readonly overrides: LiteRuntimeOverrides; readonly model: ReturnType<typeof fauxModel> } => {
+    const model = fauxModel(script, modelOptions);
     return {
       model,
       overrides: {
@@ -90,8 +90,8 @@ export function useLiteWorld() {
   };
 
   /** The file's one runtime, built exactly as the CLI builds it, closed after the file unless closed earlier. */
-  const start = async (install: Install, script: Script) => {
-    const { overrides, model } = overridesFor(script);
+  const start = async (install: Install, script: Script, modelOptions: FauxModelOptions = {}) => {
+    const { overrides, model } = overridesFor(script, modelOptions);
     const config = parseLiteConfig(install.document);
     if (!config.ok) throw new Error(JSON.stringify(config.error));
     const diagnostics: LiteDiagnostic[] = [];

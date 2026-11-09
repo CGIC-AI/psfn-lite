@@ -20,7 +20,7 @@ import { createHash } from 'node:crypto';
 import { conflict, denied, invalid, notFound, ok, unavailable, type Result } from './mcp.ts';
 import type { ToolCallOutput } from './mcp.ts';
 import { createTurnId, externalMemorySessionId, type SubstrateMessage, type TurnRecord } from './companion.ts';
-import type { HostTurn, HostTurnAgent, HostTurnContext, HostTurnEnd, HostTurnRelay } from './host-turns.ts';
+import type { HostToolChoice, HostTurn, HostTurnAgent, HostTurnContext, HostTurnEnd, HostTurnRelay } from './host-turns.ts';
 
 /** The contact a principal speaks as, provisioned by the host in the companion's contact store. */
 export interface BoundContact {
@@ -225,6 +225,19 @@ export class HostTurnBridge {
       settled.push(turnId);
     }
     return ok({ settled, open });
+  }
+
+  /**
+   * The donor's tool choice for the model call the host answers next in its
+   * open turn: the explicit tool contract the donor's provider client forced
+   * with tool_choice, which the host applies to its own model. Only the host
+   * instance that prepared the turn asks; an ended turn is not found.
+   */
+  toolChoice(principal: string, hostInstance: string, turnId: string): Result<{ readonly toolChoice: HostToolChoice }> {
+    const turn = this.options.relay.open().find((candidate) => candidate.turnId === turnId);
+    if (turn === undefined || !this.ownedBy(principal, turn)) return notFound('turn');
+    if (turn.owner !== `${principal}/${hostInstance}`) return denied('not_turn_owner', 'only the host instance that prepared the turn asks for its tool choice');
+    return ok({ toolChoice: turn.toolChoice });
   }
 
   /** A host tool call, run by the donor's loop as the model's tool call of the principal's open turn. */

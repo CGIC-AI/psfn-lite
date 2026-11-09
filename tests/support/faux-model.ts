@@ -28,8 +28,19 @@ function textOf(content: Context['messages'][number]['content']): string {
   return content.map((block) => (block.type === 'text' ? block.text : '')).join('');
 }
 
-export function fauxModel(script: Script): { readonly runtime: PiModelRuntime; readonly calls: readonly ModelCall[] } {
-  const faux = fauxProvider({ models: [{ id: 'faux-1', contextWindow: 128_000, maxTokens: 1024 }] });
+export interface FauxModelOptions {
+  /**
+   * The pi-ai API the faux model reports. The donor enforces an explicit
+   * tool request only for `openai-completions` and `pi-messages` models
+   * (explicit-tool-request.ts providerToolChoice) and refuses such a turn on
+   * any other API, so a test of that contract names one of those; the
+   * default is pi-ai's own random faux API.
+   */
+  readonly api?: string;
+}
+
+export function fauxModel(script: Script, options: FauxModelOptions = {}): { readonly runtime: PiModelRuntime; readonly calls: readonly ModelCall[] } {
+  const faux = fauxProvider({ ...(options.api === undefined ? {} : { api: options.api }), models: [{ id: 'faux-1', contextWindow: 128_000, maxTokens: 1024 }] });
   const models = createModels();
   models.setProvider(faux.provider);
   const calls: ModelCall[] = [];

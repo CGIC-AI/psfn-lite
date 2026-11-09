@@ -9,7 +9,7 @@
  */
 import { invalid, isRecord, ok, type Result } from './mcp.ts';
 import type { HostOutcome } from './bridge.ts';
-import type { HostTurnContext } from './host-turns.ts';
+import type { HostToolChoice, HostTurnContext } from './host-turns.ts';
 import type { HostedAttemptReport } from './companion.ts';
 
 export interface PrepareBody {
@@ -37,6 +37,12 @@ export interface MemoryDeletionApproveBody {
   readonly hermesInstallId: string;
   readonly proposalId: string;
   readonly memoryId: string;
+}
+
+/** The tool choice of the open turn's pending model call (the donor's explicit tool contract). */
+export interface ToolChoiceBody {
+  readonly hostInstance: string;
+  readonly turnId: string;
 }
 
 export interface CheckpointBody {
@@ -179,6 +185,14 @@ export function parseMemoryDeletionApprove(raw: unknown): Result<MemoryDeletionA
   return done(f.value, () => ({ hostInstance, hermesInstallId, proposalId, memoryId }));
 }
 
+export function parseToolChoice(raw: unknown): Result<ToolChoiceBody> {
+  const f = fields(raw, '', ['hostInstance', 'turnId']);
+  if (!f.ok) return f;
+  const hostInstance = f.value.pattern('hostInstance', INSTANCE_PATTERN, '1-64 characters of [A-Za-z0-9._-]');
+  const turnId = f.value.pattern('turnId', TURN_PATTERN, 'a turn id');
+  return done(f.value, () => ({ hostInstance, turnId }));
+}
+
 export function parseCheckpoint(raw: unknown): Result<CheckpointBody> {
   const f = fields(raw, '', ['hermesInstallId', 'sessionId', 'turnIds']);
   if (!f.ok) return f;
@@ -198,6 +212,11 @@ export function parseCheckpoint(raw: unknown): Result<CheckpointBody> {
 }
 
 /** The donor's assembled request, as JSON. */
+/** A tool choice as JSON: null, `{ kind: 'none' }` or `{ kind: 'tool', name }` (a donor tool name, not the host's). */
+export function renderToolChoice(choice: HostToolChoice): Readonly<Record<string, unknown>> | null {
+  return choice === null ? null : { ...choice };
+}
+
 export function renderContext(context: HostTurnContext): Readonly<Record<string, unknown>> {
   return {
     systemPrompt: context.systemPrompt,
@@ -208,6 +227,7 @@ export function renderContext(context: HostTurnContext): Readonly<Record<string,
       ...(m.toolName === undefined ? {} : { toolName: m.toolName }),
     })),
     tools: context.tools.map((t) => t.name),
+    toolChoice: renderToolChoice(context.toolChoice),
   };
 }
 
