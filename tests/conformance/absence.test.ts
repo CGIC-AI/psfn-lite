@@ -321,7 +321,7 @@ describe('excluded subsystems are absent from Lite', () => {
 
   it('no companion tool Lite serves is one of them', () => {
     // The donor registry still describes the cut surfaces (the companion keeps donor text verbatim); no Lite factory builds them.
-    // The live catalog the MCP transport serves is checked the same way in tests/lifecycle/host-turns.integration.test.ts.
+    // The live catalog the MCP transport serves is checked the same way by the inventory test of conformance.integration.test.ts.
     const served = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name).filter((n) => !SCAFFOLDING_HOSTED_TOOL_SURFACES.has(n));
     expect(served.length).toBeGreaterThanOrEqual(15);
     expect(served.filter((n) => excludedName(n) !== null)).toEqual([]);
