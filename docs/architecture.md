@@ -54,14 +54,22 @@ subsystems out ([conformance](conformance.md)).
    `settings.json` values, then the host's model, embedding, database and
    paths. Defaults of cut subsystems are not set.
 4. It starts the companion with `startCompanionRuntime`. It passes the Pi
-   provider runtime and the embedding provider, the session keyring, an
-   outbound sender (the operator's channel), the path snapshot (workspace
-   `workspaceDir`, and logs and temp under `dataDir`) and, when a lifecycle
-   bridge is configured, the relay's `wrapStreamTransport`. When
+   provider runtime and the embedding provider, a model-usage recorder, the
+   session keyring, an outbound sender (the operator's channel), the path
+   snapshot (workspace `workspaceDir`, and logs and temp under `dataDir`)
+   and, when a lifecycle bridge is configured, the relay's
+   `wrapStreamTransport`. When
    `lifecycle.automata` is set, it also passes a `HostedAutomataExecutor`
    (`packages/companion/src/faculties/subagents/host-execution.ts`), so
    spawned automata run as host attempts that the bridge's `automata/*`
    routes serve.
+
+   The model-usage recorder (`model-usage.ts`) is required. The core
+   records every model and embedding call through it, and the donor
+   `LLMClient` refuses every autonomous (non-foreground) call when there is
+   none. The host keeps in-memory totals by lane and by provider/model
+   (`LiteRuntime.modelUsage()`). They start at zero on every start; the
+   donor's durable usage rows, budgets, alerts and exports are cut.
 5. It provisions the configured contacts in the donor contact store, keyed
    by the host's contact key, and finds them again on every start.
 6. It mounts the MCP transport and the lifecycle bridge on loopback, unless
