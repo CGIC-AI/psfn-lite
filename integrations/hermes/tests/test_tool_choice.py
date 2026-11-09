@@ -20,20 +20,33 @@ TURN = "sess-1:task:aa"
 ORIENT_STEP = {"kind": "tool", "name": "orient", "parameters": None}
 
 
+def _openai_tools():
+    return [{"type": "function", "function": {"name": name, "description": name, "parameters": {"type": "object"}}} for name in (ORIENT, MEMORY, "terminal")]
+
+
+def _transport_request(api_mode):
+    from agent.transports import get_transport
+
+    return get_transport(api_mode).build_kwargs(model="gpt-5.5", messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
+                                                tools=_openai_tools(), instructions="s")
+
+
+# The provider requests as Hermes's own builders make them, before its llm_request middleware runs
+# (agent/chat_completion_helpers.py: the API-mode kwargs are built first, then the middleware).
 def chat_request():
-    tool = lambda name: {"type": "function", "function": {"name": name, "description": name, "parameters": {"type": "object"}}}
-    return {"model": "m", "messages": [{"role": "user", "content": "hi"}], "tools": [tool(ORIENT), tool(MEMORY), tool("terminal")]}
-
-
-def anthropic_request():
-    tool = lambda name: {"name": name, "description": name, "input_schema": {"type": "object"}}
-    return {"model": "m", "messages": [], "max_tokens": 10, "tools": [tool(ORIENT), tool(MEMORY), tool("terminal")],
-            "tool_choice": {"type": "auto"}, "thinking": {"type": "enabled", "budget_tokens": 1024}}
+    return _transport_request("chat_completions")
 
 
 def codex_request():
-    tool = lambda name: {"type": "function", "name": name, "description": name, "parameters": {"type": "object"}}
-    return {"model": "m", "input": [], "tools": [tool(ORIENT), tool(MEMORY), tool("terminal")], "tool_choice": "auto", "parallel_tool_calls": True}
+    return _transport_request("codex_responses")
+
+
+def anthropic_request():
+    from agent.anthropic_adapter import build_anthropic_kwargs
+
+    # A manual-thinking model, so the request carries the thinking block Anthropic refuses with a forced tool.
+    return build_anthropic_kwargs(model="claude-sonnet-4-5", messages=[{"role": "user", "content": "hi"}], tools=_openai_tools(),
+                                  max_tokens=1024, reasoning_config={"enabled": True, "effort": "medium"})
 
 
 def model_call(request, *, api_mode="chat_completions", turn_id=TURN, session="sess-1"):
@@ -88,6 +101,7 @@ def test_each_api_mode_gets_its_own_form_and_the_exact_arguments_schema_replaces
     exact = {"type": "object", "properties": {"action": {"type": "string", "enum": ["values_list"]}}, "required": ["action"], "additionalProperties": False}
     explicit_turn(bridge, first={"kind": "tool", "name": "orient", "parameters": exact})
 
+    assert "thinking" in anthropic_request()
     anthropic = model_call(anthropic_request(), api_mode="anthropic_messages").payload
     assert names(anthropic["tools"], "anthropic_messages") == [ORIENT] and anthropic["tools"][0]["input_schema"] == exact
     assert anthropic["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
