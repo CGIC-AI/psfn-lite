@@ -67,6 +67,26 @@ _SWEPT_KEPT = 256
 _MEMORY_TOOL = "memory"
 _PROPOSAL = re.compile(r"Memory deletion proposal ([A-Za-z0-9:._-]{1,128}) is pending")
 _EXPLANATION_SHOWN = 400
+#: The donor's memory_id aliases for a delete (shared/tool-argument-normalization.ts normalizeUnifiedMemoryArguments).
+_MEMORY_ID_ALIASES = ("id", "memoryid")
+
+
+def _argument_key(key) -> str:
+    """The donor's normalizeArgumentKey: trimmed, edge punctuation removed, lower case."""
+    return re.sub(r"[^a-zA-Z0-9_]+$", "", re.sub(r"^[^a-zA-Z0-9_]+", "", key.strip())).lower() if isinstance(key, str) else ""
+
+
+def _memory_id(args) -> str:
+    """The memory a delete names, resolved as the donor tool resolves it: memory_id, else its first non-empty alias."""
+    if not isinstance(args, dict):
+        return ""
+    canonical = args.get("memory_id")
+    if isinstance(canonical, str) and canonical.strip():
+        return canonical.strip()
+    for key, value in args.items():
+        if isinstance(value, str) and value.strip() and _argument_key(key) in _MEMORY_ID_ALIASES:
+            return value.strip()
+    return ""
 _NOTE = "system note: psfn_lite"
 TOOL_BLOCKED = (
     "PSFN Lite tools work only inside a turn recorded in the companion's Lite continuity: not in a subagent, "
@@ -203,8 +223,7 @@ class Driver:
             return {"action": "block", "message": TOOL_BLOCKED}
         if not self._is_memory_delete(tool_name, args):
             return None
-        memory_id = args.get("memory_id")
-        memory_id = memory_id.strip() if isinstance(memory_id, str) else ""
+        memory_id = _memory_id(args)
         category = args.get("justification_category")
         category = category if isinstance(category, str) else ""
         explanation = args.get("explanation")
@@ -235,7 +254,7 @@ class Driver:
         if status != "ok":
             return  # blocked (denied, timed out, gate failure) or refused by the tool: no proposal to approve
         entry = self._entry(turn_id, session_id)
-        memory_id = args.get("memory_id").strip() if isinstance(args, dict) and isinstance(args.get("memory_id"), str) else ""
+        memory_id = _memory_id(args)
         text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
         found = _PROPOSAL.search(text or "")
         if entry is None or not self._is_memory_delete(tool_name, args) or not asked or memory_id != asked or found is None:
