@@ -663,7 +663,13 @@ export interface SubagentRuntimeOptions {
  * workbench tool are cut. The fold-review queue, the subagent faculty and the
  * subagent tool are composed exactly as the donor composed them.
  */
-export function wireSubagentRuntime(options: SubagentRuntimeOptions): SubagentFaculty {
+export interface SubagentRuntime {
+  subagentFaculty: SubagentFaculty;
+  /** The fold-review queue (donor: reached through ShardManager.listFoldReviews / getFoldReview). */
+  foldReviewController: ShardFoldReviewController;
+}
+
+export function wireSubagentRuntime(options: SubagentRuntimeOptions): SubagentRuntime {
   const companionDataDir = options.companionDataDir ?? resolveConfiguredCompanionDataDir(options.config);
   // htm9.3: shard fold-back memory writes gate at the memory_write sink; the
   // gate is late-bound onto the session manager by composition.
@@ -714,5 +720,5 @@ export function wireSubagentRuntime(options: SubagentRuntimeOptions): SubagentFa
     automataLifecyclePort: options.automataLifecyclePort,
   });
   options.agentLoop.registerTool(createSubagentTool(subagentFaculty), 'core');
-  return subagentFaculty;
+  return { subagentFaculty, foldReviewController };
 }

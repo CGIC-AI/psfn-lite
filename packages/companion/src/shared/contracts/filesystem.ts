@@ -19,3 +19,17 @@ export function validateFilesystemReadMaxBytes(value: number): number {
   }
   return value;
 }
+
+/**
+ * Lite type copy (seam 3.11, extraction/cuts.tsv): verbatim from
+ * boundary/integrations/filesystem/ops.ts:39-45 so the promoted text-file
+ * paging helper (used by the journal integration) no longer names the cut
+ * filesystem integration.
+ */
+export interface FilesystemReadResult {
+  content: string;
+  offsetBytes: number;
+  nextOffsetBytes: number | null;
+  eof: boolean;
+  truncated: boolean;
+}
