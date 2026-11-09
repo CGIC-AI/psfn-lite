@@ -11,7 +11,7 @@
  */
 import { resolve, sep } from 'node:path';
 import { invalid, isRecord, ok, type Result } from './mcp.ts';
-import type { TrustLevel } from './companion.ts';
+import { DEFAULT_TRANSFORMERS_EMBEDDING_CONFIG, resolveProjectTransformersCacheDir, type TrustLevel } from './companion.ts';
 
 /** A person the companion knows, provisioned in its contact store at start. */
 export interface LiteContact {
@@ -45,12 +45,29 @@ export interface LiteConfig {
     readonly apiKeyEnv: string | null;
     readonly maxOutputTokens: number;
   };
+  /**
+   * The embedding provider: one of the donor's kinds
+   * (faculties/memory/embedding.ts `EmbeddingProviderKind`), built by the
+   * donor's own provider classes (`createEmbeddingProviderFromConfig`).
+   * Without an `embedding` block the donor's seeded default applies: the
+   * local, keyless `transformers` provider with `Xenova/all-MiniLM-L6-v2`
+   * (384 dimensions), its model cached under the data directory.
+   */
   readonly embedding: {
     readonly model: string;
     readonly dimensions: number;
     readonly provider:
-      | { readonly kind: 'disabled' }
-      | { readonly kind: 'openai_compatible'; readonly baseUrl: string; readonly apiKeyEnv: string; readonly timeoutMs: number };
+      /** In-process @huggingface/transformers; `cacheDir` is absolute (a relative value resolves under dataDir). */
+      | { readonly kind: 'transformers'; readonly cacheDir: string }
+      /** An Ollama server: the donor posts to `<url>/api/embed`. */
+      | { readonly kind: 'ollama'; readonly url: string }
+      /**
+       * An OpenAI-style embeddings endpoint: the donor posts to `url` as
+       * given (the full endpoint, for example `https://api.openai.com/v1/embeddings`).
+       * `apiKeyEnv` names the key's variable; null uses the donor's
+       * `EMBEDDING_API_KEY`, then `OPENAI_API_KEY`, and sends none if both are unset.
+       */
+      | { readonly kind: 'api'; readonly url: string; readonly apiKeyEnv: string | null };
   };
   /**
    * Session journal integrity: `keyring` signs every journal entry with the
@@ -109,23 +126,23 @@ class Reader {
   readonly issues: string[];
   private readonly raw: Readonly<Record<string, unknown>>;
   private readonly path: string;
-  constructor(raw: Readonly<Record<string, unknown>>, path: string, allowed: readonly string[], issues: string[]) {
+  constructor(raw: Readonly<Record<string, unknown>>, path: string, allowed: readonly string[], issues: string[], optional: readonly string[] = []) {
     this.raw = raw;
     this.path = path;
     this.issues = issues;
-    for (const key of Object.keys(raw)) if (!allowed.includes(key)) issues.push(`${this.at(key)} is not a known setting`);
+    for (const key of Object.keys(raw)) if (!allowed.includes(key) && !optional.includes(key)) issues.push(`${this.at(key)} is not a known setting`);
     for (const key of allowed) if (!Object.hasOwn(raw, key)) issues.push(`${this.at(key)} is required`);
   }
   at(key: string): string {
     return this.path === '' ? key : `${this.path}.${key}`;
   }
-  child(key: string, allowed: readonly string[]): Reader {
+  child(key: string, allowed: readonly string[], optional: readonly string[] = []): Reader {
     const value = this.raw[key];
     if (!isRecord(value)) {
       if (Object.hasOwn(this.raw, key)) this.issues.push(`${this.at(key)} must be an object`);
       return new Reader({}, this.at(key), [], this.issues);
     }
-    return new Reader(value, this.at(key), allowed, this.issues);
+    return new Reader(value, this.at(key), allowed, this.issues, optional);
   }
   value(key: string): unknown {
     return this.raw[key];
@@ -158,12 +175,16 @@ class Reader {
   }
 }
 
-const ROOT_KEYS = ['companionId', 'dataDir', 'workspaceDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'embedding', 'sessionIntegrity', 'mcp', 'lifecycle'];
+const ROOT_KEYS = ['companionId', 'dataDir', 'workspaceDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'sessionIntegrity', 'mcp', 'lifecycle'];
+/** Settings with a donor default when left out. */
+const OPTIONAL_ROOT_KEYS = ['embedding'];
+/** The donor's embedding provider kinds (faculties/memory/embedding.ts `EmbeddingProviderKind`). */
+export const EMBEDDING_PROVIDER_KINDS = ['transformers', 'ollama', 'api'] as const;
 
 export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   if (!isRecord(raw)) return invalid('config must be a JSON object');
   const issues: string[] = [];
-  const root = new Reader(raw, '', ROOT_KEYS, issues);
+  const root = new Reader(raw, '', ROOT_KEYS, issues, OPTIONAL_ROOT_KEYS);
   const companionId = root.matching('companionId', UUID_PATTERN, 'a UUID');
   const dataDir = root.string('dataDir');
   const workspaceDir = root.string('workspaceDir');
@@ -201,19 +222,7 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
     maxOutputTokens: md.integer('maxOutputTokens', 1, 1_000_000),
   };
 
-  const em = root.child('embedding', ['model', 'dimensions', 'provider']);
-  const providerRaw = em.value('provider');
-  let embeddingProvider: LiteConfig['embedding']['provider'] = { kind: 'disabled' };
-  if (isRecord(providerRaw) && providerRaw['kind'] === 'disabled') {
-    em.child('provider', ['kind']);
-  } else if (isRecord(providerRaw) && providerRaw['kind'] === 'openai_compatible') {
-    const pr = em.child('provider', ['kind', 'baseUrl', 'apiKeyEnv', 'timeoutMs']);
-    const baseUrl = pr.matching('baseUrl', /^https?:\/\//, 'an http(s) URL');
-    embeddingProvider = { kind: 'openai_compatible', baseUrl, apiKeyEnv: pr.envName('apiKeyEnv'), timeoutMs: pr.integer('timeoutMs', 1, 600_000) };
-  } else if (providerRaw !== undefined) {
-    issues.push('embedding.provider.kind must be "disabled" or "openai_compatible"');
-  }
-  const embedding = { model: em.string('model'), dimensions: em.integer('dimensions', 1, 16_000), provider: embeddingProvider };
+  const embedding = parseEmbedding(root, dataDir);
 
   const si = root.child('sessionIntegrity', ['kind']);
   const sessionIntegrity = { kind: si.oneOf('kind', ['keyring', 'unsigned'] as const) };
@@ -225,6 +234,47 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
 
   if (issues.length > 0) return invalid(...issues);
   return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle });
+}
+
+/**
+ * The embedding block, or the donor's seeded default without one
+ * (config/settings.seed.json `embeddingProvider: "transformers"`,
+ * `transformersModel: "Xenova/all-MiniLM-L6-v2"`, `embeddingDims: 384`: the
+ * values of embedding.ts DEFAULT_TRANSFORMERS_EMBEDDING_CONFIG). The donor
+ * cached the transformers model in `<project root>/models/transformers`
+ * (embedding.ts resolveProjectTransformersCacheDir over the working
+ * directory); a Lite host's root for it is the data directory.
+ */
+function parseEmbedding(root: Reader, dataDir: string): LiteConfig['embedding'] {
+  const defaultCacheDir = resolveProjectTransformersCacheDir(resolve(dataDir));
+  if (root.value('embedding') === undefined) {
+    return {
+      model: DEFAULT_TRANSFORMERS_EMBEDDING_CONFIG.model,
+      dimensions: DEFAULT_TRANSFORMERS_EMBEDDING_CONFIG.dims,
+      provider: { kind: 'transformers', cacheDir: defaultCacheDir },
+    };
+  }
+  const em = root.child('embedding', ['model', 'dimensions', 'provider']);
+  const model = em.string('model');
+  const dimensions = em.integer('dimensions', 1, 16_000);
+  const raw = em.value('provider');
+  const kind = isRecord(raw) ? raw['kind'] : undefined;
+  if (kind === 'ollama') {
+    const pr = em.child('provider', ['kind', 'url']);
+    return { model, dimensions, provider: { kind, url: pr.matching('url', /^https?:\/\//, 'an http(s) URL') } };
+  }
+  if (kind === 'api') {
+    const pr = em.child('provider', ['kind', 'url', 'apiKeyEnv']);
+    const url = pr.matching('url', /^https?:\/\//, 'an http(s) URL');
+    return { model, dimensions, provider: { kind, url, apiKeyEnv: pr.value('apiKeyEnv') === null ? null : pr.envName('apiKeyEnv') } };
+  }
+  if (kind === 'transformers') {
+    const pr = em.child('provider', ['kind'], ['cacheDir']);
+    const cacheDir = pr.value('cacheDir') === undefined ? defaultCacheDir : resolve(dataDir, pr.string('cacheDir'));
+    return { model, dimensions, provider: { kind, cacheDir } };
+  }
+  if (raw !== undefined) root.issues.push(`embedding.provider.kind must be one of ${EMBEDDING_PROVIDER_KINDS.join(', ')}`);
+  return { model, dimensions, provider: { kind: 'transformers', cacheDir: defaultCacheDir } };
 }
 
 function listen(reader: Reader, issues: string[], at: string): { host: string; port: number; allowedHosts: readonly string[] | null } {
@@ -270,7 +320,6 @@ function parseHostedAutomata(lifecycle: Reader): NonNullable<LiteConfig['lifecyc
 export interface LiteSecrets {
   readonly databaseUrl: string;
   readonly modelApiKey: string | null;
-  readonly embeddingApiKey: string | null;
 }
 
 export function readSecrets(config: LiteConfig, env: Readonly<Record<string, string | undefined>>): Result<LiteSecrets> {
@@ -282,8 +331,9 @@ export function readSecrets(config: LiteConfig, env: Readonly<Record<string, str
   };
   const databaseUrl = read(config.postgres.urlEnv);
   const modelApiKey = config.model.apiKeyEnv === null ? null : read(config.model.apiKeyEnv);
-  const embeddingApiKey = config.embedding.provider.kind === 'openai_compatible' ? read(config.embedding.provider.apiKeyEnv) : null;
-  return issues.length > 0 ? invalid(...issues) : ok({ databaseUrl, modelApiKey, embeddingApiKey });
+  // The donor's api provider reads its key itself, from the environment the runtime starts with (substrate-config.ts); a named one must be set.
+  if (config.embedding.provider.kind === 'api' && config.embedding.provider.apiKeyEnv !== null) read(config.embedding.provider.apiKeyEnv);
+  return issues.length > 0 ? invalid(...issues) : ok({ databaseUrl, modelApiKey });
 }
 
 function overlaps(a: string, b: string): boolean {

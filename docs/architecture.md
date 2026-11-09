@@ -21,7 +21,8 @@ and documents are the spec. That earlier core (`packages/core`,
 | Part | Package | Role |
 |---|---|---|
 | Companion core | `packages/companion` (`lite-companion`) | The donor core: identity and prompt layers, sessions and the session archive, contacts and trust, memory, episodes, journals, emotion and self-model, concerns and intention, scheduler, automata and bounded subagents, letters, North Star, and the tool registry. The Lite composition root is `src/app/agent/companion-runtime.ts`. |
-| Model and embeddings | `packages/pi` | The Pi model runtime (a pi-ai model collection, one model, the host's key) that the core's provider port takes, and an embedding port over an OpenAI-compatible `/embeddings` endpoint. The core needs one, as the donor did: the standalone refuses `embedding.provider: disabled` unless the embedding host supplies its own port (docs/extraction.md, "Shakedown fixes"). |
+| Model | `packages/pi` | The Pi model runtime (a pi-ai model collection, one model, the host's key) that the core's provider port takes, and the adapter for a host that supplies its own embedding port. |
+| Embeddings | `packages/companion` | The donor's own embedding providers (`src/faculties/memory/embedding.ts`), which the core builds from the substrate config: `transformers` (in-process `@huggingface/transformers`, local and keyless, the default), `ollama` or `api` (docs/extraction.md, "Donor embedding providers restored"). |
 | Tool transport | `packages/mcp` | MCP over streamable HTTP or stdio. It serves the donor tool catalog and binds the caller from the transport credential. |
 | Lifecycle bridge | `packages/lifecycle` | Host-driven turns for an external host that runs its own model loop: `prepare`, `settle`, `checkpoint`, and the host tool port the MCP transport hands calls to. |
 | Standalone host | `apps/standalone` | The config document, the CLI (`init`, `once`, `chat`, `serve`) and the composition of the parts above. |
@@ -42,7 +43,10 @@ subsystems out ([conformance](conformance.md)).
    host's choices only: `companionId`, `dataDir`, `workspaceDir`, the
    character card, the operator and other contacts, where the database URL
    and the provider keys live (environment variable names), the model, the
-   embedding provider, session-journal integrity (the donor HMAC keyring, or
+   embedding provider (one of the donor kinds; without an `embedding` block
+   the donor's seeded default, `transformers` with `Xenova/all-MiniLM-L6-v2`
+   at 384 dimensions, cached in `dataDir/models/transformers`),
+   session-journal integrity (the donor HMAC keyring, or
    unsigned), and the optional `mcp` and `lifecycle` endpoints. The
    `lifecycle` endpoint names the Hermes install it serves
    (`hermesInstallId`). Unknown keys are refused. Secrets are never in the
@@ -58,10 +62,12 @@ subsystems out ([conformance](conformance.md)).
    (`substrate-config.ts`): the donor's core defaults, then the scalar
    `settings.json` values, then the host's model, embedding, database and
    paths. Defaults of cut subsystems are not set. A relative
-   `textEmotionCacheDir` (the seed's `models/transformers`) resolves under
-   `dataDir`, never the working directory.
+   `textEmotionCacheDir` (the seed's `models/transformers`) or embedding
+   `cacheDir` resolves under `dataDir`, never the working directory.
 4. It starts the companion with `startCompanionRuntime`. It passes the Pi
-   provider runtime and the embedding provider, a model-usage recorder, the
+   provider runtime (and an embedding provider only when the caller supplies
+   its own port; otherwise the core builds the configured donor provider,
+   and its fail-closed startup warmup checks it), a model-usage recorder, the
    session integrity provider, an outbound sender (the operator's channel), the path
    snapshot (workspace `workspaceDir`, and logs and temp under `dataDir`)
    and, when a lifecycle bridge is configured, the relay's

@@ -42,6 +42,11 @@ export interface Install {
   readonly env: Record<string, string>;
 }
 
+export interface WorldPorts {
+  /** True runs the configured donor embedding provider instead of the deterministic test port. */
+  readonly configuredEmbeddings?: boolean;
+}
+
 export function useLiteWorld() {
   let harness: PostgresHarness | undefined;
   const opened: LiteRuntime[] = [];
@@ -77,27 +82,31 @@ export function useLiteWorld() {
     return { dataDir, configPath, document, env };
   };
 
-  const overridesFor = (script: Script, modelOptions: FauxModelOptions = {}): { readonly overrides: LiteRuntimeOverrides; readonly model: ReturnType<typeof fauxModel> } => {
+  const overridesFor = (
+    script: Script,
+    modelOptions: FauxModelOptions = {},
+    ports: WorldPorts = {},
+  ): { readonly overrides: LiteRuntimeOverrides; readonly model: ReturnType<typeof fauxModel> } => {
     const model = fauxModel(script, modelOptions);
     return {
       model,
       overrides: {
         model: model.runtime,
-        embeddings: deterministicEmbeddings,
+        ...(ports.configuredEmbeddings === true ? {} : { embeddings: deterministicEmbeddings }),
         textEmotionClassifier: { preload: () => Promise.resolve(), classify: () => Promise.resolve([{ label: 'neutral', score: 1 }]) },
       },
     };
   };
 
   /** The file's one runtime, built exactly as the CLI builds it, closed after the file unless closed earlier. */
-  const start = async (install: Install, script: Script, modelOptions: FauxModelOptions = {}) => {
-    const { overrides, model } = overridesFor(script, modelOptions);
+  const start = async (install: Install, script: Script, modelOptions: FauxModelOptions = {}, ports: WorldPorts = {}) => {
+    const { overrides, model } = overridesFor(script, modelOptions, ports);
     const config = parseLiteConfig(install.document);
     if (!config.ok) throw new Error(JSON.stringify(config.error));
     const diagnostics: LiteDiagnostic[] = [];
     const runtime = await createLiteRuntime({
       config: config.value,
-      secrets: { databaseUrl: install.env[DATABASE_URL_ENV] ?? '', modelApiKey: null, embeddingApiKey: null },
+      secrets: { databaseUrl: install.env[DATABASE_URL_ENV] ?? '', modelApiKey: null },
       env: install.env,
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
       overrides,

@@ -85,6 +85,12 @@ Lite's integration tests (`*.integration.test.ts`: lifecycle, standalone,
 conformance) run inside `npx vitest run`
 against a throwaway pinned pgvector container, so Docker is required. Without it
 they fail. `LITE_SKIP_DOCKER_TESTS=1` skips them explicitly and prints that it did.
+`tests/standalone/transformers-embeddings.integration.test.ts` starts the
+donor's default embedding provider for real, so it downloads
+`Xenova/all-MiniLM-L6-v2` (91,100,283 bytes) into its temporary data directory.
+Set `LITE_TEST_TRANSFORMERS_CACHE` to a transformers.js cache directory that
+already holds the model (a kept `<dataDir>/models/transformers`) to copy it in
+instead.
 
 Run focused checks during implementation. Fetch the base, commit a clean head,
 run the complete local gate once, and publish through its wrapper. A coherent

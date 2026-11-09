@@ -18,13 +18,18 @@ Around it, Lite has host adapters only:
 
 - `apps/standalone`: a thin host over `startCompanionRuntime`. A validated
   config document and a CLI (`init`, `once`, `chat`, `serve`) run the
-  companion on a Pi model over PostgreSQL with pgvector.
+  companion on a Pi model over PostgreSQL with pgvector. Embeddings use the
+  donor's own providers: by default `transformers`, in process and without
+  an API key (`Xenova/all-MiniLM-L6-v2`, 384 dimensions; the first start
+  downloads about 91 MB into `<dataDir>/models/transformers`), or `ollama`
+  or an `api` endpoint named in the config's `embedding` block.
 - `packages/mcp`: the donor tool catalog over MCP. The caller is bound
   from the transport credential, never from tool arguments.
 - `packages/lifecycle`: host-driven turns for a host with its own model
   loop. The donor assembles the context, runs every tool call and archives
   the turn, and the host supplies the model's answers.
-- `packages/pi`: the Pi model runtime and the embedding port.
+- `packages/pi`: the Pi model runtime, and the adapter for a host that
+  supplies its own embedding port.
 - `integrations/hermes`: the Hermes plugin, which makes every root Hermes
   turn a host-driven Lite turn.
 

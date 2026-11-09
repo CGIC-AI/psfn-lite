@@ -16,6 +16,8 @@ export const COMPANION_NAME = 'Lumen';
 export const SESSION_KEYS_ENV = 'GATEWAY_SESSION_HMAC_KEYS';
 /** The Hermes install the test bridges serve. An install id names a binding and is not a secret. */
 export const HERMES_TEST_INSTALL_ID = '5e1f0c2d9a8b47e6b3c4d5e6f7a8b9c0';
+/** An embeddings endpoint nothing listens on (the discard port). */
+export const UNREACHABLE_EMBEDDINGS = 'http://127.0.0.1:9/v1/embeddings';
 
 /** A data directory and, beside it, the companion's workspace. */
 export function liteConfigDocument(dataDir: string, companionId: string) {
@@ -28,7 +30,10 @@ export function liteConfigDocument(dataDir: string, companionId: string) {
     contacts: [{ key: 'sam', displayName: 'Sam', trust: 'regular' }],
     postgres: { urlEnv: DATABASE_URL_ENV },
     model: { provider: 'faux', modelId: 'faux-1', apiKeyEnv: null, maxOutputTokens: 1024 },
-    embedding: { model: 'test-embedding', dimensions: EMBEDDING_DIMS, provider: { kind: 'disabled' } },
+    // The tests hand the core their own port for this model (deterministicEmbeddings); the donor api provider the block names
+    // points at a port nothing listens on, so a start without that port fails at the donor's startup warmup, never embeds.
+    // Left out (undefined), the donor's default transformers provider applies.
+    embedding: { model: 'test-embedding', dimensions: EMBEDDING_DIMS, provider: { kind: 'api', url: UNREACHABLE_EMBEDDINGS, apiKeyEnv: null } } as Record<string, unknown> | undefined,
     sessionIntegrity: { kind: 'keyring' as 'keyring' | 'unsigned' },
     mcp: null as Record<string, unknown> | null,
     lifecycle: null as Record<string, unknown> | null,

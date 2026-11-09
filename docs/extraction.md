@@ -1936,9 +1936,15 @@ baseline test has its baseline status". The Hermes plugin suite: 69 passed.
 The round (`lite-hermes-artie-20261109-r1`, evidence outside the
 repository) found four Lite defects and one out-of-scope case. No donor
 file changed; the `cuts.tsv` rows `S1` to `S4` record the host-side
-changes.
+changes. `S5` restores the donor's embedding providers, a divergence
+found after the round, and supersedes `S1`.
 
 ### Embedding provider required
+
+Superseded by "Donor embedding providers restored" below (seam `S5`): the
+donor had no `disabled` kind, so Lite no longer offers one, and the
+refusal, `EMBEDDING_PROVIDER_REQUIRED` and its guard are deleted. The
+record as made:
 
 `serve` with `embedding.provider: disabled` failed at the donor's startup
 warmup ("embedding provider startup warmup failed",
@@ -2081,6 +2087,79 @@ a dedicated Discord snowflake and an email target; donor
 sends through (`notify`, the Discord and email sinks) are cut
 (`docs/tool-inventory.md`, "Donor surfaces Lite does not serve"). The
 donor never had it green either.
+
+### Donor embedding providers restored
+
+Lite's config offered only `embedding.provider` `disabled` and
+`openai_compatible`, a Lite adapter over `<baseUrl>/embeddings`
+(`packages/pi/src/embeddings.ts`, deleted). The donor offered `ollama`,
+`transformers` and `api` (`src/faculties/memory/embedding.ts:29`,
+`resolveEmbeddingProviderKind` `:564-579`, `createEmbeddingProviderFromConfig`
+`:721-734`), and its seeded `settings.json` chose `transformers`, the local,
+keyless provider over `@huggingface/transformers` 4.2.0
+(`config/settings.seed.json:499-508`: `embeddingProvider` `transformers`,
+`transformersModel` `Xenova/all-MiniLM-L6-v2`, `embeddingDims` 384). Dropping
+those kinds was a divergence, not a scaffolding cut. Seam `S5` restores
+them through the donor's own provider classes; no donor file changed.
+
+- The config's `embedding.provider.kind` is one of the donor kinds
+  (`apps/standalone/src/config.ts:48-71`, `EMBEDDING_PROVIDER_KINDS` `:182`,
+  `parseEmbedding` `:239-278`): `{kind: "transformers", cacheDir?}`,
+  `{kind: "ollama", url}` or `{kind: "api", url, apiKeyEnv}`, with
+  `embedding.model` and `embedding.dimensions`. Without an `embedding`
+  block the donor's seeded default applies (the values of
+  `DEFAULT_TRANSFORMERS_EMBEDDING_CONFIG`), so a Lite install runs without
+  any API key. `disabled`, `openai_compatible`, `baseUrl` and `timeoutMs`
+  are refused when the config is read.
+- `buildSubstrateConfig` sets the donor fields each kind reads
+  (`substrate-config.ts` `embeddingSettings`): `embeddingProvider`,
+  `embeddingModel` and `embeddingDims` for every kind (so no seeded
+  `settings.json` value of another kind, such as `embeddingApiModel`
+  `snowflake-arctic-embed2` / 1024, decides anything), plus
+  `transformersModel` and `transformersCacheDir`, `embeddingOllamaUrl`, or
+  `embeddingApiUrl`, `embeddingApiModel`, `embeddingApiDims` and
+  `embeddingApiKeyRef`. The donor read these from `settings.json`; a Lite
+  host names its provider in its config, as it does its model.
+- The standalone passes no embedding provider unless the caller supplies
+  a port (`runtime.ts` `hostEmbeddingProvider`), so the donor composition
+  builds its own (`provider-runtime-factory.ts`:
+  `options.embeddingProvider ?? createEmbeddingProviderFromConfig(config,
+  env)`), wraps it in its usage accounting and checks it with its
+  fail-closed warmup. The `EmbeddingPort` seam (`companionEmbeddingProviderOf`)
+  stays for a host with its own vectors (the tests' deterministic port).
+- Model cache: the donor cached the model at
+  `resolveProjectTransformersCacheDir(process.cwd())`
+  (`<cwd>/models/transformers`, `embedding.ts:99-103`); Lite passes
+  `resolveProjectTransformersCacheDir(dataDir)`, the directory the
+  text-emotion model uses after `S2`, and resolves a relative `cacheDir`
+  under `dataDir`. It is always absolute, so the donor's CWD fallback never
+  applies.
+- `openai_compatible` maps onto the donor `api` provider
+  (`ApiEmbeddingProvider`, `embedding.ts:403`), not onto Lite's adapter:
+  that adapter was never the donor port, only a Lite `EmbeddingPort` behind
+  `companionEmbeddingProviderOf`, and it lacked the donor's usage and cost
+  extraction. Behaviour that changes with it: `url` is the full endpoint
+  (the donor posts to it as given), the request carries no `dimensions`
+  field and no client timeout, and the key comes from the variable
+  `apiKeyEnv` names (the donor's own `embeddingApiKeyRef`, `embedding.ts:48`,
+  `:704-708`), else the donor's `EMBEDDING_API_KEY`, then `OPENAI_API_KEY`;
+  with neither the request is sent without a key. `readSecrets` still
+  names a missing `apiKeyEnv` variable at start.
+- `S1` (the `disabled` refusal) is superseded and removed with its guard.
+
+Guards: `tests/standalone/embedding-providers.test.ts` builds each kind
+through the real `parseLiteConfig`, `buildSubstrateConfig` and the donor's
+`createEmbeddingProviderFromConfig`: the donor class, its provenance and,
+for `ollama` and `api`, the request it sends to a loopback endpoint; the
+default's values are compared with the shipped seed.
+`tests/standalone/transformers-embeddings.integration.test.ts` starts a real
+runtime with no embedding block and no host port: the donor transformers
+provider downloads the model into `<dataDir>/models/transformers`
+(91,100,283 bytes; nothing in the working directory), passes the startup
+warmup, and the memory a turn writes is stored with a 384-dimension unit
+vector, every embedding call accounted to
+`transformers/Xenova/all-MiniLM-L6-v2`. `LITE_TEST_TRANSFORMERS_CACHE`
+copies an existing cache in instead of downloading.
 
 ## Measured size
 
