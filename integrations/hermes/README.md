@@ -59,13 +59,36 @@ the plugin asks the bridge (`tool-choice`) for the next one. The plugin's
 `llm_request` middleware rewrites Hermes's provider request with it, as the
 donor's provider client did: only the requested tool, with a required
 choice (and, when the participant gave the call's exact arguments, the
-donor's exact-arguments schema), or no tool. It does this for the
-`chat_completions`, `codex_responses` and `anthropic_messages` API modes;
-for an Anthropic forced step it also drops extended thinking, which
-Anthropic refuses with a forced tool. On any other API mode, or when the
-requested tool is not in Hermes's request, the request goes unchanged and
-the next turn's context says so. Hermes's own tools are not offered on a
-forced step, as the donor offered only the one tool.
+donor's exact-arguments schema), or, once the sequence ran, no tools at
+all (the request carries no `tools`, `tool_choice` or
+`parallel_tool_calls`). It does this for the `chat_completions`,
+`codex_responses` and `anthropic_messages` API modes. On any other API
+mode, or when the requested tool is not in Hermes's request, the request
+goes unchanged and the next turn's context says so. Hermes's own tools are
+not offered on a forced step, as the donor offered only the one tool.
+
+**Hermes Tool Search.** By default Hermes defers every MCP tool, the Lite
+tools included, behind its Tool Search bridges (`tools.tool_search.enabled:
+auto`): the model sees `tool_search`, `tool_describe` and `tool_call`, not
+`mcp__psfn_lite__*`. Hermes has no per-server or per-tool exemption, and
+Tool Search does not need to be turned off. A forced step for a deferred
+Lite tool offers only the `tool_call` bridge, required, with its schema
+narrowed to exactly one call whose `name` can only be the Lite tool and
+whose `arguments` are the tool's own schema from Hermes's registry (or the
+exact-arguments schema). Hermes unwraps that call before its hooks,
+approvals and dispatch, so the plugin's gate and the next step's choice see
+the Lite tool's own name. When the Lite tool is in the request (Tool Search
+off), it is offered directly as before.
+
+**Thinking on a forced step.** Some providers refuse a forced tool choice
+while thinking is on: DeepSeek answers HTTP 400 "Thinking mode does not
+support this tool_choice", the donor turned thinking off for Kimi Code, and
+Anthropic refuses extended thinking with a forced tool. For that one forced
+request the plugin turns thinking off: `extra_body.thinking: {"type":
+"disabled"}` without `reasoning_effort` for DeepSeek and Kimi (matched by
+the Hermes provider id or the provider's host, `toolchoice.py`
+`FORCED_CHOICE_WITHOUT_THINKING`), and no `thinking` block for Anthropic.
+The next, unforced call goes with the thinking Hermes configured.
 
 Lite can also end a turn itself before asking Hermes's model, for example
 when the donor decides on no reply. `prepare` then answers `answered`. The
@@ -207,9 +230,15 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
    `senders` names the Hermes `(platform, sender_id)` pairs this credential
    speaks for. The local CLI is `{"platform": "cli", "sender_id": ""}` when
    `hermes chat` runs its own agent (f0187332). Through the gateway
-   (2bd378e) it is `{"platform": "local", "sender_id": "uid:<uid>"}`, where
+   (2bd378e) it is `{"platform": "cli", "sender_id": "uid:<uid>"}`, where
    `<uid>` is the numeric id of the OS user the gateway runs as (`id -u`);
-   the gateway accepts local connections only from that user.
+   the gateway accepts local connections only from that user. The gateway
+   receives the turn as platform `local` but hands the agent and the hooks
+   `cli` (`gateway/run_turn_runner.py`, `platform_key`), so a `local` pair
+   is never matched. Other local surfaces get their own platform from the
+   same mapping (`gateway/session_policy.py` `SURFACES`: the TUI is `tui`,
+   Hermes Desktop is `desktop`), and a profile used from one of them needs
+   a pair for it; only the CLI pair is tested here.
 
 ## Hermes with a gateway (2bd378e)
 
@@ -285,13 +314,23 @@ exact commands, see `docs/development.md`.
   - the `pre_tool_call` gate, through Hermes's `resolve_pre_tool_block`.
 - `test_tool_choice.py` runs the `llm_request` middleware through Hermes's
   own `apply_llm_request_middleware`: the forced step, the step after it,
-  each supported API mode, the exact-arguments schema, and the requests it
-  must leave alone.
+  each supported API mode, the exact-arguments schema, the `tool_call`
+  bridge form of each mode and revision, thinking turned off on DeepSeek
+  and Kimi requests built by Hermes's own provider profiles, and the
+  requests it must leave alone.
+- `test_tool_search_wire.py` runs a real `AIAgent` turn with Tool Search
+  at Hermes's default, the Lite tool registered as Hermes registers an MCP
+  tool, and Hermes's DeepSeek provider, against a loopback
+  chat-completions server that records each request as it arrives over
+  HTTP: the forced step offers only the narrowed `tool_call`, required,
+  with thinking disabled; the Lite tool runs; the next step carries no
+  tools.
 - `test_profiles.py` runs two Lite profiles and one non-Lite profile in one
   process, as the 2bd378e gateway does (home override and profile secret
   scope per turn, multiplexing on): hooks, host instance and credential per
-  profile, one install id, the gateway's `local` / `uid:<uid>` sender, and
-  a non-Lite profile left alone.
+  profile, one install id, the CLI's `cli` / `uid:<uid>` sender (read from
+  the gateway's own `platform_key` mapping and its control socket), and a
+  non-Lite profile left alone.
 - `test_e2e_lite.py` runs Hermes's real MCP client and the plugin against
   a real Lite runtime over a throwaway Postgres
   (`tests/hermes/fixtures/lite-host.ts`, the conformance host). It covers:

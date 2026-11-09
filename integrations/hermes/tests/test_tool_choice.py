@@ -49,11 +49,19 @@ def anthropic_request():
                                   max_tokens=1024, reasoning_config={"enabled": True, "effort": "medium"})
 
 
-def model_call(request, *, api_mode="chat_completions", turn_id=TURN, session="sess-1"):
+def model_call(request, *, api_mode="chat_completions", turn_id=TURN, session="sess-1", provider="p", base_url="http://127.0.0.1:1/v1", model="m"):
     from hermes_cli.middleware import apply_llm_request_middleware
 
     return apply_llm_request_middleware(request, task_id="task", turn_id=turn_id, api_request_id="req-1", session_id=session, platform="cli",
-                                        model="m", provider="p", base_url="http://127.0.0.1:1/v1", api_mode=api_mode, api_call_count=1)
+                                        model=model, provider=provider, base_url=base_url, api_mode=api_mode, api_call_count=1)
+
+
+def thinking_request(provider, model):
+    """chat_request() with the thinking fields Hermes's own provider profile adds for ``provider`` (build_api_kwargs_extras)."""
+    from providers import get_provider_profile
+
+    extra_body, top_level = get_provider_profile(provider).build_api_kwargs_extras(reasoning_config={"enabled": True, "effort": "high"}, model=model)
+    return {**chat_request(), **top_level, "extra_body": extra_body}
 
 
 def names(tools, api_mode="chat_completions"):
@@ -85,8 +93,10 @@ def test_the_first_step_offers_only_the_requested_tool_with_a_required_choice_th
     after = model_call(chat_request())
     [asked] = bridge.bodies("tool-choice")
     assert asked == {"hostInstance": bridge.bodies("prepare")[0]["hostInstance"], "turnId": "turn-1"}
-    assert after.payload["tool_choice"] == "none"
-    assert names(after.payload["tools"]) == [ORIENT, MEMORY, "terminal"]
+    # The donor's "no more tools" step removes the tools (buildPiContext); "none" with the tools kept let the
+    # model write the call it wanted as the reply (shakedown r2, R2-3).
+    assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(after.payload)
+    assert after.payload == {k: v for k, v in chat_request().items() if k not in ("tools", "tool_choice", "parallel_tool_calls")}
 
     # Once Lite says the model chooses again (null), the request goes as Hermes built it.
     bridge.next_choices.append(None)
@@ -116,10 +126,10 @@ def test_each_api_mode_gets_its_own_form_and_the_exact_arguments_schema_replaces
 
     bridge.next_choices.append({"kind": "none"})
     lite_tool_ran()
-    none = model_call(anthropic_request(), api_mode="anthropic_messages").payload
-    # Hermes's own Anthropic mapping of "none" (agent/anthropic_adapter.py): no tools offered.
-    assert "tools" not in none and "tool_choice" not in none
-    assert model_call(codex_request(), api_mode="codex_responses").payload["tool_choice"] == "none"
+    # Every API mode's "no more tools" step offers no tool at all, as the donor's (and Hermes's own Anthropic "none").
+    for api_mode, request_of in (("anthropic_messages", anthropic_request), ("codex_responses", codex_request), ("chat_completions", chat_request)):
+        none = model_call(request_of(), api_mode=api_mode).payload
+        assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(none), api_mode
 
 
 @pytest.mark.parametrize("api_mode, request_of, why", [
@@ -153,3 +163,62 @@ def test_the_middleware_is_registered_once_however_often_hermes_loads_the_provid
         load_provider()
     ours = [cb for cb in get_plugin_manager()._middleware.get("llm_request", []) if getattr(cb, "__name__", "") == "psfn_lite_llm_request"]
     assert len(ours) == 1
+
+
+@pytest.mark.parametrize("provider, model, base_url", [
+    ("deepseek", "deepseek-v4-flash", "https://api.deepseek.com/v1"),
+    ("kimi-coding", "kimi-k2.6", "https://api.moonshot.ai/v1"),
+    ("custom", "deepseek-v4-flash", "https://api.deepseek.com/v1"),  # matched by the provider's host, as Hermes matches it
+])
+def test_a_forced_step_turns_thinking_off_for_that_call_on_providers_that_refuse_forced_choice_while_thinking(profile, bridge, provider, model, base_url):
+    explicit_turn(bridge)
+    built = thinking_request("deepseek" if provider == "custom" else provider, model)
+    assert built["extra_body"].get("thinking", {}).get("type") != "disabled" and (built.get("reasoning_effort") or built["extra_body"]["thinking"])
+    forced = model_call(built, provider=provider, base_url=base_url, model=model).payload
+    assert names(forced["tools"]) == [ORIENT] and forced["tool_choice"] == "required"
+    # The disabled toggle Hermes itself sends for thinking off (agent/reasoning_effort.py thinking_toggle_extras), no effort.
+    assert forced["extra_body"]["thinking"] == {"type": "disabled"} and "reasoning_effort" not in forced
+
+    bridge.next_choices.append({"kind": "none"})
+    lite_tool_ran()
+    # Only the forced call: the "no more tools" step goes with Hermes's own thinking fields.
+    none = model_call(built, provider=provider, base_url=base_url, model=model).payload
+    assert none["extra_body"] == built["extra_body"] and none.get("reasoning_effort") == built.get("reasoning_effort")
+
+
+def test_a_provider_outside_the_capability_table_keeps_its_thinking_on_a_forced_step(profile, bridge):
+    explicit_turn(bridge)
+    # An aggregator serving a DeepSeek model takes its own reasoning wire; the plugin does not guess it.
+    built = {**chat_request(), "extra_body": {"reasoning": {"enabled": True}}}
+    forced = model_call(built, provider="openrouter", base_url="https://openrouter.ai/api/v1", model="deepseek/deepseek-flash").payload
+    assert forced["tool_choice"] == "required" and forced["extra_body"] == {"reasoning": {"enabled": True}}
+
+
+def test_a_deferred_lite_tool_is_forced_through_the_tool_call_bridge_in_every_api_mode(profile, bridge):
+    from conftest import plugin_module
+
+    load_provider()
+    toolchoice = plugin_module("toolchoice")
+    schema = {"type": "object", "properties": {"action": {"type": "string"}}, "required": ["action"]}
+    known = lambda name: (schema, "Orient the companion.") if name == ORIENT else None  # noqa: E731
+    bridge_call = {"type": "object", "properties": {"calls": {"type": "array", "items": {"type": "object"}}}, "required": ["calls"]}
+    bridged = {
+        "chat_completions": {"tools": [{"type": "function", "function": {"name": n, "description": n, "parameters": bridge_call}} for n in ("terminal", "tool_search", "tool_call")]},
+        "codex_responses": {"tools": [{"type": "function", "name": n, "description": n, "parameters": bridge_call} for n in ("terminal", "tool_call")]},
+        "anthropic_messages": {"tools": [{"name": n, "description": n, "input_schema": bridge_call} for n in ("terminal", "tool_call")], "thinking": {"type": "enabled"}},
+    }
+    for api_mode, request in bridged.items():
+        forced = toolchoice.apply(request, api_mode, ORIENT_STEP, "mcp__psfn_lite__", lookup=known)
+        [only] = forced["tools"]
+        parameters = only["function"]["parameters"] if api_mode == "chat_completions" else only["parameters" if api_mode == "codex_responses" else "input_schema"]
+        call = parameters["properties"]["calls"]["items"]
+        assert call["properties"]["name"]["enum"] == [ORIENT] and call["properties"]["arguments"] == schema, api_mode
+        assert "thinking" not in forced
+    # f0187332's bridge takes one {name, arguments}; the narrowed schema keeps that form.
+    single = {"type": "object", "properties": {"name": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["name", "arguments"]}
+    request = {"tools": [{"type": "function", "function": {"name": "tool_call", "description": "d", "parameters": single}}]}
+    [only] = toolchoice.apply(request, "chat_completions", ORIENT_STEP, "mcp__psfn_lite__", lookup=known)["tools"]
+    assert only["function"]["parameters"]["properties"]["name"]["enum"] == [ORIENT]
+    # A bridge for a tool Hermes does not have is refused, not forced.
+    with pytest.raises(toolchoice.ChoiceError, match="not offered"):
+        toolchoice.apply(bridged["chat_completions"], "chat_completions", {"kind": "tool", "name": "journal", "parameters": None}, "mcp__psfn_lite__", lookup=known)

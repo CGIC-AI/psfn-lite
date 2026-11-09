@@ -38,8 +38,9 @@ class ConfigError(ValueError):
 class Sender:
     platform: str
     #: The platform's sender id. The local CLI is platform "cli" with sender "" when it runs its own agent (f0187332),
-    #: and platform "local" with sender "uid:<uid>" when ``hermes chat`` runs through the gateway (2bd378e
-    #: gateway/control_socket.py _posix_peer_subject: the OS user the gateway itself runs as).
+    #: and platform "cli" with sender "uid:<uid>" when ``hermes chat`` runs through the gateway (2bd378e: the gateway
+    #: maps its Platform.LOCAL source to "cli" before the agent and its hooks run, gateway/run_turn_runner.py
+    #: platform_key; the sender is gateway/control_socket.py _posix_peer_subject, the OS user the gateway runs as).
     sender_id: str
 
 

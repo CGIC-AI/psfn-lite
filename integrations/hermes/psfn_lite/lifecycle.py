@@ -291,7 +291,7 @@ class Driver:
         except BridgeError as error:
             self._notice(session_id, f"The memory deletion approved in Hermes did not reach Lite ({error}); memory {memory_id} is kept and its proposal stays pending.")
 
-    def llm_request(self, request=None, turn_id="", session_id="", api_mode="", **_):
+    def llm_request(self, request=None, turn_id="", session_id="", api_mode="", provider="", base_url="", **_):
         """Hermes's llm_request middleware: the provider request rewritten for the donor's tool choice of this model call."""
         entry = self._entry(turn_id, session_id)
         if entry is None or not isinstance(request, dict):
@@ -313,7 +313,7 @@ class Driver:
             if choice is None:
                 return None
         try:
-            rewritten = toolchoice.apply(request, api_mode, choice, self.config.tool_prefix)
+            rewritten = toolchoice.apply(request, api_mode, choice, self.config.tool_prefix, provider=provider, base_url=base_url)
         except toolchoice.ChoiceError as error:
             self._notice(entry["session"], f"PSFN Lite could not hold the model to the companion's requested tool step ({error}); Lite may fail the turn.")
             return None

@@ -1184,12 +1184,26 @@ one was found in the donor code or in a run:
     that ignores the forced choice fails the turn;
   - the plugin forces only Hermes's `chat_completions`, `codex_responses`
     and `anthropic_messages` request shapes. On another API mode, or when
-    Hermes's request lacks the requested tool, the request goes unchanged
-    and the turn may fail as before. Hermes's own tools are hidden on a
-    forced step, as the donor offered only the one tool;
+    Hermes's request has neither the requested tool nor Tool Search's
+    `tool_call` bridge, the request goes unchanged and the turn may fail as
+    before. Hermes's own tools are hidden on a forced step, as the donor
+    offered only the one tool;
+  - under Hermes Tool Search (on by default) the donor's one tool is
+    offered as Hermes's `tool_call` bridge narrowed to that tool, not as
+    the tool itself: the model calls `tool_call` with one
+    `{name, arguments}`, and Hermes unwraps it before its hooks and
+    dispatch (round r2, below). The model's call is one level deeper than
+    the donor's, and Hermes checks its arguments against the registry
+    schema before the tool runs (`tools/tool_search_validation.py`
+    `validate_deferred_call_args`);
   - the donor disabled reasoning for a forced call only where its provider
-    required it (Kimi). The plugin drops Anthropic extended thinking on a
-    forced step, which Anthropic refuses together with a forced tool;
+    required it (Kimi Code). The plugin turns thinking off on a forced step
+    for the providers in `toolchoice.py` `FORCED_CHOICE_WITHOUT_THINKING`
+    (DeepSeek, Kimi; matched by Hermes provider id or host) and for every
+    Anthropic Messages request. A provider that refuses a forced choice
+    while thinking but is not in the table (for example a DeepSeek model
+    behind an aggregator, which takes another reasoning wire) still refuses
+    the request;
   - the donor resolves the contract for the routed model's API and refuses
     a turn with an explicit request on any API it cannot force
     (`providerToolChoice`: only `openai-completions` and `pi-messages`).
@@ -2053,9 +2067,10 @@ plugin:
   `get_install_id` (one per install, shared by profiles; it mints once if
   missing). At f0187332, which has no such module, the file is read as
   before (`config.py` `hermes_install_id`).
-- The gateway's CLI sender is platform `local`, sender `uid:<uid>`
-  (`gateway/control_socket.py` `_posix_peer_subject`); the README says how
-  to bind it.
+- The gateway's CLI sender is `uid:<uid>` (`gateway/control_socket.py`
+  `_posix_peer_subject`); the README says how to bind it. This record first
+  gave the platform as `local`; round r2 showed it is `cli` (corrected
+  under "Shakedown fixes, round r2", R2-1).
 - `plugin.yaml` now lists `post_tool_call` and the `llm_request`
   middleware (`provides_middleware`); a test compares it with what the
   plugin registers.
@@ -2178,6 +2193,132 @@ files, 1041 tests; matched: 9066; Lite additions: 4 files, 27 tests" and
 "equivalent: every remaining baseline test has its baseline status". The
 Hermes plugin suite: 80 passed and 1 skipped at f0187332, 79 passed and 2
 skipped at 2bd378e. No test container or temporary data directory was left.
+
+## Shakedown fixes (2026-11-09, Lite with Hermes, round r2)
+
+Round `lite-hermes-companion-20261109-r2` ran Lite at `a0dd368` with the live
+Hermes `2bd378e` (evidence outside the repository: its `ROUND-NOTES.md` and
+`comparison-table.md`). S3 did not take effect there: 18 of 23 harness cases
+were ok. Four findings, all in the Hermes plugin; no donor file and no Lite
+TypeScript changed. The `cuts.tsv` row `S6` records them and amends `S3`
+and `S4`.
+
+### R2-2: Tool Search hid the Lite tools
+
+At 2bd378e Tool Search is on by default (`hermes_cli/config_defaults.py`
+`tools.tool_search.enabled: "auto"`, :1969-1985). It defers every tool
+that is not core and whose toolset starts with `mcp-` or is not a direct
+surface (`tools/tool_search.py` `is_deferrable_tool_name`, :150-162), and
+`assemble_tool_defs` (:344-379) replaces them with the `tool_search`,
+`tool_describe` and `tool_call` bridges. So `mcp__psfn_lite__*` was not in
+the provider request, `toolchoice.py` raised "not offered" 48 times, and
+the requests went out unforced (contact_sessions, prompt_stack and
+tool_discovery failed as before). The donor's model always saw its core
+tools directly.
+
+Root cause: Hermes has no supported way to keep an MCP or plugin tool
+eager. `defer` only adds tools to the deferred set
+(`ToolSearchConfig.effective_defer_tools`); `PluginContext.register_tool`
+(`hermes_cli/plugins.py:463`) and `registry.register`
+(`tools/registry.py:735`) take no flag; the only bypass,
+`skip_tool_search_assembly` in `model_tools._compute_tool_definitions`
+(:513-554, the bypass at :543), is internal. (The user guide says `defer: []` keeps every tool
+eager; the code still defers MCP and plugin tools.) Turning Tool Search off
+globally is not required.
+
+Fix: a forced step for a deferred Lite tool goes through the `tool_call`
+bridge. When the requested tool is not in the request but `tool_call` is,
+`toolchoice.apply` (`integrations/hermes/psfn_lite/toolchoice.py:180-212`,
+the branch at :198-206) offers only that bridge, with
+`tool_choice: "required"` and parallel calls off, its schema narrowed by
+`_one_call_bridge` (:148-177): exactly one call
+(`minItems`/`maxItems` 1 in 2bd378e's `{calls: [...]}` form; the single
+`{name, arguments}` form at f0187332), `name` an enum of the Lite tool
+alone, and `arguments` the tool's own schema from Hermes's registry
+(`registered_tool`, :125-138, the lookup Hermes's own validator uses) or
+the donor's exact-arguments schema. Hermes unwraps the call before its
+hooks, approvals and dispatch (`agent/tool_executor.py`
+`_unwrap_tool_search_call`, :389-432; `model_tools.py` :745-765), so the
+plugin's `pre_tool_call` gate and `post_tool_call` (which asks Lite for the
+next step) see `mcp__psfn_lite__<tool>`. An eager Lite tool (Tool Search
+off) is forced directly as before; neither present is still reported.
+
+### R2-3: the "no more tools" step kept the tools
+
+The plugin kept the tools with `tool_choice: "none"`; DeepSeek then wrote
+the call it wanted as text, which became the reply (north_star_cycle,
+memory_write_patch, the memory_delete_restore restore turn). The donor
+removes the tools (`client-request-capability.ts` `buildPiContext`,
+:238-240: `choice === 'none'` sets `tools = undefined`). Fix: a `none` step
+removes `tools`, `tool_choice` and `parallel_tool_calls` in every API mode
+(`toolchoice.py:185-189`). Hermes's own Anthropic mapping of `none` does
+the same (`agent/anthropic_adapter.py:682-683`).
+
+### R2-4: DeepSeek refuses a forced choice while thinking
+
+With Tool Search off (the round's diagnostic run), every forced step failed
+with DeepSeek HTTP 400 "Thinking mode does not support this tool_choice".
+Hermes's DeepSeek profile always sends the thinking toggle for
+`deepseek-v4*` and `deepseek-flash`
+(`plugins/model-providers/deepseek/__init__.py`, `extra_body.thinking`
+plus a top-level `reasoning_effort` from `agent/reasoning_effort.py`
+`thinking_toggle_extras`, :229-251). The plugin stripped thinking only for
+Anthropic; the donor disabled it for required tools only on Kimi Code
+(`primitives/llm/models.ts:61-67`, applied in `applyExplicitToolChoice`
+:268-280: delete reasoning, send `thinking: {type: "disabled"}`).
+
+Fix: the donor's quirk as a provider capability.
+`FORCED_CHOICE_WITHOUT_THINKING` (`toolchoice.py:46-58`) lists DeepSeek and
+Kimi by Hermes provider id and host (the hosts Hermes itself treats as
+those vendors, `agent/message_sanitization.py` `_REASONING_ECHO_RULES`);
+`thinking_family` (:101-111) also returns `anthropic` for the Messages API.
+On a forced request only, `_without_thinking` (:114-122) sets
+`extra_body.thinking` to `{"type": "disabled"}` and drops
+`reasoning_effort` (Hermes's own disabled form, `thinking_toggle_extras`
+:245-246), or drops Anthropic's `thinking`. The middleware gets the
+provider and base URL from Hermes's call (`agent/turn_api_request.py:158-162`;
+`Driver.llm_request`, `lifecycle.py:294`, :316). The next, unforced
+request keeps Hermes's thinking fields. The donor TypeScript is unchanged:
+Lite's own model calls already follow it.
+
+### R2-1: the CLI sender binds as platform `cli`
+
+The README and `config.py` said the gateway's CLI sender is
+`{"platform": "local", "sender_id": "uid:<uid>"}`, and
+`tests/test_profiles.py` bound it that way by hand. At 2bd378e the gateway
+maps its `Platform.LOCAL` source to `cli` before the agent and its hooks
+run (`gateway/run_turn_runner.py:1253`, :1270 `platform_key`; a local
+session policy gives `SURFACES["cli"]`, also `cli`), so Lite logged
+`unbound_sender: platform 'cli'`. Fix: `config.py:40-43` and the README
+give `{"platform": "cli", "sender_id": "uid:<uid>"}` and name the other
+local surfaces' platforms (`tui`, `desktop`), untested here.
+`tests/test_profiles.py` now takes the pair from Hermes's own code
+(`cli_sender`, :45-68): the `platform_key` assignment parsed out of
+`TurnRunner._run_sync_scoped` and evaluated for a `Platform.LOCAL` source
+(`gateway_platform_key`, :29-42), and the sender from
+`GatewayControlServer._posix_peer_subject` over a real Unix socket pair.
+
+### Guards
+
+- `integrations/hermes/tests/test_tool_search_wire.py` runs a real
+  `AIAgent.run_conversation` with Tool Search at its default (asserted
+  `auto`), the Lite tool registered as Hermes's MCP client registers it
+  (toolset `mcp-psfn_lite`), Hermes's DeepSeek provider (`deepseek-flash`)
+  and the plugin loaded, against a loopback chat-completions server that
+  records each request body as it arrives over HTTP. An unforced turn shows
+  what r2 saw (the bridges, no Lite tool, thinking on). An explicit turn
+  shows the forced request with only the narrowed `tool_call`, `required`,
+  `thinking: {"type": "disabled"}` and no `reasoning_effort` (own schema
+  and exact-arguments variants); the Lite tool runs with the model's
+  arguments and Lite is asked for the next step once; the next request
+  carries no `tools`, `tool_choice` or `parallel_tool_calls` and thinks
+  again; the turn settles with the reply. It runs at both revisions.
+- `tests/test_tool_choice.py`: the `none` step without tools in all three
+  API modes; thinking off on a forced step for DeepSeek and Kimi requests
+  built by Hermes's own provider profiles (and by host), restored on the
+  next step, and left alone for an aggregator; the bridge narrowed in each
+  API mode and in both bridge forms.
+- `tests/test_profiles.py`: the CLI pair from the gateway's own mapping.
 
 ## Measured size
 

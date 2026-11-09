@@ -264,7 +264,7 @@ def test_an_explicit_tool_request_is_held_to_the_donor_contract_and_the_turn_com
     assert names(forced["tools"]) == [f"mcp__{SERVER}__orient"] and forced["tool_choice"] == "required"
     assert SEED_THREAD in call_tool("orient", "list_concerns", session=session, turn_id=turn_id)
     after = model_call(chat_request(), turn_id=turn_id, session=session).payload
-    assert after["tool_choice"] == "none"
+    assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(after)  # the donor's "no more tools": no tools at all
     finish(session, turn_id, reply="Your first concern is the seed packets.")
     assert plugin_module("runtime").driver().ledger.pending() == []
     # Lite recorded the turn as completed: its reply is the session's history in the next turn.
