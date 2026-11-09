@@ -40,7 +40,10 @@ Lite.
 | `packages/lifecycle/src/*` | written for Lite: host-driven turns. They go through the donor `SubstrateAgent.handleMessage` and the stream transport seam (donor `src/app/agent/core-runtime.ts:724-726`), on the donor's Hermes channel convention (`externalMemorySessionId`). The donor tool catalog is exposed as MCP tools (donor `tool-runtime-facade` `getToolCatalog`). `memory-deletion.ts` is the host `MemoryDeletionApprovalPort` (seam E3), in place of the donor gateway's confirmation surface (donor `src/app/agent/main.ts:583-603`). `host-turns.ts` hands the host the donor's explicit tool contract per model call (seam S3; donor `src/primitives/llm/explicit-tool-request.ts` `resolveExplicitToolContract`, applied as donor `client-request-capability.ts` `applyExplicitToolChoice` and `buildPiContext` did). |
 | `packages/mcp/src/*` | written for Lite against `@modelcontextprotocol/server` 2.3.0, the donor's pinned SDK. It follows the donor's external-memory MCP route (`src/channels/api/server/external-memory-mcp.ts`, cut): a stateless per-request handler, a bearer credential bound to a fixed identity, browser `Origin` and `Mcp-Session-Id` refused. Credentials come from the environment or owner-only files and are compared in constant time against every binding (pattern of donor `src/channels/backplane/http/auth.ts` `isExpectedApiToken`, cut). stdio has no donor counterpart. |
 | `packages/pi/src/*` | written for Lite against `@earendil-works/pi-ai` 0.84.1, the donor's pinned version. It holds the model runtime the core's provider port takes, and the adapter (`companionEmbeddingProviderOf`) for a host that supplies its own embedding port; the configured embedding providers are the donor's (seam S5). |
+| `packages/operator/src/*` | written for Lite: the light Garden's operator surface (seam S8). `garden.ts` composes the donor Garden services of the eight screens as donor `src/operator/garden/local-admin-contract.ts` did (each step cites its donor lines) over the companion's own stores (`CompanionRuntime.garden`). `donor-routes.ts` compiles the donor route builders against the donor route catalogue, and `http.ts` dispatches them as donor `server-routes.ts:59-100` did, with `createStandaloneGardenRequestContext`. `lite-routes.ts` serves what no kept donor route serves: the Overview and Inner life reads, memory delete and restore and the deletion-proposal decisions (decision a), and Settings through the donor owner-file loaders (decision b). `audit.ts` ports donor `appendGardenEntry` to the same `garden-audit-history.jsonl` record. |
 | `integrations/hermes/psfn_lite/*` | written for Lite: the Hermes plugin (below). |
+| `integrations/hermes/psfn_lite/dashboard/*`, `integrations/hermes/install_plugin.py` | written for Lite: the dashboard backend, a proxy from Hermes's `/api/plugins/psfn_lite/` to the operator surface, and the install tool that never copies the Desktop half (seam S8). |
+| `integrations/hermes/desktop/*`, `integrations/hermes/psfn_lite/desktop/plugin.js` | written for Lite against the Hermes Desktop plugin SDK at 2bd378e: the light Garden in Hermes Desktop, and its committed build (seam S8). It reads and writes the donor Garden routes and the Lite routes; it holds no donor code. The donor Garden client (the Svelte app in the donor repository's `admin-ui/`) is not vendored. |
 | `tests/*`, `integrations/hermes/tests/*` | written for Lite: tests of the host adapters, the conformance suite and the Hermes plugin tests. `tests/support/postgres-harness.ts` follows donor `src/test-support/postgres-test-harness.ts`: a pinned pgvector image, tmpfs data, a label, a random port, and removal of exactly its own container. |
 | `scripts/bench/footprint.ts` | written for Lite: the install-footprint measurement ([footprint](footprint.md)). |
 
@@ -51,8 +54,9 @@ The tables below are generated from the Git blobs of
 `python3 -I packages/companion/extraction/provenance-tables.py <donor git
 dir>`, after Step E; the 2026-11-09 shakedown fixes (seams S1-S4, S6
 for round r2 and S7 for round r3) and the restored donor embedding providers (seam S5)
-changed no file here. The tree has 2,003 files: 1,772 extracted unchanged,
-200 extracted with cuts, and 31 Lite. Seam D is the operator
+changed no file here. Seam S8 (the light Garden, [extraction](extraction.md),
+"S8: the light Garden") re-vendored the donor Garden services and routes and
+added the `CompanionRuntime.garden` host seam. The tree now has 2,100 files: 1,839 extracted unchanged, 227 extracted with cuts, and 34 Lite. Seam D is the operator
 automata rules ([extraction](extraction.md), "Operator automata rules").
 Seams E1-E4 are the operator rulings of 2026-11-08/09 that changed files
 ([extraction](extraction.md), "Step E"). The extraction records, package
@@ -69,9 +73,11 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/app/agent/startup/` | extracted unchanged from donor `src/app/agent/startup/` (9 files; 2 changed listed below) |
 | `src/app/startup/composition/` | extracted unchanged from donor `src/app/startup/composition/` (4 files; 5 changed listed below) |
 | `src/app/startup/support/` | extracted unchanged from donor `src/app/startup/support/` (4 files; 3 changed listed below) |
+| `src/boundary/fleet-auth/` | extracted unchanged from donor `src/boundary/fleet-auth/` (2 files; 4 changed listed below) |
 | `src/boundary/integrations/journal/` | extracted unchanged from donor `src/boundary/integrations/journal/` (12 files) |
 | `src/boundary/integrations/` | extracted unchanged from donor `src/boundary/integrations/` (1 file) |
 | `src/boundary/pi-agent/` | extracted unchanged from donor `src/boundary/pi-agent/` (3 files) |
+| `src/channels/backplane/http/` | extracted unchanged from donor `src/channels/backplane/http/` (2 files) |
 | `src/core/agent/` | extracted unchanged from donor `src/core/agent/` (57 files; 11 changed listed below) |
 | `src/core/agent/background-work/` | extracted unchanged from donor `src/core/agent/background-work/` (18 files) |
 | `src/core/agent/substrate-agent/` | extracted unchanged from donor `src/core/agent/substrate-agent/` (42 files; 25 changed, 1 Lite-new listed below) |
@@ -133,6 +139,10 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/faculties/shards/` | extracted unchanged from donor `src/faculties/shards/` (9 files; 2 changed, 1 Lite-new listed below) |
 | `src/faculties/subagents/` | extracted unchanged from donor `src/faculties/subagents/` (18 files; 2 changed, 2 Lite-new listed below) |
 | `src/faculties/values/` | extracted unchanged from donor `src/faculties/values/` (7 files) |
+| `src/operator/garden/` | extracted unchanged from donor `src/operator/garden/` (14 files; 5 changed, 2 Lite-new listed below) |
+| `src/operator/garden/routes/` | extracted unchanged from donor `src/operator/garden/routes/` (8 files; 8 changed listed below) |
+| `src/operator/garden/services/` | extracted unchanged from donor `src/operator/garden/services/` (35 files; 8 changed listed below) |
+| `src/operator/garden/services/types/` | extracted unchanged from donor `src/operator/garden/services/types/` (6 files; 2 changed listed below) |
 | `src/persistence/journals/` | extracted unchanged from donor `src/persistence/journals/` (10 files; 2 changed listed below) |
 | `src/persistence/journals/journal/` | extracted unchanged from donor `src/persistence/journals/journal/` (10 files) |
 | `src/persistence/` | extracted unchanged from donor `src/persistence/` (10 files; 3 changed listed below) |
@@ -159,7 +169,7 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/shared/tools/` | extracted unchanged from donor `src/shared/tools/` (2 files) |
 | `src/shared/utils/` | extracted unchanged from donor `src/shared/utils/` (29 files) |
 | `src/system/capabilities/` | extracted unchanged from donor `src/system/capabilities/` (16 files; 2 changed, 1 Lite-new listed below) |
-| `src/system/config/` | extracted unchanged from donor `src/system/config/` (40 files; 11 changed, 1 Lite-new listed below) |
+| `src/system/config/` | extracted unchanged from donor `src/system/config/` (40 files; 11 changed, 2 Lite-new listed below) |
 | `src/system/config/fixtures/` | extracted unchanged from donor `src/system/config/fixtures/` (2 files; 1 changed listed below) |
 | `src/system/config/scheduler-config/` | extracted unchanged from donor `src/system/config/scheduler-config/` (21 files) |
 | `src/system/lifecycle/` | extracted unchanged from donor `src/system/lifecycle/` (6 files) |
@@ -192,6 +202,10 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/app/startup/support/ml-warmup.ts` | extracted from donor `src/app/startup/support/ml-warmup.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/app/startup/support/operator-alerts.test.ts` | extracted from donor `src/app/startup/support/operator-alerts.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/app/startup/support/operator-alerts.ts` | extracted from donor `src/app/startup/support/operator-alerts.ts`; cut: seam 3.11, E1 (`extraction/cuts.tsv`) |
+| `src/boundary/fleet-auth/garden-route-authorization.ts` | extracted from donor `src/boundary/fleet-auth/garden-route-authorization.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/boundary/fleet-auth/garden-route-capabilities.test.ts` | extracted from donor `src/boundary/fleet-auth/garden-route-capabilities.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/boundary/fleet-auth/role-action-policy.test.ts` | extracted from donor `src/boundary/fleet-auth/role-action-policy.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/boundary/fleet-auth/role-action-policy.ts` | extracted from donor `src/boundary/fleet-auth/role-action-policy.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
 | `src/boundary/integrations/filesystem/text-file-paging.ts` | extracted from donor `src/boundary/integrations/filesystem/text-file-paging.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/core/agent/companion-availability.test.ts` | extracted from donor `src/core/agent/companion-availability.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/agent/completion-handoff.ts` | extracted from donor `src/core/agent/completion-handoff.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
@@ -335,6 +349,29 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/faculties/shards/output-review.ts` | extracted from donor `src/faculties/shards/output-review.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
 | `src/faculties/subagents/faculty.test.ts` | extracted from donor `src/faculties/subagents/faculty.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/faculties/subagents/faculty.ts` | extracted from donor `src/faculties/subagents/faculty.ts`; cut: seam D (`extraction/cuts.tsv`) |
+| `src/operator/garden/api-routes-memory.test.ts` | extracted from donor `src/operator/garden/api-routes-memory.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/operator/garden/api-routes-memory.ts` | extracted from donor `src/operator/garden/api-routes-memory.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/garden-companion-scope.test.ts` | extracted from donor `src/operator/garden/garden-companion-scope.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/operator/garden/garden-request-context.test.ts` | extracted from donor `src/operator/garden/garden-request-context.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/operator/garden/garden-request-context.ts` | extracted from donor `src/operator/garden/garden-request-context.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/routes/automata-routes.test.ts` | extracted from donor `src/operator/garden/routes/automata-routes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/operator/garden/routes/concern-routes.ts` | extracted from donor `src/operator/garden/routes/concern-routes.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/routes/identity-routes.ts` | extracted from donor `src/operator/garden/routes/identity-routes.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/routes/scheduler-routes.test.ts` | extracted from donor `src/operator/garden/routes/scheduler-routes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/operator/garden/routes/scheduler-routes.ts` | extracted from donor `src/operator/garden/routes/scheduler-routes.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/routes/session-routes.test.ts` | extracted from donor `src/operator/garden/routes/session-routes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/operator/garden/routes/session-routes.ts` | extracted from donor `src/operator/garden/routes/session-routes.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/routes/types.ts` | extracted from donor `src/operator/garden/routes/types.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/services/automata-coverage.test.ts` | extracted from donor `src/operator/garden/services/automata-coverage.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/operator/garden/services/automata-service.test.ts` | extracted from donor `src/operator/garden/services/automata-service.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/operator/garden/services/identity-service.test.ts` | extracted from donor `src/operator/garden/services/identity-service.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/operator/garden/services/identity-service.ts` | extracted from donor `src/operator/garden/services/identity-service.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/services/scheduler-service.ts` | extracted from donor `src/operator/garden/services/scheduler-service.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/services/session-service.test.ts` | extracted from donor `src/operator/garden/services/session-service.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/operator/garden/services/session-service.ts` | extracted from donor `src/operator/garden/services/session-service.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/services/types.ts` | extracted from donor `src/operator/garden/services/types.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/services/types/identity.ts` | extracted from donor `src/operator/garden/services/types/identity.ts`; cut: seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/services/types/sessions.ts` | extracted from donor `src/operator/garden/services/types/sessions.ts`; cut: seam 3.6, S8 (`extraction/cuts.tsv`) |
 | `src/persistence/journals/hmac-boundary.test.ts` | extracted from donor `src/persistence/journals/hmac-boundary.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/persistence/journals/hmac-boundary.ts` | extracted from donor `src/persistence/journals/hmac-boundary.ts`; cut: seam 3.8 (`extraction/cuts.tsv`) |
 | `src/persistence/ledger-bounded-hydration.test.ts` | extracted from donor `src/persistence/ledger-bounded-hydration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
@@ -380,7 +417,7 @@ Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `
 | Lite path (under `packages/companion/`) | Entry |
 |---|---|
 | `src/app/agent/companion-runtime.boot.integration.test.ts` | Lite, a Lite test (`extraction/added-tests.tsv`) |
-| `src/app/agent/companion-runtime.ts` | Lite, seam 3.1, 3.11, B7, C, D, E3, E4 (`extraction/cuts.tsv`) |
+| `src/app/agent/companion-runtime.ts` | Lite, seam 3.1, 3.11, B7, C, D, E3, E4, S8 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/generated-media-stub.ts` | Lite |
 | `src/core/scheduler/fleet-stagger.ts` | Lite |
 | `src/core/scheduler/project-entity-id.ts` | Lite |
@@ -390,6 +427,8 @@ Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `
 | `src/faculties/shards/context-text.ts` | Lite |
 | `src/faculties/subagents/host-execution.test.ts` | Lite, seam D (`extraction/cuts.tsv`); a Lite test (`extraction/added-tests.tsv`) |
 | `src/faculties/subagents/host-execution.ts` | Lite, seam D (`extraction/cuts.tsv`) |
+| `src/operator/garden/admin-scheduler-contract.ts` | Lite, seam S8 (`extraction/cuts.tsv`) |
+| `src/operator/garden/request-capability-versions.ts` | Lite, seam S8 (`extraction/cuts.tsv`) |
 | `src/shared/contracts/api-health.ts` | Lite |
 | `src/shared/contracts/channel-prompt-port.ts` | Lite, seam 3.17 (`extraction/cuts.tsv`) |
 | `src/shared/contracts/fatigue-event-types.ts` | Lite, seam 3.17 (`extraction/cuts.tsv`) |
@@ -407,6 +446,7 @@ Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `
 | `src/shared/contracts/wiki-context.ts` | Lite |
 | `src/shared/telemetry/provider-cost-extraction.ts` | Lite |
 | `src/system/capabilities/pre-tool-hook.ts` | Lite |
+| `src/system/config/fleet-auth-vocabulary.ts` | Lite, seam S8 (`extraction/cuts.tsv`) |
 | `src/system/config/inner-life-config.ts` | Lite, seam 3.10, B7, E4 (`extraction/cuts.tsv`) |
 | `src/test-support/in-memory-automata-bus.ts` | Lite, seam D (`extraction/cuts.tsv`) |
 | `src/test-support/static-credential-vault.ts` | Lite test support: donor `boundary/custody/credential-vault.ts:94-119`, unchanged, over the credential contract (B7) |
@@ -432,13 +472,13 @@ Donor files that were carried into the tree and deleted again in B7 (`extraction
 | `src/app/gateway/` | cut (source-text, 1 file) |
 | `src/app/operator/` | cut (source-text, 1 file) |
 | `src/boundary/custody/` | cut (scaffolding, 1 file) |
-| `src/boundary/fleet-auth/` | cut (scaffolding, 27 files) |
+| `src/boundary/fleet-auth/` | cut (scaffolding, 23 files) |
 | `src/boundary/gateway/` | cut (asset-deleted, 4 files) |
 | `src/boundary/gateway/` | cut (scaffolding, 163 files) |
 | `src/boundary/integrations/` | cut (scaffolding, 20 files) |
 | `src/boundary/sandbox/` | cut (scaffolding, 18 files) |
 | `src/channels/api/` | cut (scaffolding, 34 files) |
-| `src/channels/backplane/` | cut (scaffolding, 19 files) |
+| `src/channels/backplane/` | cut (scaffolding, 18 files) |
 | `src/channels/external/` | cut (scaffolding, 8 files) |
 | `src/channels/plugins/` | cut (scaffolding, 6 files) |
 | `src/channels/shared/` | cut (scaffolding, 1 file) |
@@ -456,7 +496,7 @@ Donor files that were carried into the tree and deleted again in B7 (`extraction
 | `src/faculties/shards/` | cut (scaffolding, 13 files) |
 | `src/faculties/skills/` | cut (scaffolding, 10 files) |
 | `src/faculties/wiki/` | cut (scaffolding, 20 files) |
-| `src/operator/garden/` | cut (scaffolding, 50 files) |
+| `src/operator/garden/` | cut (scaffolding, 31 files) |
 | `src/operator/tool-health/` | cut (scaffolding, 1 file) |
 | `src/persistence/backups/` | cut (scaffolding, 23 files) |
 | `src/persistence/cutover.ts` | cut (scaffolding, 1 file) |
