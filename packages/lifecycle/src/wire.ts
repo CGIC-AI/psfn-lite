@@ -15,6 +15,8 @@ import type { HostedAttemptReport } from './companion.ts';
 export interface PrepareBody {
   /** The host process's own instance name; it narrows turn ownership within one credential, never widens it. */
   readonly hostInstance: string;
+  /** The Hermes install the host process belongs to; the bridge serves only the install it is bound to. */
+  readonly hermesInstallId: string;
   readonly idempotencyKey: string;
   /** The host's conversation; with the principal it names the donor channel. */
   readonly sessionId: string;
@@ -30,11 +32,15 @@ export interface SettleBody {
 }
 
 export interface CheckpointBody {
+  readonly hermesInstallId: string;
   readonly sessionId: string;
   readonly turnIds: readonly string[];
 }
 
 const INSTANCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+/** A Hermes install id as Hermes mints it (hermes_cli/web_server.py `_INSTALL_ID_RE`: uuid4 hex). */
+export const HERMES_INSTALL_ID_PATTERN = /^[0-9a-f]{32}$/;
+const INSTALL_DESCRIPTION = 'a Hermes install id (32 lowercase hex characters)';
 const KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;
 const SESSION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;
 /** The donor's turn ids are UUIDv7 (core/turns/id.ts). */
@@ -96,13 +102,14 @@ function done<T>(f: Fields, value: () => T): Result<T> {
 }
 
 export function parsePrepare(raw: unknown): Result<PrepareBody> {
-  const f = fields(raw, '', ['hostInstance', 'idempotencyKey', 'sessionId', 'message']);
+  const f = fields(raw, '', ['hostInstance', 'hermesInstallId', 'idempotencyKey', 'sessionId', 'message']);
   if (!f.ok) return f;
   const hostInstance = f.value.pattern('hostInstance', INSTANCE_PATTERN, '1-64 characters of [A-Za-z0-9._-]');
+  const hermesInstallId = f.value.pattern('hermesInstallId', HERMES_INSTALL_ID_PATTERN, INSTALL_DESCRIPTION);
   const idempotencyKey = f.value.pattern('idempotencyKey', KEY_PATTERN, '1-256 characters of [A-Za-z0-9:._-] starting alphanumeric');
   const sessionId = f.value.pattern('sessionId', SESSION_PATTERN, '1-256 characters of [A-Za-z0-9:._-] starting alphanumeric');
   const message = f.value.text('message', MAX_MESSAGE_CHARS);
-  return done(f.value, () => ({ hostInstance, idempotencyKey, sessionId, message }));
+  return done(f.value, () => ({ hostInstance, hermesInstallId, idempotencyKey, sessionId, message }));
 }
 
 export function parseSettle(raw: unknown): Result<SettleBody> {
@@ -152,8 +159,9 @@ function parseOutcome(raw: unknown): Result<{ outcome: HostOutcome; errorMessage
 }
 
 export function parseCheckpoint(raw: unknown): Result<CheckpointBody> {
-  const f = fields(raw, '', ['sessionId', 'turnIds']);
+  const f = fields(raw, '', ['hermesInstallId', 'sessionId', 'turnIds']);
   if (!f.ok) return f;
+  const hermesInstallId = f.value.pattern('hermesInstallId', HERMES_INSTALL_ID_PATTERN, INSTALL_DESCRIPTION);
   const sessionId = f.value.pattern('sessionId', SESSION_PATTERN, '1-256 characters of [A-Za-z0-9:._-] starting alphanumeric');
   const list = f.value.get('turnIds');
   const turnIds: string[] = [];
@@ -165,7 +173,7 @@ export function parseCheckpoint(raw: unknown): Result<CheckpointBody> {
       else f.value.issues.push(`turnIds[${index}] must be a turn id`);
     });
   }
-  return done(f.value, () => ({ sessionId, turnIds }));
+  return done(f.value, () => ({ hermesInstallId, sessionId, turnIds }));
 }
 
 /** The donor's assembled request, as JSON. */

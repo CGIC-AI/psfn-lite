@@ -16,6 +16,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ConformanceHost, HOST_TURN_TIMEOUT_MS } from '../../conformance/host/host.ts';
+import { HERMES_TEST_INSTALL_ID } from '../../support/lite-install.ts';
 import { startPostgresHarness } from '../../support/postgres-harness.ts';
 
 const protocol = process.stdout.write.bind(process.stdout);
@@ -29,7 +30,7 @@ async function main(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'lite-hermes-e2e-'));
   const base = join(root, 'data');
   try {
-    const host = new ConformanceHost({ databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, ports: null, generation: 0 });
+    const host = new ConformanceHost({ databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, sessionKeys: null, ports: null, generation: 0 });
     const ready = await host.open();
     try {
       const seed = await host.piTurn({
@@ -40,7 +41,7 @@ async function main(): Promise<void> {
         key: 'seed',
       });
       if (seed.results.some((r) => !r.ok)) throw new Error(`the seed turn failed: ${JSON.stringify(seed.results)}`);
-      protocol(`${JSON.stringify({ mcpUrl: ready.mcpUrl, lifecycleUrl: ready.lifecycleUrl, credentials: ready.credentials, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS })}\n`);
+      protocol(`${JSON.stringify({ mcpUrl: ready.mcpUrl, lifecycleUrl: ready.lifecycleUrl, credentials: ready.credentials, hermesInstallId: HERMES_TEST_INSTALL_ID, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS })}\n`);
       process.stdin.resume();
       await new Promise<void>((resolve) => process.stdin.once('end', resolve));
     } finally {

@@ -21,7 +21,7 @@ import { createTurnId, externalMemorySessionId, type LLMContext } from '../../..
 import { renderContext } from '../../../packages/lifecycle/src/wire.ts';
 import { deterministicEmbeddings } from '../../support/embeddings.ts';
 import { fauxModel, type ModelCall, type Script } from '../../support/faux-model.ts';
-import { DATABASE_URL_ENV, liteConfigDocument, newCredential, provisionDatabase, writeCharacterCard, type LiteConfigDocument } from '../../support/lite-install.ts';
+import { DATABASE_URL_ENV, HERMES_TEST_INSTALL_ID, SESSION_KEYS_ENV, liteConfigDocument, newCredential, newSessionKeys, provisionDatabase, writeCharacterCard, type LiteConfigDocument } from '../../support/lite-install.ts';
 import { captureInto, observe, resolveTemplates, type CallResult, type PlannedCall, type TurnObservation, type Vars } from '../scenario.ts';
 
 /** Hermes principals of the conformance config and the contact each is bound to. */
@@ -40,6 +40,8 @@ export interface HostState {
   readonly base: string;
   readonly companionId: string | null;
   readonly credentials: Readonly<Record<Principal, string>> | null;
+  /** The session keyring (`<version>:<key>`); null on first start, kept by successors so the journals verify. */
+  readonly sessionKeys: string | null;
   /** Null on first start (any free port); a successor binds the same ports so a host's configuration stays valid. */
   readonly ports: { readonly mcp: number; readonly lifecycle: number } | null;
   readonly generation: number;
@@ -101,9 +103,11 @@ export class ConformanceHost {
       allowedHosts: null,
       bindings: Object.entries(PRINCIPALS).map(([principal, contact]) => ({ principal, credential: { env: envName(principal) }, contact })),
     };
-    document.lifecycle = { host: '127.0.0.1', port: this.state.ports?.lifecycle ?? 0, allowedHosts: null, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS, automata: null };
+    document.lifecycle = { host: '127.0.0.1', port: this.state.ports?.lifecycle ?? 0, allowedHosts: null, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS, hermesInstallId: HERMES_TEST_INSTALL_ID, automata: null };
+    const sessionKeys = this.state.sessionKeys ?? newSessionKeys();
     const env: Record<string, string> = {
       [DATABASE_URL_ENV]: this.state.databaseUrl,
+      [SESSION_KEYS_ENV]: sessionKeys,
       ...Object.fromEntries(Object.entries(credentials).map(([p, c]) => [envName(p), c])),
     };
     if (first) await this.install(document, env);
@@ -124,7 +128,7 @@ export class ConformanceHost {
     this.runtime = runtime.value;
     const { mcpUrl, lifecycleUrl } = runtime.value.transports;
     if (mcpUrl === null || lifecycleUrl === null) throw new Error('transports were not mounted');
-    this.state = { ...this.state, companionId, credentials, ports: { mcp: Number(new URL(mcpUrl).port), lifecycle: Number(new URL(lifecycleUrl).port) } };
+    this.state = { ...this.state, companionId, credentials, sessionKeys, ports: { mcp: Number(new URL(mcpUrl).port), lifecycle: Number(new URL(lifecycleUrl).port) } };
     const contact = (key: string) => runtime.value.contactIds.get(key) ?? '';
     return { mcpUrl, lifecycleUrl, credentials, vars: { 'contact.operator': contact('operator'), 'contact.friend': contact('sam') }, state: this.state };
   }
@@ -221,7 +225,7 @@ export class ConformanceHost {
     if (bridge === null) throw new Error('the lifecycle bridge is not mounted');
     const started = Date.now();
     while (Date.now() - started < HOST_TURN_TIMEOUT_MS + LAPSE_MARGIN_MS) {
-      const answer = await bridge.checkpoint('hermes-operator', OPERATOR_SESSION, [turnId]);
+      const answer = await bridge.checkpoint('hermes-operator', HERMES_TEST_INSTALL_ID, OPERATOR_SESSION, [turnId]);
       if (answer.ok && answer.value.settled.includes(turnId)) return { settled: true, waitedMs: Date.now() - started };
       await new Promise((resolve) => setTimeout(resolve, 250));
     }

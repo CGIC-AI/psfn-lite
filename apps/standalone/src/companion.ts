@@ -23,6 +23,9 @@ export { createDefaultEmotionScopingSettings } from '../../../packages/companion
 export { createDefaultNarrativeEmotionAppraisalSettings } from '../../../packages/companion/src/system/config/narrative-emotion-appraisal-config.js';
 export { MEMORY_RETRIEVAL_BUDGET_PCT_DEFAULT, SESSION_HISTORY_BUDGET_PCT_DEFAULT } from '../../../packages/companion/src/shared/context-budget.js';
 export { createSessionHmacBoundaryService } from '../../../packages/companion/src/persistence/journals/hmac-boundary.js';
+export { createKeyringIntegrityProvider, type SessionIntegrityProvider } from '../../../packages/companion/src/persistence/sessions/store-primitives.js';
+export type { SessionHmacKeyring } from '../../../packages/companion/src/persistence/journals/journal/types.js';
+export type { JournalEntry } from '../../../packages/companion/src/core/session/types.js';
 export type { ProviderRuntime } from '../../../packages/companion/src/primitives/llm/provider-runtime.js';
 export type { EmbeddingRuntimeProvider } from '../../../packages/companion/src/faculties/memory/embedding.js';
 export type { ModelUsageEventInput, ModelUsageRecorder } from '../../../packages/companion/src/shared/telemetry/model-usage.js';

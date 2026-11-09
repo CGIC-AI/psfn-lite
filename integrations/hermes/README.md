@@ -108,7 +108,12 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
 
 1. Run Lite with the MCP transport and the lifecycle bridge configured. In
    the standalone config, set `mcp` (a binding for this Hermes profile's
-   credential) and `lifecycle`. Then run
+   credential) and `lifecycle`. Set `lifecycle.hermesInstallId` to this
+   Hermes install's id: the content of the file `install_id` in the Hermes
+   root (`~/.hermes/install_id` by default). Hermes creates that file when
+   its dashboard first starts. Use `"sessionIntegrity": {"kind": "keyring"}`
+   with the session keyring in the environment
+   (`GATEWAY_SESSION_HMAC_KEYS`), so the journals are signed. Then run
    `npm run standalone -- serve --config <file>`.
 2. Copy `psfn_lite/` to `$HERMES_HOME/plugins/psfn_lite/`. The plugin uses
    only the standard library and Hermes itself.
@@ -143,6 +148,9 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
    this themselves. While the plugin is not usable, `pre_tool_call` blocks
    the Lite MCP tools. If `psfn-lite.json` itself cannot be read, the plugin
    cannot tell which MCP server is Lite's, so it blocks every MCP tool.
+   The plugin also needs the Hermes install id. It reads the id and never
+   creates it. Without the id, or when Lite is bound to another install
+   (`wrong_install`), no Lite turn is driven and the Lite tools are blocked.
 5. Write `$HERMES_HOME/psfn-lite.json`. Every field is required, and unknown
    fields are refused:
 

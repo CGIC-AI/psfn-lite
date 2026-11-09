@@ -11,7 +11,7 @@ import subprocess
 import sys
 from unittest.mock import MagicMock, patch
 
-from conftest import CREDENTIAL, CREDENTIAL_ENV, plugin_module, write_profile
+from conftest import CREDENTIAL, CREDENTIAL_ENV, INSTALL_ID, plugin_module, write_profile
 from test_host_contract import end, fire, load_provider, turn
 
 UNAVAILABLE = (503, {"error": {"kind": "unavailable", "capability": "postgres", "detail": "x"}})
@@ -100,7 +100,7 @@ def test_a_compression_that_rotates_the_session_mid_turn_keeps_the_turn(profile,
     assert len(bridge.bodies("prepare")) == 2 and len(bridge.bodies("settle")) == 1
     assert [b["sessionId"] for b in bridge.bodies("prepare")] == ["C", "C"]
     plugin_module("runtime").driver().checkpoint("C2")
-    assert bridge.bodies("checkpoint")[-1] == {"sessionId": "C", "turnIds": ["turn-1", "turn-2"]}
+    assert bridge.bodies("checkpoint")[-1] == {"hermesInstallId": INSTALL_ID, "sessionId": "C", "turnIds": ["turn-1", "turn-2"]}
 
 
 def test_a_prepare_whose_answer_was_lost_is_prepared_again_under_the_same_key(profile, bridge):

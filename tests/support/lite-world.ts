@@ -26,11 +26,11 @@ import {
   type LiteRuntimeOverrides,
 } from '../../apps/standalone/src/index.ts';
 import { deterministicEmbeddings } from './embeddings.ts';
-import { DATABASE_URL_ENV, liteConfigDocument, provisionDatabase, writeCharacterCard, type LiteConfigDocument } from './lite-install.ts';
+import { DATABASE_URL_ENV, SESSION_KEYS_ENV, liteConfigDocument, newSessionKeys, provisionDatabase, writeCharacterCard, type LiteConfigDocument } from './lite-install.ts';
 import { fauxModel, type Script } from './faux-model.ts';
 import { HARNESS_START_TIMEOUT_MS, startPostgresHarness, type PostgresHarness } from './postgres-harness.ts';
 
-export { COMPANION_NAME, DATABASE_URL_ENV, liteConfigDocument, newCredential, type LiteConfigDocument } from './lite-install.ts';
+export { COMPANION_NAME, DATABASE_URL_ENV, HERMES_TEST_INSTALL_ID, SESSION_KEYS_ENV, liteConfigDocument, newCredential, type LiteConfigDocument } from './lite-install.ts';
 export { EMBEDDING_DIMS, deterministicEmbeddings, vectorFor } from './embeddings.ts';
 /** Starting the companion core (migrations of every kept store) takes a while. */
 export const RUNTIME_TIMEOUT_MS = 180_000;
@@ -71,7 +71,7 @@ export function useLiteWorld() {
     const configPath = join(dataDir, 'lite.json');
     await writeFile(configPath, JSON.stringify(document, null, 2));
     await writeCharacterCard(document.characterCardPath);
-    const env = { [DATABASE_URL_ENV]: await database() };
+    const env = { [DATABASE_URL_ENV]: await database(), [SESSION_KEYS_ENV]: newSessionKeys() };
     const seeded = await cli({ dataDir, configPath, document, env }, ['init', '--config', configPath]);
     if (seeded.code !== 0) throw new Error(`init failed: ${seeded.stderr}`);
     return { dataDir, configPath, document, env };

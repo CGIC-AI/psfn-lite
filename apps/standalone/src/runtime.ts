@@ -26,6 +26,7 @@ import {
   type TrustLevel,
 } from './companion.ts';
 import type { LiteConfig, LiteSecrets } from './config.ts';
+import { createHostSessionIntegrityProvider } from './session-integrity.ts';
 import {
   HostTurnBridge,
   HostTurnRelay,
@@ -148,8 +149,10 @@ export async function createLiteRuntime(input: {
 
   let sessionIntegrityProvider: StartCompanionRuntimeOptions['sessionIntegrityProvider'] = null;
   if (config.sessionIntegrity.kind === 'keyring') {
-    sessionIntegrityProvider = createSessionHmacBoundaryService({ env: { ...env } }).resolveIntegrityProvider();
-    if (sessionIntegrityProvider === null) return invalid('sessionIntegrity keyring: the session HMAC keyring environment variables are not set');
+    // The donor HMAC chain over the env keyring (seam 3.8); a Hermes install's conversations use the keyring scoped to it (Step E2).
+    const keyring = createSessionHmacBoundaryService({ env: { ...env } }).resolveKeyring();
+    if (keyring === null) return invalid('sessionIntegrity keyring: the session HMAC keyring environment variables are not set');
+    sessionIntegrityProvider = createHostSessionIntegrityProvider(keyring, config.lifecycle?.hermesInstallId ?? null);
   }
 
   const seedDir = fileURLToPath(COMPANION_SEED_DIR);
@@ -244,6 +247,7 @@ export async function createLiteRuntime(input: {
         relay,
         agent: companion.agentLoop,
         companionId: config.companionId,
+        hermesInstallId: config.lifecycle.hermesInstallId,
         contactOf: (principal) => {
           const key = principals.contactOf(principal);
           const contactId = key === null ? undefined : contactIds.get(key);

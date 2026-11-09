@@ -56,7 +56,7 @@ def operator(lite, profile, monkeypatch):
     from plugins.memory import load_memory_provider
     from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
 
-    write_profile(profile, bridge_url=lite["lifecycleUrl"], mcp_url=lite["mcpUrl"])
+    write_profile(profile, bridge_url=lite["lifecycleUrl"], mcp_url=lite["mcpUrl"], install_id=lite["hermesInstallId"])
     monkeypatch.setenv(CREDENTIAL_ENV, lite["credentials"]["hermes-operator"])
     load_memory_provider("psfn_lite").initialize("e2e-1", hermes_home=str(profile), platform="cli")
     names = discover_mcp_tools()
@@ -194,7 +194,7 @@ def test_turns_hermes_never_ends_rotates_or_loses_the_answer_of_are_archived_and
 
 
 def test_a_contact_the_operator_thread_is_not_disclosed_to_does_not_see_it(lite, profile, monkeypatch):
-    write_profile(profile, bridge_url=lite["lifecycleUrl"], senders=[{"platform": "telegram", "sender_id": "friend-1"}])
+    write_profile(profile, bridge_url=lite["lifecycleUrl"], senders=[{"platform": "telegram", "sender_id": "friend-1"}], install_id=lite["hermesInstallId"])
     monkeypatch.setenv(CREDENTIAL_ENV, lite["credentials"]["hermes-friend"])
     from plugins.memory import load_memory_provider
 

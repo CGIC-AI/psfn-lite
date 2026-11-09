@@ -11,7 +11,7 @@ import stat
 
 import pytest
 
-from conftest import CREDENTIAL, plugin_module, write_profile
+from conftest import CREDENTIAL, INSTALL_ID, plugin_module, write_profile
 
 
 def load_provider():
@@ -77,7 +77,9 @@ def test_a_root_turn_is_prepared_with_labelled_context_and_settled_with_its_repl
     assert prepare["route"] == "prepare"
     assert prepare["authorization"] == f"Bearer {CREDENTIAL}"
     # The body names no caller, contact or audience: the credential binds them.
-    assert set(prepare["body"]) == {"hostInstance", "idempotencyKey", "sessionId", "message"}
+    assert set(prepare["body"]) == {"hostInstance", "hermesInstallId", "idempotencyKey", "sessionId", "message"}
+    # The install Hermes keeps in its root, not the per-process instance name.
+    assert prepare["body"]["hermesInstallId"] == INSTALL_ID
     assert prepare["body"]["message"] == "what have you been up to?"
     assert prepare["body"]["sessionId"] == "sess-1"
     assert prepare["body"]["idempotencyKey"].startswith("hermes:")
@@ -191,7 +193,7 @@ def test_compaction_is_refused_unless_lite_proves_the_sessions_turns(profile, br
     fire("on_session_end", **end(turn_id="t-1"))
 
     manager.on_pre_compress([], evidence_messages=[], require_checkpoint=True)
-    assert bridge.bodies("checkpoint")[-1] == {"sessionId": "sess-1", "turnIds": ["turn-1"]}
+    assert bridge.bodies("checkpoint")[-1] == {"hermesInstallId": INSTALL_ID, "sessionId": "sess-1", "turnIds": ["turn-1"]}
 
     bridge.handlers["checkpoint"] = lambda route, body: (404, {"error": {"kind": "not_found", "subject": "turn turn-1"}})
     with pytest.raises(Exception, match="not_found"):
@@ -230,6 +232,37 @@ def test_the_hooks_drive_no_lite_turn_while_the_profile_keeps_a_second_memory(pr
     assert bridge.requests == []
     assert "refuses to drive Lite turns" in result["context"]
     assert any("refuses to drive Lite turns" in w for w in warnings)
+
+
+@pytest.mark.parametrize("content, issue", [(None, "does not exist yet"), ("not-an-install-id\n", "not 32 lowercase hex characters")])
+def test_no_turn_is_driven_and_no_tool_runs_without_the_hermes_install_id(profile, bridge, content, issue):
+    # The install id names the binding Lite serves; the plugin reads it from the Hermes root and never mints it.
+    path = profile / "install_id"
+    path.unlink()
+    if content is not None:
+        path.write_text(content)
+    provider = load_provider()
+    with pytest.raises(ValueError, match=issue):
+        provider.initialize("sess-1", hermes_home=str(profile), platform="cli")
+    [result] = fire("pre_llm_call", **turn())
+    assert bridge.requests == []
+    assert issue in result["context"]
+    [blocked] = fire("pre_tool_call", tool_name="mcp__psfn_lite__memory", args={"action": "list"}, session_id="sess-1", turn_id="sess-1:task:aa")
+    assert blocked["action"] == "block" and issue in blocked["message"]
+    assert not path.exists() or path.read_text() == content
+
+
+def test_a_prepare_refused_for_another_install_is_reported_and_drives_no_turn(profile, bridge):
+    bridge.handlers["prepare"] = lambda route, body: (403, {"error": {"kind": "denied", "reason": "wrong_install", "detail": "this companion is bound to another Hermes install"}})
+    warnings = []
+    provider = load_provider()
+    provider.initialize("sess-1", hermes_home=str(profile), platform="cli", warning_callback=warnings.append)
+    [result] = fire("pre_llm_call", **turn())
+    assert [r["route"] for r in bridge.requests] == ["prepare"]
+    assert "wrong_install" in result["context"] or "another Hermes install" in result["context"]
+    assert any("another Hermes install" in w or "wrong_install" in w for w in warnings)
+    [blocked] = fire("pre_tool_call", tool_name="mcp__psfn_lite__memory", args={"action": "list"}, session_id="sess-1", turn_id="sess-1:task:aa")
+    assert blocked["action"] == "block"
 
 
 def test_a_subagent_is_recognised_by_its_platform_even_without_subagent_start(profile, bridge):

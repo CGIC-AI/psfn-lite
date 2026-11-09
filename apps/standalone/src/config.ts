@@ -75,6 +75,14 @@ export interface LiteConfig {
     /** A host-driven turn the host neither continues nor settles within this time is failed. */
     readonly hostTurnTimeoutMs: number;
     /**
+     * The Hermes install the bridge serves: its install id (the file
+     * `install_id` in the Hermes root, docs/extraction.md, Step E2). Prepares
+     * from another install are refused, and with the `keyring` session
+     * integrity the install's conversations are signed with a keyring scoped
+     * to it. The id names the binding; it is not a secret.
+     */
+    readonly hermesInstallId: string;
+    /**
      * Hosted automata (docs/extraction.md, operator automata rules), or null
      * to run every spawned automaton in core as the donor does. When set, the
      * host claims each spawned automaton's attempts over the bridge and runs
@@ -94,6 +102,8 @@ export const TRUST_LEVELS: readonly TrustLevel[] = ['primary', 'trusted', 'regul
 const KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DAY_MS = 86_400_000;
+/** A Hermes install id as Hermes mints it (hermes_cli/web_server.py `_INSTALL_ID_RE`). */
+const HERMES_INSTALL_ID_PATTERN = /^[0-9a-f]{32}$/;
 
 class Reader {
   readonly issues: string[];
@@ -237,10 +247,11 @@ function parseMcp(root: Reader, issues: string[]): LiteConfig['mcp'] {
 
 function parseLifecycle(root: Reader, issues: string[]): LiteConfig['lifecycle'] {
   if (root.value('lifecycle') === null) return null;
-  const r = root.child('lifecycle', ['host', 'port', 'allowedHosts', 'hostTurnTimeoutMs', 'automata']);
+  const r = root.child('lifecycle', ['host', 'port', 'allowedHosts', 'hostTurnTimeoutMs', 'hermesInstallId', 'automata']);
   return {
     ...listen(r, issues, 'lifecycle'),
     hostTurnTimeoutMs: r.integer('hostTurnTimeoutMs', 1_000, DAY_MS),
+    hermesInstallId: r.matching('hermesInstallId', HERMES_INSTALL_ID_PATTERN, 'a Hermes install id (32 lowercase hex characters)'),
     automata: parseHostedAutomata(r),
   };
 }

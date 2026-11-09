@@ -28,6 +28,9 @@ from psfn_lite.config import HERMES_REVISION  # noqa: E402
 USER_NAMESPACE = "_hermes_user_memory"
 CREDENTIAL_ENV = "PSFN_LITE_TEST_TOKEN"
 CREDENTIAL = "test-credential-" + "x" * 32
+#: The test Hermes install (an install id names a binding and is not a secret); the TypeScript conformance host serves
+#: the same one (tests/support/lite-install.ts HERMES_TEST_INSTALL_ID).
+INSTALL_ID = "5e1f0c2d9a8b47e6b3c4d5e6f7a8b9c0"
 
 
 def pytest_configure(config):
@@ -47,8 +50,11 @@ def plugin_module(name: str):
     return sys.modules[f"{USER_NAMESPACE}.psfn_lite.{name}" if name else f"{USER_NAMESPACE}.psfn_lite"]
 
 
-def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None, automata=None) -> None:
+def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None, automata=None, install_id=INSTALL_ID) -> None:
     (home / "plugins").mkdir(parents=True, exist_ok=True)
+    # The profile is the Hermes root here (HERMES_HOME outside profiles/), where Hermes keeps its install id.
+    if install_id is not None:
+        (home / "install_id").write_text(install_id + "\n")
     shutil.copytree(PLUGIN_SOURCE, home / "plugins" / "psfn_lite", ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
     (home / "psfn-lite.json").write_text(json.dumps({
         "bridge_url": bridge_url,
