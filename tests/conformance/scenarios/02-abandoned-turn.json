@@ -1,35 +1,51 @@
 {
   "name": "abandoned-turn",
-  "invariant": "A turn whose host dies mid-turn holds its lease against the other surface, is then recovered exactly once as interrupted by the host, and the conversation continues on both surfaces with the abandoned trigger kept in canonical history.",
-  "orders": "both",
-  "internalTurns": "harness",
+  "invariant": "A host-driven turn whose Hermes host dies holds the companion's one agent (another principal is told it is busy, the same principal that it already has an open turn) until the bridge's host-turn timeout fails it; the conversation then continues on both surfaces, and what it holds survives a crash of the Lite host.",
+  "orders": "fixed",
   "steps": [
-    { "do": "turn", "id": "opened", "on": "a", "say": "I was about to tell you something important", "abandon": true },
-    { "do": "turn", "id": "early", "on": "b", "say": "are you still there?", "refused": { "error": "conflict", "reason": "turn_lease_active" } },
-    { "do": "host", "id": "lapse", "op": "advance", "args": { "minutes": 2 } },
+    { "do": "turn", "id": "opened", "on": "hermes", "say": "I was about to tell you something important", "abandon": true },
+    { "do": "turn", "id": "busy", "on": "hermes", "as": "friend", "say": "hello, anyone there?", "refused": { "error": "unavailable", "reason": "companion_turn" } },
+    { "do": "turn", "id": "again", "on": "hermes", "say": "are you still there?", "refused": { "error": "conflict", "reason": "turn_already_open" } },
+    { "do": "host", "id": "lapse", "op": "lapse", "args": { "turnId": "{{turn.opened}}" }, "expect": { "has": ["\"settled\":true"] } },
     {
-      "do": "turn", "id": "taken", "on": "b", "say": "are you still there now?",
-      "sees": ["I was about to tell you something important", "turn interrupted by host; recovered by"],
-      "speech": ["I was about to tell you something important", "are you still there now?"],
-      "notSpeech": ["turn interrupted by host; recovered by"],
-      "reply": "I am here."
+      "do": "turn",
+      "id": "taken",
+      "on": "hermes",
+      "say": "are you still there now?",
+      "reply": "I am here.",
+      "speech": ["are you still there now?"]
     },
     {
-      "do": "turn", "id": "after", "on": "a", "say": "good, then let me finish",
-      "sees": ["are you still there now?", "I am here."],
-      "reply": "Go on."
+      "do": "turn",
+      "id": "local",
+      "on": "pi",
+      "say": "I am moving the whole setup to a new disk",
+      "calls": [
+        { "tool": "memory", "action": "write", "args": { "text": "Robin is moving the companion setup to a new disk", "type": "episodic" }, "expect": { "has": ["Memory created"] } }
+      ],
+      "reply": "I will be here after the move.",
+      "sees": ["are you still there now?", "I am here."]
+    },
+    { "do": "crash", "id": "crash" },
+    {
+      "do": "turn",
+      "id": "after-hermes",
+      "on": "hermes",
+      "say": "did everything survive the move?",
+      "calls": [
+        { "tool": "memory", "action": "search", "args": { "query": "new disk" }, "expect": { "has": ["Robin is moving the companion setup to a new disk"] } }
+      ],
+      "reply": "Everything is here.",
+      "sees": ["I am moving the whole setup to a new disk", "I will be here after the move."],
+      "speech": ["did everything survive the move?", "I am moving the whole setup to a new disk"]
     },
     {
-      "do": "host", "id": "canon", "op": "history",
-      "expect": {
-        "count": {
-          "\"text\":\"I was about to tell you something important\"": 1,
-          "\"text\":\"turn interrupted by host; recovered by ": 1,
-          "\"text\":\"are you still there?\"": 0,
-          "\"text\":\"I am here.\"": 1,
-          "\"text\":\"Go on.\"": 1
-        }
-      }
+      "do": "turn",
+      "id": "after-pi",
+      "on": "pi",
+      "say": "good, then let us keep going",
+      "reply": "Let us.",
+      "sees": ["did everything survive the move?", "Everything is here."]
     }
   ]
 }

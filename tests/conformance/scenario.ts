@@ -5,12 +5,16 @@
  * name a surface role (`a`, `b`) or a fixed surface (`pi`, `hermes`); a
  * scenario whose `orders` is `both` runs once as a=pi,b=hermes and once as
  * a=hermes,b=pi. The expectation vocabulary is deliberately small:
- * substrings of the canonical JSON of a result (`has`, `lacks`, `count`),
- * error kind and reason, and what the companion was shown (`sees`, `hides`,
- * `speech`, `notSpeech`). `{{name}}` in any string resolves a variable:
- * `turn.<stepId>` is the Lite turn id of a turn step, `contact.operator` and
- * `contact.friend` the seeded contacts, and `capture` adds more from a
- * result. Python mirrors `resolveTemplates`, `captureInto` and the checks in
+ * substrings of a tool result's text as the donor returned it to the model
+ * (`has`, `lacks`, `count`), whether the donor marked it an error (`ok`), the
+ * bridge's refusal kind and reason for a turn Lite refused, and what the
+ * companion was shown (`sees`, `hides`, `speech`, `notSpeech`). Participant
+ * speech is the text of the user-role messages of the donor context; the
+ * system prompt and every other message are shown but are not speech.
+ * `{{name}}` in any string resolves a variable: `turn.<stepId>` is the turn
+ * id of a turn step, `contact.operator` and `contact.friend` the seeded
+ * contacts, and `capture` adds more from a result. Python mirrors
+ * `resolveTemplates`, `captureInto` and the checks in
  * integrations/hermes/tests/conformance_runner.py; keep them in step.
  */
 import { readdirSync, readFileSync } from 'node:fs';
@@ -21,10 +25,8 @@ export type Role = 'a' | 'b';
 export type Speaker = 'operator' | 'friend';
 
 export interface ResultExpect {
+  /** Whether the donor returned the result as a success (default true). */
   readonly ok?: boolean;
-  /** Core error kind (denied, not_found, conflict, invalid, unavailable). */
-  readonly error?: string;
-  readonly reason?: string;
   readonly has?: readonly string[];
   readonly lacks?: readonly string[];
   /** Exact number of occurrences of each substring. */
@@ -36,7 +38,7 @@ export interface PlannedCall {
   readonly action: string;
   readonly args?: Readonly<Record<string, unknown>>;
   readonly expect?: ResultExpect;
-  /** Variable name to a regular expression with one group, matched on the canonical result. */
+  /** Variable name to a regular expression with one group, matched on the result text. */
   readonly capture?: Readonly<Record<string, string>>;
 }
 
@@ -46,13 +48,11 @@ export interface TurnStep {
   readonly on: Role | Surface;
   readonly as?: Speaker;
   readonly say: string;
-  /** Governed tool calls the companion makes in the turn, in order, before it replies. */
+  /** Donor tool calls the companion makes in the turn, in order, before it replies. */
   readonly calls?: readonly PlannedCall[];
   readonly reply?: string;
-  /** The host running the turn dies mid-turn (Pi: the host process is killed; Hermes: no settlement ever arrives). */
+  /** The Hermes host dies mid-turn: no settlement ever arrives, and the bridge's host-turn timeout ends the turn. */
   readonly abandon?: boolean;
-  /** The Lite host process is killed while a worker this turn spawned is mid model call; a successor starts over the same state. */
-  readonly crash?: 'worker';
   /** Lite refuses to open the turn at all. */
   readonly refused?: { readonly error: string; readonly reason?: string };
   readonly sees?: readonly string[];
@@ -72,7 +72,7 @@ export interface HostStep {
   readonly capture?: Readonly<Record<string, string>>;
 }
 
-/** Steps a runner performs itself: `crash` kills the host process and starts a successor over the same state. */
+/** Steps a runner performs itself: `crash` kills the host process (SIGKILL) and starts a successor over the same state. */
 export interface RunnerStep {
   readonly do: 'crash';
   readonly id: string;
@@ -80,28 +80,14 @@ export interface RunnerStep {
 
 export type Step = TurnStep | HostStep | RunnerStep;
 
-export const HOST_OPS = [
-  'advance',
-  'tick',
-  'maintain',
-  'consent',
-  'worker_plan',
-  'worker_results',
-  'inventory',
-  'dispatch',
-  'history',
-  'backup_restore',
-  'restart',
-  'pi_tools',
-  'model_calls',
-] as const;
+/** `lapse` waits until the host-turn timeout has ended an abandoned turn (args.turnId); `inventory` lists the served and offered tools. */
+export const HOST_OPS = ['lapse', 'inventory'] as const;
 export type HostOp = (typeof HOST_OPS)[number];
 
 export interface Scenario {
   readonly name: string;
   readonly invariant: string;
   readonly orders: 'both' | 'fixed';
-  readonly internalTurns: 'harness' | 'delegated';
   readonly steps: readonly Step[];
 }
 
@@ -139,7 +125,7 @@ export function parseScenario(raw: unknown, file: string): Scenario {
     throw new Error(`${file}: ${why}`);
   };
   if (!isObject(raw)) return fail('a scenario is an object');
-  exactKeys(raw, ['name', 'invariant', 'orders', 'internalTurns', 'steps'], file);
+  exactKeys(raw, ['name', 'invariant', 'orders', 'steps'], file);
   const steps = raw['steps'];
   if (!Array.isArray(steps) || steps.length === 0) return fail('steps must be a non-empty list');
   const ids = new Set<string>();
@@ -149,18 +135,19 @@ export function parseScenario(raw: unknown, file: string): Scenario {
     if (ids.has(step['id'])) return fail(`duplicate step id ${step['id']}`);
     ids.add(step['id']);
     if (step['do'] === 'turn') {
-      exactKeys(step, ['do', 'id', 'on', 'as', 'say', 'calls', 'reply', 'abandon', 'crash', 'refused', 'sees', 'hides', 'speech', 'notSpeech'], at);
+      exactKeys(step, ['do', 'id', 'on', 'as', 'say', 'calls', 'reply', 'abandon', 'refused', 'sees', 'hides', 'speech', 'notSpeech'], at);
       if (!['a', 'b', 'pi', 'hermes'].includes(String(step['on']))) fail(`${at}: on must be a, b, pi or hermes`);
-      if (step['as'] === 'friend' && step['on'] !== 'hermes') fail(`${at}: only Hermes binds a friend; the standalone host vouches for the operator alone`);
+      if (step['as'] === 'friend' && step['on'] !== 'hermes') fail(`${at}: only Hermes binds a friend; a Pi turn is the operator's`);
+      if (step['abandon'] === true && step['on'] !== 'hermes') fail(`${at}: only a Hermes host abandons a turn; a crash step kills the Lite host`);
       for (const call of (step['calls'] as unknown[] | undefined) ?? []) {
         if (!isObject(call)) return fail(`${at}: a call is an object`);
         exactKeys(call, ['tool', 'action', 'args', 'expect', 'capture'], at);
-        if (isObject(call['expect'])) exactKeys(call['expect'], ['ok', 'error', 'reason', 'has', 'lacks', 'count'], at);
+        if (isObject(call['expect'])) exactKeys(call['expect'], ['ok', 'has', 'lacks', 'count'], at);
       }
     } else if (step['do'] === 'host') {
       exactKeys(step, ['do', 'id', 'op', 'args', 'expect', 'capture'], at);
       if (!(HOST_OPS as readonly string[]).includes(String(step['op']))) fail(`${at}: unknown host op ${String(step['op'])}`);
-      if (isObject(step['expect'])) exactKeys(step['expect'], ['ok', 'error', 'reason', 'has', 'lacks', 'count'], at);
+      if (isObject(step['expect'])) exactKeys(step['expect'], ['ok', 'has', 'lacks', 'count'], at);
     } else if (step['do'] === 'crash') {
       exactKeys(step, ['do', 'id'], at);
     } else {
@@ -168,7 +155,6 @@ export function parseScenario(raw: unknown, file: string): Scenario {
     }
   }
   if (raw['orders'] !== 'both' && raw['orders'] !== 'fixed') fail('orders must be both or fixed');
-  if (raw['internalTurns'] !== 'harness' && raw['internalTurns'] !== 'delegated') fail('internalTurns must be harness or delegated');
   return raw as unknown as Scenario;
 }
 
@@ -214,7 +200,11 @@ export interface CoreErrorShape {
   readonly reason?: string;
 }
 
-export type CallResult = { readonly ok: true; readonly content: unknown } | { readonly ok: false; readonly error: CoreErrorShape };
+/** A tool result as the donor returned it to the model: its text, and whether it was an error result. */
+export interface CallResult {
+  readonly ok: boolean;
+  readonly text: string;
+}
 
 /** What a surface showed the companion and what its tool calls returned. */
 export interface TurnObservation {
@@ -229,25 +219,29 @@ export interface TurnObservation {
   readonly vars?: Vars;
 }
 
+/** The donor context as the bridge renders it (packages/lifecycle/src/wire.ts renderContext). */
+export interface RenderedContext {
+  readonly systemPrompt?: unknown;
+  readonly messages?: unknown;
+}
+
+/** What a donor context shows: the system prompt and every message, and the user-role messages as participant speech. */
+export function observe(context: RenderedContext): { readonly seen: string; readonly speech: readonly string[] } {
+  const messages = Array.isArray(context.messages) ? (context.messages as { role?: unknown; text?: unknown }[]) : [];
+  const text = (m: { text?: unknown }) => (typeof m.text === 'string' ? m.text : '');
+  const seen = [typeof context.systemPrompt === 'string' ? context.systemPrompt : '', ...messages.map(text)].join('\n\n');
+  return { seen, speech: messages.filter((m) => m.role === 'user').map(text) };
+}
+
 /** The text expectations match: canonical JSON, as JSON.stringify and Python's compact json.dumps both write it. */
 export function canonical(content: unknown): string {
   return typeof content === 'string' ? content : JSON.stringify(content);
 }
 
 export function checkResult(expect: ResultExpect | undefined, result: CallResult, at: string): string[] {
-  const issues: string[] = [];
-  const wantOk = expect?.ok ?? (expect?.error === undefined);
-  if (result.ok !== wantOk) {
-    issues.push(`${at}: expected ${wantOk ? 'success' : 'a refusal'}, got ${result.ok ? canonical(result.content).slice(0, 300) : JSON.stringify(result.error)}`);
-    return issues;
-  }
-  if (!result.ok) {
-    if (expect?.error !== undefined && result.error.kind !== expect.error) issues.push(`${at}: expected error ${expect.error}, got ${JSON.stringify(result.error)}`);
-    if (expect?.reason !== undefined && result.error.reason !== expect.reason) issues.push(`${at}: expected reason ${expect.reason}, got ${JSON.stringify(result.error)}`);
-    return issues;
-  }
-  issues.push(...checkText(expect, canonical(result.content), at));
-  return issues;
+  const wantOk = expect?.ok ?? true;
+  if (result.ok !== wantOk) return [`${at}: expected ${wantOk ? 'success' : 'an error result'}, got ${result.text.slice(0, 300)}`];
+  return checkText(expect, result.text, at);
 }
 
 export function checkText(expect: Pick<ResultExpect, 'has' | 'lacks' | 'count'> | undefined, text: string, at: string): string[] {
@@ -277,7 +271,7 @@ export function checkTurn(step: TurnStep, observed: TurnObservation, at: string)
     if (!observed.seen.includes(s)) issues.push(`${at}: ${JSON.stringify(s)} was not shown at all`);
     if (observed.speech.some((t) => t.includes(s))) issues.push(`${at}: ${JSON.stringify(s)} was presented as participant speech`);
   }
-  if (step.abandon !== true && step.crash === undefined) {
+  if (step.abandon !== true) {
     const calls = step.calls ?? [];
     if (observed.results.length !== calls.length) issues.push(`${at}: ${String(calls.length)} calls planned, ${String(observed.results.length)} results`);
     calls.forEach((call, i) => {
@@ -286,13 +280,4 @@ export function checkTurn(step: TurnStep, observed: TurnObservation, at: string)
     });
   }
   return issues;
-}
-
-/** Participant-speech blocks of text rendered as labelled blocks (the Pi harness and the Hermes plugin render alike). */
-export function participantBlocks(rendered: string): string[] {
-  const blocks: string[] = [];
-  const pattern = /(?:^|\n\n)\[participant speech\]\n([\s\S]*?)(?=\n\n\[[^\]\n]+\]\n|$)/g;
-  // The Pi harness quotes a label-like line inside a block as `\[`; the speech it carries is the unquoted text.
-  for (const match of rendered.matchAll(pattern)) if (match[1] !== undefined) blocks.push(match[1].replace(/^([ \t]*)\\\[/gm, '$1['));
-  return blocks;
 }

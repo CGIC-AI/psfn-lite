@@ -1,57 +1,52 @@
 {
   "name": "handover",
-  "invariant": "One companion, one conversation, two harnesses: history, orientation, emotion, concerns, activity and memory written on one surface are what the other surface shows and reads next, and the hand back is the same.",
+  "invariant": "One companion, one donor session, two surfaces: history, orientation, open threads, scratchpad, journal and memory written on one surface are what the other surface shows and reads next, and the hand back is the same.",
   "orders": "both",
-  "internalTurns": "harness",
   "steps": [
     {
-      "do": "turn", "id": "tell", "on": "a", "say": "Ana is visiting on Saturday and I am nervous about it",
-      "speech": ["Ana is visiting on Saturday and I am nervous about it"],
+      "do": "turn",
+      "id": "tell",
+      "on": "a",
+      "say": "Ana is visiting on Saturday and I am nervous about it",
       "calls": [
-        { "tool": "orient", "action": "append", "args": { "block": "human", "text": "Robin has a sister named Ana" } },
-        { "tool": "concern", "action": "create", "args": { "text": "Robin feels nervous about the Saturday visit" }, "expect": { "has": ["Robin feels nervous about the Saturday visit"] } },
-        { "tool": "activity", "action": "start", "args": { "purpose": "Planning a calm Saturday with Robin" }, "expect": { "has": ["Planning a calm Saturday with Robin"] } },
-        { "tool": "memory", "action": "write", "args": { "writeId": "handover-1", "kind": "event", "content": "Ana visits Robin on Saturday", "sensitivity": "personal" }, "capture": { "memoryId": "\"memoryId\":\"([^\"]+)\"" } }
+        { "tool": "memory", "action": "write", "args": { "text": "Robin has a sister named Ana who visits on Saturday", "type": "semantic", "sensitivity": "personal" }, "expect": { "has": ["Memory created"] }, "capture": { "memoryId": "id: ([0-9a-f-]{36})" } },
+        { "tool": "orient", "action": "append", "args": { "block": "human", "text": "Robin has a sister named Ana" }, "expect": { "has": ["Appended to human orientation"] } },
+        { "tool": "orient", "action": "create_concern", "args": { "text": "Robin feels nervous about the Saturday visit" }, "expect": { "has": ["\"created\": true"] } },
+        { "tool": "scratchpad", "action": "add", "args": { "content": "Plan a calm Saturday with Robin" }, "expect": { "has": ["Scratchpad entry added"] } },
+        { "tool": "journal", "action": "write", "args": { "path": "saturday.md", "content": "Ana arrives on Saturday morning." }, "expect": { "has": ["Journal note created: saturday.md"] } }
       ],
-      "reply": "We can plan Saturday together."
+      "reply": "We can plan Saturday together.",
+      "speech": ["Ana is visiting on Saturday and I am nervous about it"]
     },
     {
-      "do": "turn", "id": "ask", "on": "b", "say": "what were we talking about?",
-      "sees": ["Ana is visiting on Saturday and I am nervous about it", "We can plan Saturday together.", "Robin has a sister named Ana", "Planning a calm Saturday with Robin", "Robin feels nervous about the Saturday visit"],
+      "do": "turn",
+      "id": "ask",
+      "on": "b",
+      "say": "what were we talking about?",
+      "calls": [
+        { "tool": "memory", "action": "search", "args": { "query": "Ana Saturday" }, "expect": { "has": ["{{memoryId}}", "Robin has a sister named Ana who visits on Saturday"] } },
+        { "tool": "orient", "action": "list_concerns", "args": {}, "expect": { "has": ["Robin feels nervous about the Saturday visit"] } },
+        { "tool": "scratchpad", "action": "list", "args": {}, "expect": { "has": ["Plan a calm Saturday with Robin"] } },
+        { "tool": "journal", "action": "read", "args": { "path": "saturday.md" }, "expect": { "has": ["Ana arrives on Saturday morning."] } },
+        { "tool": "session", "action": "list", "args": {}, "expect": { "has": ["\"count\": 1"] } }
+      ],
+      "reply": "You told me Ana visits on Saturday.",
+      "sees": ["Ana is visiting on Saturday and I am nervous about it", "We can plan Saturday together.", "Robin has a sister named Ana", "Robin feels nervous about the Saturday visit", "Plan a calm Saturday with Robin"],
       "speech": ["what were we talking about?", "Ana is visiting on Saturday and I am nervous about it"],
-      "notSpeech": ["Planning a calm Saturday with Robin", "Robin has a sister named Ana", "We can plan Saturday together."],
-      "calls": [
-        { "tool": "emotion", "action": "read", "expect": { "has": ["\"turnId\":\"{{turn.tell}}\"", "machine_inference"] } },
-        { "tool": "concern", "action": "list", "expect": { "has": ["Robin feels nervous about the Saturday visit"] } },
-        { "tool": "activity", "action": "recent", "args": { "limit": 5 }, "expect": { "has": ["Planning a calm Saturday with Robin"] } },
-        { "tool": "orient", "action": "view", "expect": { "has": ["Robin has a sister named Ana"] } },
-        { "tool": "memory", "action": "get", "args": { "memoryId": "{{memoryId}}" }, "expect": { "has": ["Ana visits Robin on Saturday", "companion_authored"] } },
-        { "tool": "memory", "action": "search", "args": { "query": "Ana Saturday" }, "expect": { "has": ["Ana visits Robin on Saturday"] } },
-        { "tool": "session", "action": "messages", "expect": { "has": ["Ana is visiting on Saturday and I am nervous about it", "We can plan Saturday together."] } }
-      ],
-      "reply": "You told me Ana visits on Saturday."
+      "notSpeech": ["We can plan Saturday together.", "Robin has a sister named Ana", "Plan a calm Saturday with Robin"]
     },
     {
-      "do": "turn", "id": "back", "on": "a", "say": "thanks for remembering",
+      "do": "turn",
+      "id": "back",
+      "on": "a",
+      "say": "thanks for remembering",
+      "calls": [
+        { "tool": "session", "action": "grep", "args": { "pattern": "nervous about it" }, "expect": { "has": ["Ana is visiting on Saturday and I am nervous about it"] } }
+      ],
+      "reply": "Of course.",
       "sees": ["what were we talking about?", "You told me Ana visits on Saturday."],
-      "calls": [
-        { "tool": "emotion", "action": "read", "expect": { "has": ["\"turnId\":\"{{turn.ask}}\""] } },
-        { "tool": "session", "action": "list", "expect": { "count": { "\"sessionId\"": 1 } } }
-      ],
-      "reply": "Of course."
-    },
-    {
-      "do": "host", "id": "canon", "op": "history",
-      "expect": {
-        "has": [
-          "{\"origin\":\"participant_speech\",\"text\":\"Ana is visiting on Saturday and I am nervous about it\"",
-          "{\"origin\":\"companion_speech\",\"text\":\"We can plan Saturday together.\"",
-          "{\"origin\":\"participant_speech\",\"text\":\"what were we talking about?\"",
-          "{\"origin\":\"companion_speech\",\"text\":\"You told me Ana visits on Saturday.\"",
-          "{\"origin\":\"companion_speech\",\"text\":\"Of course.\""
-        ],
-        "count": { "\"origin\":\"participant_speech\"": 3, "\"origin\":\"companion_speech\"": 3 }
-      }
+      "speech": ["thanks for remembering", "what were we talking about?"],
+      "notSpeech": ["You told me Ana visits on Saturday."]
     }
   ]
 }

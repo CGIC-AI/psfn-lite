@@ -12,11 +12,9 @@
  * module graph); the runtime, the data directories and the container are
  * removed after the file.
  */
-import { randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import pg from 'pg';
 import { afterAll, beforeAll } from 'vitest';
 import {
   createLiteRuntime,
@@ -27,33 +25,15 @@ import {
   type LiteRuntime,
   type LiteRuntimeOverrides,
 } from '../../apps/standalone/src/index.ts';
-import { EMBEDDING_DIMS, deterministicEmbeddings } from './embeddings.ts';
+import { deterministicEmbeddings } from './embeddings.ts';
+import { DATABASE_URL_ENV, liteConfigDocument, provisionDatabase, writeCharacterCard, type LiteConfigDocument } from './lite-install.ts';
 import { fauxModel, type Script } from './faux-model.ts';
 import { HARNESS_START_TIMEOUT_MS, startPostgresHarness, type PostgresHarness } from './postgres-harness.ts';
 
-export const DATABASE_URL_ENV = 'LITE_TEST_DATABASE_URL';
-export const COMPANION_NAME = 'Lumen';
+export { COMPANION_NAME, DATABASE_URL_ENV, liteConfigDocument, newCredential, type LiteConfigDocument } from './lite-install.ts';
 export { EMBEDDING_DIMS, deterministicEmbeddings, vectorFor } from './embeddings.ts';
 /** Starting the companion core (migrations of every kept store) takes a while. */
 export const RUNTIME_TIMEOUT_MS = 180_000;
-
-export function liteConfigDocument(dataDir: string, companionId: string) {
-  return {
-    companionId,
-    dataDir,
-    characterCardPath: join(dataDir, 'character-card.json'),
-    operator: { userId: 'robin', displayName: 'Robin' },
-    contacts: [{ key: 'sam', displayName: 'Sam', trust: 'regular' }],
-    postgres: { urlEnv: DATABASE_URL_ENV },
-    model: { provider: 'faux', modelId: 'faux-1', apiKeyEnv: null, maxOutputTokens: 1024 },
-    embedding: { model: 'test-embedding', dimensions: EMBEDDING_DIMS, provider: { kind: 'disabled' } },
-    sessionIntegrity: { kind: 'unsigned' },
-    mcp: null as Record<string, unknown> | null,
-    lifecycle: null as Record<string, unknown> | null,
-  };
-}
-
-export type LiteConfigDocument = ReturnType<typeof liteConfigDocument>;
 
 export interface Install {
   readonly dataDir: string;
@@ -79,30 +59,18 @@ export function useLiteWorld() {
   /** The data directory the core's PostgreSQL stores expect: the donor's extension schema provisioned (as the donor's test harness did). */
   const database = async (): Promise<string> => {
     if (harness === undefined) throw new Error('postgres harness did not start');
-    const url = await harness.createDatabase();
-    const client = new pg.Client({ connectionString: url });
-    await client.connect();
-    try {
-      await client.query('CREATE SCHEMA IF NOT EXISTS extensions');
-    } finally {
-      await client.end();
-    }
-    return url;
+    return provisionDatabase(await harness.createDatabase());
   };
 
   /** A fresh database, data directory (seeded by the real `init`), character card and config file. */
   const install = async (edit: (document: LiteConfigDocument) => void = () => undefined): Promise<Install> => {
     const dataDir = await mkdtemp(join(tmpdir(), 'lite-world-'));
-    dirs.push(dataDir);
     const document = liteConfigDocument(dataDir, crypto.randomUUID());
+    dirs.push(dataDir, document.workspaceDir);
     edit(document);
     const configPath = join(dataDir, 'lite.json');
     await writeFile(configPath, JSON.stringify(document, null, 2));
-    await writeFile(document.characterCardPath, JSON.stringify({
-      spec: 'chara_card_v2',
-      spec_version: '2.0',
-      data: { name: COMPANION_NAME, description: 'Test identity.', personality: 'Calm.', scenario: 'Test.', first_mes: 'Hello.', mes_example: '', creator: 'lite-test', tags: [] },
-    }));
+    await writeCharacterCard(document.characterCardPath);
     const env = { [DATABASE_URL_ENV]: await database() };
     const seeded = await cli({ dataDir, configPath, document, env }, ['init', '--config', configPath]);
     if (seeded.code !== 0) throw new Error(`init failed: ${seeded.stderr}`);
@@ -171,9 +139,4 @@ export function useLiteWorld() {
   };
 
   return { install, start, stop, cli, database };
-}
-
-/** A fresh random transport credential (never a fixed test secret). */
-export function newCredential(): string {
-  return randomBytes(32).toString('base64url');
 }

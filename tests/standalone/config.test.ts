@@ -20,6 +20,7 @@ describe('standalone configuration', () => {
     if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
     expect(parsed.value).toMatchObject({
       companionId: COMPANION_ID,
+      workspaceDir: '/srv/lite/data-workspace',
       operator: { userId: 'robin', displayName: 'Robin' },
       contacts: [{ key: 'sam', displayName: 'Sam', trust: 'regular' }],
       embedding: { model: 'test-embedding', dimensions: 16, provider: { kind: 'disabled' } },
@@ -57,6 +58,14 @@ describe('standalone configuration', () => {
         'sessionIntegrity.kind must be one of keyring, unsigned',
       ]),
     );
+  });
+
+  it('keeps the companion workspace out of the data directory, as the donor keeps it out of its state roots', () => {
+    const overlap = 'workspaceDir must not be dataDir or inside it, nor contain it';
+    expect(issuesOf({ ...document(), workspaceDir: '/srv/lite/data' })).toEqual([overlap]);
+    expect(issuesOf({ ...document(), workspaceDir: '/srv/lite/data/workspace' })).toEqual([overlap]);
+    expect(issuesOf({ ...document(), workspaceDir: '/srv/lite' })).toEqual([overlap]);
+    expect(issuesOf({ ...document(), workspaceDir: '/srv/lite/data-workspace' })).toEqual([]);
   });
 
   it('mounts the MCP transport and the lifecycle bridge only together', () => {

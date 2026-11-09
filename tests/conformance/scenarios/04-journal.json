@@ -1,40 +1,50 @@
 {
   "name": "journal",
-  "invariant": "The companion's workspace journal is one record across surfaces: what one surface writes the other reads, searches, lists and extends, and a contact outside the operator's conversations sees none of it.",
+  "invariant": "The companion's journal note written in the operator's conversation is one record across surfaces: what one surface writes the other reads, searches, lists and extends, and a contact outside the operator's conversation reads none of it.",
   "orders": "both",
-  "internalTurns": "harness",
   "steps": [
     {
-      "do": "turn", "id": "write", "on": "a", "say": "let us keep a garden plan",
+      "do": "turn",
+      "id": "write",
+      "on": "a",
+      "say": "let us keep a garden plan",
       "calls": [
-        { "tool": "journal", "action": "write", "args": { "path": "garden/plan.md", "body": "Three beds and a row of marigolds." } },
-        { "tool": "journal", "action": "append", "args": { "path": "garden/plan.md", "text": "Add climbing beans." } }
-      ],
-      "reply": "The plan is written down."
+        { "tool": "journal", "action": "write", "args": { "path": "garden/plan.md", "content": "Three beds and a row of marigolds." }, "expect": { "has": ["Journal note created: garden/plan.md"] } },
+        { "tool": "journal", "action": "append", "args": { "path": "garden/plan.md", "content": "Add climbing beans." } }
+      ]
     },
     {
-      "do": "turn", "id": "extend", "on": "b", "say": "what is in the garden plan?",
+      "do": "turn",
+      "id": "extend",
+      "on": "b",
+      "say": "what is in the garden plan?",
       "calls": [
         { "tool": "journal", "action": "read", "args": { "path": "garden/plan.md" }, "expect": { "has": ["Three beds and a row of marigolds.", "Add climbing beans."] } },
         { "tool": "journal", "action": "search", "args": { "query": "marigolds" }, "expect": { "has": ["garden/plan.md"] } },
-        { "tool": "journal", "action": "list", "expect": { "has": ["garden/plan.md"] } },
-        { "tool": "journal", "action": "append", "args": { "path": "garden/plan.md", "text": "Water on Sundays." } },
-        { "tool": "journal", "action": "reflections_list", "expect": { "ok": true } }
-      ],
-      "reply": "Three beds, marigolds and beans."
+        { "tool": "journal", "action": "list", "args": {}, "expect": { "has": ["garden/plan.md"] } },
+        { "tool": "journal", "action": "append", "args": { "path": "garden/plan.md", "content": "Water on Sundays." } }
+      ]
     },
     {
-      "do": "turn", "id": "reread", "on": "a", "say": "read it back to me",
+      "do": "turn",
+      "id": "reread",
+      "on": "a",
+      "say": "read it back to me",
       "calls": [
         { "tool": "journal", "action": "read", "args": { "path": "garden/plan.md" }, "expect": { "has": ["Three beds and a row of marigolds.", "Add climbing beans.", "Water on Sundays."] } }
-      ],
-      "reply": "Here it is."
+      ]
     },
-    { "do": "host", "id": "self-reads", "op": "dispatch", "args": { "as": "self", "tool": "journal", "action": "list" }, "expect": { "has": ["garden/plan.md"] } },
-    { "do": "host", "id": "self-reflections", "op": "dispatch", "args": { "as": "self", "tool": "journal", "action": "reflections_list" } },
-    { "do": "turn", "id": "friend", "on": "hermes", "as": "friend", "say": "do you keep a garden plan?", "calls": [
-        { "tool": "journal", "action": "search", "args": { "query": "marigolds" }, "expect": { "lacks": ["garden/plan.md", "marigolds"] } },
-        { "tool": "journal", "action": "read", "args": { "path": "garden/plan.md" }, "expect": { "error": "not_found" } }
-      ], "reply": "Not one I can share." }
+    {
+      "do": "turn",
+      "id": "friend",
+      "on": "hermes",
+      "as": "friend",
+      "say": "do you keep a garden plan?",
+      "calls": [
+        { "tool": "journal", "action": "search", "args": { "query": "marigolds" }, "expect": { "lacks": ["Three beds"] } },
+        { "tool": "journal", "action": "read", "args": { "path": "garden/plan.md" }, "expect": { "ok": false, "lacks": ["Three beds"] } }
+      ],
+      "hides": ["Three beds and a row of marigolds."]
+    }
   ]
 }
