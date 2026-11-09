@@ -36,7 +36,7 @@ Lite.
 
 | Lite path | Entry |
 | --- | --- |
-| `apps/standalone/src/*` | written for Lite: the Lite config document, the substrate config, the CLI and a thin host over donor `startCompanionRuntime` (Lite composition root `packages/companion/src/app/agent/companion-runtime.ts`, seams 3.1, 3.11, B7 and C). `substrate-config.ts` assembles the config the way donor `src/system/config/load-config.ts` (`loadAgentConfig`, defaults `:76-129`, assembly `:497-565`) and `settings/runtime.ts` (`applyCoreSettings`) did, for the kept subsystems only. |
+| `apps/standalone/src/*` | written for Lite: the Lite config document, the substrate config, the CLI and a thin host over donor `startCompanionRuntime` (Lite composition root `packages/companion/src/app/agent/companion-runtime.ts`, seams 3.1, 3.11, B7, C and D). `model-usage.ts` is the host's in-memory `ModelUsageRecorder` (seam 3.1, in place of the donor's Postgres model-usage store, `src/persistence/postgres/model-usage-store.ts`, cut). `substrate-config.ts` assembles the config the way donor `src/system/config/load-config.ts` (`loadAgentConfig`, defaults `:76-129`, assembly `:497-565`) and `settings/runtime.ts` (`applyCoreSettings`) did, for the kept subsystems only. |
 | `packages/lifecycle/src/*` | written for Lite: host-driven turns. They go through the donor `SubstrateAgent.handleMessage` and the stream transport seam (donor `src/app/agent/core-runtime.ts:724-726`), on the donor's Hermes channel convention (`externalMemorySessionId`). The donor tool catalog is exposed as MCP tools (donor `tool-runtime-facade` `getToolCatalog`). |
 | `packages/mcp/src/*` | written for Lite against `@modelcontextprotocol/server` 2.3.0, the donor's pinned SDK. It follows the donor's external-memory MCP route (`src/channels/api/server/external-memory-mcp.ts`, cut): a stateless per-request handler, a bearer credential bound to a fixed identity, browser `Origin` and `Mcp-Session-Id` refused. Credentials come from the environment or owner-only files and are compared in constant time against every binding (pattern of donor `src/channels/backplane/http/auth.ts` `isExpectedApiToken`, cut). stdio has no donor counterpart. |
 | `packages/pi/src/*` | written for Lite against `@earendil-works/pi-ai` 0.84.1, the donor's pinned version. It holds the model runtime the core's provider port takes, and an embedding port (none, or OpenAI-compatible `/embeddings`). |
@@ -46,11 +46,14 @@ Lite.
 
 ## The extracted core (`packages/companion`)
 
-The tables below were generated from the Git blobs of
-`packages/companion` and the donor commit. The tree has 1,924 files: 1,748
-extracted unchanged, 150 extracted with cuts, and 26 Lite. The extraction
-records, package files and `baseline.json` are Lite's own and are not
-listed.
+The tables below are generated from the Git blobs of
+`packages/companion/{src,config}` at `HEAD` and the donor commit by
+`python3 -I packages/companion/extraction/provenance-tables.py <donor git
+dir>`, after Step D and the review fixes. The tree has 2,000 files: 1,797
+extracted unchanged, 172 extracted with cuts, and 31 Lite. Seam D is the
+operator automata rules ([extraction](extraction.md), "Operator automata
+rules"). The extraction records, package files and `baseline.json` are
+Lite's own and are not listed.
 
 ### Extracted unchanged
 
@@ -59,14 +62,14 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | Lite path (under `packages/companion/`) | Entry |
 |---|---|
 | `config/` | extracted unchanged from donor `config/` (8 files) |
-| `src/app/agent/` | extracted unchanged from donor `src/app/agent/` (8 files; 4 changed, 2 Lite-new listed below) |
-| `src/app/agent/startup/` | extracted unchanged from donor `src/app/agent/startup/` (5 files; 1 changed listed below) |
-| `src/app/startup/composition/` | extracted unchanged from donor `src/app/startup/composition/` (3 files; 2 changed listed below) |
-| `src/app/startup/support/` | extracted unchanged from donor `src/app/startup/support/` (2 files; 2 changed listed below) |
-| `src/boundary/integrations/journal/` | extracted unchanged from donor `src/boundary/integrations/journal/` (8 files) |
+| `src/app/agent/` | extracted unchanged from donor `src/app/agent/` (16 files; 7 changed, 2 Lite-new listed below) |
+| `src/app/agent/startup/` | extracted unchanged from donor `src/app/agent/startup/` (9 files; 2 changed listed below) |
+| `src/app/startup/composition/` | extracted unchanged from donor `src/app/startup/composition/` (4 files; 5 changed listed below) |
+| `src/app/startup/support/` | extracted unchanged from donor `src/app/startup/support/` (4 files; 3 changed listed below) |
+| `src/boundary/integrations/journal/` | extracted unchanged from donor `src/boundary/integrations/journal/` (12 files) |
 | `src/boundary/integrations/` | extracted unchanged from donor `src/boundary/integrations/` (1 file) |
 | `src/boundary/pi-agent/` | extracted unchanged from donor `src/boundary/pi-agent/` (3 files) |
-| `src/core/agent/` | extracted unchanged from donor `src/core/agent/` (60 files; 7 changed listed below) |
+| `src/core/agent/` | extracted unchanged from donor `src/core/agent/` (60 files; 8 changed listed below) |
 | `src/core/agent/background-work/` | extracted unchanged from donor `src/core/agent/background-work/` (18 files) |
 | `src/core/agent/substrate-agent/` | extracted unchanged from donor `src/core/agent/substrate-agent/` (44 files; 23 changed, 1 Lite-new listed below) |
 | `src/core/agent/substrate-agent/runtime-context-sections/` | extracted unchanged from donor `src/core/agent/substrate-agent/runtime-context-sections/` (20 files; 3 changed listed below) |
@@ -74,25 +77,25 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/core/agent/tool-surface/` | extracted unchanged from donor `src/core/agent/tool-surface/` (10 files; 2 changed listed below) |
 | `src/core/agent/tool-surface/descriptions/` | extracted unchanged from donor `src/core/agent/tool-surface/descriptions/` (5 files) |
 | `src/core/artifacts/` | extracted unchanged from donor `src/core/artifacts/` (1 file; 2 changed listed below) |
-| `src/core/cogsec/` | extracted unchanged from donor `src/core/cogsec/` (3 files; 1 changed listed below) |
-| `src/core/cogsec/disclosure/` | extracted unchanged from donor `src/core/cogsec/disclosure/` (5 files) |
-| `src/core/cogsec/intake/` | extracted unchanged from donor `src/core/cogsec/intake/` (1 file; 1 changed listed below) |
+| `src/core/cogsec/` | extracted unchanged from donor `src/core/cogsec/` (4 files; 2 changed listed below) |
+| `src/core/cogsec/disclosure/` | extracted unchanged from donor `src/core/cogsec/disclosure/` (9 files) |
+| `src/core/cogsec/intake/` | extracted unchanged from donor `src/core/cogsec/intake/` (2 files; 1 changed listed below) |
 | `src/core/contacts/` | extracted unchanged from donor `src/core/contacts/` (36 files; 3 changed listed below) |
 | `src/core/contacts/postgres-adapter/` | extracted unchanged from donor `src/core/contacts/postgres-adapter/` (24 files; 2 changed listed below) |
 | `src/core/contacts/store/` | extracted unchanged from donor `src/core/contacts/store/` (3 files) |
-| `src/core/doing-mirror/` | extracted unchanged from donor `src/core/doing-mirror/` (2 files; 1 changed listed below) |
+| `src/core/doing-mirror/` | extracted unchanged from donor `src/core/doing-mirror/` (3 files; 2 changed listed below) |
 | `src/core/emotion/` | extracted unchanged from donor `src/core/emotion/` (38 files) |
 | `src/core/emotion/partner-affect/` | extracted unchanged from donor `src/core/emotion/partner-affect/` (7 files) |
 | `src/core/eval/observer-sidecar/` | extracted unchanged from donor `src/core/eval/observer-sidecar/` (32 files) |
 | `src/core/icp/` | extracted unchanged from donor `src/core/icp/` (30 files; 5 changed listed below) |
 | `src/core/identity/` | extracted unchanged from donor `src/core/identity/` (49 files) |
 | `src/core/identity/prompt-runtime/` | extracted unchanged from donor `src/core/identity/prompt-runtime/` (1 file) |
-| `src/core/intention/appraisal/` | extracted unchanged from donor `src/core/intention/appraisal/` (16 files) |
 | `src/core/intention/` | extracted unchanged from donor `src/core/intention/` (82 files; 1 changed listed below) |
+| `src/core/intention/appraisal/` | extracted unchanged from donor `src/core/intention/appraisal/` (16 files) |
 | `src/core/intention/postgres-adapters/` | extracted unchanged from donor `src/core/intention/postgres-adapters/` (13 files) |
 | `src/core/intention/social-outreach-turn/` | extracted unchanged from donor `src/core/intention/social-outreach-turn/` (5 files) |
 | `src/core/internal-role-envelopes/` | extracted unchanged from donor `src/core/internal-role-envelopes/` (9 files) |
-| `src/core/letters/` | extracted unchanged from donor `src/core/letters/` (3 files) |
+| `src/core/letters/` | extracted unchanged from donor `src/core/letters/` (4 files; 1 changed listed below) |
 | `src/core/scheduler/` | extracted unchanged from donor `src/core/scheduler/` (60 files; 13 changed, 2 Lite-new listed below) |
 | `src/core/scheduler/reflection-template-runtime/` | extracted unchanged from donor `src/core/scheduler/reflection-template-runtime/` (11 files; 1 changed listed below) |
 | `src/core/self-model/` | extracted unchanged from donor `src/core/self-model/` (8 files) |
@@ -100,10 +103,10 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/core/session/group-chat-harness/` | extracted unchanged from donor `src/core/session/group-chat-harness/` (5 files) |
 | `src/core/session/group-chat-harness/goldens/` | extracted unchanged from donor `src/core/session/group-chat-harness/goldens/` (7 files) |
 | `src/core/session/manager/` | extracted unchanged from donor `src/core/session/manager/` (22 files; 4 changed listed below) |
-| `src/core/tools/` | extracted unchanged from donor `src/core/tools/` (6 files) |
+| `src/core/tools/` | extracted unchanged from donor `src/core/tools/` (10 files) |
 | `src/core/turns/` | extracted unchanged from donor `src/core/turns/` (9 files) |
 | `src/faculties/automata/` | extracted unchanged from donor `src/faculties/automata/` (23 files; 1 changed listed below) |
-| `src/faculties/automata/bus/` | extracted unchanged from donor `src/faculties/automata/bus/` (47 files; 6 changed listed below) |
+| `src/faculties/automata/bus/` | extracted unchanged from donor `src/faculties/automata/bus/` (43 files; 10 changed, 2 Lite-new listed below) |
 | `src/faculties/automata/bus/conformance/v1/accept/` | extracted unchanged from donor `src/faculties/automata/bus/conformance/v1/accept/` (2 files) |
 | `src/faculties/automata/bus/conformance/v1/` | extracted unchanged from donor `src/faculties/automata/bus/conformance/v1/` (1 file) |
 | `src/faculties/automata/bus/conformance/v1/not-understood/` | extracted unchanged from donor `src/faculties/automata/bus/conformance/v1/not-understood/` (2 files) |
@@ -124,23 +127,23 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/faculties/memory/tools/` | extracted unchanged from donor `src/faculties/memory/tools/` (3 files) |
 | `src/faculties/memory/writer/` | extracted unchanged from donor `src/faculties/memory/writer/` (2 files) |
 | `src/faculties/north-star/` | extracted unchanged from donor `src/faculties/north-star/` (4 files) |
-| `src/faculties/shards/` | extracted unchanged from donor `src/faculties/shards/` (7 files; 2 changed, 1 Lite-new listed below) |
-| `src/faculties/subagents/` | extracted unchanged from donor `src/faculties/subagents/` (20 files) |
+| `src/faculties/shards/` | extracted unchanged from donor `src/faculties/shards/` (9 files; 2 changed, 1 Lite-new listed below) |
+| `src/faculties/subagents/` | extracted unchanged from donor `src/faculties/subagents/` (19 files; 1 changed, 2 Lite-new listed below) |
 | `src/faculties/values/` | extracted unchanged from donor `src/faculties/values/` (7 files) |
 | `src/persistence/journals/` | extracted unchanged from donor `src/persistence/journals/` (10 files; 2 changed listed below) |
 | `src/persistence/journals/journal/` | extracted unchanged from donor `src/persistence/journals/journal/` (10 files) |
-| `src/persistence/` | extracted unchanged from donor `src/persistence/` (10 files; 2 changed listed below) |
-| `src/persistence/postgres/` | extracted unchanged from donor `src/persistence/postgres/` (50 files; 3 changed listed below) |
-| `src/persistence/reflections/` | extracted unchanged from donor `src/persistence/reflections/` (1 file) |
-| `src/persistence/repair/` | extracted unchanged from donor `src/persistence/repair/` (3 files) |
-| `src/persistence/sessions/` | extracted unchanged from donor `src/persistence/sessions/` (41 files; 4 changed listed below) |
+| `src/persistence/` | extracted unchanged from donor `src/persistence/` (10 files; 3 changed listed below) |
+| `src/persistence/postgres/` | extracted unchanged from donor `src/persistence/postgres/` (62 files; 6 changed listed below) |
+| `src/persistence/reflections/` | extracted unchanged from donor `src/persistence/reflections/` (2 files) |
+| `src/persistence/repair/` | extracted unchanged from donor `src/persistence/repair/` (4 files) |
+| `src/persistence/sessions/` | extracted unchanged from donor `src/persistence/sessions/` (43 files; 4 changed listed below) |
 | `src/persistence/sessions/store/` | extracted unchanged from donor `src/persistence/sessions/store/` (23 files) |
-| `src/primitives/images/` | extracted unchanged from donor `src/primitives/images/` (3 files) |
+| `src/primitives/images/` | extracted unchanged from donor `src/primitives/images/` (4 files) |
 | `src/primitives/llm/` | extracted unchanged from donor `src/primitives/llm/` (58 files; 3 changed listed below) |
 | `src/primitives/llm/decision/` | extracted unchanged from donor `src/primitives/llm/decision/` (10 files) |
 | `src/shared/` | extracted unchanged from donor `src/shared/` (19 files; 1 changed listed below) |
 | `src/shared/cache/` | extracted unchanged from donor `src/shared/cache/` (3 files) |
-| `src/shared/contracts/` | extracted unchanged from donor `src/shared/contracts/` (76 files; 1 changed, 15 Lite-new listed below) |
+| `src/shared/contracts/` | extracted unchanged from donor `src/shared/contracts/` (77 files; 1 changed, 15 Lite-new listed below) |
 | `src/shared/diagnostics/` | extracted unchanged from donor `src/shared/diagnostics/` (7 files) |
 | `src/shared/escalation/` | extracted unchanged from donor `src/shared/escalation/` (2 files) |
 | `src/shared/gating/` | extracted unchanged from donor `src/shared/gating/` (2 files) |
@@ -153,183 +156,209 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/shared/tools/` | extracted unchanged from donor `src/shared/tools/` (2 files) |
 | `src/shared/utils/` | extracted unchanged from donor `src/shared/utils/` (29 files) |
 | `src/system/capabilities/` | extracted unchanged from donor `src/system/capabilities/` (16 files; 2 changed, 1 Lite-new listed below) |
-| `src/system/config/` | extracted unchanged from donor `src/system/config/` (37 files; 10 changed, 1 Lite-new listed below) |
+| `src/system/config/` | extracted unchanged from donor `src/system/config/` (39 files; 10 changed, 1 Lite-new listed below) |
 | `src/system/config/fixtures/` | extracted unchanged from donor `src/system/config/fixtures/` (3 files) |
 | `src/system/config/scheduler-config/` | extracted unchanged from donor `src/system/config/scheduler-config/` (21 files) |
 | `src/system/lifecycle/` | extracted unchanged from donor `src/system/lifecycle/` (6 files) |
 | `src/system/security/` | extracted unchanged from donor `src/system/security/` (2 files) |
 | `src/system/trust/` | extracted unchanged from donor `src/system/trust/` (15 files) |
-| `src/test-support/` | extracted unchanged from donor `src/test-support/` (17 files; 1 changed, 1 Lite-new listed below) |
+| `src/test-support/` | extracted unchanged from donor `src/test-support/` (18 files; 2 changed, 2 Lite-new listed below) |
 | `src/test-support/fixtures/` | extracted unchanged from donor `src/test-support/fixtures/` (1 file) |
 
 ### Extracted with cuts
 
 | Lite path (under `packages/companion/`) | Entry |
 |---|---|
+| `src/app/agent/automata-background-work-lifecycle.test.ts` | extracted from donor `src/app/agent/automata-background-work-lifecycle.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/app/agent/decision/decision-runtime.ts` | extracted from donor `src/app/agent/decision/decision-runtime.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/app/agent/icp-initiation-source-wiring.ts` | extracted from donor `src/app/agent/icp-initiation-source-wiring.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/app/agent/intention-follow-up-destination.ts` | extracted from donor `src/app/agent/intention-follow-up-destination.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
+| `src/app/agent/scheduler-runtime.test.ts` | extracted from donor `src/app/agent/scheduler-runtime.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/app/agent/scheduler-runtime.ts` | extracted from donor `src/app/agent/scheduler-runtime.ts`; cut: seam 3.11, 3.18 (`extraction/cuts.tsv`) |
+| `src/app/agent/startup-continuity.test.ts` | extracted from donor `src/app/agent/startup-continuity.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/app/agent/startup-continuity.ts` | extracted from donor `src/app/agent/startup-continuity.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
+| `src/app/agent/startup/free-time-lane.test.ts` | extracted from donor `src/app/agent/startup/free-time-lane.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/app/agent/startup/free-time-lane.ts` | extracted from donor `src/app/agent/startup/free-time-lane.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
-| `src/app/startup/composition/composition.ts` | extracted from donor `src/app/startup/composition/composition.ts`; cut: seam 3.6, 3.11 (`extraction/cuts.tsv`) |
+| `src/app/startup/composition/composition.test.ts` | extracted from donor `src/app/startup/composition/composition.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/app/startup/composition/composition.ts` | extracted from donor `src/app/startup/composition/composition.ts`; cut: seam 3.6, 3.11, D (`extraction/cuts.tsv`) |
+| `src/app/startup/composition/parity.test.ts` | extracted from donor `src/app/startup/composition/parity.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/app/startup/composition/parity.ts` | extracted from donor `src/app/startup/composition/parity.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
+| `src/app/startup/composition/post-turn-actions.test.ts` | extracted from donor `src/app/startup/composition/post-turn-actions.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/app/startup/support/ml-warmup.ts` | extracted from donor `src/app/startup/support/ml-warmup.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
+| `src/app/startup/support/operator-alerts.test.ts` | extracted from donor `src/app/startup/support/operator-alerts.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/app/startup/support/operator-alerts.ts` | extracted from donor `src/app/startup/support/operator-alerts.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/boundary/integrations/filesystem/text-file-paging.ts` | extracted from donor `src/boundary/integrations/filesystem/text-file-paging.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
+| `src/core/agent/companion-availability.test.ts` | extracted from donor `src/core/agent/companion-availability.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/agent/completion-handoff.ts` | extracted from donor `src/core/agent/completion-handoff.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
 | `src/core/agent/contracts.ts` | extracted from donor `src/core/agent/contracts.ts`; cut: seam 3.2, 3.6, 3.13, 3.17 (`extraction/cuts.tsv`) |
 | `src/core/agent/satellite-adapter-port.ts` | extracted from donor `src/core/agent/satellite-adapter-port.ts`; cut: seam 3.12 (`extraction/cuts.tsv`) |
+| `src/core/agent/substrate-agent.test.ts` | extracted from donor `src/core/agent/substrate-agent.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/agent/substrate-agent.ts` | extracted from donor `src/core/agent/substrate-agent.ts`; cut: seam 3.2, 3.3, 3.4, 3.6, 3.12, 3.13, 3.17, 3.18 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/adaptive-tools-runtime.ts` | extracted from donor `src/core/agent/substrate-agent/adaptive-tools-runtime.ts`; cut: seam 3.18 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/channel-routing-runtime.test.ts` | extracted from donor `src/core/agent/substrate-agent/channel-routing-runtime.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/substrate-agent/channel-routing-runtime.test.ts` | extracted from donor `src/core/agent/substrate-agent/channel-routing-runtime.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/substrate-agent/channel-routing-runtime.ts` | extracted from donor `src/core/agent/substrate-agent/channel-routing-runtime.ts`; cut: seam 3.12 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/egress-tool-custody.test.ts` | extracted from donor `src/core/agent/substrate-agent/egress-tool-custody.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/agent/substrate-agent/egress-tool-custody.test.ts` | extracted from donor `src/core/agent/substrate-agent/egress-tool-custody.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/agent/substrate-agent/egress-tool-guard.ts` | extracted from donor `src/core/agent/substrate-agent/egress-tool-guard.ts`; cut: seam 3.4, 3.6 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/moa-turn.test.ts` | extracted from donor `src/core/agent/substrate-agent/moa-turn.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/substrate-agent/moa-turn.test.ts` | extracted from donor `src/core/agent/substrate-agent/moa-turn.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/substrate-agent/moa-turn.ts` | extracted from donor `src/core/agent/substrate-agent/moa-turn.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/perception-cue.test.ts` | extracted from donor `src/core/agent/substrate-agent/perception-cue.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/substrate-agent/perception-cue.test.ts` | extracted from donor `src/core/agent/substrate-agent/perception-cue.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/substrate-agent/perception-cue.ts` | extracted from donor `src/core/agent/substrate-agent/perception-cue.ts`; cut: seam 3.13 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/prompt-context-builder.ts` | extracted from donor `src/core/agent/substrate-agent/prompt-context-builder.ts`; cut: seam 3.12, 3.17 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/runtime-context-sections/reaction-surface.test.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context-sections/reaction-surface.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/substrate-agent/runtime-context-sections/reaction-surface.test.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context-sections/reaction-surface.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/substrate-agent/runtime-context-sections/reaction-surface.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context-sections/reaction-surface.ts`; cut: seam 3.12 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/runtime-context-sections/situated-presence.test.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context-sections/situated-presence.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/agent/substrate-agent/runtime-context.test.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/substrate-agent/runtime-context.test.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/substrate-agent/runtime-context.ts` | extracted from donor `src/core/agent/substrate-agent/runtime-context.ts`; cut: seam 3.12 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent.test.ts` | extracted from donor `src/core/agent/substrate-agent.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/agent/substrate-agent/tool-runtime-facade.ts` | extracted from donor `src/core/agent/substrate-agent/tool-runtime-facade.ts`; cut: seam 3.18 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent.ts` | extracted from donor `src/core/agent/substrate-agent.ts`; cut: seam 3.2, 3.3, 3.4, 3.6, 3.12, 3.13, 3.17, 3.18 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/turn-execution-adapter.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution-adapter.ts`; cut: seam 3.2, 3.6, 3.13, 3.17 (`extraction/cuts.tsv`) |
+| `src/core/agent/substrate-agent/turn-execution-runtime.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution-runtime.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/agent/substrate-agent/turn-execution-runtime.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution-runtime.ts`; cut: seam 3.6, 3.13, 3.17 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/turn-execution/contracts.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution/contracts.ts`; cut: seam 3.2, 3.6, 3.13, 3.17 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/turn-execution/post-turn-scheduling.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution/post-turn-scheduling.ts`; cut: seam 3.12, 3.13 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/turn-execution/pre-turn-state.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution/pre-turn-state.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/turn-execution/prompt-assembly.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution/prompt-assembly.ts`; cut: seam 3.6, 3.17 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/turn-execution-runtime.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution-runtime.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/agent/substrate-agent/turn-execution-runtime.ts` | extracted from donor `src/core/agent/substrate-agent/turn-execution-runtime.ts`; cut: seam 3.6, 3.13, 3.17 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/turn-record-slimming.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-record-slimming.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/agent/substrate-agent/turn-records.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-records.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/agent/substrate-agent/turn-record-slimming.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-record-slimming.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/agent/substrate-agent/turn-records.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-records.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/agent/substrate-agent/turn-records.ts` | extracted from donor `src/core/agent/substrate-agent/turn-records.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/turn-support-runtime.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-support-runtime.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/agent/substrate-agent/turn-support-runtime.test.ts` | extracted from donor `src/core/agent/substrate-agent/turn-support-runtime.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/agent/substrate-agent/turn-support-runtime.ts` | extracted from donor `src/core/agent/substrate-agent/turn-support-runtime.ts`; cut: seam 3.6, 3.17 (`extraction/cuts.tsv`) |
-| `src/core/agent/substrate-agent/vision-attachments.test.ts` | extracted from donor `src/core/agent/substrate-agent/vision-attachments.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/substrate-agent/vision-attachments.test.ts` | extracted from donor `src/core/agent/substrate-agent/vision-attachments.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/substrate-agent/vision-attachments.ts` | extracted from donor `src/core/agent/substrate-agent/vision-attachments.ts`; cut: seam 3.13 (`extraction/cuts.tsv`) |
 | `src/core/agent/tool-call-scheduler.ts` | extracted from donor `src/core/agent/tool-call-scheduler.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
-| `src/core/agent/tool-surface/canonical-tool-catalog.test-support.ts` | extracted from donor `src/core/agent/tool-surface/canonical-tool-catalog.test-support.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/core/agent/tool-surface/factory-descriptions.test.ts` | extracted from donor `src/core/agent/tool-surface/factory-descriptions.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/agent/tool-surface/canonical-tool-catalog.test-support.ts` | extracted from donor `src/core/agent/tool-surface/canonical-tool-catalog.test-support.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/core/agent/tool-surface/factory-descriptions.test.ts` | extracted from donor `src/core/agent/tool-surface/factory-descriptions.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/agent/worker-lanes.ts` | extracted from donor `src/core/agent/worker-lanes.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
-| `src/core/artifacts/sensitivity-egress-custody.test.ts` | extracted from donor `src/core/artifacts/sensitivity-egress-custody.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/artifacts/sensitivity-egress-custody.test.ts` | extracted from donor `src/core/artifacts/sensitivity-egress-custody.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/artifacts/sensitivity-egress.ts` | extracted from donor `src/core/artifacts/sensitivity-egress.ts`; cut: seam 3.2, 3.6 (`extraction/cuts.tsv`) |
 | `src/core/cogsec/intake/derived-content.ts` | extracted from donor `src/core/cogsec/intake/derived-content.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
+| `src/core/cogsec/memory-candidacy.test.ts` | extracted from donor `src/core/cogsec/memory-candidacy.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/cogsec/memory-candidacy.ts` | extracted from donor `src/core/cogsec/memory-candidacy.ts`; cut: seam 3.4, 3.5 (`extraction/cuts.tsv`) |
 | `src/core/contacts/contact-tracking-approval-flow.test.ts` | extracted from donor `src/core/contacts/contact-tracking-approval-flow.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/contacts/observed-machine-intelligence.test.ts` | extracted from donor `src/core/contacts/observed-machine-intelligence.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/contacts/postgres-adapter/contact-archive.integration.test.ts` | extracted from donor `src/core/contacts/postgres-adapter/contact-archive.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/contacts/postgres-adapter.integration.test.ts` | extracted from donor `src/core/contacts/postgres-adapter.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/contacts/postgres-adapter/contact-archive.integration.test.ts` | extracted from donor `src/core/contacts/postgres-adapter/contact-archive.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/contacts/postgres-adapter/contact-lifecycle-ledger.integration.test.ts` | extracted from donor `src/core/contacts/postgres-adapter/contact-lifecycle-ledger.integration.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/contacts/postgres-adapter.integration.test.ts` | extracted from donor `src/core/contacts/postgres-adapter.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/doing-mirror/sources.test.ts` | extracted from donor `src/core/doing-mirror/sources.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/doing-mirror/sources.ts` | extracted from donor `src/core/doing-mirror/sources.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/core/icp/agent-facing-autonomy.ts` | extracted from donor `src/core/icp/agent-facing-autonomy.ts`; cut: seam 3.15 (`extraction/cuts.tsv`) |
 | `src/core/icp/initiation-source-support.ts` | extracted from donor `src/core/icp/initiation-source-support.ts`; cut: seam 3.15 (`extraction/cuts.tsv`) |
 | `src/core/icp/runtime-availability.ts` | extracted from donor `src/core/icp/runtime-availability.ts`; cut: seam 3.15 (`extraction/cuts.tsv`) |
-| `src/core/icp/speaking-precedence-resolver.test.ts` | extracted from donor `src/core/icp/speaking-precedence-resolver.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/icp/speaking-precedence-resolver.test.ts` | extracted from donor `src/core/icp/speaking-precedence-resolver.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/icp/speaking-precedence-resolver.ts` | extracted from donor `src/core/icp/speaking-precedence-resolver.ts`; cut: seam 3.15 (`extraction/cuts.tsv`) |
-| `src/core/intention/concern-resolution-arc.test.ts` | extracted from donor `src/core/intention/concern-resolution-arc.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/core/scheduler/free-time.test.ts` | extracted from donor `src/core/scheduler/free-time.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/core/scheduler/free-time.ts` | extracted from donor `src/core/scheduler/free-time.ts`; cut: seam 3.6, 3.9 (`extraction/cuts.tsv`) |
+| `src/core/intention/concern-resolution-arc.test.ts` | extracted from donor `src/core/intention/concern-resolution-arc.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/core/letters/memory-extraction.test.ts` | extracted from donor `src/core/letters/memory-extraction.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/scheduler/free-time-workspace-resolver.ts` | extracted from donor `src/core/scheduler/free-time-workspace-resolver.ts`; cut: seam 3.6, 3.17 (`extraction/cuts.tsv`) |
-| `src/core/scheduler/health-detector-task.test.ts` | extracted from donor `src/core/scheduler/health-detector-task.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/scheduler/post-turn-lanes.test.ts` | extracted from donor `src/core/scheduler/post-turn-lanes.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/scheduler/post-turn-runtime/scheduler-lanes.ts` | extracted from donor `src/core/scheduler/post-turn-runtime/scheduler-lanes.ts`; cut: seam 3.6, 3.9 (`extraction/cuts.tsv`) |
+| `src/core/scheduler/free-time.test.ts` | extracted from donor `src/core/scheduler/free-time.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/core/scheduler/free-time.ts` | extracted from donor `src/core/scheduler/free-time.ts`; cut: seam 3.6, 3.9 (`extraction/cuts.tsv`) |
+| `src/core/scheduler/health-detector-task.test.ts` | extracted from donor `src/core/scheduler/health-detector-task.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/scheduler/post-turn-lanes.test.ts` | extracted from donor `src/core/scheduler/post-turn-lanes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/scheduler/post-turn-runtime.ts` | extracted from donor `src/core/scheduler/post-turn-runtime.ts`; cut: seam 3.6 (`extraction/cuts.tsv`) |
+| `src/core/scheduler/post-turn-runtime/scheduler-lanes.ts` | extracted from donor `src/core/scheduler/post-turn-runtime/scheduler-lanes.ts`; cut: seam 3.6, 3.9 (`extraction/cuts.tsv`) |
 | `src/core/scheduler/quiet-hours-release-stagger.ts` | extracted from donor `src/core/scheduler/quiet-hours-release-stagger.ts`; cut: seam 3.9 (`extraction/cuts.tsv`) |
 | `src/core/scheduler/reflection-runtime-contracts.ts` | extracted from donor `src/core/scheduler/reflection-runtime-contracts.ts`; cut: seam 3.6, 3.9, 3.17 (`extraction/cuts.tsv`) |
-| `src/core/scheduler/reflection-template-runtime/daily-review-evidence.test.ts` | extracted from donor `src/core/scheduler/reflection-template-runtime/daily-review-evidence.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/scheduler/return-note-projection.test.ts` | extracted from donor `src/core/scheduler/return-note-projection.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/scheduler/reflection-template-runtime/daily-review-evidence.test.ts` | extracted from donor `src/core/scheduler/reflection-template-runtime/daily-review-evidence.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/scheduler/return-note-projection.test.ts` | extracted from donor `src/core/scheduler/return-note-projection.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/scheduler/return-note-projection.ts` | extracted from donor `src/core/scheduler/return-note-projection.ts`; cut: seam 3.6 (`extraction/cuts.tsv`) |
-| `src/core/scheduler/return-note-routing.test.ts` | extracted from donor `src/core/scheduler/return-note-routing.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/scheduler/return-note-routing.test.ts` | extracted from donor `src/core/scheduler/return-note-routing.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/core/scheduler/return-note-routing.ts` | extracted from donor `src/core/scheduler/return-note-routing.ts`; cut: seam 3.6 (`extraction/cuts.tsv`) |
 | `src/core/scheduler/scheduler.ts` | extracted from donor `src/core/scheduler/scheduler.ts`; cut: seam 3.4, 3.9 (`extraction/cuts.tsv`) |
-| `src/core/session/icp-delivery-recovery.test.ts` | extracted from donor `src/core/session/icp-delivery-recovery.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/session/icp-delivery-recovery.test.ts` | extracted from donor `src/core/session/icp-delivery-recovery.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/session/icp-recovery-response-metadata.ts` | extracted from donor `src/core/session/icp-recovery-response-metadata.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
 | `src/core/session/intake-screening-metadata.ts` | extracted from donor `src/core/session/intake-screening-metadata.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
-| `src/core/session/intake-sink-gating.test.ts` | extracted from donor `src/core/session/intake-sink-gating.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/session/intake-sink-gating.test.ts` | extracted from donor `src/core/session/intake-sink-gating.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/session/intake-sink-gating.ts` | extracted from donor `src/core/session/intake-sink-gating.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
-| `src/core/session/manager/context-builder.channel-bond.test.ts` | extracted from donor `src/core/session/manager/context-builder.channel-bond.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/session/manager/context-builder.test.ts` | extracted from donor `src/core/session/manager/context-builder.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/core/session/manager/context-builder.ts` | extracted from donor `src/core/session/manager/context-builder.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
-| `src/core/session/manager/icp-delivery-projection-store.test.ts` | extracted from donor `src/core/session/manager/icp-delivery-projection-store.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/core/session/manager-intake-screening.test.ts` | extracted from donor `src/core/session/manager-intake-screening.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/session/manager-intake-screening.test.ts` | extracted from donor `src/core/session/manager-intake-screening.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/session/manager-primitives.ts` | extracted from donor `src/core/session/manager-primitives.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
-| `src/core/session/manager.test.ts` | extracted from donor `src/core/session/manager.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/session/manager.test.ts` | extracted from donor `src/core/session/manager.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/core/session/manager.ts` | extracted from donor `src/core/session/manager.ts`; cut: seam 3.4, 3.12 (`extraction/cuts.tsv`) |
-| `src/faculties/automata/automata-certification.test.ts` | extracted from donor `src/faculties/automata/automata-certification.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/faculties/automata/bus/class-lifecycle.test.ts` | extracted from donor `src/faculties/automata/bus/class-lifecycle.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/faculties/automata/bus/postgres-store.integration.test.ts` | extracted from donor `src/faculties/automata/bus/postgres-store.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/automata/bus/production-runtime.test.ts` | extracted from donor `src/faculties/automata/bus/production-runtime.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/faculties/automata/bus/production-worker-adapter.test.ts` | extracted from donor `src/faculties/automata/bus/production-worker-adapter.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/faculties/automata/bus/worker-execution.test.ts` | extracted from donor `src/faculties/automata/bus/worker-execution.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/faculties/automata/bus/worker-run-notes.test.ts` | extracted from donor `src/faculties/automata/bus/worker-run-notes.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/core/session/manager/context-builder.channel-bond.test.ts` | extracted from donor `src/core/session/manager/context-builder.channel-bond.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/session/manager/context-builder.test.ts` | extracted from donor `src/core/session/manager/context-builder.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/core/session/manager/context-builder.ts` | extracted from donor `src/core/session/manager/context-builder.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
+| `src/core/session/manager/icp-delivery-projection-store.test.ts` | extracted from donor `src/core/session/manager/icp-delivery-projection-store.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/automata-certification.test.ts` | extracted from donor `src/faculties/automata/automata-certification.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/bus/class-lifecycle.test.ts` | extracted from donor `src/faculties/automata/bus/class-lifecycle.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/bus/postgres-store.integration.test.ts` | extracted from donor `src/faculties/automata/bus/postgres-store.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/faculties/automata/bus/production-runtime.test.ts` | extracted from donor `src/faculties/automata/bus/production-runtime.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/bus/production-worker-adapter.test.ts` | extracted from donor `src/faculties/automata/bus/production-worker-adapter.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/bus/production-worker-adapter.ts` | extracted from donor `src/faculties/automata/bus/production-worker-adapter.ts`; cut: seam D (`extraction/cuts.tsv`) |
+| `src/faculties/automata/bus/worker-access-contracts.ts` | extracted from donor `src/faculties/automata/bus/worker-access-contracts.ts`; cut: seam D (`extraction/cuts.tsv`) |
+| `src/faculties/automata/bus/worker-access-operation.ts` | extracted from donor `src/faculties/automata/bus/worker-access-operation.ts`; cut: seam D (`extraction/cuts.tsv`) |
+| `src/faculties/automata/bus/worker-access-tool.ts` | extracted from donor `src/faculties/automata/bus/worker-access-tool.ts`; cut: seam D (`extraction/cuts.tsv`) |
+| `src/faculties/automata/bus/worker-execution.test.ts` | extracted from donor `src/faculties/automata/bus/worker-execution.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/bus/worker-run-notes.test.ts` | extracted from donor `src/faculties/automata/bus/worker-run-notes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/faculties/core-memory/tools.test.ts` | extracted from donor `src/faculties/core-memory/tools.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/introspection/postgres-store.integration.test.ts` | extracted from donor `src/faculties/introspection/postgres-store.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/faculties/memory/biographical/cross-channel-conformance.integration.test.ts` | extracted from donor `src/faculties/memory/biographical/cross-channel-conformance.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/memory/biographical/postgres-store.integration.test.ts` | extracted from donor `src/faculties/memory/biographical/postgres-store.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/memory/embedding.test.ts` | extracted from donor `src/faculties/memory/embedding.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/faculties/introspection/postgres-store.integration.test.ts` | extracted from donor `src/faculties/introspection/postgres-store.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/memory/biographical/cross-channel-conformance.integration.test.ts` | extracted from donor `src/faculties/memory/biographical/cross-channel-conformance.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/faculties/memory/biographical/postgres-store.integration.test.ts` | extracted from donor `src/faculties/memory/biographical/postgres-store.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/faculties/memory/embedding.test.ts` | extracted from donor `src/faculties/memory/embedding.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/faculties/memory/embedding.ts` | extracted from donor `src/faculties/memory/embedding.ts`; cut: seam 3.14 (`extraction/cuts.tsv`) |
-| `src/faculties/memory/external/service.test.ts` | extracted from donor `src/faculties/memory/external/service.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/faculties/memory/external/service.test.ts` | extracted from donor `src/faculties/memory/external/service.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/faculties/memory/external/service.ts` | extracted from donor `src/faculties/memory/external/service.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
-| `src/faculties/memory/extraction/fact-acceptance.test.ts` | extracted from donor `src/faculties/memory/extraction/fact-acceptance.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/faculties/memory/extraction/fact-acceptance.test.ts` | extracted from donor `src/faculties/memory/extraction/fact-acceptance.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/faculties/memory/extraction/fact-acceptance.ts` | extracted from donor `src/faculties/memory/extraction/fact-acceptance.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
 | `src/faculties/memory/extraction/orchestrator.test.ts` | extracted from donor `src/faculties/memory/extraction/orchestrator.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/memory/postgres-store.integration.test.ts` | extracted from donor `src/faculties/memory/postgres-store.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/memory/retrieval-cache.test.ts` | extracted from donor `src/faculties/memory/retrieval-cache.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/faculties/memory/postgres-store.integration.test.ts` | extracted from donor `src/faculties/memory/postgres-store.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/faculties/memory/retrieval-cache.test.ts` | extracted from donor `src/faculties/memory/retrieval-cache.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/faculties/memory/runtime-wiring.ts` | extracted from donor `src/faculties/memory/runtime-wiring.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/faculties/memory/sleeptime-agent.test.ts` | extracted from donor `src/faculties/memory/sleeptime-agent.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/faculties/memory/sleeptime-agent.ts` | extracted from donor `src/faculties/memory/sleeptime-agent.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
-| `src/faculties/memory/writer.test.ts` | extracted from donor `src/faculties/memory/writer.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/faculties/memory/writer.test.ts` | extracted from donor `src/faculties/memory/writer.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/faculties/memory/writer.ts` | extracted from donor `src/faculties/memory/writer.ts`; cut: seam 3.4 (`extraction/cuts.tsv`) |
 | `src/faculties/shards/fold-review.ts` | extracted from donor `src/faculties/shards/fold-review.ts`; cut: seam 3.4, 3.17 (`extraction/cuts.tsv`) |
 | `src/faculties/shards/output-review.ts` | extracted from donor `src/faculties/shards/output-review.ts`; cut: seam 3.17 (`extraction/cuts.tsv`) |
-| `src/persistence/journals/hmac-boundary.test.ts` | extracted from donor `src/persistence/journals/hmac-boundary.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/faculties/subagents/faculty.ts` | extracted from donor `src/faculties/subagents/faculty.ts`; cut: seam D (`extraction/cuts.tsv`) |
+| `src/persistence/journals/hmac-boundary.test.ts` | extracted from donor `src/persistence/journals/hmac-boundary.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/persistence/journals/hmac-boundary.ts` | extracted from donor `src/persistence/journals/hmac-boundary.ts`; cut: seam 3.8 (`extraction/cuts.tsv`) |
-| `src/persistence/ledger-bounded-hydration.test.ts` | extracted from donor `src/persistence/ledger-bounded-hydration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/persistence/postgres/background-work-live-drain.integration.test.ts` | extracted from donor `src/persistence/postgres/background-work-live-drain.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/persistence/postgres/runtime-readiness.test.ts` | extracted from donor `src/persistence/postgres/runtime-readiness.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/persistence/postgres/schema-tenancy.integration.test.ts` | extracted from donor `src/persistence/postgres/schema-tenancy.integration.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/ledger-bounded-hydration.test.ts` | extracted from donor `src/persistence/ledger-bounded-hydration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/postgres/background-work-live-drain.integration.test.ts` | extracted from donor `src/persistence/postgres/background-work-live-drain.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/persistence/postgres/background-work-run-linkage.integration.test.ts` | extracted from donor `src/persistence/postgres/background-work-run-linkage.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/persistence/postgres/background-work-store.integration.test.ts` | extracted from donor `src/persistence/postgres/background-work-store.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/persistence/postgres/icp-felt-impulse-funnel-store.integration.test.ts` | extracted from donor `src/persistence/postgres/icp-felt-impulse-funnel-store.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/persistence/postgres/runtime-readiness.test.ts` | extracted from donor `src/persistence/postgres/runtime-readiness.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/postgres/schema-tenancy.integration.test.ts` | extracted from donor `src/persistence/postgres/schema-tenancy.integration.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/runtime-factory.test.ts` | extracted from donor `src/persistence/runtime-factory.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/persistence/runtime-factory.ts` | extracted from donor `src/persistence/runtime-factory.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
-| `src/persistence/sessions/store.session-tail.test.ts` | extracted from donor `src/persistence/sessions/store.session-tail.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/persistence/sessions/store.test.ts` | extracted from donor `src/persistence/sessions/store.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/sessions/store-turn-record-session-refs.test.ts` | extracted from donor `src/persistence/sessions/store-turn-record-session-refs.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/sessions/store.session-tail.test.ts` | extracted from donor `src/persistence/sessions/store.session-tail.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/persistence/sessions/store.test.ts` | extracted from donor `src/persistence/sessions/store.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/persistence/sessions/store.ts` | extracted from donor `src/persistence/sessions/store.ts`; cut: seam 3.6 (`extraction/cuts.tsv`) |
-| `src/persistence/sessions/store-turn-record-session-refs.test.ts` | extracted from donor `src/persistence/sessions/store-turn-record-session-refs.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/primitives/llm/client-request-capability.ts` | extracted from donor `src/primitives/llm/client-request-capability.ts`; cut: seam 3.8 (`extraction/cuts.tsv`) |
-| `src/primitives/llm/client.test.ts` | extracted from donor `src/primitives/llm/client.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/primitives/llm/provider-runtime-credential.test.ts` | extracted from donor `src/primitives/llm/provider-runtime-credential.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
+| `src/primitives/llm/client.test.ts` | extracted from donor `src/primitives/llm/client.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/primitives/llm/provider-runtime-credential.test.ts` | extracted from donor `src/primitives/llm/provider-runtime-credential.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/shared/contracts/filesystem.ts` | extracted from donor `src/shared/contracts/filesystem.ts`; cut: seam 3.11 (`extraction/cuts.tsv`) |
 | `src/shared/event-bus.ts` | extracted from donor `src/shared/event-bus.ts`; cut: seam 3.4, 3.15, 3.17 (`extraction/cuts.tsv`) |
-| `src/system/capabilities/gate.test.ts` | extracted from donor `src/system/capabilities/gate.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/capabilities/gate.test.ts` | extracted from donor `src/system/capabilities/gate.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/system/capabilities/gate.ts` | extracted from donor `src/system/capabilities/gate.ts`; cut: seam 3.3 (`extraction/cuts.tsv`) |
-| `src/system/config/biographical-candidate-policy.test.ts` | extracted from donor `src/system/config/biographical-candidate-policy.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/system/config/biographical-depth-policy.test.ts` | extracted from donor `src/system/config/biographical-depth-policy.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/system/config/decision-backend-config.test.ts` | extracted from donor `src/system/config/decision-backend-config.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/system/config/owner-file-contract-adaptation.test.ts` | extracted from donor `src/system/config/owner-file-contract-adaptation.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/system/config/owner-file-modes.test.ts` | extracted from donor `src/system/config/owner-file-modes.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/config/biographical-candidate-policy.test.ts` | extracted from donor `src/system/config/biographical-candidate-policy.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/config/biographical-depth-policy.test.ts` | extracted from donor `src/system/config/biographical-depth-policy.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/config/decision-backend-config.test.ts` | extracted from donor `src/system/config/decision-backend-config.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/config/owner-file-contract-adaptation.test.ts` | extracted from donor `src/system/config/owner-file-contract-adaptation.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/config/owner-file-modes.test.ts` | extracted from donor `src/system/config/owner-file-modes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/system/config/owner-file-modes.ts` | extracted from donor `src/system/config/owner-file-modes.ts`; cut: seam 3.10 (`extraction/cuts.tsv`) |
 | `src/system/config/provider-runtime-factory.ts` | extracted from donor `src/system/config/provider-runtime-factory.ts`; cut: seam 3.1 (`extraction/cuts.tsv`) |
 | `src/system/config/runtime-config-contracts.ts` | extracted from donor `src/system/config/runtime-config-contracts.ts`; cut: seam 3.8, 3.10, 3.13, 3.17 (`extraction/cuts.tsv`) |
-| `src/system/config/selfhood-charge-boundary.test.ts` | extracted from donor `src/system/config/selfhood-charge-boundary.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`) |
-| `src/system/config/subsystem-config.test.ts` | extracted from donor `src/system/config/subsystem-config.test.ts`; an assertion of a cut path removed (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/system/config/selfhood-charge-boundary.test.ts` | extracted from donor `src/system/config/selfhood-charge-boundary.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/system/config/subsystem-config.test.ts` | extracted from donor `src/system/config/subsystem-config.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
+| `src/test-support/postgres-test-harness.test.ts` | extracted from donor `src/test-support/postgres-test-harness.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/test-support/postgres-test-harness.ts` | extracted from donor `src/test-support/postgres-test-harness.ts`; test profile override (docs/extraction.md, Modified donor files) |
 
 ### Lite-new files in the extracted tree
 
-Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `extraction/cuts.tsv`), the composition root and its boot proof, and test support. Not donor files.
+Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `extraction/cuts.tsv`), the composition root and its boot proof, the operator automata rules (seam D), and test support. Not donor files.
 
 | Lite path (under `packages/companion/`) | Entry |
 |---|---|
-| `src/app/agent/companion-runtime.boot.integration.test.ts` | Lite, the B6 boot proof (`extraction/added-tests.tsv`) |
-| `src/app/agent/companion-runtime.ts` | Lite, seam 3.11, B7, C (`extraction/cuts.tsv`) |
+| `src/app/agent/companion-runtime.boot.integration.test.ts` | Lite, a Lite test (`extraction/added-tests.tsv`) |
+| `src/app/agent/companion-runtime.ts` | Lite, seam 3.1, 3.11, B7, C, D (`extraction/cuts.tsv`) |
 | `src/core/agent/substrate-agent/generated-media-stub.ts` | Lite |
 | `src/core/scheduler/fleet-stagger.ts` | Lite |
 | `src/core/scheduler/project-entity-id.ts` | Lite |
+| `src/faculties/automata/bus/worker-write-keys.integration.test.ts` | Lite, seam D (`extraction/cuts.tsv`); a Lite test (`extraction/added-tests.tsv`) |
+| `src/faculties/automata/bus/worker-write-keys.test.ts` | Lite, seam D (`extraction/cuts.tsv`); a Lite test (`extraction/added-tests.tsv`) |
 | `src/faculties/memory/sleeptime-wiki-stage.ts` | Lite |
 | `src/faculties/shards/context-text.ts` | Lite |
+| `src/faculties/subagents/host-execution.test.ts` | Lite, seam D (`extraction/cuts.tsv`); a Lite test (`extraction/added-tests.tsv`) |
+| `src/faculties/subagents/host-execution.ts` | Lite, seam D (`extraction/cuts.tsv`) |
 | `src/shared/contracts/api-health.ts` | Lite |
 | `src/shared/contracts/channel-prompt-port.ts` | Lite, seam 3.17 (`extraction/cuts.tsv`) |
 | `src/shared/contracts/fatigue-event-types.ts` | Lite, seam 3.17 (`extraction/cuts.tsv`) |
@@ -340,7 +369,7 @@ Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `
 | `src/shared/contracts/notification-port.ts` | Lite |
 | `src/shared/contracts/participation-types.ts` | Lite, seam 3.17 (`extraction/cuts.tsv`) |
 | `src/shared/contracts/personal-projects-port.ts` | Lite |
-| `src/shared/contracts/reaction-surface.ts` | Lite |
+| `src/shared/contracts/reaction-surface.ts` | Lite, seam 3.12 (`extraction/cuts.tsv`) |
 | `src/shared/contracts/runtime-service-health.ts` | Lite |
 | `src/shared/contracts/skills-runtime-port.ts` | Lite |
 | `src/shared/contracts/speaking-arbiter-types.ts` | Lite |
@@ -348,6 +377,7 @@ Ports, stubs and helpers a seam cut put in place of scaffolding (each named in `
 | `src/shared/telemetry/provider-cost-extraction.ts` | Lite |
 | `src/system/capabilities/pre-tool-hook.ts` | Lite |
 | `src/system/config/inner-life-config.ts` | Lite, seam 3.10, B7 (`extraction/cuts.tsv`) |
+| `src/test-support/in-memory-automata-bus.ts` | Lite, seam D (`extraction/cuts.tsv`) |
 | `src/test-support/static-credential-vault.ts` | Lite test support: donor `boundary/custody/credential-vault.ts:94-119`, unchanged, over the credential contract (B7) |
 
 ### Cut

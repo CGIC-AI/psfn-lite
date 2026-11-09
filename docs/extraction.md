@@ -29,6 +29,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | B7 delete the vendored scaffolding | Done (Seam cuts, below): every vendored scaffolding file is deleted, nothing in `packages/companion` imports, mocks or reads one, and the packages only scaffolding used are removed. |
 | C swap Lite onto the extracted core | Done (Step C, below): `apps/standalone` wraps `startCompanionRuntime`, MCP serves the donor tool catalog, the lifecycle bridge and the Hermes plugin drive host-driven donor turns, `packages/pi` keeps only the model and embedding adapters, `packages/core` and `packages/adapters` are deleted, and conformance runs on donor behaviour. |
 | Operator automata rules | Done (Operator automata rules, below): stable worker write keys; hosted automata as Hermes subagents. |
+| Review fixes after Step D | Done (Review fixes after Step D, below): the model-usage recorder port, the promoted donor tests, exactly-once corrections, and the Step D records and provenance. |
 
 ## Closure (Step A0)
 
@@ -1485,15 +1486,17 @@ revision:
   which is an owner decision this step does not take. The integration
   test spawns through `CompanionRuntime.subagentFaculty`.
 
-Tests added. No donor test was deleted or modified; the companion-project
+Tests added. Step D deleted and modified no donor test; the companion-project
 files are listed in `packages/companion/extraction/added-tests.tsv`.
 
-- `faculties/automata/bus/worker-write-keys.test.ts` (5): a note repeated
+- `faculties/automata/bus/worker-write-keys.test.ts` (6): a note repeated
   in one attempt, the same note from the next attempt, distinct writes stay
   distinct, a handoff and a correction repeated across attempts, a direct
-  port write. With random ids restored, 4 of the 5 fail.
-- `faculties/automata/bus/worker-write-keys.integration.test.ts`: the same
-  over the real Postgres store across a process restart.
+  port write, and (review fix) a supersede repeated after its target left
+  the current set. With random ids restored, 4 of the first 5 fail.
+- `faculties/automata/bus/worker-write-keys.integration.test.ts` (2): the
+  same over the real Postgres store across a process restart, and (review
+  fix) a supersede and a retract repeated by the next attempt.
 - `faculties/subagents/host-execution.test.ts` (13): a fresh budget and
   credential per attempt and a terminal cap, a budget above the policy
   refused, completion on a later attempt, two tasks running at once with
@@ -1523,6 +1526,89 @@ tests): `tests/standalone/config.test.ts` (two lifecycle documents gain
 `integrations/hermes/tests/conftest.py` and `test_config.py`
 (`automata: null`; new cases).
 
+## Review fixes after Step D
+
+Five review findings after Step D. All five were checked against the code
+and the records, and all five were real. Each is fixed below, and each fix
+has a guard that fails without it.
+
+**1. Autonomous lanes refused (blocker).** In Lite, the donor
+`createProviderRuntimeServices` ran its no-model-usage-store branch. That
+branch left the `LLMClient` without a `usageRecorder`. The client's
+accountability guard (`primitives/llm/client.ts`
+`assertAutonomousCallAccountable`) refuses every work-spec call whose lane
+is not `foreground_chat` when there is no recorder. As a result, every
+autonomous lane was refused with "has no usageRecorder configured":
+post-turn appraisal, biography, sleeptime, concern review, free time and
+the other background lanes. Only foreground chat ran. A Postgres-backed
+donor agent always had the store, so this was a seam 3.1 cut that was
+never recorded. Fix: the accountability seam is a port again.
+`createProviderRuntimeServices` takes an optional `ModelUsageRecorder` (the
+donor interface, `shared/telemetry/model-usage.ts`). It gives the recorder
+to the `LLMClient` and wraps the embedding provider in the donor's
+`withEmbeddingUsageAccounting`, with the donor's configured estimated
+rates. `startCompanionRuntime` requires a recorder.
+`apps/standalone/src/model-usage.ts` is the host's recorder: in-memory
+totals of calls, failures, tokens and effective cost, by runtime lane and
+by provider/model (`LiteRuntime.modelUsage()`). It holds no content,
+session, channel or contact ids. It is not durable, and Lite has no budget
+queries, alerts or exports. The 3.1 row of `cuts.tsv` records the
+amendment. Guards: the boot proof
+(`companion-runtime.boot.integration.test.ts`) "runs autonomous lanes
+through the host model-usage recorder". It runs turns until a
+`post_turn_appraisal` completion is recorded as a success, checks that
+foreground chat is recorded, and checks that no diagnostic says "has no
+usageRecorder configured". Without the recorder it fails on the refusal.
+`tests/standalone/model-usage.test.ts` covers the ledger arithmetic.
+
+**2. Promoted files' donor tests missing (major).** 72 colocated donor
+tests of promoted files were never selected. They are now the `promoted`
+selection: a donor baseline (Test baseline, above), `baseline.json`,
+`tests.tsv`, and every deletion and edit recorded ("Promoted selection
+(after Step D)", in Deleted and modified tests). The B1 note that promoted
+files bring no tests is replaced.
+
+**3 and 5. Stale provenance, cuts and size (major).** `docs/provenance.md`
+was regenerated from Git blobs. Its tables now come from
+`packages/companion/extraction/provenance-tables.py`, which runs `git
+ls-tree` on `HEAD` and on the donor commit, instead of from a scratch file
+list. The old tables matched the tree up to Step C (1,924 files) but not
+Step D or the promoted tests. `cuts.tsv` has seam `D` rows for every Step D change to a donor
+file and for the new files: `production-worker-adapter.ts` (stable ids,
+`replayIncumbent`, `replayExisting`), the worker-access write key
+(`worker-access-{contracts,operation,tool}.ts`), `faculties/subagents/
+faculty.ts` (the `hostExecution` port, `runHostedHandle`) and the
+`companion-runtime.ts` and `composition.ts` wiring
+(`automataHostExecution`, `hostExecution`). The new files are
+`host-execution.ts`, its test, the write-key tests and
+`test-support/in-memory-automata-bus.ts`. Measured size (below) is for the
+final tree.
+
+**4. `correct` not exactly-once (major).** The worker port's `correct`
+read its target from `automata_bus_current_findings` before computing its
+stable id. The first correction removes its target from that projection
+(`postgres-store.ts` `appendAllocated`). So the same correction, repeated
+by the model or by the next attempt, failed with "correction target is not
+current or visible" instead of replaying. Fix: `correct` computes the
+stable id first and asks the writer for the incumbent
+(`replayExisting`, inside the append serialization) before it checks the
+target. The in-memory stand-in used by the unit tests now models the
+projection. Guards: a unit case and a Postgres case (Stable write keys,
+above). With the pre-fix adapter, 3 of the 8 write-key tests fail.
+
+**Validation after the fixes** (2026-11-09, about 05:36Z). Root `tsc`,
+companion `tsc` and `eslint .` all exited 0. The plain validation command,
+with a JSON reporter, exited 0: **770 files and 9,192 tests, all passed**
+(`lite` 14 files / 89 tests, `companion` 756 files / 9,103 tests).
+Comparison: `baseline: 807 files / 10107 tests; deleted: 55 files, 1031
+tests; matched: 9076; Lite additions: 4 files, 27 tests`, `equivalent:
+every remaining baseline test has its baseline status`. That is the
+baseline's 10,107 tests minus 1,031 deleted (994 before, 37 from the
+promoted selection). The edited tests are among the matched. The Hermes
+plugin suite (`integrations/hermes/.venv`, Hermes `f0187332`) passed 64 of
+64. Afterwards, the set of running Docker containers was the same as
+before the run, and no `/tmp/lc-*` directories were left.
+
 ## Measured size
 
 After B7 (`packages/companion`, without `node_modules`):
@@ -1538,6 +1624,23 @@ After B7 (`packages/companion`, without `node_modules`):
 | Package files (`package.json`, configs, README, baseline) | 7 | 1,109 |
 
 The deleted vendored set was 760 files and 230,765 LOC.
+
+After Step D and the review fixes (the same parts, from the Git blobs at
+the fix commit):
+
+| Part | Files | LOC |
+|---|---:|---:|
+| Core non-test TypeScript | 1,190 | 335,809 |
+| Tests (with the 71 kept promoted donor test files) | 756 | 279,078 |
+| Test-support | 23 | 7,170 |
+| Non-TS assets under `src/` | 23 | 1,633 |
+| Seed config (`config/`) | 8 | 1,539 |
+| Extraction records (`extraction/`, with `provenance-tables.py`) | 13 | 5,025 |
+| Package files (`package.json`, configs, README, baseline) | 7 | 46,503 |
+
+`baseline.json` alone is 46,308 lines (one row per donor test, 10,107 of
+them). Test-support counts `src/test-support/` plus the
+`*.test-support.ts` and `*.test-fixtures.ts` helpers, as the B7 table did.
 
 After Step C, Lite's own code (lines of tracked `.ts`, `.py`, `.mjs`,
 `.json`, `.yaml` and `.sql` files). `packages/companion` changed only by
@@ -1558,3 +1661,9 @@ seam C (`companion-runtime.ts`, 15 lines) and the boot test's import:
 
 Without docs and Markdown, the Step C diff from `4a6bcf8` is 346 files,
 +3,652 / -38,646 lines. The lockfile accounts for 975 of the deleted lines.
+
+After Step D and the review fixes (the same measure; parts not listed are
+unchanged since Step C): `packages/lifecycle/src` 8 / 1,300,
+`apps/standalone/src` 11 / 1,153 (with `model-usage.ts`),
+`integrations/hermes/psfn_lite` 13 / 1,688, `integrations/hermes/tests`
+8 / 1,767, `tests` 39 / 3,484.
