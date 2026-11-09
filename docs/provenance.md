@@ -305,7 +305,7 @@ Every file counted here is byte-identical (the same Git blob) to the donor file 
 | `src/faculties/automata/bus/worker-access-operation.ts` | extracted from donor `src/faculties/automata/bus/worker-access-operation.ts`; cut: seam D (`extraction/cuts.tsv`) |
 | `src/faculties/automata/bus/worker-access-tool.ts` | extracted from donor `src/faculties/automata/bus/worker-access-tool.ts`; cut: seam D (`extraction/cuts.tsv`) |
 | `src/faculties/automata/bus/worker-execution-restart.integration.test.ts` | extracted from donor `src/faculties/automata/bus/worker-execution-restart.integration.test.ts`; tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
-| `src/faculties/automata/bus/worker-execution.test.ts` | extracted from donor `src/faculties/automata/bus/worker-execution.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
+| `src/faculties/automata/bus/worker-execution.test.ts` | extracted from donor `src/faculties/automata/bus/worker-execution.test.ts`; test edits recorded (`extraction/modified-tests.tsv`); tests of cut scaffolding deleted (`extraction/deleted-tests.tsv`) |
 | `src/faculties/automata/bus/worker-run-notes.test.ts` | extracted from donor `src/faculties/automata/bus/worker-run-notes.test.ts`; test edits recorded (`extraction/modified-tests.tsv`) |
 | `src/faculties/automata/production-registration.ts` | extracted from donor `src/faculties/automata/production-registration.ts`; cut: seam E1 (`extraction/cuts.tsv`) |
 | `src/faculties/automata/registry-contract.ts` | extracted from donor `src/faculties/automata/registry-contract.ts`; cut: seam E1 (`extraction/cuts.tsv`) |
