@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
@@ -8,6 +9,8 @@ export default defineConfig({
     maxWorkers: 16,
     projects: [
       {
+        // Hermes Desktop provides @hermes/plugin-sdk at runtime; the Desktop half's tests use a stand-in.
+        resolve: { alias: { '@hermes/plugin-sdk': fileURLToPath(new URL('./tests/support/hermes-plugin-sdk.ts', import.meta.url)) } },
         test: {
           name: 'lite',
           environment: 'node',

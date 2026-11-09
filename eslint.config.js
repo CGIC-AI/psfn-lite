@@ -30,6 +30,8 @@ export default [
     '.codex/**',
     // Extracted donor tree: own tsconfig and the donor's compiler settings (docs/development.md).
     'packages/companion/**',
+    // Generated from integrations/hermes/desktop/src by its build.mjs; tests/desktop/bundle.test.ts checks it.
+    'integrations/hermes/psfn_lite/desktop/plugin.js',
   ]),
   {
     linterOptions: {
@@ -47,7 +49,7 @@ export default [
     },
   },
   {
-    files: ['**/*.ts'],
+    files: ['**/*.ts', '**/*.tsx'],
     languageOptions: {
       parser: tsParser,
       ecmaVersion: 'latest',
