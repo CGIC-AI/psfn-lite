@@ -23,7 +23,8 @@ describe('HTTP transport authentication', () => {
   it('admits only a bound bearer credential and says nothing about why another was refused', async () => {
     const w = await mcpWorld();
     const guess = `${w.credentials.robin.slice(0, -1)}x`;
-    for (const headers of [{}, { Authorization: `Bearer ${guess}` }, { Authorization: `Basic ${w.credentials.robin}` }, { Cookie: `session=${w.credentials.robin}` }]) {
+    const attempts: Record<string, string>[] = [{}, { Authorization: `Bearer ${guess}` }, { Authorization: `Basic ${w.credentials.robin}` }, { Cookie: `session=${w.credentials.robin}` }];
+    for (const headers of attempts) {
       const refused = await post(w.url, headers);
       expect(refused.status).toBe(401);
       expect(refused.headers.get('www-authenticate')).toBe('Bearer realm="psfn-lite"');
