@@ -2061,6 +2061,16 @@ and that the root gateway adopts a new profile unless it sets
 live install, never the install itself. `tests/test_profiles.py` runs two
 Lite profiles and a non-Lite profile in one process under multiplexing.
 
+Result (the plain validation command with a JSON reporter, both
+projects): 777 files and 9,199 tests passed (`lite` 20 files / 106 tests,
+`companion` 757 files / 9,093 tests). `compare-baseline.mjs`: "baseline:
+807 files / 10107 tests; deleted: 54 files, 1041 tests; matched: 9066; Lite
+additions: 4 files, 27 tests" and "equivalent: every remaining baseline
+test has its baseline status". The Hermes plugin suite: 80 passed and 1
+skipped at f0187332 (the 2bd378e install-identity test), 79 passed and 2
+skipped at 2bd378e (the two f0187332 install-id file tests). No test
+container or `/tmp/lc-*` directory was left.
+
 ### capability_refusal_matrix is out of scope
 
 Decided (no code): the donor harness case `capability_refusal_matrix` is
