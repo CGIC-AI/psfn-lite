@@ -356,7 +356,8 @@ relaxed.
 | B5b: `turn-execution-runtime.test.ts`, 27 in `fatigue enforcement` and the `human attention pressure` describe (1) | They assert budget spend, reservation, suppression, overcharge, the fatigue and boundary alerts and recovered pending spend; the runtime runs the donor no-port path. The 7 other `fatigue enforcement` tests still pass and stay. | 3.17 fatigue |
 | B5b: `core/session/icp-delivery-recovery.test.ts` (31) | They assert parsing and binding of `fatigue` / `fatiguePendingSpend` in the recovery codec; those keys are now `excluded`. | 3.17 fatigue |
 | B5c: `system/capabilities/runtime.test.ts` (4), `system/config/{capability-tier-config,capability-tier-per-companion,charge-policy-config,charge-policy-per-companion}.test.ts` (5, 8, 16, 6), `subsystem-config.test.ts` "round-trips capability-tier.json without drift" | Their subjects are now `cut` (charge and tiers are stubs). | 3.17 charge, tiers |
-| B5c: `core/agent/substrate-agent.test.ts`: "uses the exact notify surface for candidates while ordinary turns retain the full catalog", "renders one atomic owner snapshot that agrees with self_status at the same turn boundary", "injected immutable custom access governs the capability seam over the disk runtime and tier defaults" | They need a disk-backed `CapabilityRuntime` (`setCapabilityRuntime`), which is removed. The sibling "explicit custom access works without any disk-backed CapabilityRuntime" stays and passes. | 3.17 tiers |
+| B5c: `core/agent/substrate-agent.test.ts`: "renders one atomic owner snapshot that agrees with self_status at the same turn boundary", "injected immutable custom access governs the capability seam over the disk runtime and tier defaults" | They assert the disk-backed `CapabilityRuntime` paths (`snapshotOwnerGrant`, precedence over the disk runtime), which are removed. The sibling "explicit custom access works without any disk-backed CapabilityRuntime" stays and passes. | 3.17 tiers |
+| B5c: `core/agent/substrate-agent.test.ts` "uses the exact notify surface for candidates while ordinary turns retain the full catalog" | **Not a clean scaffolding deletion.** Its subject is ICP candidate control-plane reachability (a candidate turn exposes only `notify`, an ordinary turn keeps the full catalog, the handoff is queued without the permit id or reason). The substrate-agent half is kept core; the control plane (`app/agent/control-plane.ts`) is vendored scaffolding that B6 recomposes. The test grants the custom `external.companion` tier through a disk-backed `CapabilityRuntime` and asserts on its `has`, which the tier stub removes. No other baseline test covers the candidate notify-only surface. Recorded as an open question. | 3.17 tiers |
 | B5d: `persistence/postgres/retired-fleet-grantees.test.ts` (6), `system/capabilities/shard-derivation.test.ts` (28) | Their subjects are now `cut` (closure recompute). | 3.10 recompute, 3.17 shards |
 
 Edited (`modified-tests.tsv`): `turn-execution-runtime.test.ts` "moves system
@@ -599,9 +600,11 @@ loaders, `settings/io.ts` `loadSettings`, then the load-config default where
 a key is absent): deep-equal for `scheduler.json`, `trust-policy.json`,
 `subagent-roles.json`, `automata-policy.json` and all 11 settings values.
 Without a registry it throws the donor message (`automata-policy.json.bus.reviewer.model references slot "gpt-5.4-nano", which is not an enabled models.json registry entry. ...`).
-The probe is not a committed test: it compares against vendored scaffolding
-that B7 deletes, and a new test in the companion project is an addition that
-`compare-baseline.mjs` rejects.
+Rerun it with `npx tsx packages/companion/extraction/inner-life-loader-probe.mts`
+(exit 0, one `equal` line per value). It is a probe, not a test: it compares
+against vendored scaffolding that B7 deletes (the probe leaves with it), and a
+new test in the companion project is an addition that `compare-baseline.mjs`
+rejects.
 
 **Exemptions kept from earlier batches.** `faculties/shards/context-text.ts`
 is a Lite file inside a scaffolding directory (the promoted `output-review.ts`
