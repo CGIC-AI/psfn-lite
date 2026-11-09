@@ -29,6 +29,7 @@ import {
   createDefaultNarrativeEmotionAppraisalSettings,
   createDefaultObserverEvalSidecarSettings,
   createDefaultSessionTailCacheSettings,
+  envCredential,
   type SubstrateConfig,
 } from './companion.ts';
 import type { LiteConfig } from './config.ts';
@@ -168,8 +169,38 @@ export function buildSubstrateConfig(config: LiteConfig, input: { readonly datab
     companionId: config.companionId,
     persistenceBackend: 'postgres',
     postgresDatabaseUrl: input.databaseUrl,
-    embeddingProvider: 'api',
-    embeddingApiModel: config.embedding.model,
-    embeddingApiDims: config.embedding.dimensions,
+    ...embeddingSettings(config.embedding),
   } as SubstrateConfig;
+}
+
+/**
+ * The donor embedding settings for the configured provider, the fields
+ * faculties/memory/embedding.ts createEmbeddingProviderFromConfig reads for
+ * each kind (resolve*ProviderFromRuntimeConfig) and
+ * resolveEmbeddingProviderProvenanceFromConfig records with every vector.
+ * `embeddingModel` and `embeddingDims` are set for every kind, so no seeded
+ * settings.json value of another kind decides the model or its dimensions.
+ * The donor read these from settings.json (settings/runtime.ts
+ * applyCoreSettings); a Lite host names its provider in its config, which
+ * sets them over the settings.json values, as it does for the model.
+ */
+export function embeddingSettings(embedding: LiteConfig['embedding']): Record<string, unknown> {
+  const identity = { embeddingModel: embedding.model, embeddingDims: embedding.dimensions };
+  const provider = embedding.provider;
+  switch (provider.kind) {
+    case 'transformers':
+      return { ...identity, embeddingProvider: 'transformers', transformersModel: embedding.model, transformersCacheDir: provider.cacheDir };
+    case 'ollama':
+      return { ...identity, embeddingProvider: 'ollama', embeddingOllamaUrl: provider.url };
+    case 'api':
+      return {
+        ...identity,
+        embeddingProvider: 'api',
+        embeddingApiUrl: provider.url,
+        embeddingApiModel: embedding.model,
+        embeddingApiDims: embedding.dimensions,
+        // The donor provider's own key reference (embedding.ts EmbeddingProviderRuntimeConfig.embeddingApiKeyRef), read from the runtime environment.
+        ...(provider.apiKeyEnv === null ? {} : { embeddingApiKeyRef: envCredential(provider.apiKeyEnv) }),
+      };
+  }
 }

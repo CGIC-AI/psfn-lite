@@ -1,11 +1,13 @@
 /**
- * Standalone configuration is explicit: every setting is required, unknown
+ * Standalone configuration is explicit: every setting is required (the
+ * embedding block alone has the donor's default), unknown
  * keys are refused, and secrets come from named environment variables whose
  * values are never echoed.
  */
 import { describe, expect, it } from 'vitest';
 import { parseLiteConfig, readSecrets } from '../../apps/standalone/src/index.ts';
 import { DATABASE_URL_ENV, HERMES_TEST_INSTALL_ID as INSTALL_ID, liteConfigDocument } from '../support/lite-world.ts';
+import { UNREACHABLE_EMBEDDINGS } from '../support/lite-install.ts';
 
 const COMPANION_ID = '5e1f0c3a-7b2d-4c8e-9a10-2b3c4d5e6f70';
 const document = () => liteConfigDocument('/srv/lite/data', COMPANION_ID);
@@ -23,7 +25,7 @@ describe('standalone configuration', () => {
       workspaceDir: '/srv/lite/data-workspace',
       operator: { userId: 'robin', displayName: 'Robin' },
       contacts: [{ key: 'sam', displayName: 'Sam', trust: 'regular' }],
-      embedding: { model: 'test-embedding', dimensions: 16, provider: { kind: 'disabled' } },
+      embedding: { model: 'test-embedding', dimensions: 16, provider: { kind: 'api', url: UNREACHABLE_EMBEDDINGS, apiKeyEnv: null } },
       sessionIntegrity: { kind: 'keyring' },
       mcp: null,
       lifecycle: null,
@@ -43,7 +45,7 @@ describe('standalone configuration', () => {
       contacts: [{ key: 'operator', displayName: 'Again', trust: 'primary' }, { key: 'sam', displayName: 'Sam', trust: 'regular' }, { key: 'sam', displayName: 'Sam', trust: 'regular' }],
       model: { ...document().model, maxOutputTokens: 0 },
       postgres: { urlEnv: 'postgres://user:pw@host/db' },
-      embedding: { model: 'm', dimensions: 3, provider: { kind: 'openai_compatible', baseUrl: 'ftp://x', apiKeyEnv: 'EMBED_KEY', timeoutMs: 1_000 } },
+      embedding: { model: 'm', dimensions: 3, provider: { kind: 'api', url: 'ftp://x', apiKeyEnv: 'EMBED_KEY' } },
       sessionIntegrity: { kind: 'hmac' },
     });
     expect(issues).toEqual(
@@ -54,7 +56,7 @@ describe('standalone configuration', () => {
         'contacts[2].key sam is named twice',
         'model.maxOutputTokens must be an integer from 1 to 1000000',
         'postgres.urlEnv must be an environment variable name',
-        'embedding.provider.baseUrl must be an http(s) URL',
+        'embedding.provider.url must be an http(s) URL',
         'sessionIntegrity.kind must be one of keyring, unsigned',
       ]),
     );
@@ -99,7 +101,7 @@ describe('standalone configuration', () => {
     if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
     expect(readSecrets(parsed.value, { [DATABASE_URL_ENV]: 'postgres://x', LITE_MODEL_KEY: 'k' })).toEqual({
       ok: true,
-      value: { databaseUrl: 'postgres://x', modelApiKey: 'k', embeddingApiKey: null },
+      value: { databaseUrl: 'postgres://x', modelApiKey: 'k' },
     });
     const missing = readSecrets(parsed.value, { [DATABASE_URL_ENV]: 'postgres://user:hunter2@db/lite' });
     expect(missing).toEqual({ ok: false, error: expect.objectContaining({ kind: 'invalid', issues: ['environment variable LITE_MODEL_KEY is not set'] }) as unknown });

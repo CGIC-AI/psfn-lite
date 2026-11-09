@@ -1,7 +1,7 @@
 /**
  * The standalone host: a thin wrapper over the extracted companion core's
  * composition root (`startCompanionRuntime`). It builds the host's ports
- * (the Pi model runtime and embeddings, the session keyring from the
+ * (the Pi model runtime, the session keyring from the
  * environment, the operator's outbound channel), the donor substrate config
  * and the inner-life owner files, starts the companion, provisions the
  * configured contacts, and mounts the MCP tool transport and the lifecycle
@@ -52,7 +52,6 @@ import {
   companionModelRegistryEntryOf,
   companionProviderRuntimeOf,
   createCatalogModelRuntime,
-  createOpenAiCompatibleEmbeddings,
   type EmbeddingPort,
   type PiModelRuntime,
 } from './pi.ts';
@@ -65,10 +64,6 @@ export const OPERATOR_CONTACT = 'operator';
 export const LITE_CONTACT_CHANNEL = 'lite';
 /** The registry entry id of the host model (companionModelRegistryEntryOf's default). */
 export const HOST_MODEL_ENTRY = 'host-model';
-/** Why `serve`, `once` and `chat` refuse `embedding.provider: disabled` when the host supplies no embedding port. */
-export const EMBEDDING_PROVIDER_REQUIRED =
-  'embedding.provider is "disabled" and no embedding port was supplied: the companion core needs an embedding provider '
-  + '(the donor refuses to start without one), so configure embedding.provider.kind "openai_compatible"';
 
 export type LiteDiagnostic =
   | { readonly kind: 'outbound'; readonly channelId: string; readonly content: string }
@@ -80,6 +75,7 @@ export type LiteDiagnostic =
 /** Host ports a caller may supply instead of the configured ones (tests, embedding hosts). */
 export interface LiteRuntimeOverrides {
   readonly model?: PiModelRuntime;
+  /** An embedding port serving `config.embedding.model` at `config.embedding.dimensions`, in place of the configured donor provider. */
   readonly embeddings?: EmbeddingPort;
   readonly textEmotionClassifier?: StartCompanionRuntimeOptions['textEmotionClassifier'];
 }
@@ -116,25 +112,17 @@ function buildModel(config: LiteConfig, secrets: LiteSecrets, overrides: LiteRun
 }
 
 /**
- * The embedding port. The extracted core needs a working provider: the donor
- * refused to start without one (`embeddingProvider is required`,
- * faculties/memory/embedding.ts resolveEmbeddingProviderKind) and its startup
- * warmup fails closed (`warmupEmbeddingProvider`), so `disabled` means the
- * embedding host supplies the port. Without one the start is refused here, by
- * name, before any database, model or classifier work (docs/extraction.md,
- * "Embedding provider required").
+ * The embedding provider a caller supplies, or none. Without one the donor's
+ * composition builds the configured provider itself from the substrate
+ * config (provider-runtime-factory.ts: `options.embeddingProvider ??
+ * createEmbeddingProviderFromConfig(config, env)`): the donor's
+ * transformers, ollama or api provider (substrate-config.ts embeddingSettings),
+ * checked by its fail-closed startup warmup (`warmupEmbeddingProvider`).
  */
-function buildEmbeddings(config: LiteConfig, secrets: LiteSecrets, overrides: LiteRuntimeOverrides): Result<EmbeddingPort> {
-  if (overrides.embeddings !== undefined) return ok(overrides.embeddings);
-  const provider = config.embedding.provider;
-  if (provider.kind === 'disabled') return invalid(EMBEDDING_PROVIDER_REQUIRED);
-  return ok(createOpenAiCompatibleEmbeddings({
-    baseUrl: provider.baseUrl,
-    model: config.embedding.model,
-    dimensions: config.embedding.dimensions,
-    apiKey: secrets.embeddingApiKey ?? '',
-    timeoutMs: provider.timeoutMs,
-  }));
+function hostEmbeddingProvider(config: LiteConfig, overrides: LiteRuntimeOverrides): { embeddingProvider?: EmbeddingRuntimeProvider } {
+  if (overrides.embeddings === undefined) return {};
+  const identity = { model: config.embedding.model, dimensions: config.embedding.dimensions };
+  return { embeddingProvider: companionEmbeddingProviderOf(overrides.embeddings, identity) as EmbeddingRuntimeProvider };
 }
 
 export async function createLiteRuntime(input: {
@@ -147,9 +135,6 @@ export async function createLiteRuntime(input: {
 }): Promise<Result<LiteRuntime>> {
   const { config, secrets, env, onDiagnostic } = input;
   const overrides = input.overrides ?? {};
-  const embedded = buildEmbeddings(config, secrets, overrides);
-  if (!embedded.ok) return embedded;
-  const embeddings = embedded.value;
   const model = buildModel(config, secrets, overrides);
   if (!model.ok) return model;
 
@@ -211,7 +196,7 @@ export async function createLiteRuntime(input: {
       innerLife,
       providerRuntime: companionProviderRuntimeOf(model.value) as unknown as ProviderRuntime,
       modelUsageRecorder: modelUsage,
-      embeddingProvider: companionEmbeddingProviderOf(embeddings, { model: config.embedding.model, dimensions: config.embedding.dimensions }) as EmbeddingRuntimeProvider,
+      ...hostEmbeddingProvider(config, overrides),
       ...(overrides.textEmotionClassifier === undefined ? {} : { textEmotionClassifier: overrides.textEmotionClassifier }),
       sessionIntegrityProvider,
       outboundSender: {
