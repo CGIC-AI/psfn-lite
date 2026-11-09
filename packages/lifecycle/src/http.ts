@@ -145,7 +145,7 @@ function createRoutes(options: LifecycleBridgeOptions): Routes {
     async checkpoint(request) {
       const body = parseCheckpoint(request.body);
       if (!body.ok) return fail(request, body.error);
-      const checkpoint = await bridge.checkpoint(request.principal, body.value.sessionId, body.value.turnIds);
+      const checkpoint = await bridge.checkpoint(request.principal, body.value.hermesInstallId, body.value.sessionId, body.value.turnIds);
       return checkpoint.ok ? { status: 200, body: { settled: checkpoint.value.settled, open: checkpoint.value.open } } : fail(request, checkpoint.error);
     },
   };

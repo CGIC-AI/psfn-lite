@@ -9,6 +9,7 @@
  */
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import type { HostProcess } from './host-client.ts';
+import { HERMES_TEST_INSTALL_ID } from '../support/lite-install.ts';
 import { OPERATOR_SESSION, type Principal } from './host/host.ts';
 import { captureInto, observe, resolveTemplates, type CallResult, type CoreErrorShape, type PlannedCall, type RenderedContext, type TurnObservation, type Vars } from './scenario.ts';
 
@@ -65,7 +66,7 @@ export class HermesProtocolDriver {
     const credential = this.urls.credentials[input.as];
     const hostInstance = `hermes-conformance-${String(this.instance)}`;
     const sessionId = SESSION[input.as];
-    const prepared = await this.bridge('prepare', credential, { hostInstance, idempotencyKey: `hermes:${input.key}`, sessionId, message: input.say });
+    const prepared = await this.bridge('prepare', credential, { hostInstance, hermesInstallId: HERMES_TEST_INSTALL_ID, idempotencyKey: `hermes:${input.key}`, sessionId, message: input.say });
     if (prepared.status !== 200) return { turnId: null, refused: errorShape(prepared.body['error']), seen: '', speech: [], results: [] };
     if (prepared.body['kind'] !== 'prepared') throw new Error(`unexpected prepare answer ${JSON.stringify(prepared.body)}`);
     const turnId = prepared.body['turnId'] as string;

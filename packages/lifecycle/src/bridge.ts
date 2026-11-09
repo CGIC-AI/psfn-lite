@@ -8,6 +8,13 @@
  * companion, principal, contact and the host's session id>`), a direct
  * message on the `api` channel type with the contact as the canonical
  * contact hint (donor runtime-context.ts resolveAuthorContext).
+ *
+ * The bridge serves one Hermes install (docs/extraction.md, Step E2): a
+ * Hermes install is one source serving one user through its desktop,
+ * gateway, mobile, messaging and CLI surfaces, and its sessions are bound to
+ * it. Prepare and checkpoint name the install; another install is refused.
+ * The session journals of its conversations are signed with a keyring scoped
+ * to that install (apps/standalone/src/session-integrity.ts).
  */
 import { createHash } from 'node:crypto';
 import { conflict, denied, invalid, notFound, ok, unavailable, type Result } from './mcp.ts';
@@ -25,6 +32,8 @@ export interface HostTurnBridgeOptions {
   readonly relay: HostTurnRelay;
   readonly agent: HostTurnAgent;
   readonly companionId: string;
+  /** The one Hermes install this bridge serves (its install id). */
+  readonly hermesInstallId: string;
   readonly contactOf: (principal: string) => BoundContact | null;
   /** The donor's recorded turn for a conversation, for checkpoints (SessionManager.findUniqueSourceRecordedTurn). */
   readonly findRecordedTurn: (channelId: string, turnId: string) => Promise<TurnRecord | null>;
@@ -37,6 +46,7 @@ export interface HostTurnBridgeOptions {
 
 export interface PrepareInput {
   readonly hostInstance: string;
+  readonly hermesInstallId: string;
   readonly idempotencyKey: string;
   readonly sessionId: string;
   readonly message: string;
@@ -96,9 +106,17 @@ export class HostTurnBridge {
     return turn.owner.startsWith(`${principal}/`);
   }
 
+  private boundInstall(hermesInstallId: string): Result<null> {
+    return hermesInstallId === this.options.hermesInstallId
+      ? ok(null)
+      : denied('wrong_install', 'this companion is bound to another Hermes install');
+  }
+
   async prepare(principal: string, input: PrepareInput): Promise<Result<PrepareAnswer>> {
     const contact = this.options.contactOf(principal);
     if (contact === null) return denied('unknown_authority', 'the principal is not bound to a contact');
+    const bound = this.boundInstall(input.hermesInstallId);
+    if (!bound.ok) return bound;
     if (input.idempotencyKey.length > MAX_KEY_CHARS) return invalid('idempotencyKey is too long');
     const channelId = this.channelOf(principal, contact, input.sessionId);
     const requestId = this.requestIdOf(principal, input.idempotencyKey);
@@ -186,9 +204,11 @@ export class HostTurnBridge {
   }
 
   /** Which of the session's turns the donor recorded (settled) and which are still open. */
-  async checkpoint(principal: string, sessionId: string, turnIds: readonly string[]): Promise<Result<CheckpointAnswer>> {
+  async checkpoint(principal: string, hermesInstallId: string, sessionId: string, turnIds: readonly string[]): Promise<Result<CheckpointAnswer>> {
     const contact = this.options.contactOf(principal);
     if (contact === null) return denied('unknown_authority', 'the principal is not bound to a contact');
+    const bound = this.boundInstall(hermesInstallId);
+    if (!bound.ok) return bound;
     const channelId = this.channelOf(principal, contact, sessionId);
     const settled: string[] = [];
     const open: string[] = [];

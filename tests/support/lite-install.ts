@@ -12,6 +12,10 @@ import { EMBEDDING_DIMS } from './embeddings.ts';
 
 export const DATABASE_URL_ENV = 'LITE_TEST_DATABASE_URL';
 export const COMPANION_NAME = 'Lumen';
+/** The donor session keyring variable (persistence/journals/hmac-boundary.ts); every test install signs its journals. */
+export const SESSION_KEYS_ENV = 'GATEWAY_SESSION_HMAC_KEYS';
+/** The Hermes install the test bridges serve. An install id names a binding and is not a secret. */
+export const HERMES_TEST_INSTALL_ID = '5e1f0c2d9a8b47e6b3c4d5e6f7a8b9c0';
 
 /** A data directory and, beside it, the companion's workspace. */
 export function liteConfigDocument(dataDir: string, companionId: string) {
@@ -25,7 +29,7 @@ export function liteConfigDocument(dataDir: string, companionId: string) {
     postgres: { urlEnv: DATABASE_URL_ENV },
     model: { provider: 'faux', modelId: 'faux-1', apiKeyEnv: null, maxOutputTokens: 1024 },
     embedding: { model: 'test-embedding', dimensions: EMBEDDING_DIMS, provider: { kind: 'disabled' } },
-    sessionIntegrity: { kind: 'unsigned' },
+    sessionIntegrity: { kind: 'keyring' as 'keyring' | 'unsigned' },
     mcp: null as Record<string, unknown> | null,
     lifecycle: null as Record<string, unknown> | null,
   };
@@ -51,6 +55,11 @@ export async function provisionDatabase(url: string): Promise<string> {
     await client.end();
   }
   return url;
+}
+
+/** A fresh random session keyring, as the keyring variable holds it (`<version>:<key>`). */
+export function newSessionKeys(): string {
+  return `v1:${randomBytes(32).toString('hex')}`;
 }
 
 /** A fresh random transport credential (never a fixed test secret). */

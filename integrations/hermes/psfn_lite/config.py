@@ -17,6 +17,9 @@ CONFIG_FILE = "psfn-lite.json"
 HERMES_REVISION = "f0187332d13679e2ace74d1f0eb399eb91a90571"
 
 _ENV_NAME = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+#: Hermes's install id file in the Hermes root and its format (hermes_cli/web_server.py _INSTALL_ID_FILENAME, _INSTALL_ID_RE).
+INSTALL_ID_FILE = "install_id"
+_INSTALL_ID = re.compile(r"^[0-9a-f]{32}$")
 _SERVER_NAME = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 #: Hermes surfaces that are never a participant's conversation.
 NON_INTERACTIVE_PLATFORMS = frozenset({"subagent", "cron", "tool", "flush"})
@@ -114,6 +117,26 @@ class Config:
         except (OSError, ValueError):
             raise ConfigError(f"{CONFIG_FILE} is not readable JSON") from None
         return cls.parse(raw)
+
+
+def hermes_install_id() -> str:
+    """The Hermes install this process belongs to: the id Hermes keeps in its root, shared by every profile and surface.
+
+    Read as Hermes reads it (hermes_cli/web_server.py _read_or_create_install_id), never minted here: Hermes
+    owns the file. A missing or malformed id is a configuration error, so no turn is driven unbound.
+    """
+    from hermes_constants import get_default_hermes_root
+
+    path = Path(get_default_hermes_root()) / INSTALL_ID_FILE
+    try:
+        value = path.read_text(encoding="utf-8").strip().lower()
+    except FileNotFoundError:
+        raise ConfigError(f"the Hermes install id ({path}) does not exist yet; Hermes creates it when its dashboard first starts") from None
+    except (OSError, UnicodeDecodeError):
+        raise ConfigError(f"the Hermes install id ({path}) is not readable") from None
+    if not _INSTALL_ID.match(value):
+        raise ConfigError(f"the Hermes install id ({path}) is not 32 lowercase hex characters")
+    return value
 
 
 def ownership_issues(hermes_config: dict) -> list:

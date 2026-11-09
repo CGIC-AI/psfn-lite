@@ -8,7 +8,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import type { LiteRuntime } from '../../apps/standalone/src/index.ts';
 import type { Script } from '../support/faux-model.ts';
 import { beforeAll } from 'vitest';
-import { RUNTIME_TIMEOUT_MS, newCredential, useLiteWorld } from '../support/lite-world.ts';
+import { HERMES_TEST_INSTALL_ID, RUNTIME_TIMEOUT_MS, newCredential, useLiteWorld } from '../support/lite-world.ts';
 
 /** The operator through Hermes, and a regular friend through Hermes. */
 export const HERMES_PRINCIPALS = { 'hermes-operator': 'operator', 'hermes-friend': 'sam' } as const;
@@ -22,6 +22,8 @@ export interface BridgeWorld {
   readonly mcpUrl: string;
   readonly lifecycleUrl: string;
   readonly model: { readonly calls: readonly { readonly lastUser: string }[] };
+  /** The install's data directory and environment (the session keyring among it). */
+  readonly install: { readonly dataDir: string; readonly env: Readonly<Record<string, string>> };
 }
 
 /** Registers the file's one bridge world: started before the file's tests, closed after them. */
@@ -30,6 +32,9 @@ export interface BridgeWorldOptions {
   /** The lifecycle config's hosted automata policy; default null (automata run in core). */
   readonly automata?: { readonly maxAttempts: number; readonly leaseMs: number; readonly maxIterations: number } | null;
 }
+
+/** The test Hermes install every bridge world serves; prepare and checkpoint bodies name it. */
+export const INSTALL = HERMES_TEST_INSTALL_ID;
 
 export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {}): () => BridgeWorld {
   const lite = useLiteWorld();
@@ -53,6 +58,7 @@ export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {})
       };
       document.lifecycle = { host: '127.0.0.1', port: 0, allowedHosts: null,
         hostTurnTimeoutMs: options.hostTurnTimeoutMs ?? 60_000,
+        hermesInstallId: HERMES_TEST_INSTALL_ID,
         automata: options.automata ?? null,
       };
     });
@@ -60,7 +66,7 @@ export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {})
     const { runtime, model } = await lite.start(install, script);
     const { mcpUrl, lifecycleUrl } = runtime.transports;
     if (mcpUrl === null || lifecycleUrl === null) throw new Error('transports were not mounted');
-    return { runtime, credentials, mcpUrl, lifecycleUrl, model };
+    return { runtime, credentials, mcpUrl, lifecycleUrl, model, install: { dataDir: install.dataDir, env: install.env } };
   }
 }
 

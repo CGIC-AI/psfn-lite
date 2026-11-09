@@ -956,6 +956,8 @@ still fails the comparison.
   was the gateway.
 - **Session integrity.** Without a host `sessionIntegrityProvider` the
   sessions run in the donor's non-production mode (no journal HMAC chain).
+  (Step E2: the standalone host passes the donor keyring provider whenever
+  `sessionIntegrity` is `keyring`, scoped per Hermes install.)
 - **Continuity channels.** No continuity channel ids by default. The donor
   read them from `channels.json`.
 - **Memory deletion.** Without a host approval port, the companion's memory
@@ -1666,6 +1668,69 @@ mechanism (alias correction, presentation rank, viewer ceiling), the
 fixture is re-pointed from the cut surface to a kept one, and the
 assertions keep their shape. `tests/conformance/absence.test.ts` now also
 fails if the registry lists one of the 17 again.
+
+### E2: session integrity comes from the host
+
+The donor signs every session journal entry with an HMAC chain
+(`persistence/journals/journal/integrity.ts`, `createKeyringIntegrityProvider`
+at `persistence/sessions/store-primitives.ts:144`) when its composition gets a
+`SessionIntegrityProvider`. Lite's core is unchanged. The host supplies the
+provider:
+
+- **Standalone, the operator's own Pi turns and the web connector (MCP).**
+  With `"sessionIntegrity": {"kind": "keyring"}` the standalone host reads
+  the donor keyring variables (`GATEWAY_SESSION_HMAC_KEYS`, `_KEY`,
+  `_ACTIVE_VERSION`, seam 3.8) and passes the donor provider over them
+  (`apps/standalone/src/runtime.ts:150-156`). The runtime then composes the
+  donor's production session mode. With `keyring` and no keyring in the
+  environment, the host refuses to start. With `{"kind": "unsigned"}`, the
+  journals are not signed and load without verification: the donor's
+  non-production mode (`composition.ts:155-165`), which logs "Session
+  integrity mode: disabled". A host that embeds the core keeps the donor's
+  result: no provider means no chain.
+- **Hermes.** A Hermes install is one source serving one user: its desktop
+  app, gateway, mobile, Telegram and CLI surfaces share one install. Its
+  sessions are bound to the install:
+  - The binding is Hermes's install id: the file `install_id` in the Hermes
+    root (`hermes_constants.get_default_hermes_root()`). Hermes writes a uuid4
+    hex id there (`hermes_cli/web_server.py` `_INSTALL_ID_FILENAME`,
+    `_read_or_create_install_id`), shared by every profile of the install,
+    stable across restarts and code moves. The id is public: the dashboard's
+    public status payload shows it. `hermes_cli/process_identity.py:70` `install_id()` is
+    not used: it hashes the source path, so it changes when the code moves,
+    and it names the code, not the install.
+  - The plugin reads the id (`integrations/hermes/psfn_lite/config.py`
+    `hermes_install_id`) and sends it as `hermesInstallId` on prepare and
+    checkpoint. It never creates the id. Without it, the plugin drives no
+    turn and blocks the Lite tools. The per-process `hostInstance` keeps its
+    own job (turn ownership, the dead-process sweep, automata ownership).
+  - Lite's config names the install it serves (`lifecycle.hermesInstallId`).
+    The bridge refuses a prepare or checkpoint for another install with 403
+    `wrong_install` (`packages/lifecycle/src/bridge.ts`).
+  - The chain: the entries of a Hermes conversation (the donor channel
+    convention `api:hermes:<digest>`, `externalMemorySessionId`) are signed
+    with the donor HMAC chain over the env keyring scoped to the bound
+    install. For each key version the key is
+    `HMAC-SHA256(key, "psfn-lite hermes-install session keyring v1\n" + installId)`
+    (`apps/standalone/src/session-integrity.ts`). The install id names the
+    binding. The keyring is the secret, so the install id alone does not give
+    the key. A journal written for another install, or with the plain
+    keyring, fails verification. Every other conversation keeps the plain
+    env keyring.
+- Decided: the scope is chosen per entry from its channel id, not for the
+  whole runtime. One standalone runtime serves the operator's own turns and
+  one Hermes install at the same time.
+
+Tests: `tests/standalone/session-integrity.test.ts` (the scoped keyring, the
+chain, tampering, another install, the plain chain for other channels) and
+`tests/lifecycle/host-turns.integration.test.ts` "binds the bridge to its
+Hermes install ...". That test reads the journals the running runtime wrote:
+every entry carries the donor HMAC and verifies. The Hermes conversation
+fails under another install's keyring, under the plain keyring and after an
+edit. The bridge refuses another install. The test installs now use
+`keyring` by default (`tests/support/lite-install.ts`), so every integration
+suite runs with the chain on. In the plugin suite, `test_host_contract.py`
+covers the missing or malformed id and a `wrong_install` refusal.
 
 ### E4: the capability tier is an owner file, default `autonomous`
 

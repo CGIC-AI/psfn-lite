@@ -11,6 +11,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { HERMES_TEST_INSTALL_ID } from '../support/lite-install.ts';
 import { HARNESS_START_TIMEOUT_MS, dockerTestsOptedOut, startPostgresHarness, type PostgresHarness } from '../support/postgres-harness.ts';
 import { HermesProtocolDriver } from './drivers.ts';
 import { excludedName } from './excluded-names.ts';
@@ -37,7 +38,7 @@ describe.skipIf(dockerTestsOptedOut('continuity conformance'))('continuity confo
     if (harness === undefined) throw new Error('postgres harness did not start');
     const base = await mkdtemp(join(tmpdir(), 'lite-conformance-'));
     bases.push(base, `${base}-workspace`);
-    return { databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, ports: null, generation: 0 };
+    return { databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, sessionKeys: null, ports: null, generation: 0 };
   };
 
   it('serves the donor tool catalog over MCP, offers the same tools on both surfaces, and serves no cut scaffolding tool', async () => {
@@ -59,7 +60,7 @@ describe.skipIf(dockerTestsOptedOut('continuity conformance'))('continuity confo
       expect(actions.length).toBeGreaterThan(0);
       expect([...listed, ...actions].filter((name) => excludedName(name) !== null)).toEqual([]);
       // The donor offers the model its core tools and whatever it loaded; both surfaces get the same assembly.
-      const prepared = await hermes.bridge('prepare', operator, { hostInstance: 'inventory', idempotencyKey: 'inventory-hermes', sessionId: 'inventory', message: 'hello again' });
+      const prepared = await hermes.bridge('prepare', operator, { hostInstance: 'inventory', hermesInstallId: HERMES_TEST_INSTALL_ID, idempotencyKey: 'inventory-hermes', sessionId: 'inventory', message: 'hello again' });
       const offered = (prepared.body['context'] as { tools: string[] }).tools;
       expect([...offered].sort()).toEqual([...inventory.offered].sort());
       for (const name of offered) expect(listed).toContain(name);

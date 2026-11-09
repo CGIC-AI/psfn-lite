@@ -13,7 +13,7 @@ import threading
 
 from . import automata
 from .bridge import BridgeClient
-from .config import Config, ConfigError, ownership_issues
+from .config import Config, ConfigError, hermes_install_id, ownership_issues
 from .ledger import Ledger
 from .lifecycle import Driver, host_instance
 
@@ -64,7 +64,7 @@ def driver(home: str = None) -> Driver:
             return existing
         config = Config.load(home)
         client = BridgeClient(config.bridge_url, config.credential(), config.timeout_seconds)
-        built = Driver(config, Ledger(home, bridge_url=config.bridge_url), client, instance=host_instance(), notify=notify)
+        built = Driver(config, Ledger(home, bridge_url=config.bridge_url), client, instance=host_instance(), install=hermes_install_id(), notify=notify)
         _drivers[home] = built
         # Turns an exited process of this profile left open are settled before this process prepares any.
         built.delivery.recover()

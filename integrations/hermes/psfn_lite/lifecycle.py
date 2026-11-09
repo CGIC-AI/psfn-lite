@@ -22,6 +22,11 @@ Lite turn, because Hermes's MCP client sends the profile's standing
 credential whoever the turn is for. Before Hermes compacts, ``checkpoint``
 proves every Lite turn of the session is in Lite's canonical history.
 
+A Hermes install (its desktop, gateway, mobile, messaging and CLI surfaces)
+is one source serving one user, and Lite binds its sessions to the install:
+prepare and checkpoint name the install id Hermes keeps in its root, and a
+Lite bridge bound to another install refuses them.
+
 Nothing fails silently. A lifecycle event Lite did not accept is logged,
 kept in the local ledger (a turn and, once it ends, its outcome, so it is
 retried before the next turn), reported through the provider's warning
@@ -63,11 +68,13 @@ def host_instance() -> str:
 
 
 class Driver:
-    def __init__(self, config: Config, ledger: Ledger, client: BridgeClient, *, instance: str, notify):
+    def __init__(self, config: Config, ledger: Ledger, client: BridgeClient, *, instance: str, install: str, notify):
         self.config = config
         self.ledger = ledger
         self.client = client
         self.instance = instance
+        #: The Hermes install id (config.hermes_install_id); Lite serves the install it is bound to.
+        self.install = install
         self._notify = notify
         self._lock = threading.RLock()
         #: Hermes session id -> Lite turn ids prepared in it (inherited across a compression's session rotation).
@@ -121,6 +128,7 @@ class Driver:
         warnings = carried + warnings
         body = {
             "hostInstance": self.instance,
+            "hermesInstallId": self.install,
             "idempotencyKey": idempotency_key(session_id, turn_id),
             "sessionId": self._lite_session(session_id),
             "message": user_message,
@@ -213,7 +221,7 @@ class Driver:
             raise BridgeError(f"{len(unknown)} turns of this session are not yet known to Lite; compaction would lose them", kind="undelivered")
         if not turns:
             return
-        result = self.client.call("checkpoint", {"sessionId": self._lite_session(session_id), "turnIds": turns})
+        result = self.client.call("checkpoint", {"hermesInstallId": self.install, "sessionId": self._lite_session(session_id), "turnIds": turns})
         proven = set(result.get("settled", [])) | set(result.get("open", []))
         if not set(turns) <= proven:
             raise BridgeError("Lite did not prove every turn of this session", kind="protocol")
