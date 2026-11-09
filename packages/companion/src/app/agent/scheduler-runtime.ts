@@ -1,23 +1,19 @@
+// Lite cut (seam 3.11, extraction/cuts.tsv): the donor agent scheduler
+// runtime minus the database backup lane, the runtime health detector
+// scheduler, the CogSec blind-review lane, the multi-companion shared-world
+// wiki caretaker, the companion presence heartbeat beat and the fleet
+// maintenance baton. The gateway client is replaced by the in-process
+// LLMProviderPort and the embedding dimension.
 import { randomUUID } from 'node:crypto';
 
-import type { BackupRuntimeConfig } from '../../persistence/backups/config.js';
-import {
-  SCHEDULED_BACKUP_TASK_ID,
-  SCHEDULED_BACKUP_TASK_NAME,
-  registerScheduledBackupTask,
-} from '../../persistence/backups/service.js';
-import { deriveRestoreVerifyDatabaseUrl } from '../../persistence/backups/postgres-restore.js';
-import { resolveKubernetesHelmBackupConfig } from '../../persistence/backups/kubernetes-helm.js';
-import {
-  buildFleetBackupRunOptions,
-  isFleetBackupLeader,
-  registerScheduledFleetBackupTask,
-} from '../../persistence/backups/fleet-scheduler.js';
 import { wirePostTurnActionRuntime } from '../startup/composition/post-turn-actions.js';
 import type { PostTurnActionRuntime } from '../../core/agent/post-turn-action-runtime.js';
-import type { GatewayClient } from '../../boundary/gateway/client.js';
+import type { LLMProviderPort } from '../../core/agent/contracts.js';
 import { SalienceDecay } from '../../faculties/memory/decay.js';
-import type { BiographySynthesisService } from '../../faculties/memory/biographical/synthesis-service.js';
+import type {
+  BiographyStageControl,
+  BiographySynthesisService,
+} from '../../faculties/memory/biographical/synthesis-service.js';
 import type { BiographyCompanionReviewService } from '../../faculties/memory/biographical/companion-review-service.js';
 import { createDefaultBiographicalDepthPolicy } from '../../system/config/biographical-depth-policy.js';
 import type { MemoryStorePort } from '../../faculties/memory/memory-store-port.js';
@@ -51,7 +47,6 @@ import type {
   SocialGraphProposalStore,
   SocialGraphBuilderWatermarkStore,
 } from '../../faculties/memory/social-graph/proposals.js';
-import type { CompanionPresenceTurnPort } from '../../core/agent/companion-presence-runtime.js';
 import type { EventBus } from '../../shared/event-bus.js';
 import type { CompanionAvailabilityRuntime } from '../../core/agent/companion-availability.js';
 import { emitGardenQueueChanged } from '../../shared/garden-queue-change.js';
@@ -67,24 +62,8 @@ import {
   BACKGROUND_WORK_SUPERVISOR_TASK_ID,
   registerDurableBackgroundWorkSupervisorTask,
 } from '../../core/agent/background-work/scheduler-task.js';
-import {
-  createRuntimeHealthDetectorScheduler,
-} from '../../core/scheduler/health-detector-task.js';
-import {
-  createRuntimeHealthDetectorCycle,
-} from '../../shared/observability/health-detectors/runtime.js';
-import type {
-  HealthDetectorStreamReader,
-} from '../../shared/observability/health-detectors/cycle.js';
-import type {
-  PostgresPoolTelemetryReader,
-} from '../../shared/observability/health-detectors/postgres-pressure.js';
-import type {
-  StuckJobRunView,
-} from '../../shared/observability/health-detectors/stuck-jobs.js';
 import type { SchedulerRuntimeConfig } from '../../system/config/scheduler-config.js';
 import type { SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
-import type { SharedWorldWikiCaretakerService } from '../../faculties/wiki/shared-world-caretaker.js';
 import { SENSITIVITY_LEVELS } from '../../system/trust/types.js';
 import type { AutomataBusReviewerTaskPort } from '../../faculties/automata/bus/reviewer-service.js';
 import type { ProductionAutomataClassId } from '../../faculties/automata/registry-contract.js';
@@ -93,34 +72,14 @@ import {
   type AutomataClassLifecycleRuntime,
   type AutomataClassWorkResult,
 } from '../../faculties/automata/bus/class-lifecycle.js';
-import type { FleetMaintenanceCoordinator } from '../../core/scheduler/fleet-maintenance-coordinator.js';
-import { runWithFleetMaintenanceBaton } from '../../core/scheduler/fleet-maintenance-runner.js';
-import type { BiographyStageControl } from '../../faculties/memory/biographical/synthesis-service.js';
-
-/**
- * The fleet maintenance authority a serialized lane needs: who owns the baton
- * and how long a turn at it lasts. Mirrors the post-turn lane's shape so both
- * halves of serialized maintenance are configured identically.
- */
-interface FleetMaintenanceRuntime {
-  coordinator: FleetMaintenanceCoordinator;
-  leaseDurationMs: number;
-  retryDelayMs: number;
-}
 import {
-  resolveCharacterCardHistoryPath,
-  resolveMemoryJournalPath,
   resolvePostTurnActionQueuePath,
-  resolveSessionsDir,
   type RuntimePathSnapshot,
 } from '../../persistence/layout.js';
 
 const log = createComponentLogger('Agent');
 export { BACKGROUND_WORK_SUPERVISOR_TASK_ID };
-export const SHARED_WORLD_WIKI_CARETAKER_OPERATION_ID = 'shared-world-wiki-caretaker';
 export const AUTOMATA_BUS_REVIEWER_TASK_ID = 'automata-bus-reviewer';
-/** Background-maintenance operation id for the passive Blind Reviewer lane. */
-const BLIND_REVIEW_OPERATION_ID = 'cogsec.blind-review';
 const AUTOMATA_BUS_REVIEWER_CLASS: ProductionAutomataClassId = 'scheduler.automata_bus_reviewer';
 const AUTOMATA_BUS_REVIEWER_BRIEFING_QUERY = 'automata bus evidence review consistency';
 const SOCIAL_GRAPH_BUILDER_CLASS: ProductionAutomataClassId = 'memory.social_graph_builder';
@@ -133,7 +92,6 @@ export const AUTOMATA_RETENTION_OPERATION_ID = 'automata-raw-session-retention';
 
 export interface AgentSchedulerRuntime {
   scheduler: Scheduler;
-  healthDetectorScheduler: Scheduler;
   postTurnActions: PostTurnActionRuntime;
   backgroundMaintenance: BackgroundMaintenanceRegistrar;
   compressionGuidelineEvolution: CompressionGuidelineEvolutionPort;
@@ -145,28 +103,18 @@ export interface BuildAgentSchedulerRuntimeOptions {
   config: SubstrateConfig;
   schedulerConfig: SchedulerRuntimeConfig;
   sessionManager: SessionManager;
-  gateway: GatewayClient;
+  llmProvider: LLMProviderPort;
+  /** Embedding dimension, for the startup log line (donor: gateway.dims). */
+  embeddingDims: number;
   memoryStore: MemoryStorePort;
   agentLoop: SubstrateAgent;
   concernStore?: ConcernStorePort | null;
   concernReviewWorker?: ConcernReviewSupervisorWorkerPort | null;
-  backupConfig: BackupRuntimeConfig;
   pathSnapshot: RuntimePathSnapshot;
-  /** Deployment wiring used only to resolve the optional Kubernetes recovery bundle. */
-  env?: NodeJS.ProcessEnv;
-  /**
-   * Cross-companion presence runtime (multi-companion only; null flag-off).
-   * When present, the heartbeat lane bumps this agent's own presence row on the
-   * heartbeat cadence so an idle-but-alive emanation stays inside siblings'
-   * co-presence (read-side staleness TTL).
-   */
-  companionPresence?: CompanionPresenceTurnPort | null;
   // ── Social-graph builder worker (E4.2) ──
   contactStore?: ContactStorePort | null;
   socialGraphProposalStore?: SocialGraphProposalStore | null;
   socialGraphWatermarkStore?: SocialGraphBuilderWatermarkStore | null;
-  /** Multi-companion-only operator-owned shared-world projection caretaker. */
-  sharedWorldWikiCaretaker?: Pick<SharedWorldWikiCaretakerService, 'cleanupChangedContent'> | null;
   companionAvailability?: Pick<CompanionAvailabilityRuntime, 'run'>;
   automataReviewer?: {
     task: AutomataBusReviewerTaskPort;
@@ -175,37 +123,10 @@ export interface BuildAgentSchedulerRuntimeOptions {
   /** Composition-owned governed Bus lifecycle shared by this file's automata lanes. */
   automataLifecycle?: AutomataClassLifecycleRuntime;
   automataRetention?: { runBounded(nowMs?: number): Promise<unknown> };
-  /**
-   * Continuous passive CogSec Blind Reviewer (yxz0z.3). Shares the housekeeping
-   * cadence and applies its own owner-file interval as a due-gate on top of it.
-   * Observational only: it can raise an operator alert and nothing else.
-   */
-  blindReview?: { runIfDue(nowMs?: number): Promise<boolean> };
-  /**
-   * Persisted health stream and live pool telemetry this process's runtime
-   * health detectors read (7qeo1.24.2-.4). The stream is required: the agent
-   * always opens one, and a detector without it could neither deduplicate an
-   * incident nor survive a restart.
-   */
-  healthDetectors: {
-    stream: HealthDetectorStreamReader;
-    postgresPoolTelemetry: PostgresPoolTelemetryReader;
-    /**
-     * Projection of the automata run registry's public runtime read view
-     * (7qeo1.24.4). Projected at the entrypoint so the run-lifecycle owner can
-     * reshape its record without touching the detector.
-     */
-    automataRuns: () => readonly StuckJobRunView[];
-  };
   /** Cross-silo biography candidate synthesis lane (o61vb.12). */
   biographySynthesis?: Pick<BiographySynthesisService, 'run'>;
   /** Companion protected self-review of biography candidates (o61vb.13). */
   biographyCompanionReview?: Pick<BiographyCompanionReviewService, 'run'>;
-  /**
-   * Fleet-wide serialized maintenance authority (y0bft.4). Absent in a
-   * single-companion deployment, where there is no baton to contend for.
-   */
-  fleetMaintenance?: FleetMaintenanceRuntime;
   /** Doing-mirror disposition lifecycle whose Letter deliveries this lane redrives. */
   doingMirrorService: Pick<DoingMirrorService, 'drainPendingLetters'>;
 }
@@ -312,52 +233,19 @@ export const BIOGRAPHY_COMPANION_REVIEW_TASK_ID = 'biography-companion-review';
 async function runBiographyStageUnderBaton<
   T extends { readonly outcome: 'complete' | 'yield' },
 >(input: {
-  fleetMaintenance?: FleetMaintenanceRuntime;
   phase: string;
   label: string;
   run: (control: BiographyStageControl) => Promise<T>;
   summarize: (telemetry: T) => string;
 }): Promise<AutomataClassWorkResult<T | undefined>> {
-  const fleetMaintenance = input.fleetMaintenance;
-  if (!fleetMaintenance) {
-    // A single-companion deployment has no baton to contend for, so no
-    // safe-boundary hook is supplied and the stage cannot be asked to yield.
-    const telemetry = await input.run({});
-    if (telemetry.outcome === 'yield') {
-      throw new Error(
-        `${input.label} yielded without fleet maintenance authority to yield to`,
-      );
-    }
-    return { value: telemetry, summary: input.summarize(telemetry) };
-  }
-  const batonRun = await runWithFleetMaintenanceBaton({
-    coordinator: fleetMaintenance.coordinator,
-    leaseDurationMs: fleetMaintenance.leaseDurationMs,
-    retryDelayMs: fleetMaintenance.retryDelayMs,
-    phase: input.phase,
-    run: async control => await input.run({
-      onSafeBoundary: async () => await control.checkpoint({
-        phase: input.phase,
-        checkpointRef: null,
-      }),
-    }),
-  });
-  if (batonRun.outcome === 'waiting') {
-    return {
-      value: undefined,
-      lifecycleState: 'cancelled',
-      outcome: 'cancelled',
-      resultKind: 'none',
-    };
-  }
-  const telemetry = batonRun.result;
+  // Lite: a single-companion deployment has no baton to contend for, so no
+  // safe-boundary hook is supplied and the stage cannot be asked to yield
+  // (the donor's no-fleetMaintenance branch).
+  const telemetry = await input.run({});
   if (telemetry.outcome === 'yield') {
-    return {
-      value: telemetry,
-      outcome: 'budget_limited',
-      resultKind: 'partial',
-      summary: `${input.label} yielded for fleet preemption: ${input.summarize(telemetry)}`,
-    };
+    throw new Error(
+      `${input.label} yielded without fleet maintenance authority to yield to`,
+    );
   }
   return { value: telemetry, summary: input.summarize(telemetry) };
 }
@@ -367,7 +255,6 @@ export function registerBiographyCompanionReviewTask(input: {
   review: Pick<BiographyCompanionReviewService, 'run'>;
   intervalMs: number;
   automataLifecycle?: AutomataClassLifecycleRuntime;
-  fleetMaintenance?: FleetMaintenanceRuntime;
   eventBus?: EventBus;
 }): void {
   input.scheduler.register({
@@ -397,7 +284,6 @@ export function registerBiographyCompanionReviewTask(input: {
         },
         briefingQuery: BIOGRAPHY_REVIEW_BRIEFING_QUERY,
         work: async () => await runBiographyStageUnderBaton({
-          ...(input.fleetMaintenance ? { fleetMaintenance: input.fleetMaintenance } : {}),
           phase: 'biography_companion_review',
           label: 'Companion biography review',
           run: async control => await input.review.run(control),
@@ -437,7 +323,6 @@ export function registerBiographySynthesisTask(input: {
   synthesis: Pick<BiographySynthesisService, 'run'>;
   intervalMs: number;
   automataLifecycle?: AutomataClassLifecycleRuntime;
-  fleetMaintenance?: FleetMaintenanceRuntime;
   eventBus?: EventBus;
 }): void {
   input.scheduler.register({
@@ -466,7 +351,6 @@ export function registerBiographySynthesisTask(input: {
         },
         briefingQuery: BIOGRAPHY_SYNTHESIS_BRIEFING_QUERY,
         work: async () => await runBiographyStageUnderBaton({
-          ...(input.fleetMaintenance ? { fleetMaintenance: input.fleetMaintenance } : {}),
           phase: 'biography_synthesis',
           label: 'Biography synthesis',
           run: async control => await input.synthesis.run(control),
@@ -525,169 +409,6 @@ export function registerDoingMirrorLetterDrainOperation(input: {
   });
 }
 
-export function registerSharedWorldWikiCaretakerOperation(input: {
-  backgroundMaintenance: BackgroundMaintenanceRegistrar;
-  caretaker: Pick<SharedWorldWikiCaretakerService, 'cleanupChangedContent'>;
-  batchSize: number;
-}): void {
-  input.backgroundMaintenance.registerOperation({
-    id: SHARED_WORLD_WIKI_CARETAKER_OPERATION_ID,
-    name: 'Shared-World Wiki Caretaker',
-    description:
-      'Checks a bounded batch of approved shared-world documents and reprojects only changed content.',
-    handler: async () => {
-      const result = await input.caretaker.cleanupChangedContent(input.batchSize);
-      log.info('Shared-world wiki caretaker maintenance batch completed', {
-        checked: result.checked,
-        reprojected: result.reprojected,
-        failed: result.failed,
-      });
-      if (result.failed > 0) {
-        throw new Error(
-          `Shared-world wiki caretaker failed ${result.failed} of ${result.checked} projection checks`,
-        );
-      }
-    },
-  });
-}
-
-export interface RegisterAgentDatabaseBackupLaneOptions {
-  scheduler: Scheduler;
-  eventBus: EventBus;
-  config: Pick<
-    SubstrateConfig,
-    | 'fleetAuthVerifier'
-    | 'postgresDatabaseUrl'
-    | 'multiCompanion'
-    | 'companionFleet'
-    | 'companionId'
-    | 'characterCardPath'
-  >;
-  backupConfig: BackupRuntimeConfig;
-  pathSnapshot: RuntimePathSnapshot;
-  env?: NodeJS.ProcessEnv;
-}
-
-export function registerAgentDatabaseBackupLane(
-  options: RegisterAgentDatabaseBackupLaneOptions,
-): void {
-  if (options.config.fleetAuthVerifier !== undefined) {
-    log.warn(
-      'Fleet auth is enabled: database backups are owned by the gateway consistent-backup lane; this agent registers no database backup task',
-    );
-    return;
-  }
-
-  const postgresDatabaseUrl = options.config.postgresDatabaseUrl?.trim() || '';
-  if (!postgresDatabaseUrl) {
-    throw new Error(
-      'PostgreSQL scheduled backups require config.postgresDatabaseUrl — refusing to run without a database backup source',
-    );
-  }
-  const onBackupFailure = (error: unknown): void => {
-    void options.eventBus.emit('backup.failed', {
-      taskId: SCHEDULED_BACKUP_TASK_ID,
-      taskName: SCHEDULED_BACKUP_TASK_NAME,
-      error: error instanceof Error ? error.message : String(error),
-      timestamp: Date.now(),
-    });
-  };
-  const kubernetesHelm = resolveKubernetesHelmBackupConfig(options.env ?? process.env);
-
-  const fleet = options.config.multiCompanion ? options.config.companionFleet : undefined;
-  if (options.config.multiCompanion && !fleet) {
-    throw new Error(
-      'Multi-companion mode is enabled but the resolved config carries no companion fleet — refusing to register a single-companion backup lane',
-    );
-  }
-  if (fleet) {
-    if (isFleetBackupLeader(options.config.companionId, fleet)) {
-      const fleetOptions = buildFleetBackupRunOptions({
-        fleet,
-        ownCompanionId: options.config.companionId,
-        ownResolvedCompanionDataDir: options.pathSnapshot.companionDataDir,
-        systemDataDir: options.pathSnapshot.systemDataDir,
-        postgres: { databaseUrl: postgresDatabaseUrl },
-        backupConfig: options.backupConfig,
-        ...(kubernetesHelm ? { kubernetesHelm } : {}),
-      });
-      registerScheduledFleetBackupTask({
-        scheduler: options.scheduler,
-        fleetOptions,
-        config: options.backupConfig,
-        onBackupFailure,
-      });
-      log.info('Fleet backups enabled (leader)', {
-        companionCount: fleet.companions.length,
-        mode: fleetOptions.groupMode ? 'group' : 'per-companion',
-        intervalMs: options.backupConfig.intervalMs,
-        backupRootDir: options.backupConfig.rootDir,
-        verifyRestore: options.backupConfig.verifyRestore,
-        encryption: options.backupConfig.encryption.mode,
-        kubernetesHelmRecovery: Boolean(kubernetesHelm),
-      });
-    } else {
-      const leader = fleet.companions[0];
-      log.info('Fleet backup delegated to leader companion; no backup lane registered in this follower process', {
-        companionId: options.config.companionId,
-        leaderCompanionId: leader?.companionId ?? 'unknown',
-      });
-    }
-    return;
-  }
-
-  registerScheduledBackupTask({
-    scheduler: options.scheduler,
-    postgres: {
-      databaseUrl: postgresDatabaseUrl,
-      ...(options.backupConfig.verifyRestore
-        ? {
-          restoreVerifyDatabaseUrl: (() => {
-            const derived = deriveRestoreVerifyDatabaseUrl(postgresDatabaseUrl);
-            if (!derived) {
-              throw new Error(
-                'Backup verifyRestore is enabled but the restore-verify scratch database URL cannot be derived from config.postgresDatabaseUrl',
-              );
-            }
-            return derived;
-          })(),
-        }
-        : {}),
-    },
-    companionDataDir: options.pathSnapshot.companionDataDir,
-    systemDataDir: options.pathSnapshot.systemDataDir,
-    ...(kubernetesHelm ? { kubernetesHelm } : {}),
-    workspacePath: options.pathSnapshot.workspacePath,
-    workspaceProtectedPaths: [
-      options.pathSnapshot.systemDataDir,
-      options.pathSnapshot.companionDataDir,
-      options.pathSnapshot.runtimePathLayout.logsDir,
-      options.pathSnapshot.runtimePathLayout.tempDir,
-      options.pathSnapshot.runtimePathLayout.backupsDir,
-    ],
-    sessionsDir: resolveSessionsDir(options.pathSnapshot.companionDataDir),
-    memoriesJournalPath: resolveMemoryJournalPath(options.pathSnapshot.companionDataDir),
-    characterCardPath: options.config.characterCardPath,
-    characterCardHistoryPath: resolveCharacterCardHistoryPath(options.pathSnapshot.companionDataDir),
-    config: options.backupConfig,
-    onBackupFailure,
-  });
-  log.info('Scheduled backups enabled', {
-    intervalMs: options.backupConfig.intervalMs,
-    postgresSource: true,
-    maxRotatingBackups: options.backupConfig.maxRotatingBackups,
-    maxDailyBackups: options.backupConfig.maxDailyBackups,
-    maxWeeklyBackups: options.backupConfig.maxWeeklyBackups,
-    maxMonthlyBackups: options.backupConfig.maxMonthlyBackups,
-    backupRootDir: options.backupConfig.rootDir,
-    mirrorDir: options.backupConfig.mirrorDir || '(none)',
-    verifyRestore: options.backupConfig.verifyRestore,
-    encryption: options.backupConfig.encryption.mode,
-    workspacePath: options.pathSnapshot.workspacePath,
-    kubernetesHelmRecovery: Boolean(kubernetesHelm),
-  });
-}
-
 export function buildAgentSchedulerRuntime(
   options: BuildAgentSchedulerRuntimeOptions,
 ): AgentSchedulerRuntime {
@@ -738,29 +459,6 @@ export function buildAgentSchedulerRuntime(
     });
   }
 
-  const healthDetectorScheduler = createRuntimeHealthDetectorScheduler({
-    eventBus: options.eventBus,
-    source: {
-      owner: resolveHealthEventOwner(options.config.companionId),
-      process: 'agent',
-    },
-    intervalMs: options.schedulerConfig.healthDetectors.intervalMs,
-    cycle: createRuntimeHealthDetectorCycle({
-      stream: options.healthDetectors.stream,
-      publisher: options.eventBus,
-      source: {
-        owner: resolveHealthEventOwner(options.config.companionId),
-        process: 'agent',
-      },
-      config: options.schedulerConfig.healthDetectors,
-      postgresPoolTelemetry: options.healthDetectors.postgresPoolTelemetry,
-      stuckJobs: {
-        listRuns: options.healthDetectors.automataRuns,
-        listTasks: () => scheduler.listTasks(),
-      },
-    }),
-  });
-
   const backgroundMaintenance = new BackgroundMaintenanceRegistry({
     scheduler,
     eligibilityGate: options.eligibilityGate,
@@ -768,7 +466,7 @@ export function buildAgentSchedulerRuntime(
   });
   const compressionGuidelineEvolution = createCompressionGuidelineEvolution({
     eligibilityGate: options.eligibilityGate,
-    llmProvider: options.gateway,
+    llmProvider: options.llmProvider,
   });
 
   if (options.automataRetention) {
@@ -779,19 +477,6 @@ export function buildAgentSchedulerRuntime(
       handler: async () => {
         await options.automataRetention!.runBounded();
       },
-    });
-  }
-
-  if (options.blindReview) {
-    backgroundMaintenance.registerOperation({
-      id: BLIND_REVIEW_OPERATION_ID,
-      name: 'CogSec Blind Review',
-      description: 'Reviews bounded reasoning/activity evidence off the hot path and may raise '
-        + 'a content-minimized operator alert; never blocks, holds, or alters a turn.',
-      handler: async () => {
-        await options.blindReview!.runIfDue();
-      },
-      eligibility: { requiredTokens: ['identity.read'] },
     });
   }
 
@@ -810,7 +495,6 @@ export function buildAgentSchedulerRuntime(
       review: options.biographyCompanionReview,
       intervalMs: biographyRefreshIntervalMs,
       ...(options.automataLifecycle ? { automataLifecycle: options.automataLifecycle } : {}),
-      ...(options.fleetMaintenance ? { fleetMaintenance: options.fleetMaintenance } : {}),
       eventBus: options.eventBus,
     });
   }
@@ -821,7 +505,6 @@ export function buildAgentSchedulerRuntime(
       synthesis: options.biographySynthesis,
       intervalMs: biographyRefreshIntervalMs,
       ...(options.automataLifecycle ? { automataLifecycle: options.automataLifecycle } : {}),
-      ...(options.fleetMaintenance ? { fleetMaintenance: options.fleetMaintenance } : {}),
       eventBus: options.eventBus,
     });
   }
@@ -834,56 +517,12 @@ export function buildAgentSchedulerRuntime(
       options.schedulerConfig.backgroundMaintenance.doingMirrorLetters.maxDeliveryFailures,
   });
 
-  if (options.config.multiCompanion === true) {
-    if (!options.sharedWorldWikiCaretaker) {
-      throw new Error(
-        'Multi-companion background maintenance requires shared-world wiki caretaker dependencies',
-      );
-    }
-    const fleet = options.config.companionFleet;
-    if (!fleet) {
-      throw new Error(
-        'Multi-companion background maintenance requires the resolved companion fleet',
-      );
-    }
-    // Every companion process owns a scheduler. Reuse the fleet's deterministic
-    // leader so one shared projection is not redundantly embedded N times.
-    if (isFleetBackupLeader(options.config.companionId, fleet)) {
-      registerSharedWorldWikiCaretakerOperation({
-        backgroundMaintenance,
-        caretaker: options.sharedWorldWikiCaretaker,
-        batchSize:
-          options.schedulerConfig.backgroundMaintenance.sharedWorldWikiCaretaker.batchSize,
-      });
-    } else {
-      const leader = fleet.companions[0];
-      log.info('Shared-world wiki caretaker maintenance delegated to fleet leader', {
-        companionId: options.config.companionId,
-        leaderCompanionId: leader?.companionId ?? 'unknown',
-      });
-    }
-  }
-
-  registerAgentDatabaseBackupLane({
-    scheduler,
-    eventBus: options.eventBus,
-    config: options.config,
-    backupConfig: options.backupConfig,
-    pathSnapshot: options.pathSnapshot,
-    ...(options.env ? { env: options.env } : {}),
-  });
-
   scheduler.registerHeartbeat(async () => {
     const now = Date.now();
     await options.eventBus.emit('schedule.healthcheck', {
       timestamp: now,
       taskCount: scheduler.taskCount,
     });
-    // Multi-companion presence liveness beat. No-op flag-off (companionPresence
-    // is null) and when this agent has no current situated place. Refresh errors
-    // are logged loudly inside the runtime and never thrown, so they can never
-    // take down the heartbeat lane.
-    await options.companionPresence?.refreshOwnPresence();
   });
   registerAmbientPresenceOperation({
     backgroundMaintenance,
@@ -1004,10 +643,9 @@ export function buildAgentSchedulerRuntime(
     eligibilityGate: options.eligibilityGate,
     persistencePath: resolvePostTurnActionQueuePath(options.pathSnapshot.companionDataDir),
   });
-  log.info(`Memory system enabled (${options.gateway.dims}d embeddings via gateway)`);
+  log.info(`Memory system enabled (${options.embeddingDims}d embeddings)`);
   return {
     scheduler,
-    healthDetectorScheduler,
     postTurnActions,
     backgroundMaintenance,
     compressionGuidelineEvolution,

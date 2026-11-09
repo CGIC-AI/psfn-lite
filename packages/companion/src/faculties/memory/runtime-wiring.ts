@@ -35,7 +35,8 @@ export function registerMemoryTools(
     roomMembershipAuthority?: CompanionRoomMembershipAuthority | null;
     memoryStore: MemoryStorePort;
     memoryDeletionProposalStore: MemoryDeletionProposalStorePort;
-    memoryDeletionApprovalPort: MemoryDeletionApprovalPort;
+    /** Lite (seam 3.11): optional; the donor gateway port is a host port here. */
+    memoryDeletionApprovalPort?: MemoryDeletionApprovalPort;
     memoryDeletionPolicy: MemoryDeletionPolicy | (() => MemoryDeletionPolicy | undefined);
     episodicStore?: (EpisodicTimelineStore & EpisodeDrilldownStore) | null;
     episodeSearch?: HybridEpisodeSearchPort | null;
