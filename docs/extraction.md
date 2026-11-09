@@ -31,7 +31,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | Operator automata rules | Done (Operator automata rules, below): stable worker write keys; hosted automata as Hermes subagents. |
 | Review fixes after Step D | Done (Review fixes after Step D, below): the model-usage recorder port, the promoted donor tests, exactly-once corrections, and the Step D records and provenance. |
 | E operator rulings 2026-11-08/09 | Done (Step E, below): cut tool surfaces pruned from the registry, host-bound session integrity, host approval of memory deletion, the capability tier as an owner file (default `autonomous`), fatigue deferred, model usage in memory. |
-| S8 light Garden | In progress (S8: the light Garden, below): the donor Garden services, routes and route catalogue re-vendored; operator surface, plugin backend and Desktop half follow. |
+| S8 light Garden | Implemented (S8: the light Garden, below): the donor Garden services, routes and route catalogue re-vendored; the operator surface `packages/operator`; the `psfn_lite` dashboard backend and install tool; the Desktop half `psfn_lite/desktop/plugin.js`. Decision (c) awaits the owner. |
 
 ## Closure (Step A0)
 
@@ -2890,6 +2890,96 @@ It needs nothing of the lifecycle bridge: the host passes it a read-only
   (`operator`), and no Garden credential or principal may also be an MCP one,
   so a tool transport credential never opens the Garden. `serve` prints
   `garden <url>`.
+
+### The plugin backend: `psfn_lite/dashboard`
+
+Hermes's dashboard mounts a user plugin's `dashboard/plugin_api.py` router
+at `/api/plugins/<name>/`, behind its own session token or OAuth and its
+profile scope. It does so only when `plugins.enabled` names the plugin
+(`hermes_cli/web_server_dashboard.py` at 2bd378e). The router is a thin
+proxy with no Garden logic:
+
+- only the two Garden route families pass (`api/admin/...`,
+  `api/lite/...`), and every other path gets 404;
+- the outbound request is built fresh: method, path, query without
+  Hermes's `profile` selector, the JSON body and the Garden bearer. The
+  bearer comes from the profile's `.env` through the profile secret scope
+  (`psfn-lite.json` `garden.credential_env`), so the browser's Origin,
+  cookies and Host never reach Lite, which refuses all three;
+- the answer passes through with its status. No `garden` block gives 404,
+  a missing credential 503 (naming the variable), and an unreachable Lite
+  502.
+
+The plugin is called `psfn_lite` everywhere: the folder, both manifests,
+the MCP server key, `plugins.enabled` and the Desktop half's id.
+`integrations/hermes/install_plugin.py` checks the folder and manifest
+names, never copies `desktop/` or `plugin.js`, and refuses a profile that
+already holds a Desktop half. `plugin.yaml` keeps `provides_middleware`:
+Hermes does not read the key, but it records the middleware the plugin
+registers, and `test_host_contract.py:88` checks it against what is
+registered. Listing the plugin in `plugins.enabled` loads it no second way:
+it is a memory provider, so the general loader skips it
+(`test_host_contract.py`).
+
+### The Desktop half: `psfn_lite/desktop/plugin.js`
+
+The source is `integrations/hermes/desktop/src` (TypeScript and React,
+checked by the root `tsconfig.json` and eslint). esbuild builds it into one
+ESM file whose only imports are `@hermes/plugin-sdk`, `react` and
+`react/jsx-runtime`, the three that Desktop's runtime loader rewrites to its
+live modules (`apps/desktop/src/contrib/runtime-loader.ts` at 2bd378e).
+JSX compiles to `jsx()` calls, so the file holds no JSX. It follows the
+bundled Kanban plugin: routes and the sidebar row through
+`ctx.registerMany`, and data through `ctx.rest` to the plugin's own backend
+namespace.
+
+- **Navigation**. One "Garden" sidebar row and one route per screen. A
+  contributed route is one segment with no parameters, so the paths are
+  `/garden`, `/garden-memories`, `/garden-persona`, `/garden-people`,
+  `/garden-sessions`, `/garden-inner-life`, `/garden-automata` and
+  `/garden-settings`. None is a Desktop app route. Each page has a strip
+  linking the eight.
+- **Pane**. One optional right pane, "Memory deletions", with the pending
+  proposals and the recoverable deletions beside the chat, where a
+  deletion the companion asks for is decided. The Memories screen opens it,
+  and the choice is remembered (`ctx.storage`). Nothing is added to the
+  workspace until the operator asks: the deletion queue is the one Garden
+  view that belongs next to a conversation.
+- **Transcript directives**. `::garden-memory{id="..."}` renders a memory
+  card. `::garden-layer-diff{layer="..."}` renders the last change to a
+  prompt layer as a line diff (the donor's `GET /api/admin/prompts/:id/diff`
+  gives the two versions). The attributes are model output. A memory id
+  must be a UUID and a layer id a plain segment before either becomes part
+  of a path.
+- **Screens and routes**. Every item of the eight screens maps to a route
+  the Garden serves. `tests/operator/garden.integration.test.ts` requests
+  every path the screens build and fails on one no route serves.
+
+| Screen | Reads | Writes |
+|---|---|---|
+| Overview | `GET /api/lite/overview` (tier, model, heartbeat, open concerns, focus, emotion, recent turns) | none |
+| Memories | `GET /api/admin/memory`, `/memory/search`, `/memory/:id`; `GET /api/lite/memory-deletions` | `PATCH /api/admin/memory/:id/patch` (redact); `POST /api/lite/memories/:id/delete`, `/memories/restore`, `/memory-deletions/:id/approve` and `/reject` |
+| Persona & prompts | `GET /api/admin/identity` (card and its history), `/prompts`, `/prompts/:id` (layer history), `/prompts/:id/diff`, `/prompts/constitution` (the values layer), `/prompts/north-star` | `PATCH /api/admin/identity/fields`, `POST /identity/rollback`, `PATCH /prompts/:id`, `POST /prompts/:id/rollback` |
+| People | `GET /api/admin/contacts`, `/biographical-claims`, `/graph-proposals` | `POST /api/admin/graph-proposals/:id/approve` and `/reject` |
+| Sessions | `GET /api/admin/sessions`, `/sessions/:id` (messages and turns), `/sessions/:id/turns/:turnId` (prompt, recalled and written memories, tools) | none |
+| Inner life | `GET /api/admin/concerns`, `/api/lite/inner-life` (focus, emotion, introspection consent, wake window), `/api/admin/scheduler` | `POST /api/admin/concerns/:id/resolve` and `/transition` |
+| Automata | `GET /api/admin/automata` (classes, coverage, runs, the bus; `busRunId` inspects one run's events) | none |
+| Settings | `GET /api/lite/settings` | `PUT /api/lite/settings/tier`, `/settings/scheduler` (restart needed) |
+
+**The built file is committed** rather than built at install. The Hermes
+install is Python and the standard library only (`install_plugin.py`), and
+the owner loads the Desktop half by copying one file. Building at install
+would put Node, npm and the repository's `node_modules` on every machine
+that runs Hermes, and the file Desktop runs would depend on that machine's
+build. The build is deterministic (pinned esbuild, no minifying, no
+timestamp). `tests/desktop/bundle.test.ts` rebuilds it in memory and fails
+when the committed file differs, so a source change cannot ship without
+its build. The absence test also scans the committed file. The
+install tool never copies it, and no test writes it under `~/.hermes`.
+Desktop copies any `plugins/<name>/desktop/plugin.js` it finds in the root
+or a profile into its own `desktop-plugins/` root
+(`apps/desktop/electron/desktop-plugins-root.ts`). So the owner loads it
+themselves (README, "Loading the Desktop half").
 
 ## Measured size
 

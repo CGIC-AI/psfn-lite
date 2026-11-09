@@ -333,25 +333,45 @@ Settings. It has three parts:
 
 ### Loading the Desktop half
 
-Hermes Desktop hot-loads `plugins/<name>/desktop/plugin.js` from the Hermes
-root and from every profile. That is why the install tool never copies the
-file. To load the Garden into Desktop for one profile that already has the
-backend (step 6):
+Hermes Desktop loads desktop plugins from one place: `desktop-plugins/` in
+the Hermes root (`apps/desktop/electron/desktop-plugins-root.ts` at
+2bd378e). It also copies any `plugins/<name>/desktop/plugin.js` that it
+finds in the root or in any profile into that folder, so a Desktop half
+placed under `plugins/` loads too. That is why the install tool never copies
+the file, and why the tests never create one under `~/.hermes`.
+
+You load the Desktop half yourself, once the profile Desktop uses serves the
+backend (step 6). Copy the built file into Desktop's own folder:
 
 ```bash
-mkdir -p "$HERMES_HOME/plugins/psfn_lite/desktop"
-cp integrations/hermes/psfn_lite/desktop/plugin.js "$HERMES_HOME/plugins/psfn_lite/desktop/plugin.js"
+mkdir -p ~/.hermes/desktop-plugins/psfn_lite
+cp integrations/hermes/psfn_lite/desktop/plugin.js ~/.hermes/desktop-plugins/psfn_lite/plugin.js
 ```
 
-Desktop shows a "Garden" entry in the sidebar. Every screen calls
-`/api/plugins/psfn_lite/api/...` through Desktop's own authenticated REST
-client. To unload it, remove that `desktop/` folder. After that, run
-`install_plugin.py` only once the folder is gone, because it refuses a
-profile that holds a Desktop half.
+Desktop picks it up within a few seconds (it rescans the folder) or at its
+next start. You can also switch it on or off in Capabilities ▸ Plugins.
+This keeps `plugins/psfn_lite` free of a Desktop half, so
+`install_plugin.py` keeps working. To unload it, remove
+`~/.hermes/desktop-plugins/psfn_lite`.
 
-`psfn_lite/desktop/plugin.js` is built from `integrations/hermes/desktop/`
-(see `docs/development.md`), and the built file is committed. A Vitest
-check rebuilds it and fails if the committed file differs.
+The alternative is Desktop's paired layout. Put the file at
+`<profile home>/plugins/psfn_lite/desktop/plugin.js`, and Desktop copies it
+to `desktop-plugins/psfn_lite/` with a marker that names the source. Desktop
+removes that copy itself once the source file is gone. While the file is
+there, `install_plugin.py` refuses that profile.
+
+Desktop shows a "Garden" entry in the sidebar, with one page per screen. It
+also shows a "Memory deletions" side pane when the Memories screen opens it,
+and two transcript directives a reply can use:
+`::garden-memory{id="<memory id>"}` and `::garden-layer-diff{layer="<layer id>"}`.
+Every request goes through Desktop's authenticated REST client to
+`/api/plugins/psfn_lite/...` on the active profile's dashboard. A profile
+without the backend answers 404, and the screens say so.
+
+`psfn_lite/desktop/plugin.js` is built from `integrations/hermes/desktop/src`
+by `integrations/hermes/desktop/build.mjs` (see `docs/development.md`), and
+the built file is committed. `tests/desktop/bundle.test.ts` rebuilds it and
+fails if the committed file differs.
 
 ## Hermes with a gateway (2bd378e)
 
