@@ -3,10 +3,6 @@ import type { ScratchpadViewer } from '../../../../faculties/memory/scratchpad-v
 import type { AssistantMessage } from '@earendil-works/pi-ai';
 import type { EventBus, EventMap } from '../../../../shared/event-bus.js';
 import type { CostTelemetryPort } from '../../../../shared/telemetry/cost-telemetry-port.js';
-import type {
-  DurableRunChargeProbe,
-  DurableRunChargeRecorder,
-} from '../../../../shared/telemetry/run-charge.js';
 import type { ComposeContext } from '../../../identity/prompt-types.js';
 import type { ImageVisionReviewer } from '../../../../shared/contracts/image-vision-review.js';
 import type { VisionIntakeImageScreenerPort } from '../vision-attachments.js';
@@ -96,8 +92,6 @@ export type TurnAdmissionSessionManager = TurnSessionManager & Pick<
 export interface TurnExecutionRuntime {
   eventBus: EventBus;
   costTelemetry: CostTelemetryPort;
-  durableChargeRecorder?: DurableRunChargeRecorder | null;
-  durableChargeProbe?: DurableRunChargeProbe | null;
   satellitePresence: SatellitePresencePort;
   /**
    * Cross-companion presence (sprint 10, W5a). Absent/null (single-companion,

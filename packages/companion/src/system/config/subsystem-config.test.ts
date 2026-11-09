@@ -6,11 +6,6 @@ import { DEFAULT_HEALTH_DETECTORS_CONFIG } from './scheduler-config/health-detec
 import { DEFAULT_FLEET_STAGGER_CONFIG } from './scheduler-config/fleet-stagger.js';
 import { DEFAULT_HUMAN_ESCALATION_CONFIG } from './scheduler-config/human-escalation.js';
 import {
-  CAPABILITY_TIER_FILE_NAME,
-  loadCapabilityTierConfig,
-  saveCapabilityTierConfig,
-} from './capability-tier-config.js';
-import {
   MODELS_FILE_NAME,
   loadModelsConfig,
   saveModelsConfig,
@@ -852,18 +847,6 @@ describe('subsystem config round-trip', () => {
       ...base,
       audienceScopeThresholds: { fewMax: 10, manyMax: 100, extra: true },
     })).toThrow(/unsupported keys/);
-  });
-
-  it('round-trips capability-tier.json without drift', () => {
-    const dataDir = makeDataDir('psfn-capability-tier-config-');
-    const expected = {
-      tier: 'custom',
-      customTokens: ['identity.read', 'git.read'],
-    };
-
-    expect(saveCapabilityTierConfig(dataDir, expected)).toEqual(expected);
-    expect(readJsonFile(join(dataDir, CAPABILITY_TIER_FILE_NAME))).toEqual(expected);
-    expect(loadCapabilityTierConfig(dataDir)).toEqual(expected);
   });
 
   it('round-trips providers.json without drift', () => {

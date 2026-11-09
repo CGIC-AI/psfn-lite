@@ -37,7 +37,7 @@ import type {
 import { drainObserverEvalSidecarQueue } from '../../eval/observer-sidecar/runtime.js';
 import { sanitizeObserverEvalInput } from '../../eval/observer-sidecar/privacy.js';
 import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
-import type { ChargePolicyConfig } from '../../../system/config/charge-policy-config.js';
+import type { ChargePolicyConfig } from '../../../shared/contracts/charge-policy.js';
 import type {
   AgentResponse,
   IntentionalNoReplyMetadata,

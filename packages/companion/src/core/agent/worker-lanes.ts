@@ -1,5 +1,5 @@
 import { isSocialOutreachChannelId } from '../../shared/contracts/social-outreach-channel.js';
-import type { ChargePolicyRuntimeLane } from '../../system/config/charge-policy-config.js';
+import type { ChargePolicyRuntimeLane } from '../../shared/contracts/charge-policy.js';
 import type {
   CompletionPurpose,
   ObservabilityCallType,

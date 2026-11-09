@@ -1,6 +1,6 @@
 import { runDeliberation } from '../../../primitives/llm/deliberation.js';
 import type { CorrelationMetadata, LLMContext, ObservabilityCallType, SubstrateMessage, TurnID, TurnUsage } from '../../../shared/contracts/runtime.js';
-import type { ChargePolicyReferenceModelClass } from '../../../system/config/charge-policy-config.js';
+import type { ChargePolicyReferenceModelClass } from '../../../shared/contracts/charge-policy.js';
 import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
 import {
   chargeSurface,
