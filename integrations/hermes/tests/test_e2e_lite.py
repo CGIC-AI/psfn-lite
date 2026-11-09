@@ -354,3 +354,116 @@ def test_a_forced_step_with_exact_arguments_is_held_to_the_arguments_lite_hands_
     context = begin(session, f"{turn_id}2", "thanks")
     assert "[your own earlier reply]\nThe seed packets." in context
     finish(session, f"{turn_id}2", reply="You are welcome.")
+
+
+GARDEN_ENV = "PSFN_LITE_GARDEN_TEST_TOKEN"
+
+
+def _mounted_dashboard(home: Path, enabled: set):
+    """A FastAPI app with the plugin's dashboard backend mounted the way Hermes mounts it.
+
+    On 2bd378e through Hermes's own discovery and mount (``_discover_dashboard_plugins``,
+    ``_mount_one_plugin_api``: the ``plugins.enabled`` gate and the profile secret-scope dependency);
+    on f0187332, which has no per-plugin mount, by importing ``plugin_api.py`` as its
+    ``_mount_plugin_api_routes`` does. Returns None when Hermes refuses to mount it.
+    """
+    import importlib.util as util
+
+    from fastapi import FastAPI
+
+    app = FastAPI()
+    try:
+        from hermes_cli import web_server_dashboard as dashboard
+    except ImportError:
+        dashboard = None
+    if dashboard is not None and hasattr(dashboard, "_mount_one_plugin_api"):
+        [plugin] = [p for p in dashboard._discover_dashboard_plugins([(home / "plugins", "user")]) if p["name"] == "psfn_lite"]
+        return app if dashboard._mount_one_plugin_api(app, plugin, enabled, set()) else None
+    if "psfn_lite" not in enabled:
+        return None
+    api = home / "plugins" / "psfn_lite" / "dashboard" / "plugin_api.py"
+    spec = util.spec_from_file_location("hermes_dashboard_plugin_psfn_lite", api)
+    module = util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    app.include_router(module.router, prefix="/api/plugins/psfn_lite")
+    return app
+
+
+@pytest.fixture
+def dashboard(lite, profile, monkeypatch):
+    """The profile's dashboard backend in front of the real Lite Garden, with the Garden's own credential in the profile's scope."""
+    from starlette.testclient import TestClient
+
+    write_profile(profile, bridge_url=lite["lifecycleUrl"], mcp_url=lite["mcpUrl"], install_id=lite["hermesInstallId"],
+                  garden={"url": lite["garden"]["url"], "credential_env": GARDEN_ENV, "timeout_seconds": 30})
+    monkeypatch.setenv(CREDENTIAL_ENV, lite["credentials"]["hermes-operator"])
+    monkeypatch.setenv(GARDEN_ENV, lite["garden"]["credential"])
+    assert _mounted_dashboard(profile, set()) is None, "Hermes must not mount a backend that is not in plugins.enabled"
+    app = _mounted_dashboard(profile, {"psfn_lite"})
+    assert app is not None
+    with TestClient(app) as client:
+        yield client
+    sys.modules.pop("hermes_dashboard_plugin_psfn_lite", None)
+
+
+def test_the_install_never_carries_a_desktop_half(tmp_path):
+    from conftest import PLUGIN_SOURCE, install_plugin
+    from install_plugin import InstallError, desktop_halves
+
+    target = install_plugin(tmp_path)
+    assert target == tmp_path / "plugins" / "psfn_lite"
+    assert (target / "dashboard" / "plugin_api.py").exists() and (target / "plugin.yaml").exists()
+    assert desktop_halves(target) == []
+    if (PLUGIN_SOURCE / "desktop" / "plugin.js").exists():
+        assert desktop_halves(PLUGIN_SOURCE) != []  # the source has one; the install did not copy it
+    # A Desktop half already in the profile stops the install before anything is copied.
+    (target / "desktop").mkdir()
+    (target / "desktop" / "plugin.js").write_text("export default {}\n")
+    with pytest.raises(InstallError, match="Desktop half"):
+        install_plugin(tmp_path)
+    assert (target / "desktop" / "plugin.js").exists()
+
+
+def test_the_dashboard_backend_proxies_every_garden_screen_with_the_gardens_own_credential(dashboard, lite):
+    base = "/api/plugins/psfn_lite"
+    for path in ("/api/lite/overview", "/api/admin/memory", "/api/lite/memory-deletions", "/api/admin/identity", "/api/admin/prompts",
+                 "/api/admin/contacts", "/api/admin/biographical-claims", "/api/admin/graph-proposals", "/api/admin/sessions",
+                 "/api/admin/concerns", "/api/lite/inner-life", "/api/admin/scheduler", "/api/admin/automata", "/api/lite/settings"):
+        # The browser's Origin and cookies reach Hermes, never the Garden (which refuses any Origin).
+        answer = dashboard.get(f"{base}{path}", headers={"Origin": "http://127.0.0.1:9119", "Cookie": "psfn_garden_session=x"})
+        assert answer.status_code == 200, f"{path}: {answer.text[:300]}"
+    # Never ?profile= here: Hermes would scope the request to a real profile outside the test home.
+    overview = dashboard.get(f"{base}/api/lite/overview").json()
+    assert overview["model"]["modelId"] and overview["restartRequired"] is False
+    assert SEED_THREAD in json.dumps(dashboard.get(f"{base}/api/admin/concerns").json())
+    assert dashboard.get(f"{base}/api/admin/automata", params={"limit": "1", "busLimit": "1"}).status_code == 200  # the query passes
+    # Only the Garden's two route families pass.
+    assert dashboard.get(f"{base}/lifecycle/v1/prepare").status_code == 404
+    # The client normalises a literal "..", so send it encoded; Starlette decodes it into the path.
+    assert dashboard.get(f"{base}/api/lite/%2E%2E/admin/memory").status_code == 404
+
+
+def test_garden_writes_through_the_dashboard_backend_reach_lite(operator, dashboard):
+    # operator first: its profile is then rewritten with the Garden block (the MCP client it started stays up).
+    base = "/api/plugins/psfn_lite"
+    begin("e2e-garden", "e2e-garden:t", "remember the shed key")
+    written = call_tool("memory", "write", session="e2e-garden", turn_id="e2e-garden:t", text="Robin keeps the shed key on the red hook.", type="semantic")
+    finish("e2e-garden", "e2e-garden:t", reply="Noted.")
+    memory_id = re.search(r"id: ([0-9a-f-]{36})", written).group(1)
+
+    deleted = dashboard.post(f"{base}/api/lite/memories/{memory_id}/delete", json={"reason": "moved"})
+    assert deleted.status_code == 200, deleted.text
+    restored = dashboard.post(f"{base}/api/lite/memories/restore", json={"deleteId": deleted.json()["deleteId"]})
+    assert restored.status_code == 200 and restored.json()["memoryId"] == memory_id
+    tier = dashboard.put(f"{base}/api/lite/settings/tier", json={"tier": "apprentice", "customTokens": []})
+    assert tier.status_code == 200 and tier.json()["restartRequired"] is True
+    refused = dashboard.put(f"{base}/api/lite/settings/tier", json={"tier": "omnipotent", "customTokens": []})
+    assert refused.status_code == 400
+    assert dashboard.get(f"{base}/api/lite/settings").json()["tier"]["tier"] == "apprentice"
+
+
+def test_the_dashboard_backend_says_why_when_the_garden_credential_is_missing(dashboard, monkeypatch):
+    monkeypatch.delenv(GARDEN_ENV)
+    answer = dashboard.get("/api/plugins/psfn_lite/api/lite/overview")
+    assert answer.status_code == 503 and GARDEN_ENV in answer.json()["error"]

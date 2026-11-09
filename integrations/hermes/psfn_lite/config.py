@@ -51,6 +51,19 @@ class Automata:
 
 
 @dataclass(frozen=True)
+class Garden:
+    """The light Garden the dashboard backend proxies to (dashboard/plugin_api.py): Lite's operator API."""
+
+    url: str
+    #: The variable holding the Garden's own credential (bound in Lite to the primary contact), never the MCP one.
+    credential_env: str
+    timeout_seconds: float
+
+    def credential(self) -> str:
+        return _scoped_secret(self.credential_env, "the Lite Garden credential")
+
+
+@dataclass(frozen=True)
 class Config:
     bridge_url: str
     credential_env: str
@@ -60,18 +73,12 @@ class Config:
     max_context_chars: int
     #: Hosted automata (operator automata rule 4), or None to leave the companion's automata to Lite's core.
     automata: "Automata | None"
+    #: The light Garden behind the dashboard backend, or None for no Garden.
+    garden: "Garden | None"
 
     def credential(self) -> str:
         """The bridge credential from this profile's secret scope (agent.secret_scope.get_secret, fail-closed in a multiplexing gateway)."""
-        from agent.secret_scope import UnscopedSecretError, get_secret
-
-        try:
-            value = get_secret(self.credential_env) or ""
-        except UnscopedSecretError:
-            raise ConfigError(f"Hermes has no profile secret scope for {self.credential_env} here (a multiplexing gateway reads it only inside a profile's turn)") from None
-        if len(value) < _MIN_CREDENTIAL or any(c.isspace() for c in value):
-            raise ConfigError(f"environment variable {self.credential_env} must hold the Lite bridge credential ({_MIN_CREDENTIAL}+ characters)")
-        return value
+        return _scoped_secret(self.credential_env, "the Lite bridge credential")
 
     def binds(self, platform: str, sender_id: str) -> bool:
         return any(s.platform == platform and s.sender_id == sender_id for s in self.senders)
@@ -82,7 +89,7 @@ class Config:
 
     @classmethod
     def parse(cls, values) -> "Config":
-        fields = ("bridge_url", "credential_env", "mcp_server", "senders", "timeout_seconds", "max_context_chars", "automata")
+        fields = ("bridge_url", "credential_env", "mcp_server", "senders", "timeout_seconds", "max_context_chars", "automata", "garden")
         _exact(values, fields, "config")
         url = values["bridge_url"]
         if not isinstance(url, str) or not re.match(r"^https?://[^\s/]+(/[^\s]*)?$", url) or not url.rstrip("/").endswith("/lifecycle/v1"):
@@ -118,7 +125,8 @@ class Config:
             if type(claim_limit) is not int or not 1 <= claim_limit <= 8:
                 raise ConfigError("automata.claim_limit must be an integer from 1 to 8")
             automata = Automata(claim_limit)
-        return cls(url.rstrip("/"), env, server, tuple(parsed), float(timeout), limit, automata)
+        garden = _garden(values["garden"], env)
+        return cls(url.rstrip("/"), env, server, tuple(parsed), float(timeout), limit, automata, garden)
 
     @classmethod
     def load(cls, hermes_home) -> "Config":
@@ -178,6 +186,37 @@ def ownership_issues(hermes_config: dict) -> list:
     if compression.get("checkpoint_required") is not True:
         issues.append("compression.checkpoint_required must be true (compaction must not drop unproven turns)")
     return issues
+
+
+def _garden(raw, bridge_env: str) -> "Garden | None":
+    if raw is None:
+        return None
+    _exact(raw, ("url", "credential_env", "timeout_seconds"), "garden")
+    url = raw["url"]
+    if not isinstance(url, str) or not re.match(r"^https?://[^\s/]+/?$", url):
+        raise ConfigError("garden.url must be the http(s) base URL of the Lite Garden (what `serve` prints as `garden <url>`)")
+    env = raw["credential_env"]
+    if not isinstance(env, str) or not _ENV_NAME.match(env):
+        raise ConfigError("garden.credential_env must name an environment variable")
+    if env == bridge_env:
+        raise ConfigError("garden.credential_env must be the Garden's own credential, not the bridge credential")
+    timeout = raw["timeout_seconds"]
+    if type(timeout) not in (int, float) or not 0 < timeout <= 300:
+        raise ConfigError("garden.timeout_seconds must be a number from 0 to 300")
+    return Garden(url.rstrip("/"), env, float(timeout))
+
+
+def _scoped_secret(name: str, what: str) -> str:
+    """A credential from this profile's secret scope (agent.secret_scope.get_secret, fail-closed in a multiplexing gateway)."""
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
+    try:
+        value = get_secret(name) or ""
+    except UnscopedSecretError:
+        raise ConfigError(f"Hermes has no profile secret scope for {name} here (a multiplexing gateway reads it only inside a profile's turn)") from None
+    if len(value) < _MIN_CREDENTIAL or any(c.isspace() for c in value):
+        raise ConfigError(f"environment variable {name} must hold {what} ({_MIN_CREDENTIAL}+ characters)")
+    return value
 
 
 def _exact(raw, fields, at: str) -> None:

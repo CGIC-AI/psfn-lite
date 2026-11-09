@@ -24,6 +24,11 @@ PLUGIN_SOURCE = Path(__file__).resolve().parents[1] / "psfn_lite"
 sys.path.insert(0, str(PLUGIN_SOURCE.parent))
 
 from psfn_lite.config import HERMES_REVISIONS  # noqa: E402
+from install_plugin import install as _install  # noqa: E402
+
+
+def install_plugin(home: Path) -> Path:
+    return _install(PLUGIN_SOURCE, Path(home))
 
 USER_NAMESPACE = "_hermes_user_memory"
 CREDENTIAL_ENV = "PSFN_LITE_TEST_TOKEN"
@@ -76,12 +81,13 @@ def plugin_module(name: str, package: str = None):
     return sys.modules[f"{package}.{name}" if name else package]
 
 
-def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None, automata=None, install_id=INSTALL_ID) -> None:
+def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None, automata=None, install_id=INSTALL_ID, garden=None) -> None:
     (home / "plugins").mkdir(parents=True, exist_ok=True)
     # The profile is the Hermes root here (HERMES_HOME outside profiles/), where Hermes keeps its install id.
     if install_id is not None:
         (home / "install_id").write_text(install_id + "\n")
-    shutil.copytree(PLUGIN_SOURCE, home / "plugins" / "psfn_lite", ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
+    # As the install tool installs it (install_plugin.py): never the Desktop half.
+    install_plugin(home)
     (home / "psfn-lite.json").write_text(json.dumps({
         "bridge_url": bridge_url,
         "credential_env": CREDENTIAL_ENV,
@@ -90,6 +96,7 @@ def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoi
         "timeout_seconds": 5,
         "max_context_chars": 9000,
         "automata": automata,
+        "garden": garden,
     }))
     (home / "config.yaml").write_text(
         "memory:\n  provider: psfn_lite\n"
