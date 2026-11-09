@@ -119,8 +119,8 @@ export interface LiteConfig {
    * own port, loopback unless `allowedHosts` opts in to a wider address.
    * Its bindings use the MCP binding format; every one must name the
    * primary contact (`operator`), and none may reuse an MCP credential or
-   * principal. A Lite route reads a body of at most `maxBodyBytes` (a donor
-   * route reads up to its catalogue limit); the Overview shows the latest
+   * principal. A route reads a body of at most `maxBodyBytes` (the donor's
+   * standalone Garden read 64 KiB); the Overview shows the latest
    * session's last `recentTurnLimit` turns.
    */
   readonly garden: {

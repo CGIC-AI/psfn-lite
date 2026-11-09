@@ -2813,6 +2813,84 @@ The model is not an owner file. It is named in the Lite config file
 name. Settings shows it read-only; changing the model means editing the
 Lite config and restarting.
 
+### Decision (c): which memories the Garden operator sees
+
+The donor's Garden read memory through the subject-authorized projection
+(`createSubjectAuthorizedMemoryStore`) with one frozen context. Its
+standalone token Garden passed an empty one (`local-admin-contract.ts:766-776`;
+nothing in the donor's `main.ts` sets either context option). An empty
+context hides every memory classified as being about a person, the
+operator's own included. Over the real runtime, the Garden then could not
+find a memory the operator had just told the companion, and redact answered
+"Memory not found".
+
+Lite's Garden operator is the primary contact, the one human and the one
+admin of a single-operator install. So the Garden gets the context the
+donor gave a signed owner on a single-admin deployment
+(`memory-service.ts:189-204` `fleetSubjectAccessContext`, access mode
+`sole_admin`, `subject-authorized-store.ts:44-52`):
+
+- `viewerContactId` is the primary contact;
+- `adminAccessMode: 'sole_admin'`: every subject class and relation is
+  visible to them.
+
+This widens the Garden's memory reads beyond the donor's token Garden. The
+operator also sees intimate or confidential memories about other contacts
+of this companion. It changes no tool, no prompt and no recall path, only
+what the operator's own Garden shows. It is an owner decision recorded as
+an open item; keeping the donor's empty context means the Memories screen
+lists only memories about no one.
+
+### The operator surface: `packages/operator`
+
+A host-neutral package beside `packages/mcp` and `packages/lifecycle`, for
+the same reason they are separate: it is a host adapter over the extracted
+core, mounted by the standalone app and reachable by any host. It reaches
+the core only through `src/companion.ts` and the MCP transport only through
+`src/mcp.ts` (the boundary test lists both), and it has no dependencies.
+It needs nothing of the lifecycle bridge: the host passes it a read-only
+`awaitingHostTurn` check (decision a).
+
+- **Composition** (`garden.ts`). The donor services of the eight screens,
+  each built as `local-admin-contract.ts` built it (each step cites its donor
+  lines), over `CompanionRuntime.garden`. That is a new host seam: the
+  in-process stores the running companion uses, which the donor handed its
+  Garden composition (`cuts.tsv` S8 row). So a Garden write reaches the
+  store the companion reads, never a second copy. The biography review
+  uses the companion's own profile store instead of the second pool the
+  donor opened for it.
+- **Routes**. The donor routes (`/api/admin/...`, `donor-routes.ts`) come
+  from the donor builders, in the donor's order, compiled against the route
+  catalogue. They are dispatched as `server-routes.ts:59-100` did: the
+  request is bound for the response, and the route gets
+  `createStandaloneGardenRequestContext` from its catalogue entry, with the
+  actor `standalone-token:operator`. The Lite routes (`/api/lite/...`,
+  `lite-routes.ts`) cover only what no kept donor route serves:
+  - the Overview and Inner life reads (the dashboard service is cut);
+  - memory delete and restore, and the proposal decisions (decision a);
+  - Settings (decision b).
+  Introspection consent is shown read-only, because its only writer is the
+  companion itself. The values journal routes stay denied as in the donor;
+  the persona screen shows the values layer.
+- **Audit** (`audit.ts`). A port of the donor's `appendGardenEntry` to the
+  same file, `garden-audit-history.jsonl`, with the same record. Every
+  Garden write the donor audited is audited with actor `operator`, and so
+  is every Lite write.
+- **Transport** (`http.ts`). It follows `packages/lifecycle/src/http.ts`:
+  - it binds loopback unless `allowedHosts` names a wider address;
+  - any `Origin` gets 403, and a Host it does not serve gets 403;
+  - a missing or unbound bearer gets 401 with `WWW-Authenticate`, before any
+    body is read;
+  - every answer is `Cache-Control: no-store`;
+  - a body is read up to `maxBodyBytes` (the donor's flat
+    `ADMIN_MAX_BODY_SIZE`).
+- **Config** (`apps/standalone` `garden`, optional). `host`, `port`,
+  `allowedHosts`, `maxBodyBytes`, `recentTurnLimit` and `bindings` in the
+  MCP binding format. Every binding must name the primary contact
+  (`operator`), and no Garden credential or principal may also be an MCP one,
+  so a tool transport credential never opens the Garden. `serve` prints
+  `garden <url>`.
+
 ## Measured size
 
 After B7 (`packages/companion`, without `node_modules`):
