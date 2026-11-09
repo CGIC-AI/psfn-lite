@@ -47,6 +47,8 @@ describe.skipIf(dockerTestsOptedOut('lifecycle hosted automata'))('hosted automa
       await bridge(w, 'automata/claim', credential, { hostInstance, maxIterations, limit: 4 });
 
     expect((await claim(operator, 'hermes-1')).body).toEqual({ attempts: [] });
+    // Only a principal bound to the primary contact runs the companion's automata.
+    expect((await claim(friend, 'hermes-1')).status).toBe(403);
 
     // Lite's fixed nursery tier denies the `subagent` tool in turns (no shard.spawn), so the
     // automaton is started through the same control port the tool drives, as an admitted owner turn would.

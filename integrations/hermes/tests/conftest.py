@@ -47,7 +47,7 @@ def plugin_module(name: str):
     return sys.modules[f"{USER_NAMESPACE}.psfn_lite.{name}" if name else f"{USER_NAMESPACE}.psfn_lite"]
 
 
-def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None) -> None:
+def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoint_required=True, senders=None, mcp_url=None, automata=None) -> None:
     (home / "plugins").mkdir(parents=True, exist_ok=True)
     shutil.copytree(PLUGIN_SOURCE, home / "plugins" / "psfn_lite", ignore=shutil.ignore_patterns("__pycache__"), dirs_exist_ok=True)
     (home / "psfn-lite.json").write_text(json.dumps({
@@ -57,6 +57,7 @@ def write_profile(home: Path, *, bridge_url: str, memory_enabled=False, checkpoi
         "senders": senders if senders is not None else [{"platform": "cli", "sender_id": ""}, {"platform": "telegram", "sender_id": "4242"}],
         "timeout_seconds": 5,
         "max_context_chars": 9000,
+        "automata": automata,
     }))
     (home / "config.yaml").write_text(
         "memory:\n  provider: psfn_lite\n"

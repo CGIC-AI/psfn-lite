@@ -34,6 +34,7 @@ import os
 import secrets
 import threading
 
+from .automata import AutomataHost
 from .bridge import BridgeClient, BridgeError
 from .config import NON_INTERACTIVE_PLATFORMS, Config
 from .delivery import Delivery
@@ -81,13 +82,17 @@ class Driver:
         #: Warnings to show in the next turn's context, per Hermes session.
         self._carry = {}
         self.delivery = Delivery(client, ledger, instance=instance, fail=self._fail, notice=self._notice)
+        #: Hosted automata: the companion's automata claimed at the start of a bound root turn and run as this Hermes's subagents.
+        self.automata = None if config.automata is None else AutomataHost(client, instance=instance, claim_limit=config.automata.claim_limit, notify=notify)
 
     # -- hooks ---------------------------------------------------------------
 
-    def subagent_start(self, child_session_id=None, **_):
+    def subagent_start(self, child_session_id=None, **kwargs):
         if isinstance(child_session_id, str) and child_session_id:
             with self._lock:
                 self._subagents.add(child_session_id)
+        if self.automata is not None:
+            self.automata.subagent_start(child_session_id=child_session_id, **kwargs)
 
     def session_switch(self, new_session_id: str, parent_session_id: str) -> None:
         """A compression rotated the session id; the provider forwards only that reason of Hermes's notification."""
@@ -152,6 +157,9 @@ class Driver:
             entry["turn"] = lite_turn
             self._remember(session_id, lite_turn)
         self.ledger.bind_turn(entry["row"], lite_turn)
+        if self.automata is not None:
+            # Inside the root turn, where Hermes bound the parent its lifecycle children belong to.
+            warnings += self.automata.claim_and_launch()
         text = render_context(prepared["context"], warnings=warnings, limit=self.config.max_context_chars)
         return {"context": text}
 
