@@ -2159,7 +2159,25 @@ provider downloads the model into `<dataDir>/models/transformers`
 warmup, and the memory a turn writes is stored with a 384-dimension unit
 vector, every embedding call accounted to
 `transformers/Xenova/all-MiniLM-L6-v2`. `LITE_TEST_TRANSFORMERS_CACHE`
-copies an existing cache in instead of downloading.
+copies an existing cache in instead of downloading. The named key's
+reference reaches the donor factory unchanged: `startCompanionRuntime`
+assigns only the inner-life policy keys over the config
+(`companion-runtime.ts` `applyInnerLifeConfig`) before
+`createProviderRuntimeServices`, and `sanitizeCoreSubstrateConfig` removes
+only its listed secret-bearing keys, not `embeddingApiKeyRef`.
+
+Result (the plain validation command with a JSON reporter, both
+projects): 778 files and 9,201 tests, 9,200 passed (`lite` 21 files / 108
+tests, `companion` 757 files / 9,093 tests). The one failure was the
+transformers boot test: the model download into the temporary data
+directory hit the workstation's `/tmp` tmpfs user quota (`usrquota`,
+"Unknown system error -122", `EDQUOT`) while 16 workers ran; the file
+passed on its own before and after that run, on the same code.
+`compare-baseline.mjs`: "baseline: 807 files / 10107 tests; deleted: 54
+files, 1041 tests; matched: 9066; Lite additions: 4 files, 27 tests" and
+"equivalent: every remaining baseline test has its baseline status". The
+Hermes plugin suite: 80 passed and 1 skipped at f0187332, 79 passed and 2
+skipped at 2bd378e. No test container or temporary data directory was left.
 
 ## Measured size
 
