@@ -21,6 +21,8 @@ export interface BridgeWorld {
   readonly credentials: Readonly<Record<HermesPrincipal, string>>;
   readonly mcpUrl: string;
   readonly lifecycleUrl: string;
+  /** The light Garden and its own operator credential, when the world mounts it (`garden: true`). */
+  readonly garden: { readonly url: string; readonly credential: string } | null;
   readonly model: { readonly calls: readonly { readonly lastUser: string }[] };
   /** The install's data directory and environment (the session keyring among it). */
   readonly install: { readonly dataDir: string; readonly env: Readonly<Record<string, string>> };
@@ -33,7 +35,13 @@ export interface BridgeWorldOptions {
   readonly automata?: { readonly maxAttempts: number; readonly leaseMs: number; readonly maxIterations: number } | null;
   /** The pi-ai API the world's faux model reports (tests/support/faux-model.ts FauxModelOptions). */
   readonly modelApi?: string;
+  /** Mounts the light Garden (seam S8) with its own credential bound to the operator. */
+  readonly garden?: boolean;
 }
+
+/** The Garden's own principal and the variable holding its credential. */
+export const GARDEN_PRINCIPAL = 'garden-operator';
+const GARDEN_ENV = 'LITE_GARDEN_TEST_TOKEN';
 
 /** The test Hermes install every bridge world serves; prepare and checkpoint bodies name it. */
 export const INSTALL = HERMES_TEST_INSTALL_ID;
@@ -50,6 +58,7 @@ export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {})
   };
 
   async function startWorld(): Promise<BridgeWorld> {
+    const gardenCredential = options.garden === true ? newCredential() : null;
     const credentials = Object.fromEntries(Object.keys(HERMES_PRINCIPALS).map((p) => [p, newCredential()])) as Record<HermesPrincipal, string>;
     const install = await lite.install((document) => {
       document.mcp = {
@@ -63,12 +72,19 @@ export function useBridgeWorld(script: Script, options: BridgeWorldOptions = {})
         hermesInstallId: HERMES_TEST_INSTALL_ID,
         automata: options.automata ?? null,
       };
+      if (gardenCredential !== null) {
+        document.garden = { host: '127.0.0.1', port: 0, allowedHosts: null, maxBodyBytes: 65_536, recentTurnLimit: 12,
+          bindings: [{ principal: GARDEN_PRINCIPAL, credential: { env: GARDEN_ENV }, contact: 'operator' }] };
+      }
     });
+    if (gardenCredential !== null) install.env[GARDEN_ENV] = gardenCredential;
     Object.assign(install.env, Object.fromEntries(Object.entries(credentials).map(([p, c]) => [envName(p), c])));
     const { runtime, model } = await lite.start(install, script, options.modelApi === undefined ? {} : { api: options.modelApi });
-    const { mcpUrl, lifecycleUrl } = runtime.transports;
+    const { mcpUrl, lifecycleUrl, gardenUrl } = runtime.transports;
     if (mcpUrl === null || lifecycleUrl === null) throw new Error('transports were not mounted');
-    return { runtime, credentials, mcpUrl, lifecycleUrl, model, install: { dataDir: install.dataDir, env: install.env } };
+    if ((gardenCredential === null) !== (gardenUrl === null)) throw new Error('the Garden was not mounted as configured');
+    const garden = gardenUrl === null || gardenCredential === null ? null : { url: gardenUrl, credential: gardenCredential };
+    return { runtime, credentials, mcpUrl, lifecycleUrl, garden, model, install: { dataDir: install.dataDir, env: install.env } };
   }
 }
 
