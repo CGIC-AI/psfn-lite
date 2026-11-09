@@ -1,41 +1,53 @@
 # PSFN Lite
 
-A modular persistent companion core, derived from [PSFN Framework](https://github.com/CGIC-AI/psfn-framework), with a native Pi harness and a planned Hermes integration.
+A persistent companion core you can embed, extracted from
+[PSFN Framework](https://github.com/CGIC-AI/psfn-framework), with a standalone
+host on Pi and a native Hermes integration.
 
-Status: bootstrap. `packages/core` defines the domain interfaces, tool inventory and
-application boundary (ingress, turn lifecycle, dispatch); no storage, harness or
-companion runtime is implemented yet. See [the tool inventory](docs/tool-inventory.md).
+The companion is the donor's own core, extracted path-preserving into
+`packages/companion` from `psfn-framework` at
+`e6a9546051f4e92bf7218b133b4523ac53a797c0`. Only the recorded seam cuts
+were made ([extraction record](docs/extraction.md)), and the extracted donor
+tests reproduce the donor baseline, less the recorded deletions of tests of
+cut scaffolding. It owns one companion's identity and
+continuity: prompt layers and persona, values and North Star, sessions,
+contacts and trust, memory, episodes, journals, emotion and self-model,
+concerns, scheduler and free time, letters, and bounded subagents.
 
-The core owns one companion's identity and continuity: constitution, persona,
-values, North Star, sessions, contacts, privacy, core and long-term memory,
-episodes, journals, emotion, self-model, concerns, reflection, free time,
-automata, and bounded subagents. A replaceable harness provides conversation
-and practical execution without becoming another owner of the companion's self.
+Around it, Lite has host adapters only:
 
-Hermes integration must expose the companion's internal capabilities, not only
-a small subset of memory search. MCP supplies a transport for governed tools;
-a native Hermes adapter supplies identity/context and lifecycle integration.
-Both use the same application operations and authorization rules.
+- `apps/standalone`: a thin host over `startCompanionRuntime`. A validated
+  config document and a CLI (`init`, `once`, `chat`, `serve`) run the
+  companion on a Pi model over PostgreSQL with pgvector.
+- `packages/mcp`: the donor tool catalog over MCP. The caller is bound
+  from the transport credential, never from tool arguments.
+- `packages/lifecycle`: host-driven turns for a host with its own model
+  loop. The donor assembles the context, runs every tool call and archives
+  the turn, and the host supplies the model's answers.
+- `packages/pi`: the Pi model runtime and the embedding port.
+- `integrations/hermes`: the Hermes plugin, which makes every root Hermes
+  turn a host-driven Lite turn.
 
-No PSFN Gateway, satellites, fleet, shared worlds, shards, or charge subsystem
-is required. Host control planes own credentials, approvals, execution isolation,
-and delivery; the core retains privacy, authorship, and continuity authority.
+No PSFN Gateway, satellites, fleet, shared worlds, shards, charge, wiki,
+skills, Discord, CogSec intake or Garden is included. Host control planes
+own credentials, approvals, execution isolation, practical tools and
+delivery. The companion keeps privacy, authorship and continuity authority.
 
 - [Agent operating contract](AGENTS.md)
-- [Architecture and extraction decisions](docs/architecture.md)
+- [Architecture](docs/architecture.md)
 - [Lite charter](docs/charter.md)
-- [Development and validation contract](docs/development.md)
+- [Development and validation](docs/development.md)
 - [Source provenance](docs/provenance.md)
+- [Companion tool inventory](docs/tool-inventory.md)
 - [Continuity conformance](docs/conformance.md)
 - [Measured footprint](docs/footprint.md)
 - [Donor extraction record](docs/extraction.md)
+- [Hermes plugin](integrations/hermes/README.md)
 
 Work is tracked in Beads, not Markdown task lists. In this checkout run
 `bd prime` and `bd ready --json`. New clones require local Beads setup; Git
 intentionally contains no tracker database or exports.
 
-The bootstrap hook protects main from direct pushes. The complete local-gate
-and publication workflow is a tracked prerequisite to product implementation;
-this bootstrap does not claim those gates are already ported.
+The bootstrap hook protects main from direct pushes.
 
 The inherited license text is retained in [LICENSE](LICENSE).

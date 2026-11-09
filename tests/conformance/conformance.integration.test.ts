@@ -47,10 +47,17 @@ describe.skipIf(dockerTestsOptedOut('continuity conformance'))('continuity confo
       await host.request('pi_turn', { say: 'hello', calls: [], reply: 'Hello.', vars: {}, key: 'inventory-pi' });
       const inventory = await host.request<{ catalog: string[]; offered: string[] }>('inventory');
       const operator = host.ready.credentials['hermes-operator'];
-      const listed = (await (await hermes.client(operator)).listTools()).tools.map((tool) => tool.name);
+      const tools = (await (await hermes.client(operator)).listTools()).tools;
+      const listed = tools.map((tool) => tool.name);
       expect(inventory.catalog.length).toBeGreaterThan(0);
       expect([...listed].sort()).toEqual([...inventory.catalog].sort());
-      expect(listed.filter((name) => excludedName(name) !== null)).toEqual([]);
+      // Neither a served tool nor one of its actions names an excluded subsystem.
+      const actions = tools.flatMap((tool) => {
+        const action = (tool.inputSchema.properties as Record<string, { enum?: unknown }> | undefined)?.['action'];
+        return Array.isArray(action?.enum) ? action.enum.map((name) => `${tool.name}.${String(name)}`) : [];
+      });
+      expect(actions.length).toBeGreaterThan(0);
+      expect([...listed, ...actions].filter((name) => excludedName(name) !== null)).toEqual([]);
       // The donor offers the model its core tools and whatever it loaded; both surfaces get the same assembly.
       const prepared = await hermes.bridge('prepare', operator, { hostInstance: 'inventory', idempotencyKey: 'inventory-hermes', sessionId: 'inventory', message: 'hello again' });
       const offered = (prepared.body['context'] as { tools: string[] }).tools;

@@ -1,7 +1,8 @@
 # Development and validation contract
 
-The repository is at bootstrap, with no product code or installed dependencies.
-Beads contains the executable work plan. Do not mistake this document for a task tracker.
+The product is the extracted donor core (`packages/companion`) and Lite's host
+adapters (see [architecture](architecture.md)). Beads contains the executable
+work plan. Do not mistake this document for a task tracker.
 
 ## Bootstrap commands
 
@@ -80,7 +81,8 @@ configs cap the run at 16 forks (`maxWorkers`), the shared-workstation budget. D
 not raise it with `--maxWorkers`: uncapped runs lost forks there (see
 [extraction](extraction.md)).
 
-Adapter integration tests (`*.integration.test.ts`) run inside `npx vitest run`
+Lite's integration tests (`*.integration.test.ts`: lifecycle, standalone,
+conformance) run inside `npx vitest run`
 against a throwaway pinned pgvector container, so Docker is required. Without it
 they fail. `LITE_SKIP_DOCKER_TESTS=1` skips them explicitly and prints that it did.
 
@@ -129,9 +131,12 @@ uv pip compile --no-config "$HERMES_CLONE/pyproject.toml" /tmp/psfn-test-extra.i
 conformance host process the TypeScript runner drives. It needs the same
 Docker, Node and `node_modules`. See [conformance](conformance.md).
 
-`tests/test_e2e_lite.py` starts `tests/hermes/fixtures/lite-host.ts` (the
-standalone runtime over a throwaway pgvector container, with the MCP
-transport and the lifecycle bridge on loopback), so it needs Docker, Node on
-`PATH` (hence `mise exec`) and the repository's `node_modules`. As with the
+`tests/test_e2e_lite.py` starts `tests/hermes/fixtures/lite-host.ts` with
+`node --import tsx`. That is the conformance host (the standalone runtime
+over the extracted companion core, with the MCP transport and the lifecycle
+bridge on loopback) over a throwaway pgvector container. Before it reports
+ready, a seed turn of the standalone writes a thread for the Hermes tests
+to find. So the e2e tests need Docker, Node on `PATH` (hence `mise exec`)
+and the repository's `node_modules`. As with the
 TypeScript integration suites, `LITE_SKIP_DOCKER_TESTS=1` skips it explicitly.
 

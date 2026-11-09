@@ -27,6 +27,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | B5 seam cuts (3.10, 3.17) | Done (Seam cuts, below): no core import of vendored scaffolding remains. |
 | B6 seam cuts (3.1, 3.11) | Done (Seam cuts, below): the composition root boots over PostgreSQL (boot proof). |
 | B7 delete the vendored scaffolding | Done (Seam cuts, below): every vendored scaffolding file is deleted, nothing in `packages/companion` imports, mocks or reads one, and the packages only scaffolding used are removed. |
+| C swap Lite onto the extracted core | Done (Step C, below): `apps/standalone` wraps `startCompanionRuntime`, MCP serves the donor tool catalog, the lifecycle bridge and the Hermes plugin drive host-driven donor turns, `packages/pi` keeps only the model and embedding adapters, `packages/core` and `packages/adapters` are deleted, and conformance runs on donor behaviour. |
 
 ## Closure (Step A0)
 
@@ -913,7 +914,253 @@ deleted path as data, not as a module reference: the consumer metadata in
 comments in `shared/contracts/world-notes.ts:9` and
 `system/config/companions-config.ts:33`. The core tool registry still lists
 the 17 surfaces whose factories were scaffolding. These are open questions
-for Step C, not imports.
+for Step C, not imports. Step C left them as they are (below).
+
+## Step C: Lite over the extracted core
+
+Step C replaced Lite's own companion core with the extracted donor core. The
+Lite-side code that remains is host adapters around
+`startCompanionRuntime` (see [architecture](architecture.md)):
+
+- `apps/standalone` is a thin wrapper. It validates the Lite config
+  document, builds the donor substrate config from the donor's load-config
+  defaults plus the host's choices (`substrate-config.ts`), and loads the
+  inner-life owner files with the donor loader. It then starts the companion
+  with the Pi model runtime, the embedding port, the session keyring and an
+  outbound sender, provisions the configured contacts, and mounts the MCP
+  transport and the lifecycle bridge. The CLI keeps `init`, `once`, `chat`
+  and `serve`.
+- `packages/mcp` serves the donor tool catalog: one MCP tool per tool the
+  `SubstrateAgent` registers, with the donor's name, description and TypeBox
+  schema (`packages/lifecycle/src/tools.ts`). It holds no tool logic,
+  validation or authorization. A call is handed with its credential's
+  principal to the host tool port, and that port runs it as a model tool
+  call of the principal's open host-driven turn, inside the donor loop.
+- `packages/lifecycle` does host-driven turns. `prepare` calls
+  `SubstrateAgent.handleMessage` on the donor's Hermes channel convention
+  (`externalMemorySessionId`). The relay answers that turn's model calls
+  from the host through the donor's stream transport seam (seam C below).
+  `prepare` returns the first model call's context (system prompt, history
+  with donor message classes, offered tools). A host tool call is answered
+  to the donor loop as the model's tool call, and the donor's tool result
+  comes back. `settle` with the host's final reply ends the donor loop, and
+  the donor then archives the turn and runs its post-turn work.
+  `checkpoint` looks each turn up in the donor's archive (`sessionManager.findUniqueSourceRecordedTurn`).
+- `integrations/hermes` drives those turns from Hermes hooks.
+- `packages/pi` keeps only the Pi model runtime, the embedding port and
+  their result shape. The Lite Pi harness (companion harness, loop, context,
+  tools, settlement, worker host, inference) is deleted, because the donor
+  `SubstrateAgent` is the harness.
+- `packages/core` (125 files) and `packages/adapters` (33 files), 19,618
+  lines between them, are deleted. So are their tests and the Lite runtime
+  benchmarks (`scripts/bench/inference.ts`, `latency.ts`, `lite-host.ts`).
+
+### Seams and host choices
+
+- **C: `wrapStreamTransport`** (`cuts.tsv`, seam C).
+  `startCompanionRuntime` takes an optional function that receives the
+  default in-process stream transport (`{ stream: llmProvider.stream }`, the
+  `SubstrateAgent` default) and returns the transport the agent uses. In the
+  donor, `core-runtime.ts:724-726` passed `gateway.stream` there, and that
+  was the foreground turn's only model seam. Without the option, behaviour
+  is unchanged.
+- **Workspace, logs and temp.** The donor took `WORKSPACE_PATH` from the
+  environment of its fleet startup (cut). Otherwise `persistence/layout.ts`
+  falls back to `./workspace`, `./logs` and `./tmp` of the working directory
+  (`:75-77`, `:243-260`). A first conformance run wrote a `workspace/` into
+  the repository that way, and the journal of one run then showed another
+  run's notes. Lite's config now requires `workspaceDir`, which must not be
+  `dataDir`, sit inside it or contain it (the donor's own overlap rule,
+  `layout.ts:146-155`). The runtime passes a `pathSnapshot`
+  (`resolveRuntimePathSnapshotFromConfig`) with that workspace and with
+  `<dataDir>/logs` and `<dataDir>/tmp`.
+- **`CONFIG_DIR`.** The donor seed loaders read `process.env.CONFIG_DIR` and
+  fall back to `./config` of the working directory (for example
+  `system/config/companions-config.ts:646`,
+  `core/identity/runtime-prompt-layers.ts:208`). The standalone sets it to
+  the companion's shipped seeds when the process has none, and passes it in
+  the runtime `env`.
+- **Database.** The donor keeps pgvector in an `extensions` schema
+  (`persistence/postgres/connection-options.ts`). Installs and test
+  fixtures create that schema before `init` (`tests/support/lite-install.ts`).
+- **Logger.** The donor logger writes to stdout. Processes that speak a
+  protocol on stdout (the conformance host, the Hermes e2e host) keep the
+  real `stdout.write` for protocol lines and send the rest to stderr.
+- **One runtime per process.** The donor keeps process-wide state (the
+  readiness ledger, among others), so every test or host that needs a fresh
+  companion starts its own process (the conformance host process) or a
+  fresh vitest fork.
+- **The 17 registry surfaces whose factories were scaffolding** (the B7
+  question above) stay in the donor registry text. No factory builds them,
+  so they are not in the live catalog. The conformance inventory test
+  checks that the MCP list equals the live donor catalog and that no served
+  tool or action names an excluded subsystem. The four data references to
+  deleted paths stay as donor text.
+
+### Lite-new behaviour removed
+
+The Lite-new rules of plan §7.6 are gone, with the code that implemented
+them. Conformance no longer asserts them:
+
+- delegated internal turns (`internal/claim`, `internal/release`, minted
+  per-turn credentials, `PSFN_LITE_INTERNAL_HOST`), Lite free time and rest;
+- turn leases and lease recovery (`turn_lease_active`), and worker
+  recovery, requeue and effect receipts;
+- write receipts and `writeId` replay;
+- the continuity backup and restore API;
+- the settlement fields `partialReply`, `delivery`, `by`, `toolCallCount`
+  and `postTurn`, and the checkpoint re-append of an unarchived turn;
+- Lite's typed attribution origins and the `TOOL_INVENTORY` registry (now
+  the donor's message classes and tool registry).
+
+### What a host-driven turn cannot reproduce
+
+These are limits of the bridge and the Hermes plugin over donor turns. Each
+one was found in the donor code or in a run:
+
+- **No model call after the host's final reply.** If the donor asks for
+  another completion after `settle` (a corrective re-prompt), nobody is left
+  to answer. The relay fails that call (`NonRecoverableFallbackError`), and
+  the donor records the turn as it ends on that failure.
+- **Donor turn limits apply to the host's loop.** A host turn is held to the
+  donor's 36 assistant steps and its 5-minute parent-turn wall time
+  (`core/agent/turn-limits.ts`). When the donor ends the turn on one of
+  them, the host's next tool call gets `turn_ended`. The bridge also fails a
+  turn the host neither continues nor settles within `hostTurnTimeoutMs`
+  (`host_turn_timeout`).
+- **One agent.** The donor runs one foreground turn at a time. While a host
+  turn is open, another principal's `prepare` is refused as `unavailable`
+  (`capability: companion_turn`, HTTP 503), and the same principal's is
+  refused as `turn_already_open` (409).
+- **The donor may rewrite the reply.** `settle` returns the reply as the
+  donor recorded it, after its own reply handling. Hermes has already
+  delivered its own reply after the hook, so the participant sees the
+  host's text. There is no streaming.
+- **Provider-side retries see the host.** The donor's stream adapter re-asks
+  a completion whose tool call has empty required arguments
+  (`core/agent/stream-adapter.ts`, `corrupt_empty_arguments`). Such a host
+  call then returns "The companion runtime returned no result for this
+  tool call." rather than the tool's own validation error.
+- **Extended tools.** An extended tool the turn has not loaded is answered
+  with the donor's unknown-tool correction, which names `toolset`, exactly
+  as a `SubstrateAgent` model call is.
+- **History shown twice.** The rendered context carries the donor's session
+  history. Hermes also shows the model its own transcript, so earlier turns
+  of the conversation appear in both.
+- **Orientation is per conversation.** The donor's human block of `orient`
+  belongs to one conversation. Another session of the same contact (another
+  Hermes session id) does not see it. A concern scoped to the contact
+  (`contactId`, `sensitivity: personal`) is visible across that contact's
+  sessions and hidden from other contacts. A concern without `contactId` is
+  global, so a friend sees it too.
+- **Dead processes.** When the Hermes plugin starts, it settles as failed
+  (`hermes_process_ended`) the open turns of exited processes of the
+  profile, before it prepares anything. So a successor never sees
+  `turn_already_open` for a dead process's turn. Until a successor starts,
+  the bridge's host-turn timeout ends such a turn.
+
+### Deleted and modified Lite tests
+
+These are Lite's own tests, not donor tests: the donor-test record is
+`deleted-tests.tsv` and `modified-tests.tsv`, and Step C changes neither.
+Before Step C, `lite` had 52 files and 440 tests. After it, `lite` has 11
+files and 83 tests.
+
+Deleted with the code they tested:
+
+- `tests/core/*` (20 test files and 10 helpers): Lite core activity,
+  attribution, automata, backup, contacts, continuity handlers, dispatch,
+  emotion, episodes, free time, identity, ingress, journals, memory,
+  schedule, self-state, sessions, `TOOL_INVENTORY` and turn lifecycle;
+- `tests/adapters/*` (9 test files and 2 helpers): the Lite Postgres
+  stores, migrations, the JSONL session archive, history backup and
+  continuity recovery;
+- `tests/boundary/{adapter,core,harness,mcp}-imports.test.ts`: the Lite
+  core's import rules. They are replaced by `host-imports.test.ts`, which
+  checks that each host package reaches the companion only through its one
+  `companion.ts` module and lists exactly the donor modules it uses;
+- `tests/lifecycle/bridge.integration.test.ts` (and `bindings.ts`): the
+  Lite turn ledger bridge. It is replaced by
+  `host-turns.integration.test.ts`;
+- `tests/mcp/{argument-drift,authority,internal-turns,inventory-parity,leakage}.test.ts`,
+  `postgres.integration.test.ts` and `bindings-fixture.ts`: Lite argument
+  descriptions, the dispatcher's admission, minted internal-turn
+  credentials, and `TOOL_INVENTORY` parity. Transport authentication and
+  error replacement moved to `transport.test.ts`;
+- `tests/pi/{companion-harness,internal-activity,turn-settlement}.test.ts`
+  (and `faux-brain.ts`, `pi-world.ts`): the Lite Pi harness;
+- `tests/standalone/shutdown.integration.test.ts` (and `lite-config.ts`,
+  `standalone-world.ts`): the Lite tick loop and stacks;
+- conformance scenarios `05-free-time`, `06-free-time-delegated`,
+  `07-authorship`, `08-worker-recovery` and `09-backup-restore`, and
+  `host/brain.ts` (the scripted Lite brain). 07 asserted Lite's
+  attribution origins. It is replaced by `05-attribution` on donor
+  behaviour.
+
+Rewritten for the donor core, with the same subject:
+
+- `tests/mcp/bindings.test.ts`, `stdio.test.ts`, `mcp-world.ts`: the
+  credential and binding rules are unchanged, and a fake host tool port
+  stands in for the Lite dispatcher;
+- `tests/pi/model-ports.test.ts`: only the model and embedding ports;
+- `tests/standalone/config.test.ts` (adds the `workspaceDir` overlap
+  test) and `standalone.integration.test.ts` (`init`, `once` and `serve`
+  over the donor runtime);
+- the conformance contract, host, drivers and runner, and scenarios
+  01-04: a Pi turn is a donor-driven turn (`agentLoop.handleMessage`, with
+  the scripted model making the planned tool calls), and a Hermes turn is
+  `prepare`, MCP and `settle`. Both run on the operator's donor session
+  channel. `02-abandoned-turn` now waits out the host-turn timeout instead
+  of a lease, and it drops the conflict step that the plugin's own
+  recovery makes unreachable from the real Hermes runner;
+- `tests/conformance/absence.test.ts`:
+  - `excludedName` moved to `excluded-names.ts`, unchanged, so the
+    inventory test can use it.
+  - The product-file floor went from more than 50 files to more than 40:
+    there are now 46 product files, and a truncated listing still fails.
+  - One donor contract key is allowed by name and file: `channels` in
+    `apps/standalone/src/runtime.ts`, the donor's `Contact.channels`
+    identity links.
+  - The tool rule now reads the donor registry minus the 17 scaffolding
+    surfaces, because `TOOL_INVENTORY` is gone. Action names are checked
+    on the live catalog by the conformance inventory test, which also
+    checks the MCP list against the donor catalog. That test replaces the
+    inventory parity test.
+- `tests/hermes/fixtures/lite-host.ts`: it now runs the conformance host
+  over a throwaway database. A seed Pi turn writes a contact-scoped concern.
+- Donor test `companion-runtime.boot.integration.test.ts`: one import was
+  re-pointed from `packages/pi/src/core.ts` (deleted) to
+  `packages/pi/src/result.ts`, which has the same `ok`. No assertion
+  changed.
+
+Hermes plugin tests (Python):
+
+- `test_host_contract.py` deleted two tests for delegated internal turns:
+  `test_a_delegated_internal_turn_prepares_the_trigger_lite_fixed_and_says_it_is_internal`
+  and
+  `test_the_internal_turn_host_runs_a_claimed_turn_with_the_minted_credential_and_releases_it`.
+  The rest moved to the new wire: `sessionId` in `prepare` and
+  `checkpoint`, the `completed`, `interrupted` and `failed` outcomes
+  without `partialReply`, and no `toolCallCount`.
+- `test_turn_integrity.py` deleted
+  `test_a_subagent_inside_an_internal_turn_never_drives_the_turn_or_uses_lite_tools`.
+  Its compression test now asserts that both turns prepare in the root
+  session.
+- `test_e2e_lite.py` was rewritten to donor tools, the seeded concern and
+  donor context history (three tests renamed for that).
+  `test_conformance.py` and `conformance_runner.py` were rewritten to the
+  new scenarios. The inventory test now checks that Hermes registers
+  exactly the donor catalog Lite serves.
+
+### Other changes
+
+- Root `tsconfig.json`: `exactOptionalPropertyTypes` was removed and
+  `esModuleInterop` added, as in the donor's compiler options, because the
+  host adapters now type-check against donor types.
+- Packages: `knip` (dev, unused) and the dead `test:ci-rules` script were
+  removed, along with 975 lockfile lines. `@earendil-works/pi-agent-core`
+  left `packages/pi/package.json`. The root keeps it for the companion.
+  No package was added.
 
 ## Package changes
 
@@ -1011,3 +1258,23 @@ After B7 (`packages/companion`, without `node_modules`):
 | Package files (`package.json`, configs, README, baseline) | 7 | 1,109 |
 
 The deleted vendored set was 760 files and 230,765 LOC.
+
+After Step C, Lite's own code (lines of tracked `.ts`, `.py`, `.mjs`,
+`.json`, `.yaml` and `.sql` files). `packages/companion` changed only by
+seam C (`companion-runtime.ts`, 15 lines) and the boot test's import:
+
+| Part | Before C (files / lines) | After C (files / lines) |
+|---|---:|---:|
+| `packages/core/src` | 124 / 15,295 | deleted |
+| `packages/adapters/src` | 32 / 4,300 | deleted |
+| `packages/lifecycle/src` | 6 / 746 | 8 / 1,109 |
+| `packages/mcp/src` | 18 / 1,389 | 7 / 565 |
+| `packages/pi/src` | 14 / 1,537 | 5 / 329 |
+| `apps/standalone/src` | 16 / 1,526 | 10 / 1,030 |
+| `integrations/hermes/psfn_lite` | 12 / 1,312 | 11 / 1,157 |
+| `integrations/hermes/tests` | 7 / 1,630 | 7 / 1,464 |
+| `tests` (with the scenario JSON) | 93 / 14,874 | 36 / 3,284 |
+| `scripts` | 5 / 500 | 2 / 158 |
+
+Without docs and Markdown, the Step C diff from `4a6bcf8` is 346 files,
++3,652 / -38,646 lines. The lockfile accounts for 975 of the deleted lines.
