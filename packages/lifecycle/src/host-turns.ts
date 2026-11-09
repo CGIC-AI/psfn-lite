@@ -142,6 +142,7 @@ export class HostTurn {
   private waiters: (() => void)[] = [];
   private ended = false;
   private answered = false;
+  private interruptRequested = false;
   private chain: Promise<unknown> = Promise.resolve();
   private endValue: HostTurnEnd | null = null;
   private readonly endPromise: Promise<HostTurnEnd>;
@@ -178,6 +179,11 @@ export class HostTurn {
 
   get isEnded(): boolean {
     return this.ended;
+  }
+
+  /** True once the host interrupted the turn (set before the donor run is aborted). */
+  get wasInterrupted(): boolean {
+    return this.interruptRequested;
   }
 
   end(): Promise<HostTurnEnd> {
@@ -250,6 +256,7 @@ export class HostTurn {
 
   /** The host's turn was interrupted: the donor's run is aborted, as a caller cancellation. */
   interrupt(agent: HostTurnAgent): Promise<HostTurnEnd> {
+    this.interruptRequested = true;
     return this.serial(async () => {
       this.answered = true;
       agent.abort(this.requestId);

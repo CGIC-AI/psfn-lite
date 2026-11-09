@@ -26,8 +26,10 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, posix, relative, sep } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
-import { TOOL_INVENTORY } from '../../packages/core/src/index.ts';
+import { CANONICAL_FIRST_PARTY_TOOL_SURFACES } from '../../packages/companion/src/core/agent/tool-surface/registry.js';
+import { SCAFFOLDING_HOSTED_TOOL_SURFACES } from '../../packages/companion/src/core/agent/tool-surface/canonical-tool-catalog.test-support.js';
 import { collectSpecifiers } from '../boundary/import-checker.ts';
+import { excludedName } from './excluded-names.ts';
 
 const REPO = join(import.meta.dirname, '..', '..');
 const SELF = relative(REPO, import.meta.filename).split(sep).join('/');
@@ -47,40 +49,6 @@ const EXCLUDED_PACKAGES: readonly RegExp[] = [
   /^@character-foundry\//,
   /^psfn-framework$/,
 ];
-
-/** Words that name an excluded subsystem; matched against the words of an identifier or a path segment. */
-const EXCLUDED_WORDS = new Set([
-  'wiki', 'wikis', 'shard', 'shards', 'fleet', 'fleets', 'charge', 'charges', 'gateway', 'gateways',
-  'cogsec', 'channels', 'skill', 'skills', 'discord', 'redis',
-]);
-/** Excluded subsystems whose name is two words. */
-const EXCLUDED_PAIRS: readonly (readonly [string, string])[] = [
-  ['findings', 'bus'],
-  ['finding', 'bus'],
-  ['gateway', 'server'],
-  ['cog', 'sec'],
-];
-
-/** The words of an identifier or file name: camelCase, PascalCase, snake_case, kebab-case and dots split apart. */
-export function wordsOf(name: string): string[] {
-  return name
-    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-    .split(/[^A-Za-z0-9]+/)
-    .filter((w) => w !== '')
-    .map((w) => w.toLowerCase());
-}
-
-export function excludedName(name: string): string | null {
-  const words = wordsOf(name);
-  const single = words.find((w) => EXCLUDED_WORDS.has(w));
-  if (single !== undefined) return single;
-  for (let i = 0; i + 1 < words.length; i += 1) {
-    const pair = EXCLUDED_PAIRS.find(([a, b]) => words[i] === a && words[i + 1] === b);
-    if (pair !== undefined) return pair.join(' ');
-  }
-  return null;
-}
 
 export function excludedPackage(specifier: string): boolean {
   const name = specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : (specifier.split('/')[0] ?? specifier);
@@ -220,6 +188,15 @@ const pythonFiles = sources.filter((f) => f.endsWith('.py'));
  * The extracted donor tree keeps donor names verbatim (the donor is the spec), so the name and path rule covers
  * Lite's own packages; packages/companion is held to its deletion record instead (the last describe).
  */
+/**
+ * Field names of donor contracts a host must fill, which happen to contain an
+ * excluded word but name a kept concept. Each is a property key written into a
+ * donor type, never a name Lite declares for itself.
+ */
+const DONOR_CONTRACT_KEYS: readonly (readonly [file: string, key: string, reason: string])[] = [
+  ['apps/standalone/src/runtime.ts', 'channels', 'Contact.channels (packages/companion/src/core/contacts/types.ts:333): a contact\'s identity links, not the cut channel adapters'],
+];
+
 const productFiles = sources.filter((f) => /^(packages|apps|integrations\/hermes\/psfn_lite)\//.test(f) && !f.startsWith(COMPANION));
 
 describe('the checker itself', () => {
@@ -327,20 +304,27 @@ describe('excluded subsystems are absent from Lite', () => {
   });
 
   it('no product file, directory or declared name is one of the excluded subsystems', () => {
-    expect(productFiles.length).toBeGreaterThan(50);
+    // Step C: the host adapters, the standalone app and the Hermes plugin (46 files); a truncated listing must not pass.
+    expect(productFiles.length).toBeGreaterThan(40);
     const paths = sources.filter((f) => f !== SELF && !f.startsWith(COMPANION)).flatMap((f) => f.split('/').map((segment) => [f, segment, excludedName(segment)] as const)).filter(([, , w]) => w !== null);
     expect(paths.map(([f, segment, w]) => `${f}: ${segment} (${String(w)})`)).toEqual([]);
     const names = productFiles.flatMap((file) => {
       const text = readFileSync(join(REPO, file), 'utf8');
       const declared = file.endsWith('.py') ? pythonNames(text) : /\.(ts|mts|cts|js|mjs|cjs)$/.test(file) ? declaredNames(file, text) : [];
-      return declared.map((n) => [file, n, excludedName(n)] as const).filter(([, , w]) => w !== null);
+      return declared
+        .filter((n) => !DONOR_CONTRACT_KEYS.some(([f, key]) => f === file && key === n))
+        .map((n) => [file, n, excludedName(n)] as const)
+        .filter(([, , w]) => w !== null);
     });
     expect(names.map(([f, n, w]) => `${f}: ${n} (${String(w)})`)).toEqual([]);
   });
 
-  it('no governed tool or action is one of them', () => {
-    const names = TOOL_INVENTORY.flatMap((t) => [t.name, ...t.actions.map((a) => `${t.name}.${a.name}`)]);
-    expect(names.filter((n) => excludedName(n) !== null)).toEqual([]);
+  it('no companion tool Lite serves is one of them', () => {
+    // The donor registry still describes the cut surfaces (the companion keeps donor text verbatim); no Lite factory builds them.
+    // The live catalog the MCP transport serves is checked the same way in tests/lifecycle/host-turns.integration.test.ts.
+    const served = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name).filter((n) => !SCAFFOLDING_HOSTED_TOOL_SURFACES.has(n));
+    expect(served.length).toBeGreaterThanOrEqual(15);
+    expect(served.filter((n) => excludedName(n) !== null)).toEqual([]);
   });
 });
 
