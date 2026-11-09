@@ -59,6 +59,7 @@ import { resolveMemoryRetrievalPolicy } from '../../system/config/memory-retriev
 import { createDefaultBiographicalDepthPolicy } from '../../system/config/biographical-depth-policy.js';
 import { createDefaultBiographicalCandidatePolicy } from '../../system/config/biographical-candidate-policy.js';
 import { createProviderRuntimeServices } from '../../system/config/provider-runtime-factory.js';
+import type { ModelUsageRecorder } from '../../shared/telemetry/model-usage.js';
 import type { LLMClientRuntimeOptions } from '../../primitives/llm/client.js';
 import type { ProviderRuntime } from '../../primitives/llm/provider-runtime.js';
 import { getRequestContext } from '../../primitives/llm/request-context.js';
@@ -269,6 +270,14 @@ export interface StartCompanionRuntimeOptions {
    * packages/pi companionProviderRuntimeOf. Default: the donor PiProviderRuntime.
    */
   providerRuntime?: ProviderRuntime;
+  /**
+   * Model-usage recorder (seam 3.1): takes the place of the donor's Postgres
+   * model-usage store, which a Postgres-backed donor agent always had. The
+   * LLMClient records every model call and every embedding call through it,
+   * and its accountability guard refuses every autonomous (non-foreground)
+   * work-spec call when there is none, so it is required.
+   */
+  modelUsageRecorder: ModelUsageRecorder;
   llmOptions?: Omit<LLMClientRuntimeOptions, 'runtime'>;
   /** Embedding provider (seam 3.1), for example packages/pi companionEmbeddingProviderOf. */
   embeddingProvider?: EmbeddingRuntimeProvider;
@@ -421,6 +430,7 @@ async function composeCompanionRuntime(
       ...(options.llmOptions ?? {}),
       ...(options.providerRuntime ? { runtime: options.providerRuntime } : {}),
     },
+    modelUsageRecorder: options.modelUsageRecorder,
     ...(options.embeddingProvider ? { embeddingProvider: options.embeddingProvider } : {}),
   });
   const { llmClient, embeddingProvider } = providerServices;

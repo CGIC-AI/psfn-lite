@@ -751,7 +751,7 @@ fixtures.
 
 | Seam | Cut | Behaviour change |
 |---|---|---|
-| 3.1 provider | `createProviderRuntimeServices` keeps the donor no-model-usage-store branch and takes an optional host `embeddingProvider`. Host adapters in `packages/pi`: `companionProviderRuntimeOf` (a structural `ProviderRuntime` over one `PiModelRuntime`), `companionModelRegistryEntryOf` (one `models.json` registry entry routing the donor's single-model purposes to the host model) and `companionEmbeddingProviderOf` (a donor `EmbeddingRuntimeProvider` over a Lite `EmbeddingPort`). The in-process `LLMProviderPort` is the donor's own `LLMClient`. | No model-usage ledger or embedding usage accounting. The host model and key serve every purpose. |
+| 3.1 provider | `createProviderRuntimeServices` keeps the donor no-model-usage-store branch and takes an optional host `embeddingProvider`. (Amended after Step D, see "Review fixes after Step D": the host's `ModelUsageRecorder` now takes the store's slot.) Host adapters in `packages/pi`: `companionProviderRuntimeOf` (a structural `ProviderRuntime` over one `PiModelRuntime`), `companionModelRegistryEntryOf` (one `models.json` registry entry routing the donor's single-model purposes to the host model) and `companionEmbeddingProviderOf` (a donor `EmbeddingRuntimeProvider` over a Lite `EmbeddingPort`). The in-process `LLMProviderPort` is the donor's own `LLMClient`. | No model-usage ledger or embedding usage accounting. The host model and key serve every purpose. (Unrecorded at the time: every autonomous lane was refused; fixed after Step D.) |
 | 3.11 composition helpers | `composition.ts` and `parity.ts` promoted and cut (rows in `cuts.tsv`): Redis session tail, CogSec integrity observers, fatigue options, operator hooks and the shard manager are cut. `wireShardAndThinkRuntime` became `wireSubagentRuntime`, which returns the subagent faculty and the fold-review controller. | See `cuts.tsv`. |
 | 3.11 persistence | `createAgentPersistenceRuntime` keeps the donor single-companion path and the kept stores. It drops the fleet, health, escalation, CogSec receipt, custody, partner-affect, ICP-candidate, social-pot, arbiter and participation stores. | The scaffolding tables are never created (boot proof). |
 | 3.11 scheduler runtime | `scheduler-runtime.ts` promoted and cut: the backup lane, health detectors, blind review, the shared-world caretaker, presence and fleet maintenance are cut. The gateway option becomes `llmProvider` + `embeddingDims`. | Those lanes are never scheduled. Biography stages run without a fleet baton. |
@@ -1284,6 +1284,20 @@ Lite (`packages/companion/...` after this step) or Hermes at
   writer does not rely on the store's byte comparison: for these writes it
   reads the incumbent first (`replayIncumbent`) and answers it with
   `inserted: false`. The first attempt's event stands.
+- A correction (`correct`: corrects, supersedes, retracts) asks the writer
+  for the incumbent (`CanonicalAutomataBusWriter.replayExisting`, inside the
+  append serialization) before it reads its target. The first correction
+  removed the target from `automata_bus_current_findings`
+  (`faculties/automata/bus/postgres-store.ts` `appendAllocated`), so a
+  repeat that read the target first failed with "correction target is not
+  current or visible" (review finding after Step D, fixed). The repeat now
+  returns the stored relation with `inserted: false`. Guards:
+  `worker-write-keys.test.ts` (the in-memory stand-in
+  `test-support/in-memory-automata-bus.ts` now removes a relation's target
+  from its current set, as the Postgres store does) and the Postgres case
+  "replays a correction repeated by the next attempt" in
+  `worker-write-keys.integration.test.ts` (supersede and retract). With the
+  pre-fix adapter, 3 of those 8 tests fail.
 - Behaviour change: identical repeated worker writes of one task now
   coalesce into one event (the donor stored each). Distinct text, action or
   task still give distinct events.

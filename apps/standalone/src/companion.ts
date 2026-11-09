@@ -25,6 +25,7 @@ export { MEMORY_RETRIEVAL_BUDGET_PCT_DEFAULT, SESSION_HISTORY_BUDGET_PCT_DEFAULT
 export { createSessionHmacBoundaryService } from '../../../packages/companion/src/persistence/journals/hmac-boundary.js';
 export type { ProviderRuntime } from '../../../packages/companion/src/primitives/llm/provider-runtime.js';
 export type { EmbeddingRuntimeProvider } from '../../../packages/companion/src/faculties/memory/embedding.js';
+export type { ModelUsageEventInput, ModelUsageRecorder } from '../../../packages/companion/src/shared/telemetry/model-usage.js';
 export type { SubstrateMessage, AgentResponse } from '../../../packages/companion/src/shared/contracts/runtime-base.js';
 export type { TrustLevel } from '../../../packages/companion/src/shared/contracts/trust-contracts.js';
 export { createTurnId } from '../../../packages/companion/src/core/turns/id.js';
