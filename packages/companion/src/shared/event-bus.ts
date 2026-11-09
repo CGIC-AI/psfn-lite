@@ -22,7 +22,6 @@ import type {
   AdaptiveToolSnapshotTelemetry,
 } from '../core/agent/adaptive-tools-telemetry.js';
 import type { CompletionHandoffRecord } from './contracts/completion-handoff.js';
-import type { HumanAttentionPressureEvent } from '../core/agent/fatigue/human-attention-pressure.js';
 import type { PlaceKind } from './contracts/places-registry.js';
 import type { SatelliteTelemetryAuthContext } from './contracts/satellite-registry.js';
 import type { IcpAvailabilityState, IcpInitiationCandidateStatus } from './contracts/icp-autonomy.js';
@@ -30,7 +29,7 @@ import type {
   ParticipationAction,
   ParticipationCandidateTrigger,
   ParticipationSuppressionReason,
-} from '../core/participation/types.js';
+} from './contracts/participation-types.js';
 import type {
   AcquireEgressLeaseDeclineReason,
   EgressLeaseErrorStage,
@@ -39,8 +38,11 @@ import type {
   ReservationGateErrorStage,
   RoomEpisodeBreakerState,
 } from './contracts/speaking-arbiter-types.js';
-import type { RoomEpisodeCircuitBreakerFiring } from '../core/agent/fatigue/room-episode-circuit-breaker.js';
-import type { SocialPotEnforcementOutcome } from '../core/agent/fatigue/social-pot-enforcement.js';
+import type {
+  HumanAttentionPressureEvent,
+  RoomEpisodeCircuitBreakerFiring,
+  SocialPotEnforcementOutcome,
+} from './contracts/fatigue-event-types.js';
 import type { PartnerAffectShadowTelemetryEvent } from './contracts/partner-affect.js';
 import type { EmoSimProactivityImpulse } from '../core/emotion/emosim-proactivity-port.js';
 import type { IcpConversationCostBreakerEvent } from './telemetry/model-usage.js';

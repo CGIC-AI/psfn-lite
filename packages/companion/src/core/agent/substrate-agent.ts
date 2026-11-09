@@ -166,7 +166,6 @@ import {
   type TurnDeliveryLifecycle,
 } from './substrate-agent/turn-execution-runtime.js';
 import type { TurnSessionIdentity } from './substrate-agent/turn-execution/contracts.js';
-import type { HumanAttentionPressurePort } from './fatigue/human-attention-pressure.js';
 import { createTurnExecutionRuntimeAdapter } from './substrate-agent/turn-execution-adapter.js';
 import type { BackgroundWorkRuntimeTuning } from './background-work/config.js';
 import {
@@ -211,8 +210,6 @@ import { executePostTurnBackgroundWork } from './background-work/post-turn-runti
 import { runBackgroundWorkTick } from './background-work/tick-runtime.js';
 import { BackgroundWorkHandoffRecoveryRuntime } from './background-work/handoff-recovery-runtime.js';
 import type { ObserverEvalSidecarRuntime } from '../eval/observer-sidecar/types.js';
-import type { FatigueBudgetPort } from './fatigue/fatigue-budget.js';
-import type { IcpFatigueRegulationReservationPort } from './fatigue/regulation-reservation.js';
 import type { RuntimeServiceHealthStatus } from '../../shared/contracts/runtime-service-health.js';
 import type { IntakeFirewallMode } from '../../system/config/intake-policy-config.js';
 import type { ViewerCeiling } from '../session/viewer-ceiling.js';
@@ -262,9 +259,6 @@ export interface SubstrateAgentOptions {
   emotionRuntime?: EmotionRuntimeWiring;
   selfModelRuntime?: SelfModelRuntimeWiring;
   observerEvalSidecar?: ObserverEvalSidecarRuntime;
-  fatigueBudget?: FatigueBudgetPort | null;
-  humanAttentionPressure?: HumanAttentionPressurePort | null;
-  fatigueRegulationReservations?: IcpFatigueRegulationReservationPort | null;
   streamTransport?: SubstrateStreamTransport;
   appCache?: AppCache;
   /** Contact-tracking policy gate (E3.4). Absent gate behaves as 'auto' everywhere. */
@@ -384,9 +378,6 @@ export class SubstrateAgent {
   private readonly satellitePresencePort = createActiveEmanationSatellitePresencePort();
   private selfModelRuntimeRequired = false;
   private readonly emotionSelfModelRuntime: EmotionSelfModelRuntime;
-  private readonly fatigueBudget: FatigueBudgetPort | null;
-  private readonly humanAttentionPressure: HumanAttentionPressurePort | null;
-  private readonly fatigueRegulationReservations: IcpFatigueRegulationReservationPort | null;
   private readonly promptContextBuilder: PromptContextBuilder;
   private readonly followUpIngress: FollowUpIngressRouter;
   private durableChargeRecorder: DurableRunChargeRecorder | null = null;
@@ -635,9 +626,6 @@ export class SubstrateAgent {
     this.appCache = options.appCache ?? createMemoryAppCache({ name: 'substrate-agent-prompt-cache' });
     this.selfModelRuntimeRequired = options.selfModelRuntime?.requireWiring ?? false;
     this.observerEvalSidecar = options.observerEvalSidecar ?? null;
-    this.fatigueBudget = options.fatigueBudget ?? null;
-    this.humanAttentionPressure = options.humanAttentionPressure ?? null;
-    this.fatigueRegulationReservations = options.fatigueRegulationReservations ?? null;
     this.contactTrackingGate = options.contactTrackingGate ?? null;
     this.placesRegistryConfig = options.placesRegistryConfig;
     this.sessionPresenceOverrideState = new SessionPresenceOverrideState(this.placesRegistryConfig);
@@ -1753,7 +1741,7 @@ export class SubstrateAgent {
     message: SubstrateMessage,
     deliveryLifecycle?: TurnDeliveryLifecycle,
     conversationScope?: import('../session/conversation-scope.js').ConversationScope,
-    precomputedNoReplyDisposition?: import('../participation/types.js').PrecomputedNoReplyDisposition,
+    precomputedNoReplyDisposition?: import('../../shared/contracts/participation-types.js').PrecomputedNoReplyDisposition,
     captureCompletedDisclosureLineage?: (lineage: DisclosureLineage | undefined) => void,
   ): Promise<AgentResponse> {
     const run = async (): Promise<AgentResponse> => handleMessageForTurn(createTurnExecutionRuntimeAdapter({
@@ -1761,9 +1749,6 @@ export class SubstrateAgent {
       costTelemetry: createEventBusCostTelemetryPort(this.eventBus),
       durableChargeRecorder: this.durableChargeRecorder,
       durableChargeProbe: this.durableChargeProbe,
-      fatigueBudget: this.fatigueBudget,
-      humanAttentionPressure: this.humanAttentionPressure,
-      fatigueRegulationReservations: this.fatigueRegulationReservations,
       satellitePresence: this.satellitePresencePort,
       companionPresence: this.companionPresence,
       llmClient: this.llmClient,
