@@ -343,3 +343,25 @@ export function normalizeAutomataBusWorkerOperation(
     }
   }
 }
+
+function canonicalJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (isRecord(value)) {
+    return Object.fromEntries(Object.keys(value)
+      .filter(key => value[key] !== undefined)
+      .sort()
+      .map(key => [key, canonicalJson(value[key])]));
+  }
+  return value;
+}
+
+/**
+ * Lite (operator automata rule 1): the stable write key of one worker write,
+ * the canonical JSON of what the write says (its action and validated fields,
+ * keys sorted, absent fields dropped). It carries no run, attempt or time, so
+ * the same write from any attempt of one task has one key; the port scopes it
+ * to the companion, class and task.
+ */
+export function automataBusWorkerWriteKey(write: Readonly<Record<string, unknown>>): string {
+  return JSON.stringify(canonicalJson(write));
+}

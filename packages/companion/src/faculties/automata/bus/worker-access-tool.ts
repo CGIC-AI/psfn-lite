@@ -16,6 +16,7 @@ import {
 } from './worker-access-formation.js';
 import {
   automataBusToolParametersForActions,
+  automataBusWorkerWriteKey,
   normalizeAutomataBusWorkerOperation,
 } from './worker-access-operation.js';
 import {
@@ -102,6 +103,7 @@ async function dispatchOperation(
         }],
         artifactRefs: [],
         verificationStatus: 'pending',
+        writeKey: automataBusWorkerWriteKey(operation),
       });
     case 'append':
       return await port.append({
@@ -116,6 +118,7 @@ async function dispatchOperation(
         ...(operation.lessonAttribution === undefined
           ? {}
           : { lessonAttribution: operation.lessonAttribution }),
+        writeKey: automataBusWorkerWriteKey(operation),
       });
     case 'correct':
       return await port.correct({
@@ -126,6 +129,7 @@ async function dispatchOperation(
         ...(operation.replacementClaim === undefined
           ? {}
           : { replacementClaim: operation.replacementClaim }),
+        writeKey: automataBusWorkerWriteKey(operation),
       });
     case 'handoff':
       return await port.handoff({
@@ -135,6 +139,7 @@ async function dispatchOperation(
         validationPerformed: operation.validationPerformed,
         ...(operation.blocker === undefined ? {} : { blocker: operation.blocker }),
         ...(operation.nextAction === undefined ? {} : { nextAction: operation.nextAction }),
+        writeKey: automataBusWorkerWriteKey(operation),
       });
     case 'runs':
       return await port.runs({

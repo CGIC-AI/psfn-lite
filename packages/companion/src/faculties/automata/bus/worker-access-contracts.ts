@@ -118,6 +118,13 @@ export interface AutomataBusWorkerPort {
     source?: string;
     confidence?: number;
     lessonAttribution?: AutomataBusLessonAttribution;
+    /**
+     * Lite (operator automata rule 1): the stable write key of this worker
+     * write. The governed tool derives it from the validated operation, so
+     * the same write repeated by any attempt of the same task is one Bus
+     * event. Absent, the port derives it from its own input.
+     */
+    writeKey?: string;
   }): Promise<unknown>;
   correct(input: {
     scope: AutomataBusWorkerScope;
@@ -125,6 +132,13 @@ export interface AutomataBusWorkerPort {
     relation: AutomataBusRelationKind;
     reason: string;
     replacementClaim?: string;
+    /**
+     * Lite (operator automata rule 1): the stable write key of this worker
+     * write. The governed tool derives it from the validated operation, so
+     * the same write repeated by any attempt of the same task is one Bus
+     * event. Absent, the port derives it from its own input.
+     */
+    writeKey?: string;
   }): Promise<unknown>;
   handoff(input: {
     scope: AutomataBusWorkerScope;
@@ -133,6 +147,13 @@ export interface AutomataBusWorkerPort {
     validationPerformed: readonly string[];
     blocker?: string;
     nextAction?: string;
+    /**
+     * Lite (operator automata rule 1): the stable write key of this worker
+     * write. The governed tool derives it from the validated operation, so
+     * the same write repeated by any attempt of the same task is one Bus
+     * event. Absent, the port derives it from its own input.
+     */
+    writeKey?: string;
   }): Promise<unknown>;
   runs(input: {
     scope: AutomataBusWorkerScope;
