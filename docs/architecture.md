@@ -21,7 +21,7 @@ and documents are the spec. That earlier core (`packages/core`,
 | Part | Package | Role |
 |---|---|---|
 | Companion core | `packages/companion` (`lite-companion`) | The donor core: identity and prompt layers, sessions and the session archive, contacts and trust, memory, episodes, journals, emotion and self-model, concerns and intention, scheduler, automata and bounded subagents, letters, North Star, and the tool registry. The Lite composition root is `src/app/agent/companion-runtime.ts`. |
-| Model and embeddings | `packages/pi` | The Pi model runtime (a pi-ai model collection, one model, the host's key) that the core's provider port takes, and an embedding port: none, or an OpenAI-compatible `/embeddings` endpoint. |
+| Model and embeddings | `packages/pi` | The Pi model runtime (a pi-ai model collection, one model, the host's key) that the core's provider port takes, and an embedding port over an OpenAI-compatible `/embeddings` endpoint. The core needs one, as the donor did: the standalone refuses `embedding.provider: disabled` unless the embedding host supplies its own port (docs/extraction.md, "Shakedown fixes"). |
 | Tool transport | `packages/mcp` | MCP over streamable HTTP or stdio. It serves the donor tool catalog and binds the caller from the transport credential. |
 | Lifecycle bridge | `packages/lifecycle` | Host-driven turns for an external host that runs its own model loop: `prepare`, `settle`, `checkpoint`, and the host tool port the MCP transport hands calls to. |
 | Standalone host | `apps/standalone` | The config document, the CLI (`init`, `once`, `chat`, `serve`) and the composition of the parts above. |
@@ -57,7 +57,9 @@ subsystems out ([conformance](conformance.md)).
 3. It builds the substrate config the way the donor's `loadAgentConfig` did
    (`substrate-config.ts`): the donor's core defaults, then the scalar
    `settings.json` values, then the host's model, embedding, database and
-   paths. Defaults of cut subsystems are not set.
+   paths. Defaults of cut subsystems are not set. A relative
+   `textEmotionCacheDir` (the seed's `models/transformers`) resolves under
+   `dataDir`, never the working directory.
 4. It starts the companion with `startCompanionRuntime`. It passes the Pi
    provider runtime and the embedding provider, a model-usage recorder, the
    session integrity provider, an outbound sender (the operator's channel), the path

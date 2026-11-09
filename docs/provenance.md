@@ -36,8 +36,8 @@ Lite.
 
 | Lite path | Entry |
 | --- | --- |
-| `apps/standalone/src/*` | written for Lite: the Lite config document, the substrate config, the CLI and a thin host over donor `startCompanionRuntime` (Lite composition root `packages/companion/src/app/agent/companion-runtime.ts`, seams 3.1, 3.11, B7, C and D). `session-integrity.ts` scopes the donor session keyring to the bound Hermes install (seam E2; donor `createKeyringIntegrityProvider`, `src/persistence/sessions/store-primitives.ts:144`). `model-usage.ts` is the host's in-memory `ModelUsageRecorder` (seam 3.1, E6, in place of the donor's Postgres model-usage store, `src/persistence/postgres/model-usage-store.ts`, cut). `substrate-config.ts` assembles the config the way donor `src/system/config/load-config.ts` (`loadAgentConfig`, defaults `:76-129`, assembly `:497-565`) and `settings/runtime.ts` (`applyCoreSettings`) did, for the kept subsystems only. |
-| `packages/lifecycle/src/*` | written for Lite: host-driven turns. They go through the donor `SubstrateAgent.handleMessage` and the stream transport seam (donor `src/app/agent/core-runtime.ts:724-726`), on the donor's Hermes channel convention (`externalMemorySessionId`). The donor tool catalog is exposed as MCP tools (donor `tool-runtime-facade` `getToolCatalog`). `memory-deletion.ts` is the host `MemoryDeletionApprovalPort` (seam E3), in place of the donor gateway's confirmation surface (donor `src/app/agent/main.ts:583-603`). |
+| `apps/standalone/src/*` | written for Lite: the Lite config document, the substrate config, the CLI and a thin host over donor `startCompanionRuntime` (Lite composition root `packages/companion/src/app/agent/companion-runtime.ts`, seams 3.1, 3.11, B7, C and D). `session-integrity.ts` scopes the donor session keyring to the bound Hermes install (seam E2; donor `createKeyringIntegrityProvider`, `src/persistence/sessions/store-primitives.ts:144`). `model-usage.ts` is the host's in-memory `ModelUsageRecorder` (seam 3.1, E6, in place of the donor's Postgres model-usage store, `src/persistence/postgres/model-usage-store.ts`, cut). `runtime.ts` refuses a disabled embedding provider without a host port, as donor `src/faculties/memory/embedding.ts:564-569` refused a missing one (seam S1). `substrate-config.ts` resolves a relative `textEmotionCacheDir` under `dataDir` (seam S2) and assembles the config the way donor `src/system/config/load-config.ts` (`loadAgentConfig`, defaults `:76-129`, assembly `:497-565`) and `settings/runtime.ts` (`applyCoreSettings`) did, for the kept subsystems only. |
+| `packages/lifecycle/src/*` | written for Lite: host-driven turns. They go through the donor `SubstrateAgent.handleMessage` and the stream transport seam (donor `src/app/agent/core-runtime.ts:724-726`), on the donor's Hermes channel convention (`externalMemorySessionId`). The donor tool catalog is exposed as MCP tools (donor `tool-runtime-facade` `getToolCatalog`). `memory-deletion.ts` is the host `MemoryDeletionApprovalPort` (seam E3), in place of the donor gateway's confirmation surface (donor `src/app/agent/main.ts:583-603`). `host-turns.ts` hands the host the donor's explicit tool contract per model call (seam S3; donor `src/primitives/llm/explicit-tool-request.ts` `resolveExplicitToolContract`, applied as donor `client-request-capability.ts` `applyExplicitToolChoice` and `buildPiContext` did). |
 | `packages/mcp/src/*` | written for Lite against `@modelcontextprotocol/server` 2.3.0, the donor's pinned SDK. It follows the donor's external-memory MCP route (`src/channels/api/server/external-memory-mcp.ts`, cut): a stateless per-request handler, a bearer credential bound to a fixed identity, browser `Origin` and `Mcp-Session-Id` refused. Credentials come from the environment or owner-only files and are compared in constant time against every binding (pattern of donor `src/channels/backplane/http/auth.ts` `isExpectedApiToken`, cut). stdio has no donor counterpart. |
 | `packages/pi/src/*` | written for Lite against `@earendil-works/pi-ai` 0.84.1, the donor's pinned version. It holds the model runtime the core's provider port takes, and an embedding port (none, or OpenAI-compatible `/embeddings`). |
 | `integrations/hermes/psfn_lite/*` | written for Lite: the Hermes plugin (below). |
@@ -49,7 +49,8 @@ Lite.
 The tables below are generated from the Git blobs of
 `packages/companion/{src,config}` at `HEAD` and the donor commit by
 `python3 -I packages/companion/extraction/provenance-tables.py <donor git
-dir>`, after Step E. The tree has 2,003 files: 1,772 extracted
+dir>`, after Step E; the 2026-11-09 shakedown fixes (seams S1-S4) changed
+no file here. The tree has 2,003 files: 1,772 extracted
 unchanged, 200 extracted with cuts, and 31 Lite. Seam D is the operator
 automata rules ([extraction](extraction.md), "Operator automata rules").
 Seams E1-E4 are the operator rulings of 2026-11-08/09 that changed files
@@ -524,16 +525,32 @@ The donor's own implementation replaces each one.
 ## Hermes integration
 
 Hermes reference: https://github.com/NousResearch/hermes-agent. The tested
-upstream revision is `f0187332d13679e2ace74d1f0eb399eb91a90571`. It is
-recorded as `HERMES_REVISION` in `integrations/hermes/psfn_lite/config.py`,
-and the host contract tests refuse any other revision. No Hermes code is
-copied into Lite.
+upstream revisions are `f0187332d13679e2ace74d1f0eb399eb91a90571` and
+`2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`. They are recorded as
+`HERMES_REVISIONS` in `integrations/hermes/psfn_lite/config.py`, and the
+host contract tests refuse any other revision. No Hermes code is copied
+into Lite.
 
-The plugin uses these capabilities at that revision:
+The plugin uses these capabilities at both revisions unless a line says
+otherwise:
 
 - the memory-slot loader for a user plugin directory (`plugins/memory`
   `load_memory_provider`, exclusive classification), and `register(ctx)`
-  forwarding `register_hook` to a real `PluginContext`;
+  forwarding `register_hook` and `register_middleware` to a real
+  `PluginContext`. The provider's module is `_hermes_user_memory.psfn_lite`
+  at f0187332 (one per process) and
+  `_hermes_user_memory.psfn_lite__source_<digest of the plugin directory>`
+  at 2bd378e;
+- a plugin manager per Hermes home (`hermes_cli/plugins.py`
+  `get_plugin_manager`) and the context-local home override
+  (`hermes_constants.set_hermes_home_override`) with which a gateway runs a
+  profile's turn; the plugin keeps its hooks, drivers and callbacks per
+  home;
+- the `llm_request` middleware (`hermes_cli/middleware.py`
+  `apply_llm_request_middleware`, called before every provider request with
+  `turn_id`, `session_id` and `api_mode`): a `{"request": ...}` result
+  replaces the provider kwargs. The plugin uses it for the donor's explicit
+  tool contract;
 - hooks delivered through `hermes_cli.lifecycle.invoke_hook` with the
   payloads at that revision:
   - `pre_llm_call`: context returned as `{"context": ...}` is injected into
@@ -561,12 +578,24 @@ The plugin uses these capabilities at that revision:
   (`agent/conversation_compression.py`). `MemoryProvider.on_session_switch`
   reports that rotation;
 - the install id Hermes keeps in its root (`get_default_hermes_root()/install_id`,
-  32 hex characters, written by `hermes_cli/web_server.py`
-  `_read_or_create_install_id`). The plugin reads it and never creates it;
+  32 hex characters), one per install and shared by every profile. At
+  2bd378e the plugin reads it through `hermes_cli/install_identity.py`
+  `get_install_id`, which creates it once if it is missing. At f0187332 the
+  only reader is `hermes_cli/web_server.py` `get_install_id` (the dashboard
+  server), so the plugin reads the file itself and never creates it;
+- the profile secret scope (`agent/secret_scope.py` `get_secret`): the
+  bridge credential is read through it, so a gateway turn gets its
+  profile's `.env` value, and a multiplexing gateway without a scope fails
+  closed (`UnscopedSecretError`);
+- the local CLI sender: platform `cli` with sender `""` at f0187332;
+  platform `local` with sender `uid:<uid>` at 2bd378e, where `hermes chat`
+  goes through the gateway's control socket
+  (`gateway/control_socket.py` `_posix_peer_subject`);
 - `MemoryProvider` checkpoint API v2, with `MemoryManager.on_pre_compress(...,
   require_checkpoint=True)` propagating the refusal;
 - MCP servers from `config.yaml` `mcp_servers`, with `${VAR}` header
-  interpolation, through `tools.mcp_tool.discover_mcp_tools` and the tool
+  interpolation, through `discover_mcp_tools` (`tools/mcp_tool.py` at
+  f0187332, `tools/mcp_tool_discovery.py` at 2bd378e) and the tool
   registry, against Lite's stateless streamable HTTP endpoint.
 
 The donor's `integrations/hermes-memory` (`psfn_memory/provider.py`,
@@ -591,5 +620,5 @@ each prepared turn); `sync_turn` ingestion of completed pairs (Lite settles
 every outcome); gateway body and receipt assertions (the bridge binds the
 caller from the credential); and Telegram DM identity parsing (senders are
 an explicit `(platform, sender_id)` allowlist bound to one credential). The
-plugin pins the newer Hermes revision above, not the donor's
+plugin pins the newer Hermes revisions above, not the donor's
 `5bd439d3ed4ae5f099857813383389dcd0ab4369`.

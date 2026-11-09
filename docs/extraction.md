@@ -1169,6 +1169,33 @@ one was found in the donor code or in a run:
   profile, before it prepares anything. So a successor never sees
   `turn_already_open` for a dead process's turn. Until a successor starts,
   the bridge's host-turn timeout ends such a turn.
+- **An explicit tool request is forced by the host, not by Lite.** The donor
+  forced each model call of a turn whose participant named tools ("call
+  tool_search, then orient"): its provider client offered only the next
+  requested tool with a required choice, or no tool once the sequence ran
+  (`primitives/llm/client-request-capability.ts` `applyExplicitToolChoice`,
+  `buildPiContext`), and its stream adapter fails the turn on any other
+  answer (`core/agent/stream-adapter.ts`, `explicit-tool-request.ts`,
+  `tool_contract_incompatible`). Lite hands that choice to the host per
+  model call (Shakedown fixes, below), and the Hermes plugin applies it.
+  What it cannot reproduce:
+  - the donor re-asked its model once when a required call was missing
+    (`missing_required_call`). A host turn cannot be re-asked; a host model
+    that ignores the forced choice fails the turn;
+  - the plugin forces only Hermes's `chat_completions`, `codex_responses`
+    and `anthropic_messages` request shapes. On another API mode, or when
+    Hermes's request lacks the requested tool, the request goes unchanged
+    and the turn may fail as before. Hermes's own tools are hidden on a
+    forced step, as the donor offered only the one tool;
+  - the donor disabled reasoning for a forced call only where its provider
+    required it (Kimi). The plugin drops Anthropic extended thinking on a
+    forced step, which Anthropic refuses together with a forced tool;
+  - the donor resolves the contract for the routed model's API and refuses
+    a turn with an explicit request on any API it cannot force
+    (`providerToolChoice`: only `openai-completions` and `pi-messages`).
+    The relay keeps that check on Lite's configured model, so a host turn
+    with an explicit request fails when Lite's own model is on another API,
+    whatever the host's model is.
 
 ### Deleted and modified Lite tests
 
@@ -1698,7 +1725,8 @@ provider:
   - The binding is Hermes's install id: the file `install_id` in the Hermes
     root (`hermes_constants.get_default_hermes_root()`). Hermes writes a uuid4
     hex id there (`hermes_cli/web_server.py` `_INSTALL_ID_FILENAME`,
-    `_read_or_create_install_id`), shared by every profile of the install,
+    `_read_or_create_install_id` at f0187332; `hermes_cli/install_identity.py`
+    `read_or_create_install_id` at 2bd378e), shared by every profile of the install,
     stable across restarts and code moves. The id is public: the dashboard's
     public status payload shows it. `hermes_cli/process_identity.py:70` `install_id()` is
     not used: it hashes the source path, so it changes when the code moves,
@@ -1902,6 +1930,147 @@ projects): 774 files and 9,190 tests passed. `compare-baseline.mjs`:
 "baseline: 807 files / 10107 tests; deleted: 54 files, 1041 tests; matched:
 9066; Lite additions: 4 files, 27 tests" and "equivalent: every remaining
 baseline test has its baseline status". The Hermes plugin suite: 69 passed.
+
+## Shakedown fixes (2026-11-09, Lite with Hermes, round r1)
+
+The round (`lite-hermes-artie-20261109-r1`, evidence outside the
+repository) found four Lite defects and one out-of-scope case. No donor
+file changed; the `cuts.tsv` rows `S1` to `S4` record the host-side
+changes.
+
+### Embedding provider required
+
+`serve` with `embedding.provider: disabled` failed at the donor's startup
+warmup ("embedding provider startup warmup failed",
+`app/agent/companion-runtime.ts:572`, `app/startup/support/ml-warmup.ts:62-79`,
+`faculties/memory/embedding.ts:560`). Every test passed
+`overrides.embeddings`, so none reached the path.
+
+Root cause: the core needs an embedding provider, and the donor never
+started without one. Donor `resolveEmbeddingProviderKind`
+(`src/faculties/memory/embedding.ts:564-569`) throws "embeddingProvider is
+required in settings.json; startup no longer defaults embeddings", its
+warmup fails startup on any error (`docs/memory/l2-typed.md`, "Fail-closed
+warmup"), and memory writes embed or throw. Lite's disabled port
+(`packages/pi/src/embeddings.ts`) answers "unavailable" to every call, so
+the donor's warmup refused it as it would refuse a broken provider.
+
+Fix, and a deliberate divergence from "a disabled provider must not fail
+startup": making it start would invent a no-embedding core the donor never
+had (writes without vectors, recall without search). Instead the
+standalone refuses `disabled` by name before any database, model or
+classifier work (`apps/standalone/src/runtime.ts:69`
+`EMBEDDING_PROVIDER_REQUIRED`, `buildEmbeddings` `:127-130`, called first at
+`:150`), unless the host passes its own embedding port
+(`overrides.embeddings`). `embedding.provider.kind` must be
+`openai_compatible` for a standalone deployment. Guard:
+`tests/standalone/embedding-required.test.ts` runs the real
+`main.ts serve` with `disabled`, no overrides and a database nothing
+listens on: exit status 1, stderr names the requirement and never the
+warmup.
+
+### Model cache under the data directory
+
+The first `serve` of the round downloaded the 478 MB text-emotion model
+into the source checkout (`<worktree>/models/transformers/`). Root cause:
+the donor's seeded `settings.json` value is relative
+(`config/settings.seed.json` `"textEmotionCacheDir": "models/transformers"`),
+Lite copied it into the substrate config as is, and the classifier hands it
+to transformers' `env.cacheDir`, which resolves it against the working
+directory. The donor ran from its repository root, with `/models/`
+gitignored (donor `.gitignore:138`). Fix: `textEmotionCacheDir` stays the
+owner's `settings.json` value, but a relative value, and a missing one
+(the donor default `models/transformers`), resolves under `dataDir`
+(`apps/standalone/src/substrate-config.ts:117-150`); an absolute value is
+kept. `/models/` is gitignored at the repository root, as in the donor.
+Guard: `tests/standalone/model-cache.test.ts` seeds a data directory with
+the real `init` and builds the substrate config as the runtime does.
+
+### The explicit tool contract reaches the host
+
+Four turns of the round failed as `tool_contract_incompatible`
+(contact_sessions, focus_cycle, tool_discovery, the restore turn of
+memory_delete_restore). Root cause: the donor's provider client forced the
+tool choice of every model call of a turn with an explicit tool request,
+but `HostTurnContext` carried no tool choice, so Hermes's model chose
+freely and the donor's stream adapter refused its answer.
+
+Fix: the relay hands the host the donor's own contract per model call,
+computed by the donor's `resolveExplicitToolContract` for
+`agent.turn.prompt` (`packages/lifecycle/src/host-turns.ts:76-110`):
+`{kind: "tool", name, parameters}` (with the donor's exact-arguments schema,
+`buildExactToolArgumentsModelSchema`, when the participant gave the call's
+arguments), `{kind: "none"}`, or null. `prepare`'s context carries the
+first call's (`wire.ts` `renderToolChoice`); the bridge's `tool-choice`
+route (`http.ts:159`, `bridge.ts:236`) answers it for the open turn's next
+call, serialized with the host's tool calls (`HostTurn.toolChoice`,
+`host-turns.ts:226`), only to the host instance that prepared the turn.
+The Hermes plugin registers Hermes's `llm_request` middleware
+(`integrations/hermes/psfn_lite/runtime.py` `_llm_request`, `Driver.llm_request`
+in `lifecycle.py`, the rewrite in `toolchoice.py` `apply`), keeps the
+prepared choice, asks `tool-choice` again after each Lite tool call, and
+rewrites the provider request as the donor's provider client did. Its
+limits are under "What a host-driven turn cannot reproduce". Guards:
+`tests/lifecycle/tool-choice.test.ts` (the contract per call over the
+donor's message shapes), `tests/lifecycle/host-turns.integration.test.ts`
+(prepare and `tool-choice` over HTTP, owner checks, and a completed turn
+that follows them), `integrations/hermes/tests/test_tool_choice.py`
+(through Hermes's own `apply_llm_request_middleware`) and
+`test_e2e_lite.py` (an explicit request against the real Lite, recorded as
+completed). The test faux model reports `openai-completions` where the
+contract is exercised (`tests/support/faux-model.ts` `FauxModelOptions`),
+since the donor refuses explicit requests on other APIs.
+
+### Hermes 2bd378e
+
+At Hermes `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19` (the operator's live
+install), `hermes chat` runs through a gateway (`hermes_cli/gateway_chat.py`),
+and one gateway serves several profiles. Root causes and fixes, all in the
+plugin:
+
+- The plugin kept one set of hooks, warning callbacks and handles per
+  process (`runtime.py`, `_handles` by hook name). With a module shared by
+  several homes (f0187332 names a user provider's module by its name only),
+  a second profile's manager got no hooks. Everything is now keyed by the
+  resolved home (`runtime.py` `_handles`, `_drivers`,
+  `_warning_callbacks`, `register_hooks`), so each profile has its own
+  hooks, driver, ledger and host instance.
+- The fail-closed gate that blocks every MCP tool when `psfn-lite.json`
+  cannot be read applied in any profile whose manager held the hooks. It
+  now applies only where `memory.provider` is `psfn_lite`
+  (`runtime.py` `_selected`); another profile is left alone.
+- The bridge credential was read from `os.environ`; a gateway clears the
+  inherited environment and loads each profile's `.env`. It is read through
+  Hermes's `agent.secret_scope.get_secret` (`config.py` `Config.credential`),
+  which fails closed without a profile scope under multiplexing.
+- The install id is read through `hermes_cli/install_identity.py`
+  `get_install_id` (one per install, shared by profiles; it mints once if
+  missing). At f0187332, which has no such module, the file is read as
+  before (`config.py` `hermes_install_id`).
+- The gateway's CLI sender is platform `local`, sender `uid:<uid>`
+  (`gateway/control_socket.py` `_posix_peer_subject`); the README says how
+  to bind it.
+- `plugin.yaml` now lists `post_tool_call` and the `llm_request`
+  middleware (`provides_middleware`); a test compares it with what the
+  plugin registers.
+
+The README documents that the credential belongs in the profile's `.env`
+and that the root gateway adopts a new profile unless it sets
+`gateway.standalone: true`. The suite runs at both revisions
+(`HERMES_REVISIONS`, `docs/development.md`); 2bd378e from a clone of the
+live install, never the install itself. `tests/test_profiles.py` runs two
+Lite profiles and a non-Lite profile in one process under multiplexing.
+
+### capability_refusal_matrix is out of scope
+
+Decided (no code): the donor harness case `capability_refusal_matrix` is
+out of scope for Lite shakedowns. It dispatches only with dedicated real
+external sinks (`PSFN_MATRIX_EXTERNAL_SINKS_CONFIRMED=dedicated-test-sinks`,
+a dedicated Discord snowflake and an email target; donor
+`shakedown/harness/lib/capability-matrix.mjs:327-344`), and the surfaces it
+sends through (`notify`, the Discord and email sinks) are cut
+(`docs/tool-inventory.md`, "Donor surfaces Lite does not serve"). The
+donor never had it green either.
 
 ## Measured size
 

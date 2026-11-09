@@ -96,12 +96,16 @@ checks pass. Close delivered implementation beads; track later live testing sepa
 
 `integrations/hermes` is Python. Its tests run in a project-local virtualenv
 (`integrations/hermes/.venv`, gitignored) with [uv](https://docs.astral.sh/uv/).
-Hermes itself is installed editable from a throwaway clone at the tested
-revision, `f0187332d13679e2ace74d1f0eb399eb91a90571`. Never install into an
-operator's Hermes checkout, `~/.hermes` profile or `hermes` binary. The suite
-sets `HERMES_HOME` to a temporary directory before importing Hermes, and it
-refuses to run unless the imported Hermes is a git checkout at that revision.
-Every test dependency is pinned exactly in `requirements-test.txt`.
+Hermes itself is installed editable from a throwaway clone at a tested
+revision. Two are tested (`HERMES_REVISIONS` in `psfn_lite/config.py`), and
+the suite runs once against each:
+`f0187332d13679e2ace74d1f0eb399eb91a90571` (Python 3.13, pins in
+`requirements-test.txt`) and `2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19`
+(Python 3.14, pins in `requirements-test-2bd378e.txt`). Never install into
+an operator's Hermes checkout, `~/.hermes` profile or `hermes` binary. The
+suite sets `HERMES_HOME` to a temporary directory before importing Hermes,
+and it refuses to run unless the imported Hermes is a git checkout at a
+tested revision. Every test dependency is pinned exactly.
 
 ```bash
 HERMES_CLONE=/tmp/hermes-agent-f0187332   # any disposable path
@@ -113,6 +117,30 @@ uv pip install --no-config --python .venv/bin/python -r requirements-test.txt
 uv pip install --no-config --python .venv/bin/python --no-deps -e "$HERMES_CLONE"
 mise exec node@24.22.1 npm@11.17.0 -- .venv/bin/python -I -m pytest -q
 ```
+
+For 2bd378e, use a second virtualenv outside the repository. A live Hermes
+install at that revision can be the clone's source, read-only: clone it
+(`git clone --no-hardlinks --no-checkout <live checkout> "$HERMES_CLONE"`),
+never install into it or run anything inside it. The pins are Hermes's own
+`uv.lock` (Hermes overrides a dependency there, so they install with
+`--no-deps`), plus pytest:
+
+```bash
+HERMES_CLONE=/tmp/hermes-agent-2bd378e   # any disposable path
+git clone --no-checkout https://github.com/NousResearch/hermes-agent.git "$HERMES_CLONE"
+git -C "$HERMES_CLONE" checkout --detach 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19
+VENV=/tmp/psfn-hermes-2bd378e-venv        # any disposable path
+uv venv --no-config --python 3.14 "$VENV"
+uv pip install --no-config --no-deps --python "$VENV/bin/python" -r integrations/hermes/requirements-test-2bd378e.txt
+uv pip install --no-config --no-deps --python "$VENV/bin/python" -e "$HERMES_CLONE"
+cd integrations/hermes
+mise exec node@24.22.1 npm@11.17.0 -- "$VENV/bin/python" -I -m pytest -q -p no:cacheprovider
+```
+
+`requirements-test-2bd378e.txt` is
+`uv export --no-config --frozen --no-hashes --no-header --no-annotate --extra mcp --no-dev --no-emit-project --python 3.14`
+run in the clone, followed by `iniconfig==2.3.1`, `pluggy==1.7.0` and
+`pytest==8.4.2`.
 
 Hermes's `setup.py` refuses to build a wheel, so it cannot be a locked uv git
 dependency; hence the editable install with `--no-deps`. `--no-config` keeps
