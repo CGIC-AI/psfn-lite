@@ -1,19 +1,17 @@
 // Shared runtime wiring.
 // Common primitives used by both split-runtime and gateway agent mode.
+//
+// Lite cut (seam 3.11, extraction/cuts.tsv): buildReplConfig (analysis
+// workbench), wireFilesystemToolsRuntime (filesystem integration) and the
+// lifecycle system tool are cut. The donor agent called wireSettingsRuntime
+// with registerSystemTool: false, so that path is unchanged.
 
 import type { CapabilityTier, SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
 import type { Scheduler } from '../../../core/scheduler/scheduler.js';
 import { createComponentLogger } from '../../../shared/logger.js';
 import type { ToolRegistrarTarget } from '../../../core/agent/tool-registrar.js';
-import {
-  DEFAULT_REPL_CONFIG,
-  type REPLConfig,
-  type TierAnalysisWorkbenchBudget,
-  validateAnalysisWorkbenchDirectResponseTimeoutMs,
-} from '../../../core/tools/analysis-workbench/types.js';
 import type { MessageSender } from '../../../system/lifecycle/notifications.js';
 import type { LLMProviderPort } from '../../../core/agent/contracts.js';
-import { wireFilesystemRuntime, type FilesystemRuntimeTarget } from '../../../boundary/integrations/filesystem/runtime-wiring.js';
 import type { SessionManager } from '../../../core/session/manager.js';
 import {
   createSessionTool,
@@ -52,7 +50,6 @@ import {
   resolvePromptRegistryPath,
   resolveValuesJournalPath,
 } from '../../../persistence/layout.js';
-import { createSystemTool } from '../../../core/tools/lifecycle.js';
 import {
   wireReflectionRuntime as wireCoreReflectionRuntime,
   type ReflectionAgent,
@@ -76,8 +73,6 @@ export function buildCharacterPromptVariablesProvider(
 ): () => Record<string, string> {
   return () => buildCharacterPromptTemplateVariables(cardStore.getCurrent().card);
 }
-
-export type FilesystemToolRuntimeTarget = ToolRegistrarTarget & FilesystemRuntimeTarget;
 
 /**
  * Wire prompt stack storage, composition, and tools.
@@ -152,57 +147,6 @@ export function wireStaticPromptRegistry(
 }
 
 /**
- * Build REPL config with runtime settings overrides.
- * Shared across the split runtime entrypoints to keep analysis workbench budgets aligned.
- */
-export function buildReplConfig(config: SubstrateConfig): REPLConfig {
-  const replConfig: REPLConfig = {
-    ...DEFAULT_REPL_CONFIG,
-    budget: { ...DEFAULT_REPL_CONFIG.budget },
-  };
-  if (config.analysisWorkbenchMaxTokens !== undefined) replConfig.budget.maxTokens = config.analysisWorkbenchMaxTokens;
-  if (config.analysisWorkbenchMaxWallTimeMs !== undefined) replConfig.budget.maxWallTimeMs = config.analysisWorkbenchMaxWallTimeMs;
-  if (config.analysisWorkbenchDirectResponseTimeoutMs !== undefined) {
-    replConfig.directResponseTimeoutMs = validateAnalysisWorkbenchDirectResponseTimeoutMs(
-      config.analysisWorkbenchDirectResponseTimeoutMs,
-    );
-  }
-  if (config.analysisWorkbenchMaxSubQueries !== undefined) replConfig.budget.maxSubQueries = config.analysisWorkbenchMaxSubQueries;
-  if (config.analysisWorkbenchMaxIterations !== undefined) {
-    replConfig.budget.maxIterations = config.analysisWorkbenchMaxIterations;
-  }
-  if (
-    config.analysisWorkbenchMaxIterations !== undefined
-    || config.analysisWorkbenchMaxWallTimeMs !== undefined
-    || config.analysisWorkbenchMaxSubQueries !== undefined
-  ) {
-    // Owner-set limits are the real loop ceilings. Lift every matching tier
-    // clamp so production execution does not silently truncate below the
-    // settings contract. Copy per tier to avoid mutating the shared defaults.
-    const liftTierCeilings = (tier: TierAnalysisWorkbenchBudget): TierAnalysisWorkbenchBudget => ({
-      ...tier,
-      maxIterations: config.analysisWorkbenchMaxIterations === undefined
-        ? tier.maxIterations
-        : Math.max(tier.maxIterations, config.analysisWorkbenchMaxIterations),
-      maxWallTimeMs: config.analysisWorkbenchMaxWallTimeMs === undefined
-        ? tier.maxWallTimeMs
-        : Math.max(tier.maxWallTimeMs, config.analysisWorkbenchMaxWallTimeMs),
-      maxSubQueries: config.analysisWorkbenchMaxSubQueries === undefined
-        ? tier.maxSubQueries
-        : Math.max(tier.maxSubQueries, config.analysisWorkbenchMaxSubQueries),
-    });
-    replConfig.tierBudgets = {
-      nursery: liftTierCeilings(replConfig.tierBudgets.nursery),
-      apprentice: liftTierCeilings(replConfig.tierBudgets.apprentice),
-      autonomous: liftTierCeilings(replConfig.tierBudgets.autonomous),
-    };
-  }
-  if (config.analysisWorkbenchExecutionTimeoutMs !== undefined) replConfig.executionTimeoutMs = config.analysisWorkbenchExecutionTimeoutMs;
-  if (config.analysisWorkbenchOutputTruncation !== undefined) replConfig.outputTruncation = config.analysisWorkbenchOutputTruncation;
-  return replConfig;
-}
-
-/**
  * Wire runtime settings introspection tool (read-only).
  * Shared across the split runtime entrypoints.
  */
@@ -214,7 +158,9 @@ export function wireSettingsRuntime(
   } = {},
 ): void {
   if (options.registerSystemTool !== false) {
-    target.registerTool(createSystemTool(config), 'core');
+    void target;
+    void config;
+    throw new Error('The lifecycle system tool is not part of Lite; pass registerSystemTool: false');
   }
 }
 
@@ -239,18 +185,6 @@ export function wireSessionToolsRuntime(
       );
     },
   }), 'core');
-}
-
-export function wireFilesystemToolsRuntime(
-  target: FilesystemToolRuntimeTarget,
-  workspacePath: string,
-  config: Pick<SubstrateConfig, 'fsReadMaxBytes'> = {},
-): void {
-  wireFilesystemRuntime(target, workspacePath, {
-    ...(config.fsReadMaxBytes !== undefined
-      ? { defaultReadMaxBytes: config.fsReadMaxBytes }
-      : {}),
-  });
 }
 
 /**
