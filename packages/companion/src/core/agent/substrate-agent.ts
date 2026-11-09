@@ -19,12 +19,7 @@ import type { AgentTool, StreamFn } from '../../boundary/pi-agent/index.js';
 import type { UserMessage } from '@earendil-works/pi-ai';
 import type { EventBus } from '../../shared/event-bus.js';
 import { createEventBusCostTelemetryPort } from '../../shared/telemetry/cost-telemetry-port.js';
-import {
-  getRunChargeContext,
-  runWithChargeContext,
-  type DurableRunChargeProbe,
-  type DurableRunChargeRecorder,
-} from '../../shared/telemetry/run-charge.js';
+import { getRunChargeContext, runWithChargeContext } from '../../shared/telemetry/run-charge.js';
 import { createMemoryAppCache } from '../../shared/cache/memory-cache.js';
 import type { AppCache } from '../../shared/cache/types.js';
 import { RUNTIME_LAYOUT_MODE, resolveRuntimeLayoutMode } from '../../persistence/layout.js';
@@ -87,7 +82,6 @@ import {
 } from '../../shared/contracts/intake-sink-gate-port.js';
 import { classifyToolResultCogSecProvenance } from '../cogsec/intake/tool-result-provenance.js';
 import type { IntakeEnvelopeSnapshot } from '../../shared/contracts/intake-envelope.js';
-import { CapabilityRuntime } from '../../system/capabilities/runtime.js';
 import type { CapabilityGrantSnapshot } from '../../system/capabilities/access.js';
 import { normalizeCapabilityTier, resolveTierCapabilityTokens } from '../../system/capabilities/tiers.js';
 import type { CapabilityToken } from '../../system/capabilities/tokens.js';
@@ -335,7 +329,6 @@ export class SubstrateAgent {
   private modelSignature: string | null = null;
   private bridge: EventBridge;
   private channelRegistry: ChannelPromptRegistryPort = new Map();
-  private capabilityRuntime: CapabilityRuntime | null = null;
   /**
    * Explicit injected capability access (mus2.1). When set, it is the single
    * authority for tool gates, prompt tool availability, and audit fields —
@@ -380,8 +373,6 @@ export class SubstrateAgent {
   private readonly emotionSelfModelRuntime: EmotionSelfModelRuntime;
   private readonly promptContextBuilder: PromptContextBuilder;
   private readonly followUpIngress: FollowUpIngressRouter;
-  private durableChargeRecorder: DurableRunChargeRecorder | null = null;
-  private durableChargeProbe: DurableRunChargeProbe | null = null;
   private currentInternalState: InternalState | null = null;
   private currentInternalStateSnapshotRef: string | null = null;
   private currentMetacognitiveFlags: MetacognitiveFlag[] = [];
@@ -972,12 +963,6 @@ export class SubstrateAgent {
       return;
     }
 
-    if (this.capabilityRuntime) {
-      const refreshed = this.capabilityRuntime.refreshFromDisk();
-      this.config.capabilityTier = refreshed.tier;
-      return;
-    }
-
     this.config.capabilityTier = this.resolveCapabilityTier();
   }
 
@@ -987,7 +972,6 @@ export class SubstrateAgent {
 
   private resolveCapabilityAccess(): CapabilityAccess {
     if (this.explicitCapabilityAccess) return this.explicitCapabilityAccess;
-    if (this.capabilityRuntime) return this.capabilityRuntime;
 
     const tier = this.resolveCapabilityTier();
     const grantedTokens = new Set(resolveTierCapabilityTokens(tier));
@@ -1005,10 +989,6 @@ export class SubstrateAgent {
    * resolved grant preserves the same prompt/tool-gate semantics.
    */
   private snapshotCapabilityGrant(): Pick<CapabilityGrantSnapshot, 'tier' | 'grantedTokens'> {
-    if (!this.explicitCapabilityAccess && this.capabilityRuntime) {
-      return this.capabilityRuntime.snapshotOwnerGrant();
-    }
-
     const access = this.resolveCapabilityAccess();
     return Object.freeze({
       tier: access.getTier(),
@@ -1237,12 +1217,6 @@ export class SubstrateAgent {
     invalidateStaticPromptPrefixCache(this.appCache, 'channel-registry-updated', log);
   }
 
-  setCapabilityRuntime(runtime: CapabilityRuntime | null): void {
-    this.capabilityRuntime = runtime;
-    this.gatedToolCache = new WeakMap<AgentTool<any>, AgentTool<any>>();
-    this.refreshCapabilityRuntime();
-  }
-
   /**
    * Inject an explicit capability access (mus2.1), e.g. an immutable derived
    * shard access from `deriveShardCapabilityGrant`. While set, it governs tool
@@ -1462,15 +1436,6 @@ export class SubstrateAgent {
 
   setBehavioralPatternProvider(provider: BehavioralPatternContextProvider | null): void {
     this.behavioralPatternProvider = provider;
-  }
-
-  /** Late-wired by the agent entrypoint before any message callback is exposed. */
-  setDurableChargeRecorder(
-    recorder: DurableRunChargeRecorder,
-    probe: DurableRunChargeProbe,
-  ): void {
-    this.durableChargeRecorder = recorder;
-    this.durableChargeProbe = probe;
   }
 
   setSelfModelRuntimeRequired(required: boolean): void {
@@ -1747,8 +1712,6 @@ export class SubstrateAgent {
     const run = async (): Promise<AgentResponse> => handleMessageForTurn(createTurnExecutionRuntimeAdapter({
       eventBus: this.eventBus,
       costTelemetry: createEventBusCostTelemetryPort(this.eventBus),
-      durableChargeRecorder: this.durableChargeRecorder,
-      durableChargeProbe: this.durableChargeProbe,
       satellitePresence: this.satellitePresencePort,
       companionPresence: this.companionPresence,
       llmClient: this.llmClient,

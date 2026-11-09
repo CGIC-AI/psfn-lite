@@ -1,6 +1,6 @@
 import type { CredentialReference, CredentialVaultPort } from '../../shared/contracts/credential-contracts.js';
 import type { CapabilityTier } from '../capabilities/tier-types.js';
-import type { ChargePolicyConfig } from './charge-policy-config.js';
+import type { ChargePolicyConfig } from '../../shared/contracts/charge-policy.js';
 import type { SubagentRoleRegistryConfig } from '../../faculties/subagents/role-registry.js';
 import type { AutomataOwnerPolicy } from '../../faculties/automata/registry-contract.js';
 import type { ResolvedCompanionsFleetConfig } from './companions-config.js';

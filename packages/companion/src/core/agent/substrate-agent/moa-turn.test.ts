@@ -4,7 +4,7 @@ import { buildMoaPrompt, runMoaTurn, type ResolvedMoaSettings } from './moa-turn
 import { runDeliberation } from '../../../primitives/llm/deliberation.js';
 import type { LLMContext, ObservabilityCallType, SubstrateMessage } from '../../../shared/contracts/runtime.js';
 import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
-import type { ChargePolicyConfig } from '../../../system/config/charge-policy-config.js';
+import type { ChargePolicyConfig } from '../../../shared/contracts/charge-policy.js';
 import { resetRunChargeRollingWindowForTests } from '../../../shared/telemetry/run-charge.js';
 import { makeTestFatiguePolicyConfig } from '../../../test-support/charge-policy.js';
 

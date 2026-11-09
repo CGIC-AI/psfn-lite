@@ -882,3 +882,6 @@ cut	src/core/agent/substrate-agent/turn-execution/icp-fatigue-regulation.ts
 cut	src/core/participation/types.ts
 cut	src/core/session/icp-recovery-fatigue-binding.ts
 cut	src/core/session/icp-recovery-fatigue-metadata.ts
+cut	src/system/capabilities/runtime.ts
+cut	src/system/config/charge-policy-config.ts
+cut	src/system/config/capability-tier-config.ts
