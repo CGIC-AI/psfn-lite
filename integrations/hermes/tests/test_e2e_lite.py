@@ -1,10 +1,12 @@
 """The plugin and Hermes's own MCP client against a real PSFN Lite runtime.
 
-tests/hermes/fixtures/lite-host.ts starts the standalone runtime over a
-throwaway Postgres with the MCP transport and the lifecycle bridge on
-loopback; the operator's standalone (Pi harness) turn has already started an
-activity. Hermes then runs turns through the plugin's hooks and calls the
-governed tools through its real MCP client and tool registry.
+tests/hermes/fixtures/lite-host.ts starts the standalone runtime (the
+extracted donor companion core) over a throwaway Postgres with the MCP
+transport and the lifecycle bridge on loopback; the operator's own Pi turn
+has already noted what Robin is doing as one of the companion's
+open threads, scoped to Robin. Hermes then runs host-driven turns through the plugin's hooks
+and calls the companion's tools through its real MCP client and tool
+registry, so the donor runs every call in its own tool loop.
 
 Docker and Node are required, as for the TypeScript integration suites;
 LITE_SKIP_DOCKER_TESTS=1 opts out explicitly and says so.
@@ -36,7 +38,7 @@ def lite():
     tsx = REPO / "node_modules" / ".bin" / "tsx"
     if not tsx.exists() or shutil.which("node") is None:
         pytest.fail("the end-to-end suite needs node and the repository's node_modules (run it under mise; see docs/development.md)")
-    process = subprocess.Popen([str(tsx), str(FIXTURE)], cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
+    process = subprocess.Popen([shutil.which("node"), "--import", "tsx", str(FIXTURE)], cwd=REPO, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr, text=True)
     ready, _, _ = select.select([process.stdout], [], [], START_TIMEOUT_SECONDS)
     line = process.stdout.readline() if ready else ""
     if not line:
@@ -101,23 +103,24 @@ def hermes_turn(session, turn_id, message, *, reply=None, interrupted=False, fai
     return context
 
 
-def test_hermes_reaches_the_governed_tools_over_its_own_mcp_client(operator):
-    for tool in ("journal", "memory", "automata", "free_time", "activity", "session", "orient"):
+SEED_THREAD = "Robin is sorting the seed packets for spring"
+
+
+def test_hermes_reaches_the_companion_tools_over_its_own_mcp_client(operator):
+    for tool in ("journal", "memory", "orient", "scratchpad", "session", "contact", "tool_search"):
         assert f"mcp__{SERVER}__{tool}" in operator
     begin("e2e-tools", "e2e-tools:t", "keep a note about the garden")
-    call_tool("journal", "write", path="garden/seeds.md", body="Tomatoes, beans and marigolds this spring.")
-    assert "garden/seeds.md" in call_tool("journal", "list", limit=10)
-    call_tool("memory", "write", writeId="hermes-e2e-1", kind="fact", content="Robin is planting marigolds beside the beans.", sensitivity="personal")
-    call_tool("memory", "census")
-    call_tool("automata", "status", limit=5)
-    call_tool("free_time", "status")
-    assert "Sorting the seed packets for spring" in call_tool("activity", "recent", limit=5)
+    call_tool("journal", "write", path="garden/seeds.md", content="Tomatoes, beans and marigolds this spring.")
+    assert "garden/seeds.md" in call_tool("journal", "list")
+    assert "Memory created" in call_tool("memory", "write", text="Robin is planting marigolds beside the beans.", type="semantic", sensitivity="personal")
+    assert "Robin is planting marigolds beside the beans." in call_tool("memory", "search", query="marigolds")
+    assert SEED_THREAD in call_tool("orient", "list_concerns")
     finish("e2e-tools", "e2e-tools:t", reply="Noted.")
 
 
 def test_lite_tools_are_refused_outside_a_bound_lite_turn_though_the_mcp_client_holds_the_credential(operator):
     # Hermes's MCP client sends the operator's standing credential on every call; the plugin's gate decides.
-    assert "only inside a turn recorded" in dispatch("memory", "census", session="e2e-none", turn_id="e2e-none:t")
+    assert "only inside a turn recorded" in dispatch("memory", "search", session="e2e-none", turn_id="e2e-none:t", query="marigolds")
     context = begin("e2e-stranger", "e2e-stranger:t", "what does Robin keep in memory?", platform="telegram", sender="stranger-1")
     assert "not bound to the companion's PSFN Lite continuity" in context
     refused = dispatch("memory", "search", session="e2e-stranger", turn_id="e2e-stranger:t", query="marigolds", limit=5)
@@ -125,22 +128,23 @@ def test_lite_tools_are_refused_outside_a_bound_lite_turn_though_the_mcp_client_
     finish("e2e-stranger", "e2e-stranger:t", reply="I can't say.", platform="telegram")
 
 
-def test_a_hermes_turn_sees_the_standalone_turns_activity_and_archives_every_outcome(operator, profile):
+def test_a_hermes_turn_sees_the_standalone_turns_open_thread_and_every_outcome_is_settled(operator, profile):
     context = hermes_turn("e2e-1", "e2e-1:t1", "what have you been up to?", reply="Sorting the seed packets.")
-    assert "[internal signal: activity]" in context
-    assert "Sorting the seed packets for spring" in context and "in another conversation" in context
+    assert "[system note: companion context]" in context and SEED_THREAD in context
     hermes_turn("e2e-1", "e2e-1:t2", "tell me everything", interrupted=True)
     hermes_turn("e2e-1", "e2e-1:t3", "and then?", failed=True)
     assert plugin_module("runtime").driver().ledger.pending() == []
     # The same Hermes turn again is replayed by Lite, not recorded twice.
     again = begin("e2e-1", "e2e-1:t1", "what have you been up to?")
-    assert "already recorded this turn as completed" in again
+    assert "already recorded this turn" in again
 
-    begin("e2e-1", "e2e-1:t4", "show me our conversation")
-    messages = call_tool("session", "messages", session="e2e-1", turn_id="e2e-1:t4", limit=20)
+    # The next turn's donor context carries the completed exchange as the session's history.
+    context = begin("e2e-1", "e2e-1:t4", "show me our conversation")
+    assert "what have you been up to?" in context
+    assert "[your own earlier reply]\nSorting the seed packets." in context
+    found = call_tool("session", "grep", session="e2e-1", turn_id="e2e-1:t4", pattern="seed packets")
     finish("e2e-1", "e2e-1:t4", reply="Here it is.")
-    for text in ("what have you been up to?", "Sorting the seed packets.", "turn interrupted by participant", "turn failed: hermes_turn_failed"):
-        assert text in messages
+    assert "Sorting the seed packets." in found
     # Compaction is allowed: Lite proves every turn of the session.
     from agent.memory_manager import MemoryManager
 
@@ -181,16 +185,15 @@ def test_turns_hermes_never_ends_rotates_or_loses_the_answer_of_are_archived_and
     finish("e2e-2b", "e2e-2b:resumed", reply="Still here.")
     assert driver.ledger.pending() == [] and driver.ledger.turns() == []
 
-    begin("e2e-2b", "e2e-2b:read", "show me")
-    messages = call_tool("session", "messages", session="e2e-2b", turn_id="e2e-2b:read", limit=30)
+    # The rotated conversation is one Lite session: its next turn's donor context holds every completed exchange, the resumed one once.
+    context = begin("e2e-2b", "e2e-2b:read", "show me")
     finish("e2e-2b", "e2e-2b:read", reply="Done.")
-    for text in ("first try", "turn failed: hermes_turn_unfinished", "Second answer.", "After the rotation.", "Still here."):
-        assert text in messages
-    # Resumed, not recorded twice (the tool result carries the entries in each of its representations once).
-    assert messages.count("are you there?") == messages.count("Still here.")
+    for text in ("Second answer.", "After the rotation.", "Still here."):
+        assert f"[your own earlier reply]\n{text}" in context
+    assert context.count("[your own earlier reply]\nStill here.") == 1
 
 
-def test_a_contact_the_activity_is_not_disclosed_to_does_not_see_it(lite, profile, monkeypatch):
+def test_a_contact_the_operator_thread_is_not_disclosed_to_does_not_see_it(lite, profile, monkeypatch):
     write_profile(profile, bridge_url=lite["lifecycleUrl"], senders=[{"platform": "telegram", "sender_id": "friend-1"}])
     monkeypatch.setenv(CREDENTIAL_ENV, lite["credentials"]["hermes-friend"])
     from plugins.memory import load_memory_provider
@@ -198,7 +201,7 @@ def test_a_contact_the_activity_is_not_disclosed_to_does_not_see_it(lite, profil
     load_memory_provider("psfn_lite").initialize("friend-1", hermes_home=str(profile), platform="telegram")
     [result] = fire("pre_llm_call", session_id="friend-s", task_id="task", turn_id="friend-s:t1", user_message="what have you been up to?", conversation_history=[], is_first_turn=True,
                     model="m", platform="telegram", parent_session_id="", sender_id="friend-1")
-    assert "seed packets" not in result["context"]
+    assert "seed packets" not in result["context"] and "[system note: companion context]" in result["context"]
     assert "continuity is unavailable" not in result["context"]
     fire("on_session_end", session_id="friend-s", task_id="task", turn_id="friend-s:t1", completed=False, failed=False, interrupted=True, turn_exit_reason="interrupted", model="m", platform="telegram")
     deadline = time.monotonic() + 5

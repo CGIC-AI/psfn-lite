@@ -1,13 +1,15 @@
 """Drives the Lite turn lifecycle from Hermes plugin hooks.
 
 Every root Hermes turn (not a subagent, not the background review fork, not
-a cron or flush agent) of a bound sender, or the root turn of a delegated
-internal-turn process, becomes one Lite turn:
+a cron or flush agent) of a bound sender becomes one host-driven turn of
+the donor companion core:
 
-- ``pre_llm_call`` prepares it under a stable idempotency key and injects
-  Lite's labelled context into the user message;
-- ``post_llm_call`` and ``post_tool_call`` collect the reply and the
-  governed tool calls;
+- ``pre_llm_call`` prepares it under a stable idempotency key, in the Lite
+  session of the Hermes conversation (the root of its compression lineage),
+  and injects the context the donor assembled into the user message;
+- the companion's tools, called over the Lite MCP server inside the turn,
+  run in the donor's own tool loop;
+- ``post_llm_call`` collects the reply;
 - ``on_session_end`` settles it as completed, interrupted or failed.
 
 Open turns are keyed by Hermes's turn id, which Hermes mints once per turn,
@@ -35,14 +37,12 @@ import threading
 from .bridge import BridgeClient, BridgeError
 from .config import NON_INTERACTIVE_PLATFORMS, Config
 from .delivery import Delivery
-from .ledger import JOB, STANDING, Ledger
+from .ledger import Ledger
 from .outcomes import outcome, unfinished
 from .render import block, render_context
 
 logger = logging.getLogger(__name__)
 
-#: Set in the environment of a Hermes process the plugin starts to run one delegated internal turn.
-INTERNAL_JOB_ENV = "PSFN_LITE_INTERNAL_JOB"
 _SWEPT_KEPT = 256
 _NOTE = "system note: psfn_lite"
 TOOL_BLOCKED = (
@@ -62,17 +62,16 @@ def host_instance() -> str:
 
 
 class Driver:
-    def __init__(self, config: Config, ledger: Ledger, client: BridgeClient, *, instance: str, internal_job: bool, notify):
+    def __init__(self, config: Config, ledger: Ledger, client: BridgeClient, *, instance: str, notify):
         self.config = config
         self.ledger = ledger
         self.client = client
         self.instance = instance
-        self.internal_job = internal_job
         self._notify = notify
         self._lock = threading.RLock()
         #: Hermes session id -> Lite turn ids prepared in it (inherited across a compression's session rotation).
         self._turns = {}
-        #: Hermes turn id -> the open Lite turn ({turn, session, reply, tools, prepare, row}).
+        #: Hermes turn id -> the open Lite turn ({turn, session, reply, prepare, row}).
         self._open = {}
         #: Hermes session id -> the session it continues after a compression.
         self._parents = {}
@@ -81,7 +80,7 @@ class Driver:
         self._subagents = set()
         #: Warnings to show in the next turn's context, per Hermes session.
         self._carry = {}
-        self.delivery = Delivery(client, ledger, instance=instance, scope=JOB if internal_job else STANDING, fail=self._fail, notice=self._notice)
+        self.delivery = Delivery(client, ledger, instance=instance, fail=self._fail, notice=self._notice)
 
     # -- hooks ---------------------------------------------------------------
 
@@ -97,12 +96,12 @@ class Driver:
                 self._link(new_session_id, parent_session_id)
 
     def pre_llm_call(self, session_id="", turn_id="", user_message="", parent_session_id="", platform="", sender_id="", **_):
-        # Subagents, the review fork and cron or flush agents never drive Lite, in an internal-turn process too.
+        # Subagents, the review fork and cron or flush agents never drive Lite.
         if not self._root(session_id, parent_session_id, platform):
             return None
         # Sessions are linked only by a compression (on_session_switch) or a turn seen under a rotated id;
         # Hermes gives a root agent no parent session id, and a branch is another conversation.
-        if not self.internal_job and not self.config.binds(platform or "", sender_id or ""):
+        if not self.config.binds(platform or "", sender_id or ""):
             # Logged and reported, not carried: an unbound conversation never gets Lite context to show it in.
             logger.error("psfn_lite unbound_sender for session %s: platform %r sender is not bound to PSFN Lite", session_id, platform)
             self._notify(f"PSFN Lite ignored a turn from platform {platform!r}: its sender is not bound to PSFN Lite")
@@ -118,7 +117,8 @@ class Driver:
         body = {
             "hostInstance": self.instance,
             "idempotencyKey": idempotency_key(session_id, turn_id),
-            "message": None if self.internal_job else user_message,
+            "sessionId": self._lite_session(session_id),
+            "message": user_message,
         }
         entry = self._begin(session_id, turn_id, body)
         try:
@@ -136,17 +136,23 @@ class Driver:
             )])}
         if prepared.get("kind") == "replayed":
             self._drop(turn_id)
-            return {"context": block(_NOTE, f"Lite already recorded this turn as {prepared.get('status')}; it is not recorded again.")}
+            return {"context": block(_NOTE, "Lite already recorded this turn; it is not recorded again.")}
+        if prepared.get("kind") == "answered":
+            # The donor ended the turn before asking for a model answer; it is recorded with the donor's own reply.
+            self._drop(turn_id)
+            with self._lock:
+                if isinstance(prepared.get("turnId"), str):
+                    self._remember(session_id, prepared["turnId"])
+            return {"context": block(_NOTE, "Your PSFN Lite continuity ended this turn itself and recorded it; nothing you reply now is recorded there.")}
         lite_turn = prepared.get("turnId")
         if prepared.get("kind") != "prepared" or not isinstance(lite_turn, str) or not isinstance(prepared.get("context"), dict):
             self._fail("prepare", session_id, None, "Lite answered prepare with an unexpected shape", record=False)
             return {"context": block(_NOTE, "Your PSFN Lite continuity answered unexpectedly; you have no fresh continuity context for this turn.")}
         with self._lock:
-            known = set(self._turns.get(session_id, []))
             entry["turn"] = lite_turn
             self._remember(session_id, lite_turn)
         self.ledger.bind_turn(entry["row"], lite_turn)
-        text = render_context(prepared["context"], known_turns=known, internal=prepared.get("internal"), warnings=warnings, limit=self.config.max_context_chars)
+        text = render_context(prepared["context"], warnings=warnings, limit=self.config.max_context_chars)
         return {"context": text}
 
     def pre_tool_call(self, tool_name="", session_id="", turn_id="", **_):
@@ -164,14 +170,6 @@ class Driver:
         if entry is not None and isinstance(assistant_response, str) and assistant_response.strip():
             with self._lock:
                 entry["reply"] = assistant_response
-
-    def post_tool_call(self, session_id="", turn_id="", tool_name="", status="", **_):
-        if not isinstance(tool_name, str) or not tool_name.startswith(self.config.tool_prefix) or status == "blocked":
-            return
-        entry = self._entry(turn_id, session_id)
-        if entry is not None:
-            with self._lock:
-                entry["tools"] += 1
 
     def on_session_end(self, session_id="", turn_id="", completed=False, failed=False, interrupted=False, turn_exit_reason="", **_):
         entry = self._entry(turn_id, session_id)
@@ -199,7 +197,7 @@ class Driver:
         with self._lock:
             lineage = self._related(session_id)
             turns = list(self._turns.get(session_id, []))
-        kept = [r for r in self.ledger.pending_settlements(scope=self.delivery.scope, instance=self.instance) if r["session_id"] in lineage]
+        kept = [r for r in self.ledger.pending_settlements() if r["session_id"] in lineage]
         if kept:
             raise BridgeError(f"{len(kept)} turn outcomes of this session are not yet in Lite; compaction would lose them", kind="undelivered")
         unknown = [r for r in self.ledger.turns() if r["host_instance"] == self.instance and r["turn_id"] is None and r["session_id"] in lineage]
@@ -207,7 +205,7 @@ class Driver:
             raise BridgeError(f"{len(unknown)} turns of this session are not yet known to Lite; compaction would lose them", kind="undelivered")
         if not turns:
             return
-        result = self.client.call("checkpoint", {"turnIds": turns})
+        result = self.client.call("checkpoint", {"sessionId": self._lite_session(session_id), "turnIds": turns})
         proven = set(result.get("settled", [])) | set(result.get("open", []))
         if not set(turns) <= proven:
             raise BridgeError("Lite did not prove every turn of this session", kind="protocol")
@@ -227,8 +225,8 @@ class Driver:
             entry = self._open.get(turn_id)
         if entry is not None:
             return entry  # Hermes prepared the same turn again; Lite resumes its key
-        row = self.ledger.open_turn(session_id=session_id, host_instance=self.instance, scope=self.delivery.scope, pid=os.getpid(), hermes_turn=turn_id, prepare=body)
-        entry = {"turn": None, "session": session_id, "reply": None, "tools": 0, "prepare": body, "row": row}
+        row = self.ledger.open_turn(session_id=session_id, host_instance=self.instance, pid=os.getpid(), hermes_turn=turn_id, prepare=body)
+        entry = {"turn": None, "session": session_id, "reply": None, "prepare": body, "row": row}
         with self._lock:
             self._open[turn_id] = entry
         return entry
@@ -240,7 +238,7 @@ class Driver:
             self.ledger.resolve(entry["row"])
 
     def _finish(self, entry: dict, result: dict) -> None:
-        settle = {"hostInstance": self.instance, "turnId": entry["turn"], "outcome": result, "toolCallCount": min(entry["tools"], 10_000)}
+        settle = {"hostInstance": self.instance, "turnId": entry["turn"], "outcome": result}
         answer = self.delivery.settle(entry["session"], entry["row"], settle, entry["prepare"])
         if answer is not None and entry["turn"] is None and isinstance(answer.get("turnId"), str):
             with self._lock:
@@ -262,7 +260,7 @@ class Driver:
             logger.error("psfn_lite settles an unfinished turn of session %s as failed: %s", entry["session"], why)
             self._notify(message)
             warnings.append(message)
-            self._finish(entry, unfinished(entry["reply"], why))
+            self._finish(entry, unfinished(why))
         return warnings
 
     def _entry(self, turn_id, session_id):
@@ -278,6 +276,15 @@ class Driver:
         self._parents[child] = parent
         if parent in self._turns and child not in self._turns:
             self._turns[child] = list(self._turns[parent])
+
+    def _lite_session(self, session_id: str) -> str:
+        """The Lite session of a Hermes conversation: the session its compressions rotated from first, so it stays one donor session."""
+        with self._lock:
+            seen = {session_id}
+            while session_id in self._parents and self._parents[session_id] not in seen:
+                session_id = self._parents[session_id]
+                seen.add(session_id)
+            return session_id
 
     def _remember(self, session_id: str, lite_turn: str) -> None:
         turns = self._turns.setdefault(session_id, [])

@@ -1,11 +1,10 @@
 {
   "name": "abandoned-turn",
-  "invariant": "A host-driven turn whose Hermes host dies holds the companion's one agent (another principal is told it is busy, the same principal that it already has an open turn) until the bridge's host-turn timeout fails it; the conversation then continues on both surfaces, and what it holds survives a crash of the Lite host.",
+  "invariant": "A host-driven turn whose Hermes host dies holds the companion's one agent (another principal is told it is busy) until the bridge's host-turn timeout fails it; the conversation then continues on both surfaces, and what it holds survives a crash of the Lite host.",
   "orders": "fixed",
   "steps": [
     { "do": "turn", "id": "opened", "on": "hermes", "say": "I was about to tell you something important", "abandon": true },
     { "do": "turn", "id": "busy", "on": "hermes", "as": "friend", "say": "hello, anyone there?", "refused": { "error": "unavailable", "reason": "companion_turn" } },
-    { "do": "turn", "id": "again", "on": "hermes", "say": "are you still there?", "refused": { "error": "conflict", "reason": "turn_already_open" } },
     { "do": "host", "id": "lapse", "op": "lapse", "args": { "turnId": "{{turn.opened}}" }, "expect": { "has": ["\"settled\":true"] } },
     {
       "do": "turn",
