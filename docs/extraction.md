@@ -417,7 +417,7 @@ relaxed.
 | B5b: the 11 `src/core/agent/fatigue/*.test.ts` files (113), `turn-execution/icp-fatigue-regulation.test.ts` (1), `core/session/icp-recovery-fatigue-binding.test.ts` (345) | Their subjects are now `cut` (fatigue is types only). | 3.17 fatigue |
 | B5b: `turn-execution-runtime.test.ts`, 27 in `fatigue enforcement` and the `human attention pressure` describe (1) | They assert budget spend, reservation, suppression, overcharge, the fatigue and boundary alerts and recovered pending spend; the runtime runs the donor no-port path. The 7 other `fatigue enforcement` tests still pass and stay. | 3.17 fatigue |
 | B5b: `core/session/icp-delivery-recovery.test.ts` (31) | They assert parsing and binding of `fatigue` / `fatiguePendingSpend` in the recovery codec; those keys are now `excluded`. | 3.17 fatigue |
-| B5c: `system/capabilities/runtime.test.ts` (4), `system/config/{capability-tier-config,capability-tier-per-companion,charge-policy-config,charge-policy-per-companion}.test.ts` (5, 8, 16, 6), `subsystem-config.test.ts` "round-trips capability-tier.json without drift" | Their subjects are now `cut` (charge and tiers are stubs). | 3.17 charge, tiers |
+| B5c: `system/capabilities/runtime.test.ts` (4), `system/config/{capability-tier-config,capability-tier-per-companion,charge-policy-config,charge-policy-per-companion}.test.ts` (5, 8, 16, 6), `subsystem-config.test.ts` "round-trips capability-tier.json without drift" | Their subjects are now `cut` (charge and tiers are stubs). Step E4 brought back `capability-tier-config.ts` with its test and the round trip. | 3.17 charge, tiers |
 | B5c: `core/agent/substrate-agent.test.ts`: "renders one atomic owner snapshot that agrees with self_status at the same turn boundary", "injected immutable custom access governs the capability seam over the disk runtime and tier defaults" | They assert the disk-backed `CapabilityRuntime` paths (`snapshotOwnerGrant`, precedence over the disk runtime), which are removed. The sibling "explicit custom access works without any disk-backed CapabilityRuntime" stays and passes. | 3.17 tiers |
 | B5c: `core/agent/substrate-agent.test.ts` "uses the exact notify surface for candidates while ordinary turns retain the full catalog" | **Not a clean scaffolding deletion.** Its subject is ICP candidate control-plane reachability (a candidate turn exposes only `notify`, an ordinary turn keeps the full catalog, the handoff is queued without the permit id or reason). The substrate-agent half is kept core; the control plane (`app/agent/control-plane.ts`) is vendored scaffolding that B6 recomposes. The test grants the custom `external.companion` tier through a disk-backed `CapabilityRuntime` and asserts on its `has`, which the tier stub removes. No other baseline test covers the candidate notify-only surface. Recorded as an open question. | 3.17 tiers |
 | B5d: `persistence/postgres/retired-fleet-grantees.test.ts` (6), `system/capabilities/shard-derivation.test.ts` (28) | Their subjects are now `cut` (closure recompute). | 3.10 recompute, 3.17 shards |
@@ -782,7 +782,7 @@ LOC before B5 to 1,110 files / 314,881 LOC.
 | 3.17 introspection, EmoSim/ICP, biography, social graph | Operator KEEP; none needed (all Step A0 seeds). Introspection keeps its donor default: audit off (`scheduler-config/introspection.ts:22-23`, seed `introspectionAudit.enabled: false`). | none. |
 | 3.17 fatigue / participation | Type copy only what `shared/event-bus.ts` and three core sites need: `shared/contracts/participation-types.ts` (`core/participation/types.ts:11-26,95-141,154-156,186-197`) and `shared/contracts/fatigue-event-types.ts` (`human-attention-pressure.ts:7-41`, `room-episode-circuit-breaker.ts:50-64,77-78,80-102`, `social-pot-enforcement.ts:54-62`). Delete call path: the fatigue ports (`fatigueBudget`, `humanAttentionPressure`, `fatigueRegulationReservations`), the evaluation, reservation, spend, finalize and release blocks in `turn-execution-runtime.ts`, and the two alerts in `prompt-assembly.ts`. Stub: the ICP recovery codec marks `fatigue` and `fatiguePendingSpend` `excluded`. 15 files `cut` (`core/agent/fatigue/*` in the closure, `icp-fatigue-regulation.ts`, `core/participation/types.ts`, `icp-recovery-fatigue-{binding,metadata}.ts`). | A turn runs the donor's no-port path: no budget, no MI-turn suppression or overcharge, no `agent.fatigue` events, no fatigue or human-attention prompt alerts (both builders return `''` without their ports). A recorded ICP recovery response that carries fatigue metadata is rejected with `<label> contains unknown fields: fatigue, fatiguePendingSpend` (the donor parsed and bound it); Lite never records one. |
 | 3.17 charge | Stub (inert mode): nothing in the core loads `charge-policy.json`, so `SubstrateConfig.chargePolicy` stays undefined and every core caller takes its donor no-policy branch (`substrate-agent.ts:1944`, `moa-turn.ts:213,432-433`, `run-charge.ts:376-378,443-447,520-523`, `runtime-context-sections/charge.ts:61-69`). `run-charge.ts`, the `charge-policy.ts` contract and the charge prompt section stay core, unchanged. Redirect the three type imports to the contract; delete call path: the durable charge recorder/probe (their only reader was `icp-fatigue-regulation.ts`). `charge-policy-config.ts` is `cut`. | No run-charge quotas, no `Charge quota exceeded` errors, no `agent.charge` events; the charge prompt variables report no budget. The donor seed set quotas per lane (interactive 24, companion_social 24, background 16, maintenance 0, subagent 6, shard 12). A host that sets `config.chargePolicy` itself still gets the donor behaviour. |
-| 3.17 capability tiers | Delete call path: `CapabilityRuntime` (the per-refresh `capability-tier.json` reader) and `setCapabilityRuntime` in `substrate-agent.ts`. `tier-types.ts` and `tiers.ts` stay core; the tier comes from an injected `CapabilityAccess` or `config.capabilityTier` via `normalizeCapabilityTier`, fallback `nursery` (`tiers.ts:88-93`), the donor seed's tier (`capability-tier.seed.json`: `{"tier": "nursery", "customTokens": []}`). `system/capabilities/runtime.ts` and `capability-tier-config.ts` are `cut`. | The tier is fixed by the host; owner edits to `capability-tier.json` (and its `custom` token list) are no longer read. |
+| 3.17 capability tiers | Delete call path: `CapabilityRuntime` (the per-refresh `capability-tier.json` reader) and `setCapabilityRuntime` in `substrate-agent.ts`. `tier-types.ts` and `tiers.ts` stay core; the tier comes from an injected `CapabilityAccess` or `config.capabilityTier` via `normalizeCapabilityTier`, fallback `nursery` (`tiers.ts:88-93`), the donor seed's tier (`capability-tier.seed.json`: `{"tier": "nursery", "customTokens": []}`). `system/capabilities/runtime.ts` and `capability-tier-config.ts` are `cut`. Amended by Step E4: `capability-tier-config.ts` and the seed are back, and the tier is the owner file, read at start. | The tier is fixed by the host; owner edits to `capability-tier.json` (and its `custom` token list) are no longer read. Since E4: read at start, default `autonomous`. |
 | 3.10 config contract | Type copy into a vendored module augmentation: 83 `SubstrateConfig` fields of cut subsystems (gateway, fleet auth, CogSec screening, kube lifecycle, wiki hydration, shards/satellites/Wyoming, document ingest, images, voice, Discord triggers/Telegram, Garden theme, analysis workbench, web fetch / Home Assistant / Obsidian) and 5 declarations leave `runtime-config-contracts.ts` for `system/config/scaffolding-config-fields.ts` (`declare module './runtime-config-contracts.js'`). None of the 83 has a core reader (1,128 core files scanned). `discordToken` and `discordBotId` stay (`extraction.ts:849` reads `discordBotId`). Inline `FLEET_AUTH_FILE_NAME` in `owner-file-modes.ts`; the 3 fleet-auth config files are `cut`. | none. |
 | 3.10 loader | Port: `system/config/inner-life-config.ts` (Lite file). `loadInnerLifeConfig({ dataDir, companionDataDir?, seedDir?, modelRegistry? })` loads `scheduler.json`, `trust-policy.json`, `subagent-roles.json` (`subagent-roles-config.ts` promoted) and `automata-policy.json` through the donor loaders, and from `settings.json` the 8 inner-life policy keys through their closure normalisers with the donor defaults; `compositionalPolicy`, `observerEvalSidecar` and `emosimProactivity` take the load-config defaults. The automata loader, reviewer-model check and `listEnabledModelRegistrySlotKeys` are copied verbatim except that the registry comes from the host, not `models.json`. | Other `settings.json` keys are ignored; an override of the 3 default-only keys is ignored; the reviewer check needs a host registry and fails closed with the donor message without one. |
 | 3.10 closure recompute | Reachability from the Step A0 seeds over the current core imports (all import kinds, fixpoint). Newly unreachable, now `cut`: `persistence/postgres/retired-fleet-grantees.ts`, `shared/utils/postgres-credential.ts`, `shared/contracts/cogsec-persona-conformance.ts`, `system/capabilities/shard-derivation.ts`. Unreached but kept: the two forked session workers and the quarantine module (spawn edges, Step A0) and the new loader with `subagent-roles-config.ts` (B6 composes them). | none. |
@@ -858,7 +858,8 @@ fixtures.
    policy keys, `setRuntimeTrustPolicy`, subagent roles and the Automata
    policy (donor `bootstrap-helpers.ts:244,271-272,423-425`).
 3. Builds the fixed `CapabilityAccess` from `config.capabilityTier`, then the
-   eligibility gate and the persistence runtime.
+   eligibility gate and the persistence runtime. (Since Step E4 the access
+   comes from the owner's `capability-tier.json`.)
 4. Builds availability, contact approvals, the social graph stores and the
    tracking gate.
 5. Runs identity, ML warm-up and emotion.
@@ -981,7 +982,7 @@ copied); `extraction/inner-life-loader-probe.mts` (it compared against the
 deleted donor loaders, as planned under B5); and 11 seeds (backup,
 capability-tier, charge-policy, fleet-auth, intake-l1-rules, mcp-servers,
 models, partner-affect-shadow, places, providers, skills). The 8 seeds that
-core loaders read stay. The rows stay in `vendored-files.txt` as the record;
+core loaders read stay. (Step E4 brought back the capability-tier seed.) The rows stay in `vendored-files.txt` as the record;
 the absence test fails if one comes back.
 
 Every reference was found with an import scan (both quote styles,
@@ -1482,12 +1483,12 @@ revision:
 - **Claims ride on root turns.** The plugin claims only inside a bound root
   turn, where Hermes binds the lifecycle parent; a waiting automaton waits
   for the next such turn.
-- **No spawn from a Lite turn today.** Lite fixes the capability tier at
-  the donor seed's `nursery` (seam 3.17), which does not grant
-  `shard.spawn`, so the donor `subagent` tool is denied in every turn.
-  Hosted execution is reachable from turns only when the tier grants it,
-  which is an owner decision this step does not take. The integration
-  test spawns through `CompanionRuntime.subagentFaculty`.
+- **Spawn from a Lite turn (since Step E4).** At Step D Lite fixed the
+  capability tier at the donor seed's `nursery` (seam 3.17), which does not
+  grant `shard.spawn`, so the donor `subagent` tool was denied in every
+  turn. Step E4 made the tier an owner file with the default `autonomous`,
+  and the integration test now spawns through the `subagent` tool in an
+  owner turn.
 
 Tests added. Step D deleted and modified no donor test; the companion-project
 files are listed in `packages/companion/extraction/added-tests.tsv`.
@@ -1665,6 +1666,46 @@ mechanism (alias correction, presentation rank, viewer ceiling), the
 fixture is re-pointed from the cut surface to a kept one, and the
 assertions keep their shape. `tests/conformance/absence.test.ts` now also
 fails if the registry lists one of the 17 again.
+
+### E4: the capability tier is an owner file, default `autonomous`
+
+Lite had fixed the tier at `nursery` (seam 3.17,
+`apps/standalone/src/substrate-config.ts:105`). Now it is
+`capability-tier.json` again, as in the donor:
+
+- `system/config/capability-tier-config.ts` is the donor file at e6a9546.
+  It validates the file and fails closed: `tier` must be `nursery`,
+  `apprentice`, `autonomous` or `custom`, and `customTokens` may hold only
+  known capability tokens. The donor tier semantics (`tiers.ts`) are
+  unchanged, so `custom` grants exactly `customTokens`.
+- `config/capability-tier.seed.json` is back with the Lite default
+  `{"tier": "autonomous", "customTokens": []}` (the donor seed is
+  `nursery`). `lite-standalone init` seeds it with the other owner files.
+- `loadInnerLifeConfig` reads it at the companion data root, as the donor
+  did (`config-store.ts:197`, `runtime-config.ts:65-67`).
+  `createFixedCapabilityAccess` (`app/agent/companion-runtime.ts:361`)
+  resolves the grant from the tier and custom tokens, as the donor
+  `CapabilityRuntime` did (`runtime.ts:88-92`).
+- Decided: the file is read once at start, like every other Lite owner
+  file. The donor's per-refresh reader (`system/capabilities/runtime.ts`)
+  stays cut. An owner edit takes effect at the next start.
+
+At `autonomous` the model may use `shard.spawn`, so an owner turn can start
+an automaton through the `subagent` tool, and a lifecycle host runs it.
+`tests/lifecycle/hosted-automata.integration.test.ts` now spawns through the
+tool in a real turn (with the seed set to `nursery` the same test fails with
+`Capability denied: tool "subagent"`). `memory.delete` is granted too, but
+the donor tool still needs both the proposal store and an approval port.
+Without a port it returns "memory deletion proposal persistence and
+confirmation are not configured" and deletes nothing. With a port it only
+creates a pending proposal. The memory is deleted only when a person
+approves (`approveMemoryDeletionProposal`). So the tier does not let the
+model skip approval (E3, below).
+
+Tests: the donor `capability-tier-config.test.ts` and the subsystem-config
+round trip are back unchanged, and their deleted rows are removed.
+`capability-tier-per-companion.test.ts` and `runtime.test.ts` stay deleted
+(their subjects stay cut), with reworded reasons.
 
 ## Measured size
 

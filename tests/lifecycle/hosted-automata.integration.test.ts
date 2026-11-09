@@ -1,8 +1,8 @@
 /**
  * Hosted automata over the real standalone runtime (docs/extraction.md,
- * operator automata rules): an automaton is spawned through the faculty the
- * donor `subagent` tool drives; core derives its task and Bus scope from
- * that spawn and queues it; the host claims the attempt
+ * operator automata rules): an owner turn at the seeded capability tier
+ * (`autonomous`, Step E4) calls the donor `subagent` tool; core derives the
+ * automaton's task and Bus scope from that spawn and queues it; the host claims the attempt
  * over the lifecycle bridge with its standing credential, runs it as its own
  * subagent, persists through the attempt's `automata/bus` calls under the
  * per-attempt credential, and reports how the child ended. A lost child
@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import { dockerTestsOptedOut } from '../support/postgres-harness.ts';
-import { buildSubagentWorkSpec } from '../../packages/companion/src/faculties/subagents/work-spec.js';
+import type { Script } from '../support/faux-model.ts';
 import { runWithRequestContext } from '../../packages/companion/src/primitives/llm/request-context.js';
 import { bridge, useBridgeWorld } from './bridge-world.ts';
 
@@ -36,8 +36,20 @@ async function asOwner<T>(run: () => Promise<T>): Promise<T> {
   );
 }
 
+const SPAWN_REQUEST = 'Please map the route docs in the background.';
+
+/** The owner's turn: the model calls the `subagent` tool once, then replies with the tool's result. */
+const spawnScript: Script = (call) => {
+  if (!call.lastUser.includes(SPAWN_REQUEST) || (call.context.tools?.length ?? 0) === 0) return null;
+  const messages = call.context.messages;
+  const results = messages.slice(messages.map((m) => m.role).lastIndexOf('user') + 1).filter((m) => m.role === 'toolResult');
+  if (results.length === 0) return { toolCalls: [{ name: 'subagent', arguments: { action: 'spawn', name: 'route-research', task: 'Map the route docs.' } }] };
+  const [result] = results;
+  return `${result!.isError ? 'refused' : 'spawned'}: ${result!.content.map((block) => (block.type === 'text' ? block.text : '')).join('')}`;
+};
+
 describe.skipIf(dockerTestsOptedOut('lifecycle hosted automata'))('hosted automata over the lifecycle bridge', () => {
-  const world = useBridgeWorld(() => null, { automata: POLICY });
+  const world = useBridgeWorld(spawnScript, { automata: POLICY });
 
   it('runs a spawned automaton as host attempts: lost, retried, one Bus event, completed', async () => {
     const w = world();
@@ -50,11 +62,12 @@ describe.skipIf(dockerTestsOptedOut('lifecycle hosted automata'))('hosted automa
     // Only a principal bound to the primary contact runs the companion's automata.
     expect((await claim(friend, 'hermes-1')).status).toBe(403);
 
-    // Lite's fixed nursery tier denies the `subagent` tool in turns (no shard.spawn), so the
-    // automaton is started through the same control port the tool drives, as an admitted owner turn would.
+    // The seeded tier grants shard.spawn, so the owner's own turn starts the automaton through the `subagent` tool.
     const faculty = w.runtime.companion.subagentFaculty;
-    const spawned = await asOwner(() => faculty.spawn({ name: 'route-research', task: 'Map the route docs.', workSpec: buildSubagentWorkSpec() }));
-    const subagentId = spawned.subagentId;
+    const reply = await w.runtime.converse(SPAWN_REQUEST);
+    expect(reply.content).toMatch(/^spawned: /);
+    const subagentId = /"subagent_id":\s*"([^"]+)"/.exec(reply.content)?.[1] ?? '';
+    expect(subagentId).not.toBe('');
       // The host's per-attempt budget may not exceed the policy's.
       expect((await claim(operator, 'hermes-1', 251)).status).toBe(409);
       let claimed: Claim[] = [];

@@ -10,6 +10,9 @@
 //
 // - scheduler.json       loadSchedulerConfig (scheduler-config.ts), read at the
 //                        companion data root (donor config-store.ts:195);
+// - capability-tier.json loadCapabilityTierConfig (capability-tier-config.ts),
+//                        companion data root (donor config-store.ts:197,
+//                        runtime-config.ts:65-67); read once at start;
 // - trust-policy.json    loadTrustPolicyConfig (trust-policy-config.ts), system
 //                        data root (config-store.ts:217);
 // - subagent-roles.json  loadSubagentRolesConfig (subagent-roles-config.ts,
@@ -30,6 +33,7 @@ import {
 import type { SubagentRoleRegistryConfig } from '../../faculties/subagents/role-registry.js';
 import type { CanonicalModelRegistry } from '../../shared/contracts/runtime.js';
 import { isRecord } from '../../shared/utils/types.js';
+import { loadCapabilityTierConfig, type CapabilityTierConfig } from './capability-tier-config.js';
 import {
   createDefaultBiographicalCandidatePolicy,
   normalizeBiographicalCandidatePolicy,
@@ -94,6 +98,7 @@ export type InnerLifePolicySettings = Required<Pick<SubstrateConfig,
 
 export interface InnerLifeConfig {
   scheduler: SchedulerRuntimeConfig;
+  capabilityTier: CapabilityTierConfig;
   trustPolicy: TrustPolicyConfig;
   subagentRoles: SubagentRoleRegistryConfig;
   automataPolicy: AutomataOwnerPolicy;
@@ -121,6 +126,7 @@ export function loadInnerLifeConfig(options: InnerLifeConfigLoadOptions): InnerL
   const companionDataDir = options.companionDataDir ?? options.dataDir;
   return {
     scheduler: loadSchedulerConfig(companionDataDir, loadOptions),
+    capabilityTier: loadCapabilityTierConfig(companionDataDir, loadOptions),
     trustPolicy: loadTrustPolicyConfig(options.dataDir, loadOptions),
     subagentRoles: loadSubagentRolesConfig(options.dataDir, loadOptions),
     automataPolicy: loadAutomataPolicyConfig(options.dataDir, {

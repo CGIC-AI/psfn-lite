@@ -102,7 +102,6 @@ function donorCoreDefaults(): Record<string, unknown> {
     observerEvalSidecar: createDefaultObserverEvalSidecarSettings(),
     emosimProactivity: createDefaultEmoSimProactivitySettings(),
     sessionTailCache: createDefaultSessionTailCacheSettings(),
-    capabilityTier: 'nursery',
   };
 }
 

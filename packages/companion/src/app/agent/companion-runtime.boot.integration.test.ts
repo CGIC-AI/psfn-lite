@@ -201,7 +201,7 @@ beforeAll(async () => {
 
   // The owner files: the shipped seeds, with the Automata reviewer pointed at
   // the host model (the seed names a registry slot this host does not have).
-  for (const file of ['scheduler', 'trust-policy', 'subagent-roles', 'settings']) {
+  for (const file of ['scheduler', 'capability-tier', 'trust-policy', 'subagent-roles', 'settings']) {
     copyFileSync(join(SEED_DIR, `${file}.seed.json`), join(dataDir, `${file}.json`));
   }
   const automataPolicy = JSON.parse(readFileSync(join(SEED_DIR, 'automata-policy.seed.json'), 'utf8')) as {
