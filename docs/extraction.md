@@ -159,6 +159,25 @@ Evidence about stability:
   completed baseline runs and their non-passed tests: all `pending` or hook
   timeouts, never an assertion failure, apart from the `TMPDIR` case above.
 
+**Promoted selection (added after Step D).** The colocated donor tests of
+the promoted files (`extraction/vendored-files.txt` kind `promoted`) were
+missing from the selection above. A test belongs to the promoted selection
+when its sibling source file (the test path without `.test.ts` and any
+trailing `.qualifier`) exists in `packages/companion` and no deleted or
+excluded record names it. That gives 72 files, which are listed in
+`extraction/tests.tsv` with selection `promoted`. They were run the same way
+as above, in the same throwaway clone, with their own profile override and
+`--maxWorkers=16`. Runs `promoted-a1` and `promoted-a2` each gave **72 files,
+622 tests: 621 passed and 1 failed**. The failure is
+`test-support/postgres-test-harness.test.ts` "forces disposable PostgreSQL
+data into bounded RAM without swap or Docker logs". That test asserts the
+harness's default profile label, so it fails under the isolation override.
+That file alone without the override (it starts no container) passed all 14
+of its tests (`promoted-harness-noenv`). `baseline.json` takes that file
+from the no-override run and the other 71 from `promoted-a2`, and records
+all three runs under `promoted_selection`. The baseline is now **807 files,
+10,107 tests, all passed**.
+
 ## Extracted tree (Step A)
 
 Copied byte-identical from the donor commit with `git archive` (verified
@@ -490,6 +509,73 @@ Not clean, recorded as open questions: the per-lane success-rate expects of
 the live drain test and the Loom-view equality of the slimming test leave with
 their Garden subjects; the kept core paths in those tests are unchanged.
 
+### Promoted selection (after Step D)
+
+The 72 promoted test files (Test baseline, above) were copied from the
+donor unchanged. Then only the recorded edits were applied. The rows are in
+`deleted-tests.tsv` and `modified-tests.tsv`, after the B7 rows. Of the 72
+files, 54 are byte-identical to the donor, 17 are edited and 1 is deleted.
+
+Deleted (37 tests):
+
+| Test | Reason | Seam |
+|---|---|---|
+| `app/agent/scheduler-runtime.fleet-auth.test.ts` (whole file, 2) | Its subject is the agent database backup lane (`registerAgentDatabaseBackupLane`) and its hand-off to fleet auth; the backup lane, backups and fleet auth are cut. | 3.11 scheduler-runtime, fleet |
+| `app/agent/scheduler-runtime.test.ts` (3): "cancels a biography stage that never won the fleet baton", the two shared-world caretaker tests | They assert the fleet maintenance baton and the shared-world wiki caretaker operation; both are cut. | 3.11 scheduler-runtime |
+| `persistence/runtime-factory.test.ts` (2): the one-entry fleet tenancy test and the multi-companion fleet maintenance coordinator test | Fleet tenancy, the shared schema and the coordinator are cut. | 3.11 runtime-factory |
+| `app/agent/startup-continuity.test.ts` "is awaited by the agent entrypoint", `core/letters/memory-extraction.test.ts` "is wired from the real agent runtime composition" (2) | Source-text tests of donor `app/agent/main.ts`, which is not extracted. The seam 3.11 composition root `companion-runtime.ts` replaces it. | 3.11 composition root |
+| `core/cogsec/memory-candidacy.test.ts` (9) | They assert the cut candidacy classes: C persona review, D policy pattern, E executable and obfuscation patterns, the CogSec notice allow and rejections, and the local heuristics behind an allowing gate. These are the same classes B2 deleted for the other consumers. | 3.5 candidacy |
+| `app/startup/composition/parity.test.ts` (2): `wireSettingsRuntime` registers the system tool, `wireFilesystemToolsRuntime` registers fs | The lifecycle system tool and the fs tool are cut. | 3.11 parity |
+| `app/startup/support/operator-alerts.test.ts` `model budget threshold alerts` (5) | The model-budget threshold alert handler and its durable claim store are cut with the model-usage ledger. | 3.11 operator-alerts |
+| `core/doing-mirror/sources.test.ts` (3 wishlist tests) | The wiki wishlist doing-mirror source is cut with the wiki. | 3.11 doing-mirror sources |
+| `core/agent/companion-availability.test.ts` "retries a failed protected observation while live observation failures remain non-blocking" | The test drives the queue through the gateway Discord message handlers and satellite routing, which are cut. | gateway, channels (operator ruling) |
+| `app/startup/composition/post-turn-actions.test.ts` "executes restored companion outreach through the real handler" | The deferred peer-companion outreach handler (`core/tools/notify-companion-handoff.ts`) is cut. | B7; ICP peer-target routing (operator ruling) |
+| `app/startup/composition/composition.test.ts` (7 of 8) | They assert the analysis workbench REPL helpers, shell and code execution over the sandbox, gateway paged reads and the startup module loader. All of these are cut. | 3.11 composition |
+
+Edited (10 tests; no kept assertion changed):
+
+- `scheduler-runtime.test.ts` (4): the reads of donor `main.ts` and
+  `core-runtime.ts` and the expectations on their text are removed (not
+  extracted; the composition root replaces them). In the biography
+  synthesis test, the fleet baton option and its `['continue']` checkpoint
+  expectation are also removed, because Lite runs the donor no-coordinator
+  branch.
+- `runtime-factory.test.ts` (2): 8 keys of cut stores are removed from the
+  expected runtime object, and so is the schema-pin expectation of the cut
+  enrollment store's pool.
+- `startup-continuity.test.ts` "completes both continuity warmups": the wiki
+  context refresh expectation is removed (wiki hydration is cut; the two
+  kept warmups are still asserted).
+- `background-work-store.integration.test.ts` "projects a completed
+  production turn through real extraction into Garden detail": the operator
+  Garden tail is removed. The production turn, the TurnRecord deltas and
+  every durable job assertion are kept.
+- `icp-felt-impulse-funnel-store.integration.test.ts` "preserves
+  exactly-once content-free outcomes and candidate lifecycle across
+  restart": the peer initiation candidate store, its fixtures and the
+  candidate projection assertions are removed. The funnel outcomes and their
+  exactly-once checks across the restart are kept. This is not a clean
+  deletion: the candidate lifecycle half of the test leaves with its
+  subject (open questions).
+- `composition.test.ts` "registers subagent as the only canonical
+  bounded-worker surface": the helper calls `wireSubagentRuntime`, the seam
+  3.11 cut of `wireShardAndThinkRuntime`, instead of the cut function. Its
+  three expects are byte-identical.
+
+File-level rows (15) cover imports, mocks and helpers that only deleted
+tests used. They also cover redirects to the core copy of the same symbol:
+`inner-life-config.js` for `loadAutomataPolicySeedDefaults`, the promoted
+disclosure `decision.js` and `contracts.js` for the deleted barrel,
+`shared/contracts/intake-sink-gate-port.js`, `notification-port.js` and
+`personal-projects-port.js`. They also record the removal of the
+`runtime-factory.test.ts` `vi.mock` blocks of 9 cut modules. One row is
+test infrastructure: `test-support/postgres-test-harness.test.ts` gets a
+`vi.hoisted` block that clears `PSFN_POSTGRES_TEST_PROFILE_OVERRIDE` before
+the harness module loads, and an `afterAll` that restores it. Lite's
+per-run isolation sets that override for the whole run (vitest global
+setup), and the test asserts the default profile label, so the test sees
+the same environment it had in the donor's own run. No assertion changed.
+
 ## Seam cuts
 
 Every cut has a row in `packages/companion/extraction/cuts.tsv` (seam, site
@@ -521,8 +607,13 @@ Remaining seam statements: 171 before, 150 after.
 | 3.16 observer | Superseded by the operator ruling (EmoSim / felt impulse KEEP): `core/eval/observer-sidecar` is a closure seed, so no dispatch call is deleted. | none |
 | 3.18 Garden | Type copy of `RuntimeServiceHealthStatus` into `shared/contracts/runtime-service-health.ts` (3 sites). `emitGardenQueueChanged` is in the composition root `app/agent/scheduler-runtime.ts:57` (B6). | none |
 
-Promoted files bring no tests: their donor tests were not in the Step A0
-selection, so the baseline does not include them.
+The promoted files' colocated donor tests were not in the Step A0 selection
+at first (a review finding after Step D). They are now the `promoted`
+selection: 72 files and 622 tests, with their own donor baseline. 37 of the
+tests (one whole file of 2 and 35 single tests) are deleted as tests of cut
+scaffolding. 10 tests are edited, and 15 file-level rows record import, mock,
+helper or setup changes, in 17 files in all. The other 585 tests run in Lite
+and pass. See "Review fixes after Step D".
 
 ### B2 (3.4, 3.5, 3.6)
 
