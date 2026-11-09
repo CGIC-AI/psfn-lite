@@ -9,6 +9,7 @@
  * the provider keys and the transport credentials, and those are read once at
  * start. Unknown keys are rejected so a typo cannot silently fall back.
  */
+import { resolve, sep } from 'node:path';
 import { invalid, isRecord, ok, type Result } from './mcp.ts';
 import type { TrustLevel } from './companion.ts';
 
@@ -25,6 +26,12 @@ export interface LiteConfig {
   readonly companionId: string;
   /** The companion data directory: owner files and the donor's file stores. */
   readonly dataDir: string;
+  /**
+   * The companion's personal workspace (journal, knowledge and its other
+   * personal files): the donor's WORKSPACE_PATH. It must not overlap dataDir
+   * (the donor refuses a workspace inside its runtime state roots).
+   */
+  readonly workspaceDir: string;
   readonly characterCardPath: string;
   /** The primary operator, who talks to the companion through this CLI; contact key `operator`, trust primary. */
   readonly operator: { readonly userId: string; readonly displayName: string };
@@ -128,7 +135,7 @@ class Reader {
   }
 }
 
-const ROOT_KEYS = ['companionId', 'dataDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'embedding', 'sessionIntegrity', 'mcp', 'lifecycle'];
+const ROOT_KEYS = ['companionId', 'dataDir', 'workspaceDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'embedding', 'sessionIntegrity', 'mcp', 'lifecycle'];
 
 export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   if (!isRecord(raw)) return invalid('config must be a JSON object');
@@ -136,6 +143,8 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   const root = new Reader(raw, '', ROOT_KEYS, issues);
   const companionId = root.matching('companionId', UUID_PATTERN, 'a UUID');
   const dataDir = root.string('dataDir');
+  const workspaceDir = root.string('workspaceDir');
+  if (dataDir !== '' && workspaceDir !== '' && overlaps(dataDir, workspaceDir)) issues.push('workspaceDir must not be dataDir or inside it, nor contain it');
   const characterCardPath = root.string('characterCardPath');
 
   const op = root.child('operator', ['userId', 'displayName']);
@@ -192,7 +201,7 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   if (mcp !== null && lifecycle === null) issues.push('mcp needs lifecycle: companion tools run only inside host-driven turns');
 
   if (issues.length > 0) return invalid(...issues);
-  return ok({ companionId, dataDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle });
+  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle });
 }
 
 function listen(reader: Reader, issues: string[], at: string): { host: string; port: number; allowedHosts: readonly string[] | null } {
@@ -237,4 +246,10 @@ export function readSecrets(config: LiteConfig, env: Readonly<Record<string, str
   const modelApiKey = config.model.apiKeyEnv === null ? null : read(config.model.apiKeyEnv);
   const embeddingApiKey = config.embedding.provider.kind === 'openai_compatible' ? read(config.embedding.provider.apiKeyEnv) : null;
   return issues.length > 0 ? invalid(...issues) : ok({ databaseUrl, modelApiKey, embeddingApiKey });
+}
+
+function overlaps(a: string, b: string): boolean {
+  const left = resolve(a);
+  const right = resolve(b);
+  return left === right || left.startsWith(`${right}${sep}`) || right.startsWith(`${left}${sep}`);
 }

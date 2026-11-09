@@ -7,12 +7,14 @@
  * configured contacts, and mounts the MCP tool transport and the lifecycle
  * bridge for an external companion host when the config names them.
  */
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   COMPANION_SEED_DIR,
   createSessionHmacBoundaryService,
   createTurnId,
   loadInnerLifeConfig,
+  resolveRuntimePathSnapshotFromConfig,
   startCompanionRuntime,
   type AgentResponse,
   type CompanionRuntime,
@@ -155,16 +157,23 @@ export async function createLiteRuntime(input: {
   let companion: CompanionRuntime;
   try {
     const innerLife = loadInnerLifeConfig({ dataDir: config.dataDir, seedDir, modelRegistry: registry as never });
+    const substrateConfig = buildSubstrateConfig(config, {
+      databaseUrl: secrets.databaseUrl,
+      model: {
+        modelId: model.value.model.id,
+        provider: model.value.model.provider,
+        maxOutputTokens: model.value.maxOutputTokens,
+        contextWindow: model.value.model.contextWindow,
+        registry,
+      },
+    });
     companion = await startCompanionRuntime({
-      config: buildSubstrateConfig(config, {
-        databaseUrl: secrets.databaseUrl,
-        model: {
-          modelId: model.value.model.id,
-          provider: model.value.model.provider,
-          maxOutputTokens: model.value.maxOutputTokens,
-          contextWindow: model.value.model.contextWindow,
-          registry,
-        },
+      config: substrateConfig,
+      // The donor read WORKSPACE_PATH (and its logs and temp roots) from the environment of its fleet startup (cut); Lite names them in its config.
+      pathSnapshot: resolveRuntimePathSnapshotFromConfig(substrateConfig, {
+        workspacePath: config.workspaceDir,
+        logsDir: join(config.dataDir, 'logs'),
+        tempDir: join(config.dataDir, 'tmp'),
       }),
       innerLife,
       providerRuntime: companionProviderRuntimeOf(model.value) as unknown as ProviderRuntime,
