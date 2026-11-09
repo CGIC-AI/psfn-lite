@@ -12,10 +12,6 @@ import {
   type BackgroundWorkPayload,
   type EnqueueBackgroundWorkInput,
 } from '../../core/agent/background-work/types.js';
-import {
-  BackgroundWorkHealthAccumulator,
-  type BackgroundWorkHealthUpdate,
-} from '../../operator/garden/services/background-work-health.js';
 import { EventBus } from '../../shared/event-bus.js';
 import {
   DEFAULT_POSTGRES_TEST_IMAGE,
@@ -308,13 +304,7 @@ describe('Postgres background-work live drain regression', () => {
       });
 
       const executionOrder: string[] = [];
-      const health = new BackgroundWorkHealthAccumulator();
-      const latestHealth = new Map<string, BackgroundWorkHealthUpdate>();
       const eventBus = new EventBus();
-      eventBus.on('agent.turn.performance', (event) => {
-        const update = health.observe(event, liveNowMs);
-        if (update) latestHealth.set(update.laneId, update);
-      });
       supervisor = createSupervisor({
         store: restartedStore,
         eventBus,
@@ -328,9 +318,6 @@ describe('Postgres background-work live drain regression', () => {
       });
       await supervisor.tick();
       await waitForCondition(async () => (await restartedStore!.countPending()) === 0, 40_000);
-      await waitForCondition(() => Promise.resolve(
-        [...latestHealth.values()].reduce((total, update) => total + update.counts.terminal, 0) === 881,
-      ), 40_000);
 
       expect(executionOrder.indexOf(oscillator.jobId)).toBeGreaterThanOrEqual(880);
       expect(await restartedStore.get(oscillator.jobId)).toMatchObject({
@@ -340,24 +327,6 @@ describe('Postgres background-work live drain regression', () => {
         maxAttempts: 5,
       });
       expect(await restartedStore.countPending()).toBe(0);
-      expect(latestHealth.get('background_work:memory_extraction')?.counts).toEqual({
-        succeeded: 294,
-        failed: 0,
-        terminal: 294,
-        successRatePct: 100,
-      });
-      expect(latestHealth.get('background_work:intention_post_turn_hooks')?.counts).toEqual({
-        succeeded: 293,
-        failed: 0,
-        terminal: 293,
-        successRatePct: 100,
-      });
-      expect(latestHealth.get('background_work:emotion_appraisal')?.counts).toEqual({
-        succeeded: 293,
-        failed: 1,
-        terminal: 294,
-        successRatePct: 99.66,
-      });
     } finally {
       const teardownErrors: unknown[] = [];
       if (supervisor) {

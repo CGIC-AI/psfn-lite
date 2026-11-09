@@ -5,7 +5,7 @@ import {
   type HealthEvent,
 } from '../../../shared/contracts/health-event.js';
 
-import { loadAutomataPolicySeedDefaults } from '../../../system/config/automata-policy-config.js';
+import { loadAutomataPolicySeedDefaults } from '../../../system/config/inner-life-config.js';
 import type { LLMProviderPort } from '../../../core/agent/contracts.js';
 import { AutomataRunRegistry, InMemoryAutomataRunStore } from '../run-registry.js';
 import {

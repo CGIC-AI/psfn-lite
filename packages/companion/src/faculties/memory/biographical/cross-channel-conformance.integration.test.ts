@@ -13,14 +13,9 @@
 // which audience, and what survives a restart and a whole-database restore.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import type { Pool } from 'pg';
 
 import { createPostgresPool } from '../../../persistence/postgres.js';
-import { runBackupCycle } from '../../../persistence/backups/service.js';
-import { verifyPostgresDumpRestore } from '../../../persistence/backups/postgres-restore.js';
 import {
   startPostgresTestHarness,
   type PostgresTestHarness,
@@ -31,7 +26,6 @@ import {
   type ConversationScope,
 } from '../../../core/session/conversation-scope.js';
 import type { ContextEnvelope } from '../../../system/trust/context-envelope.js';
-import { AdminBiographicalReviewService } from '../../../operator/garden/services/biographical-review-service.js';
 import { createBiographicalAliasResolver } from './alias-address.js';
 import type { ContactStorePort } from '../../../core/contacts/contact-store-port.js';
 import {
@@ -494,232 +488,36 @@ describe('cross-channel biographical conformance — recognition and non-disclos
 
   it('keeps the projection bounded and identical across a restart and a restore', async () => {
     if (!harness) throw new Error('PostgreSQL integration harness is not available');
-    const root = mkdtempSync(join(tmpdir(), 'psfn-biography-conformance-'));
-    try {
-      await withDatabase(async (pool, databaseUrl) => {
-        const fx = await seedFixture(pool);
-        const base = {
-          store: fx.store,
-          live: fx.live,
-          companionSubject: PURRS,
-          scope: publicGroup(),
-          currentAuthor: PARTNER,
-        };
-        const before = await project(base);
-        expect(before.admittedClaimIds.length).toBeGreaterThan(0);
-
-        // Prompt economy: with a budget below the rendered size, the lowest
-        // priority claims are deterministically trimmed and reported, and the
-        // disclosure contributions shrink with them rather than going stale.
-        const budgeted = await project({ ...base, tokenBudget: 1 });
-        expect(budgeted.admittedClaimIds).toEqual([]);
-        expect(budgeted.withheld.some(entry => entry.reason === 'token-budget-exhausted'))
-          .toBe(true);
-        expect(budgeted.disclosureSources).toEqual([]);
-
-        // Restart: a brand-new store instance over the same database projects
-        // exactly the same claims, in the same order, with the same withheld
-        // reasons. Continuity is durable, not in-process.
-        const restarted = new PostgresBiographicalProfileStore(pool, () => NOW);
-        const after = await project({ ...base, store: restarted });
-        expect(after.admittedClaimIds).toEqual(before.admittedClaimIds);
-        expect(after.promptSection).toEqual(before.promptSection);
-        expect(after.withheld.map(entry => `${entry.claimId}:${entry.reason}`))
-          .toEqual(before.withheld.map(entry => `${entry.claimId}:${entry.reason}`));
-
-        // Whole-database backup and restore round-trips every biography table,
-        // including the new stage cursors.
-        const backup = await runBackupCycle({
-          postgres: {
-            databaseUrl,
-            pgDumpBinary: harness!.clientBinaries.pgDumpBinary,
-            pgRestoreBinary: harness!.clientBinaries.pgRestoreBinary,
-          },
-          sessionsDir: join(root, 'sessions'),
-          backupRootDir: join(root, 'backups'),
-          maxRotatingBackups: 1,
-          maxWeeklyBackups: 0,
-          maxMonthlyBackups: 0,
-          now: () => NOW.getTime(),
-        });
-        if (backup.postgresDumpPath === undefined) throw new Error('expected Postgres dump');
-        const scratch = await harness!.createDatabase();
-        const scratchPool = createPostgresPool(scratch.databaseUrl, {
-          applicationName: 'psfn-biographical-conformance-restore',
-          max: 1,
-        });
-        try {
-          await scratchPool.query('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions');
-        } finally {
-          await scratchPool.end();
-        }
-        const verified = await verifyPostgresDumpRestore({
-          dumpPath: backup.postgresDumpPath,
-          scratchDatabaseUrl: scratch.databaseUrl,
-          sourceDatabaseUrl: databaseUrl,
-          criticalTables: ['biographical_claims', 'biographical_grants'],
-          psqlBinary: harness!.clientBinaries.psqlBinary,
-          pgRestoreBinary: harness!.clientBinaries.pgRestoreBinary,
-        });
-        expect(verified.tableCounts).toEqual([
-          { table: 'biographical_claims', restored: 6, source: 6 },
-          { table: 'biographical_grants', restored: 2, source: 2 },
-        ]);
-      });
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  }, INTEGRATION_TIMEOUT_MS);
-
-  it('gates every stage transition on a receipt and shows it in Garden', async () => {
     await withDatabase(async pool => {
       const fx = await seedFixture(pool);
-      const service = new AdminBiographicalReviewService({
-        store: fx.store,
-        queryLimit: 50,
-        now: () => NOW,
-      });
-
-      // Garden shows reviewed portability and derivation on the queue. The
-      // review surface deliberately shows the structured claim an operator is
-      // deciding about; what it must never republish is the raw evidence, so
-      // sources appear as refs, revisions and digests only.
-      const listed = await service.listClaims();
-      const relationalView = listed.claims.find(claim => claim.id === fx.relational.id);
-      expect(relationalView).toMatchObject({
-        portabilityScope: 'subject_present',
-        derivation: 'human_derived',
-      });
-      for (const claim of listed.claims) {
-        for (const viewSource of claim.sources) {
-          expect(Object.keys(viewSource).sort()).toEqual([
-            'consentFingerprint',
-            'evidenceDigest',
-            'ref',
-            'revision',
-            'sensitivityContribution',
-            'sourceChannelId',
-            'subjectEvidenceDigest',
-          ]);
-        }
-      }
-
-      // Tightening a live claim withdraws its reach immediately, on the very
-      // next turn, with an append-only audit.
-      await service.review(fx.published.id, {
-        action: 'set-portability',
-        claimDigest: fx.published.claimDigest,
-        sourceSetDigest: fx.published.sourceSetDigest,
-        portabilityScope: 'origin_only',
-      }, { kind: 'operator', authorityRef: 'garden-standalone:operator' });
-      const afterRevoke = await project({
+      const base = {
         store: fx.store,
         live: fx.live,
         companionSubject: PURRS,
         scope: publicGroup(),
         currentAuthor: PARTNER,
-      });
-      expect(afterRevoke.admittedClaimIds).not.toContain(fx.published.id);
-      expect(await fx.store.listReviewAudits(fx.published.id, 10)).toEqual([
-        expect.objectContaining({ action: 'set-portability', reason: 'portability-set' }),
-      ]);
-
-      // An intimate claim can never be granted portability, whoever asks.
-      await expect(service.review(fx.intimate.id, {
-        action: 'set-portability',
-        claimDigest: fx.intimate.claimDigest,
-        sourceSetDigest: fx.intimate.sourceSetDigest,
-        portabilityScope: 'universal',
-      }, { kind: 'operator', authorityRef: 'garden-standalone:operator' }))
-        .rejects.toMatchObject({ reason: 'portability-refused' });
-
-      // A staged candidate reaches the prompt only through the whole receipt
-      // chain: automata → companion → human. Every shortcut fails closed.
-      const operator = { kind: 'operator' as const, authorityRef: 'garden-standalone:operator' };
-      const staged = await fx.store.writeCandidate({
-        automataRunId: 'biography-synthesis:conformance',
-        automataAuthorityRef: 'maintenance:biography-synthesis',
-        policy: createDefaultBiographicalCandidatePolicy(),
-        socialContext: { kind: 'companion_self', companionId: 'purrs' },
-        rationale: 'new_subject_claim',
-        claim: {
-          subject: PURRS,
-          kind: 'nickname',
-          value: { kind: 'nickname', nickname: 'Staged sprout', scope: 'self' },
-          basis: 'explicit',
-          confidence: 1,
-          sources: [source('memory:staged', {
-            sensitivityAtProjection: 'public',
-            sourceType: 'semantic',
-            lifecycleStateAtProjection: 'active',
-          })],
-          now: NOW,
-        },
-      });
-      fx.live.seed([source('memory:staged', { sensitivityAtProjection: 'public' })]);
-      const stagedClaim = (await fx.store.getClaim(staged.claimId))!;
-      const stagedDigests = {
-        claimDigest: stagedClaim.claimDigest,
-        sourceSetDigest: stagedClaim.sourceSetDigest,
       };
+      const before = await project(base);
+      expect(before.admittedClaimIds.length).toBeGreaterThan(0);
 
-      // The claim-only approval cannot bypass companion review.
-      await expect(service.review(stagedClaim.id, { action: 'approve', ...stagedDigests }, operator))
-        .rejects.toMatchObject({ reason: 'invalid-state' });
-      // Nor can a human decide a candidate the companion has not forwarded.
-      await expect(service.review(stagedClaim.id, {
-        action: 'stage-approve',
-        ...stagedDigests,
-        candidateRevision: staged.revision,
-        portabilityScope: 'universal',
-      }, operator)).rejects.toMatchObject({ reason: 'invalid-state' });
+      // Prompt economy: with a budget below the rendered size, the lowest
+      // priority claims are deterministically trimmed and reported, and the
+      // disclosure contributions shrink with them rather than going stale.
+      const budgeted = await project({ ...base, tokenBudget: 1 });
+      expect(budgeted.admittedClaimIds).toEqual([]);
+      expect(budgeted.withheld.some(entry => entry.reason === 'token-budget-exhausted'))
+        .toBe(true);
+      expect(budgeted.disclosureSources).toEqual([]);
 
-      const reviewed = await fx.store.transitionCandidate({
-        candidateId: staged.id,
-        expectedRevision: staged.revision,
-        to: 'companion_review',
-        receipts: [{
-          authority: 'companion',
-          decision: 'approved',
-          actorAuthorityRef: 'companion:purrs',
-          reason: 'reviewer_approved',
-        }],
-        now: NOW,
-      });
-      const forwarded = await fx.store.transitionCandidate({
-        candidateId: reviewed.id,
-        expectedRevision: reviewed.revision,
-        to: 'human_review',
-        receipts: [{
-          authority: 'companion',
-          decision: 'approved',
-          actorAuthorityRef: 'companion:purrs',
-          reason: 'reviewer_approved',
-        }],
-        now: NOW,
-      });
-      // Still not projectable: activation is the human's decision. The room is
-      // invite-only because the staged claim is `personal` — scope decides how
-      // far a claim travels, never whether it clears the destination gate.
-      const stagedTurn = {
-        store: fx.store,
-        live: fx.live,
-        companionSubject: PURRS,
-        scope: inviteOnlyGroup(),
-        currentAuthor: PARTNER,
-      };
-      expect((await project(stagedTurn)).promptSection).not.toContain('Staged sprout');
-
-      await service.review(stagedClaim.id, {
-        action: 'stage-approve',
-        ...stagedDigests,
-        candidateRevision: forwarded.revision,
-        portabilityScope: 'universal',
-      }, operator);
-      const activated = await project(stagedTurn);
-      expect(activated.promptSection).toContain('Staged sprout');
-      expect(activated.disclosureSources.map(entry => entry.ref))
-        .toContain(`biographical:${stagedClaim.id}`);
+      // Restart: a brand-new store instance over the same database projects
+      // exactly the same claims, in the same order, with the same withheld
+      // reasons. Continuity is durable, not in-process.
+      const restarted = new PostgresBiographicalProfileStore(pool, () => NOW);
+      const after = await project({ ...base, store: restarted });
+      expect(after.admittedClaimIds).toEqual(before.admittedClaimIds);
+      expect(after.promptSection).toEqual(before.promptSection);
+      expect(after.withheld.map(entry => `${entry.claimId}:${entry.reason}`))
+        .toEqual(before.withheld.map(entry => `${entry.claimId}:${entry.reason}`));
     });
   }, INTEGRATION_TIMEOUT_MS);
 

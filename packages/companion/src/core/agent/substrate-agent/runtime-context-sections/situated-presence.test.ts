@@ -6,7 +6,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SubstrateMessage } from '../../../../shared/contracts/runtime.js';
 import type { PlacesRegistryConfig } from '../../../../shared/contracts/places-registry.js';
-import { resolveWikiRetrievalPlan } from '../../../../faculties/wiki/retrieval.js';
 import type { CompanionPresenceMetadata } from '../../presence-metadata.js';
 import {
   buildSituatedPresenceContextBlock,
@@ -554,28 +553,6 @@ describe('situated-presence + wiki scope after a virtual move (vinz.26)', () => 
 
     const siteId = resolveSituatedSiteId(placelessTurn, PLACES_REGISTRY, tracker.resolvePlaceId());
     expect(siteId).toBe('site.mud');
-  });
-
-  it('swaps the wiki shared-world retrieval scope to the destination site (integration)', () => {
-    const tracker = trackerEmanatedThenMoved();
-    const currentSiteId = resolveSituatedSiteId(makeMessage(), PLACES_REGISTRY, tracker.resolvePlaceId());
-    const plan = resolveWikiRetrievalPlan({
-      settings: {
-        enabled: true,
-        chatTokenCap: 1000,
-        groupTokenCap: 500,
-        focusTokenCap: 2000,
-        similarityThreshold: 0.4,
-        groupSimilarityThreshold: 0.5,
-      },
-      isDirectMessage: true,
-      focusActive: false,
-      multiCompanion: true,
-      currentSiteId,
-    });
-    expect(plan?.allowedScopes).toContain('shared_world:site.mud');
-    expect(plan?.allowedScopes).toContain('personal');
-    expect(plan?.allowedScopes).not.toContain('shared_world:site.home');
   });
 
   it('the turn place still outranks the fallback for wiki scope (physical turn intact)', () => {

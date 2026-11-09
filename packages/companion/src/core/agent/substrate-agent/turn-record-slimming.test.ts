@@ -17,7 +17,6 @@ import { rebuildProviderWireMessagesForPrompt } from './turn-execution/prompt-in
 import { contextMessagesToPiMessages } from '../../../primitives/llm/message-conversion.js';
 import { createDmConversationScope } from '../../session/conversation-scope.js';
 import { createFilesystemTurnRecordStorePort } from '../../../persistence/sessions/turn-records.js';
-import { buildPromptLoomData } from '../../../operator/garden/services/session-turn-observability.js';
 import type {
   ContextMessage,
   LLMProviderWireMessage,
@@ -276,7 +275,7 @@ describe('turn-record slimming (bead hgw3.3)', () => {
 
   it('round-trips through the filesystem store: ref on disk, resolved on read, Loom views identical', () => {
     const sessionsDir = mkdtempSync(join(tmpdir(), 'psfn-turn-record-slimming-'));
-    const { fatSnapshot, record } = buildPlainDmFixture();
+    const { record } = buildPlainDmFixture();
     const store = createFilesystemTurnRecordStorePort(sessionsDir);
 
     store.appendTurnRecord(record);
@@ -290,15 +289,6 @@ describe('turn-record slimming (bead hgw3.3)', () => {
 
     const [readBack] = store.readRecentTurnRecords(CHANNEL_ID, 5);
     expect(readBack).toEqual(record);
-
-    // Garden derives views deep-equal to the fat-record equivalents.
-    const fatRecord = buildFatEquivalentRecord(record, fatSnapshot);
-    const fatLoom = buildPromptLoomData(fatRecord, fatRecord.observability!.snapshot!);
-    const slimLoom = buildPromptLoomData(readBack!, readBack!.observability!.snapshot!);
-    expect(slimLoom).toEqual(fatLoom);
-    expect(slimLoom.providerPayload.providerMessages.at(-1)?.content).toBe(CURRENT_TURN_INPUT);
-    expect(slimLoom.providerPayload.activeTools.map(tool => tool.name))
-      .toEqual(fatSnapshot.plan!.toolDefinitions.map(tool => tool.name));
   });
 
   it('persists a slim DM record at under 40% of its fat equivalent', () => {
@@ -359,16 +349,5 @@ describe('turn-record slimming (bead hgw3.3)', () => {
       expect(record.observability?.snapshot?.promptContext?.providerObservability?.providerWireMessages)
         .toEqual(snapshot.promptContext!.providerObservability!.providerWireMessages);
     });
-  });
-
-  it('fails loudly in the Garden read path when a plan carries an unresolved toolDefinitionsRef', () => {
-    const { fatSnapshot, record } = buildPlainDmFixture();
-    const unresolved = structuredClone(fatSnapshot);
-    delete unresolved.toolContext;
-    const plan = unresolved.plan as unknown as Record<string, unknown>;
-    delete plan.toolDefinitions;
-    plan.toolDefinitionsRef = 'deadbeef';
-
-    expect(() => buildPromptLoomData(record, unresolved)).toThrow(/unresolved toolDefinitionsRef "deadbeef"/);
   });
 });

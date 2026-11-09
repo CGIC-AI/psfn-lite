@@ -1,10 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { fromAny } from '@total-typescript/shoehorn';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { createIntakeSinkGate } from '../../core/cogsec/intake/sink-gates.js';
-import { validateIntakePolicy } from '../../system/config/intake-policy-config.js';
-import { MemoryCandidacyPolicyError, MemoryWriter, MemoryWritePolicyError } from './writer.js';
+import { MemoryWriter, MemoryWritePolicyError } from './writer.js';
 import type { MemoryWriteOptions } from './writer.js';
 import type { EmbeddingProviderPort } from '../../shared/contracts/embedding-provider.js';
 import type { MemoryEvolutionLinkInput, MemoryStorePort } from './memory-store-port.js';
@@ -149,98 +145,6 @@ describe('MemoryWriter', () => {
         workloadType: 'background_work',
         workloadId: 'memory-extraction:job-1',
       },
-    });
-  });
-
-  describe('intake sink gate (htm9.3)', () => {
-    function seedGate(mode: 'shadow' | 'enforce', mutate?: (raw: Record<string, unknown>) => void) {
-      const seed = JSON.parse(
-        readFileSync(join(process.cwd(), 'config', 'intake-policy.seed.json'), 'utf8'),
-      ) as Record<string, unknown>;
-      const raw = { ...seed, mode: mode === 'enforce' ? 'strict' : 'shadow' };
-      mutate?.(raw);
-      return createIntakeSinkGate({
-        policy: validateIntakePolicy(raw, 'intake-policy.test'),
-        actor: 'test:intake-sink-gate',
-      });
-    }
-
-    it('rejects writes covered by a quarantined intake envelope in enforce mode', async () => {
-      writer.intakeSinkGateProvider = () => seedGate('enforce');
-      await expect(writer.write({
-        text: 'An innocuous-looking fact extracted from held content.',
-        type: 'semantic',
-        intakeEnvelopes: [{
-          envelopeId: 'held-envelope-001',
-          sourceClass: 'web_fetch',
-          sourceRiskTier: 'untrusted',
-          state: 'quarantined',
-          riskLabels: ['injection/override_attempt'],
-          subject: { kind: 'body' },
-        }],
-      })).rejects.toBeInstanceOf(MemoryCandidacyPolicyError);
-      expect(store.insertMemory).not.toHaveBeenCalled();
-    });
-
-    it('threads the tool invocation separately from the write operation correlation', async () => {
-      const evaluate = vi.fn().mockReturnValue({
-        sink: 'memory_write',
-        allowed: false,
-        verdict: 'deny',
-        mode: 'enforce',
-        reason: 'held',
-        unscreened: false,
-        deniedEnvelopeIds: ['held-envelope-002'],
-      });
-      writer.intakeSinkGateProvider = () => ({
-        mode: 'enforce',
-        evaluate,
-        assessEgressTrifecta: vi.fn(),
-      });
-
-      await expect(writer.write({
-        text: 'Another derived fact.',
-        type: 'semantic',
-        sourceRef: 'source:tool:memory_write|item:2',
-        provenance: {
-          toolName: 'memory_write',
-          toolCallId: 'memory-call-2',
-          channelId: 'api:memory',
-          sessionId: 'session-memory',
-        },
-        intakeEnvelopes: [{
-          envelopeId: 'held-envelope-002',
-          sourceClass: 'web_fetch',
-          sourceRiskTier: 'untrusted',
-          state: 'quarantined',
-          riskLabels: ['injection/override_attempt'],
-          subject: { kind: 'body' },
-        }],
-      })).rejects.toBeInstanceOf(MemoryCandidacyPolicyError);
-      expect(evaluate).toHaveBeenCalledWith(
-        'memory_write',
-        expect.any(Array),
-        expect.any(Object),
-        {
-          attemptRef: 'memory-call-2',
-          correlationRef: 'source:tool:memory_write|item:2',
-          sourceChannelId: 'api:memory',
-          logicalSessionId: 'session-memory',
-        },
-      );
-    });
-
-    it('never blocks in shadow mode and honors the explicit unscreened policy default', async () => {
-      writer.intakeSinkGateProvider = () => seedGate('shadow');
-      const shadowResult = await writer.write({ text: 'Ordinary fact.', type: 'semantic' });
-      expect(shadowResult.action).toBe('created');
-
-      writer.intakeSinkGateProvider = () => seedGate('enforce', (raw) => {
-        const sinkGates = raw.sinkGates as { sinks: Record<string, { unscreened: string }> };
-        sinkGates.sinks.memory_write.unscreened = 'deny';
-      });
-      await expect(writer.write({ text: 'Another ordinary fact.', type: 'semantic' }))
-        .rejects.toBeInstanceOf(MemoryCandidacyPolicyError);
     });
   });
 

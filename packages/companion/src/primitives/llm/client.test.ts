@@ -2,13 +2,10 @@ import { isRetryableError } from './retry.js';
 import { createHash } from 'node:crypto';
 import { fromAny } from '@total-typescript/shoehorn';
 import { Type } from '@sinclair/typebox';
-import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { JSONRPCClient, JSONRPCServer, JSONRPCServerAndClient } from 'json-rpc-2.0';
-import type { Context } from '@earendil-works/pi-ai';
 import type { AgentTool, AssistantMessage } from '../../boundary/pi-agent/index.js';
 import type { CanonicalModelRegistry, CompletionPurpose, ModelRegistryEntry, ModelSlot } from '../../shared/contracts/runtime.js';
 import {
@@ -16,16 +13,11 @@ import {
   type IcpConversationCorrelation,
 } from '../../shared/contracts/icp-autonomy.js';
 import type { SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
-import {
-  createEnvCredentialVault,
-  envCredential,
-} from '../../boundary/custody/credential-vault.js';
+import { envCredential } from '../../shared/contracts/credential-contracts.js';
+import { createEnvCredentialVault } from '../../test-support/static-credential-vault.js';
 import { FallbackRunner } from './fallback.js';
 import { ModelCallPreemptedError } from './model-call-gate.js';
 import { createEligibilityGate, EligibilityDeniedError } from '../../system/capabilities/eligibility.js';
-import { CapabilityRuntime } from '../../system/capabilities/runtime.js';
-import { GatewayCapabilityTierResolver } from '../../boundary/gateway/capability-tier-resolver.js';
-import type { ResolvedCompanionsFleetConfig } from '../../system/config/companions-config.js';
 
 const mocks = vi.hoisted(() => ({
   getModel: vi.fn(),
@@ -99,20 +91,10 @@ import {
   SlidingWindowCircuitBreaker,
 } from '../../shared/resilience/circuit-breaker.js';
 import { COMPANION_PRIVATE_BACKGROUND_TELEMETRY } from '../../shared/telemetry/model-usage.js';
-import { createSubstrateStreamFn, resolveModel } from '../../core/agent/stream-adapter.js';
 import { executeToolCallsWithScheduler } from '../../core/agent/tool-call-scheduler.js';
 import type { WirableTool } from '../../core/agent/tool-wiring-validator.js';
-import { GatewayClient } from '../../boundary/gateway/client.js';
-import { registerLLMMethods } from '../../boundary/gateway/methods/llm.js';
 import type { ModelUsageEventInput } from '../../shared/telemetry/model-usage.js';
 import type { IcpConversationCostAccountingPort } from '../../shared/telemetry/model-usage.js';
-import type { GatewayRpcConnection } from '../../boundary/gateway/transport.js';
-import type { GatewayMethodRuntime } from '../../boundary/gateway/methods/types.js';
-import { GatewayLLMRequestCancellation } from '../../boundary/gateway/llm-request-cancellation.js';
-import {
-  consumeActiveGatewayCapturedProviderCostEvidence,
-  withGatewayLLMCostCapture,
-} from '../../boundary/gateway/llm-cost-capture.js';
 import type { ChargePolicyConfig } from '../../shared/contracts/charge-policy.js';
 import { makeTestFatiguePolicyConfig } from '../../test-support/charge-policy.js';
 import {
@@ -3227,125 +3209,6 @@ describe('LLMClient eligibility gate', () => {
 
     expect(mocks.completeSimple).not.toHaveBeenCalled();
   });
-
-  // an52.3 remediation: the gateway multi-companion wiring pairs the LLM
-  // client with a STRICT per-companion access provider. Identity comes only
-  // from the server-injected eligibilityCompanionId — never from
-  // agent-controlled correlation — and an absent identity fails closed.
-  function makeStrictFleetEligibilityGate(input: { companionBTierFile: boolean }) {
-    const root = mkdtempSync(join(tmpdir(), 'psfn-llm-strict-tier-'));
-    tempDirs.push(root);
-    const baseDir = join(root, 'gateway-root');
-    const dirA = join(root, 'companion-a');
-    const dirB = join(root, 'companion-b');
-    for (const dir of [baseDir, dirA, dirB]) {
-      mkdirSync(dir, { recursive: true });
-    }
-    // The gateway-hydrated root is autonomous: any regression that falls back
-    // to the root tier would ALLOW the calls these tests expect to be denied.
-    writeFileSync(join(baseDir, 'capability-tier.json'), JSON.stringify({ tier: 'autonomous', customTokens: [] }));
-    writeFileSync(join(dirA, 'capability-tier.json'), JSON.stringify({ tier: 'autonomous', customTokens: [] }));
-    if (input.companionBTierFile) {
-      // custom tier with no tokens: lacks memory.write, so the token-gated
-      // background/memory/import purposes must be denied for companion-b.
-      writeFileSync(join(dirB, 'capability-tier.json'), JSON.stringify({ tier: 'custom', customTokens: [] }));
-    }
-    const resolver = new GatewayCapabilityTierResolver({
-      baseRuntime: new CapabilityRuntime({ dataDir: baseDir }),
-      multiCompanion: true,
-      companionFleet: {
-        persistenceRoot: root,
-        workspacesRoot: join(root, 'workspaces'),
-        sharedWorkspacePath: join(root, 'workspaces', 'shared'),
-        companions: [
-          {
-            companionId: 'companion-a',
-            companionDataDir: dirA,
-            characterCardPath: join(dirA, 'companion.json'),
-            postgresSchema: 'companion_a',
-            personalWorkspacePath: join(root, 'workspaces', 'companion-a'),
-          },
-          {
-            companionId: 'companion-b',
-            companionDataDir: dirB,
-            characterCardPath: join(dirB, 'companion.json'),
-            postgresSchema: 'companion_b',
-            personalWorkspacePath: join(root, 'workspaces', 'companion-b'),
-          },
-        ],
-      } as unknown as ResolvedCompanionsFleetConfig,
-    });
-    return createEligibilityGate((companionId) => resolver.resolveAccessStrict(companionId));
-  }
-
-  const backgroundContext = {
-    systemPrompt: 'System',
-    messages: [{ role: 'user' as const, content: 'Process memories' }],
-  };
-
-  it('fails closed when the multi-companion eligibility identity is absent', async () => {
-    const client = new LLMClient(makeConfig(), {
-      eligibilityGate: makeStrictFleetEligibilityGate({ companionBTierFile: true }),
-    });
-
-    await expect(client.complete(backgroundContext, 'background', { disableRetry: true }))
-      .rejects.toThrow(/authenticated companion identity/);
-
-    expect(mocks.completeSimple).not.toHaveBeenCalled();
-  });
-
-  it('denies a token-gated purpose on the companion\'s own tier, ignoring agent-controlled correlation', async () => {
-    const client = new LLMClient(makeConfig(), {
-      eligibilityGate: makeStrictFleetEligibilityGate({ companionBTierFile: true }),
-    });
-
-    // Correlation carries a companionId claim AND companion_private telemetry
-    // (which strips identity from correlation); neither may influence the
-    // decision — only the server-injected eligibilityCompanionId does.
-    await expect(client.complete(backgroundContext, 'background', {
-      disableRetry: true,
-      eligibilityCompanionId: 'companion-b',
-      correlation: {
-        companionId: 'companion-a',
-        telemetryVisibility: 'companion_private',
-      },
-    })).rejects.toBeInstanceOf(EligibilityDeniedError);
-
-    expect(mocks.completeSimple).not.toHaveBeenCalled();
-  });
-
-  it('fails closed (not root fallback) when the companion tier file is missing', async () => {
-    const client = new LLMClient(makeConfig(), {
-      eligibilityGate: makeStrictFleetEligibilityGate({ companionBTierFile: false }),
-    });
-
-    await expect(client.complete(backgroundContext, 'background', {
-      disableRetry: true,
-      eligibilityCompanionId: 'companion-b',
-    })).rejects.toThrow(/capability-tier/);
-
-    expect(mocks.completeSimple).not.toHaveBeenCalled();
-  });
-
-  it('allows the token-gated purpose for a companion whose own tier grants it', async () => {
-    const client = new LLMClient(makeConfig(), {
-      eligibilityGate: makeStrictFleetEligibilityGate({ companionBTierFile: true }),
-    });
-    mocks.completeSimple.mockResolvedValue({
-      content: [{ type: 'text', text: 'ok' }],
-      model: 'openrouter:background/model',
-      usage: { input: 3, output: 2 },
-      stopReason: 'stop',
-    });
-
-    const response = await client.complete(backgroundContext, 'background', {
-      disableRetry: true,
-      eligibilityCompanionId: 'companion-a',
-    });
-
-    expect(response.content).toBe('ok');
-    expect(mocks.completeSimple).toHaveBeenCalledTimes(1);
-  });
 });
 
 describe('LLMClient correlation metadata', () => {
@@ -3798,166 +3661,6 @@ describe('LLMClient model budget gates and usage metering', () => {
       attempt: 7,
       status: 'failure',
     }));
-  });
-
-  it('records adapter fallback attempts under one logical call through the production gateway stack', async () => {
-    const config = makeConfig({
-      retryMaxAttempts: 0,
-      retryBaseDelayMs: 0,
-    });
-    const baseRegistry = config.modelRegistry!;
-    config.modelRegistry = {
-      ...baseRegistry,
-      models: [
-        ...baseRegistry.models,
-        {
-          id: 'chat-fallback',
-          rank: 20,
-          identity: {
-            provider: 'openrouter',
-            model: 'moonshotai/kimi-k2.5',
-            source: { type: 'openrouter' },
-          },
-          purposes: [{ purpose: 'chat', primary: false }],
-          capabilities: { maxOutputTokens: 2_048, contextWindow: 128_000 },
-          tuning: { maxOutputTokens: 2_048, contextWindow: 128_000 },
-        },
-      ],
-    };
-    const usageEvents: ModelUsageEventInput[] = [];
-    const gatewayLlmClient = new LLMClient(config, {
-      usageRecorder: {
-        async recordUsageEvent(event) {
-          usageEvents.push(event);
-        },
-      },
-    });
-
-    let providerAttempt = 0;
-    mocks.streamSimple.mockImplementation(async function* (_model: unknown) {
-      providerAttempt += 1;
-      if (providerAttempt === 1) {
-        throw new Error('403 primary unavailable');
-      }
-      yield {
-        type: 'done',
-        message: {
-          model: 'moonshotai/kimi-k2.5',
-          usage: { input: 7, output: 4, totalTokens: 11 },
-          content: [{ type: 'text', text: 'Recovered on fallback.' }],
-        },
-        reason: 'stop',
-      };
-    });
-
-    let receiveFromGateway: ((message: unknown) => void) | undefined;
-    const serverRpc = new JSONRPCServerAndClient(
-      new JSONRPCServer(),
-      new JSONRPCClient(async request => {
-        receiveFromGateway?.(request);
-      }),
-    );
-    const connection: GatewayRpcConnection = Object.assign(new EventEmitter(), {
-      send(message: unknown): boolean {
-        void serverRpc.receiveAndSend(message);
-        return true;
-      },
-      onMessage(handler: (message: unknown) => void): void {
-        receiveFromGateway = handler;
-      },
-      destroy(): void {},
-      get destroyed(): boolean {
-        return false;
-      },
-    });
-    const gatewayClient = new GatewayClient(connection, 2, { keepaliveIntervalMs: 60_000 });
-    const runtime: GatewayMethodRuntime = {
-      target: serverRpc,
-      llmProvider: gatewayLlmClient,
-      embeddingService: {
-        dims: 2,
-        async embed() {
-          return new Float32Array([0, 0]);
-        },
-        async embedBatch() {
-          return [];
-        },
-      },
-      modelDiscovery: { getAvailableModels: vi.fn(async () => []), invalidateCache: vi.fn() },
-      discordAdapter: {
-        id: 'test',
-        outbound: {
-          textChunkLimit: 2_000,
-          async sendText() {},
-        },
-      },
-      policyConfig: { workspacePath: process.cwd() },
-      workspacePath: process.cwd(),
-      sessionHmacKeyring: { activeVersion: 'v1', keys: { v1: 'test' } },
-      approvalBoundary: {
-        listPendingConfirmations: () => [],
-        listConfirmationHistory: () => [],
-        resolveConfirmation: async () => ({
-          id: 'noop',
-          status: 'not_found',
-          message: 'noop',
-          executed: false,
-        }),
-        gate: options => options.handler,
-      },
-      notifyRequester(method, params) {
-        receiveFromGateway?.({ jsonrpc: '2.0', method, params });
-      },
-      listPendingConfirmations: () => [],
-      listConfirmationHistory: () => [],
-      resolveConfirmation: async () => ({
-        id: 'noop',
-        status: 'not_found',
-        message: 'noop',
-        executed: false,
-      }),
-      sendNtfy: async () => ({ status: 'debounced', topic: 'test' }),
-      getRuntimeHealth: () => ({ checkedAt: 0, services: [] }),
-      nextStreamRequestId: () => 'gateway-stream-1',
-      authenticatedCompanionId: () => undefined,
-      llmRequestCancellation: new GatewayLLMRequestCancellation(),
-      audited: (_method, handler) => handler,
-    };
-    registerLLMMethods(runtime);
-
-    try {
-      const streamFn = createSubstrateStreamFn(config, { transport: gatewayClient });
-      const context: Context = {
-        systemPrompt: 'System',
-        messages: [{ role: 'user', content: 'hello', timestamp: 0 }],
-      };
-      const stream = await streamFn(resolveModel(config, 'chat'), context, {});
-      for await (const _event of stream as AsyncIterable<unknown>) {
-        // Drain the public stream to completion.
-      }
-    } finally {
-      gatewayClient.destroy();
-    }
-
-    expect(mocks.streamSimple).toHaveBeenCalledTimes(2);
-    expect(usageEvents).toHaveLength(2);
-    expect(usageEvents).toMatchObject([
-      {
-        logicalCallId: expect.stringMatching(/^llm:/),
-        attempt: 1,
-        status: 'failure',
-        provider: 'openrouter',
-        model: 'z-ai/glm-5',
-      },
-      {
-        logicalCallId: expect.stringMatching(/^llm:/),
-        attempt: 2,
-        status: 'success',
-        provider: 'openrouter',
-        model: 'moonshotai/kimi-k2.5',
-      },
-    ]);
-    expect(usageEvents[0]?.logicalCallId).toBe(usageEvents[1]?.logicalCallId);
   });
 
   it('keeps pi-ai 0.73 streaming usage buckets stable in provider cost telemetry', async () => {
@@ -4526,52 +4229,6 @@ describe('LLMClient model budget gates and usage metering', () => {
       effectiveCostUsd: 0.42,
       costSource: 'provider',
     }));
-  });
-
-  it.each(['completion', 'stream'] as const)('retains %s serving-provider evidence in response and usage metadata', async (kind) => {
-    const usageRecorder = { recordUsageEvent: vi.fn(async (_event: ModelUsageEventInput) => undefined) };
-    const client = new LLMClient(makeConfig({ retryMaxAttempts: 0 }), {
-      usageRecorder,
-      providerCostResolver: consumeActiveGatewayCapturedProviderCostEvidence,
-    });
-    const providerResponse = { responseId: 'gen-attribution-test', servingProvider: 'Together' };
-    const message = {
-      responseId: providerResponse.responseId,
-      content: [{ type: 'text', text: 'private response' }],
-      model: 'deepseek/deepseek-v3.2',
-      usage: { input: 20, output: 4, totalTokens: 24 },
-      stopReason: 'stop',
-    };
-    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
-      id: message.responseId,
-      provider: providerResponse.servingProvider,
-      choices: [{ message: { content: 'private response' } }],
-    })));
-    mocks.completeSimple.mockImplementation(async () => {
-      await fetch('https://provider.test/completion');
-      return message;
-    });
-    mocks.streamSimple.mockImplementation(async function* () {
-      await fetch('https://provider.test/stream');
-      yield { type: 'done', reason: 'stop', message };
-    });
-    try {
-      const { result } = await withGatewayLLMCostCapture(async () => {
-        const context = { systemPrompt: 'private prompt', messages: [] };
-        return kind === 'completion'
-          ? await client.complete(context, 'background', { disableRetry: true })
-          : await client.stream(context);
-      });
-      expect(result.providerObservability).toMatchObject({ backendProvider: 'openrouter', providerResponse });
-      expect(usageRecorder.recordUsageEvent).toHaveBeenCalledWith(expect.objectContaining({
-        provider: 'openrouter',
-        metadata: expect.objectContaining({ backendProvider: 'openrouter', providerResponse }),
-      }));
-      expect(JSON.stringify(usageRecorder.recordUsageEvent.mock.calls)).not.toContain('private response');
-      expect(JSON.stringify(usageRecorder.recordUsageEvent.mock.calls)).not.toContain('private prompt');
-    } finally {
-      vi.unstubAllGlobals();
-    }
   });
 
   it('retains a partial stream generation ID without guessing its serving provider', async () => {

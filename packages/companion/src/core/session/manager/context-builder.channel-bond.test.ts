@@ -1,20 +1,11 @@
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
 import { buildSessionContext, captureTurnSessionContext } from './context-builder.js';
 import type { CrossChannelContinuityPort } from '../cross-channel-continuity-port.js';
 import type { ActiveContinuityChannel } from '../continuity.js';
 import { CHANNEL_BOND_METADATA_KEY, parseChannelBondEntryMarker } from '../channel-bond.js';
-import { createIntakeSinkGate } from '../../cogsec/intake/sink-gates.js';
-import { validateIntakePolicy } from '../../../system/config/intake-policy-config.js';
-import { INTAKE_FIREWALL_NOTICE_TEMPLATES } from '../../cogsec/intake-firewall-notice-templates.js';
-import { buildSessionMetadataWithIntakeScreening } from '../intake-screening-metadata.js';
-import type { IntakeEnvelopeSnapshot } from '../../../shared/contracts/intake-envelope.js';
 import type { TurnSessionContextSnapshot } from '../../turns/snapshot.js';
 import type { SessionEntry } from '../types.js';
-import { INTAKE_DATAMARK_MARKER } from '../../cogsec/intake/scanners/datamark.js';
-import { countTokens } from '../../../primitives/llm/tokens.js';
 
 const NOW = Date.now();
 
@@ -387,92 +378,5 @@ describe('buildSessionContext channel bonding compaction accounting', () => {
     const ownHeavy = Array.from({ length: 30 }, (_, index) => ownEntry(100 + index, `${LONG} #${index}`));
     const context = await buildTrigger([...OWN_SHORT, ...ownHeavy]);
     expect(context.manifest.compaction.eligible).toBe(true);
-  });
-});
-
-describe('buildSessionContext channel bonding + intake sink gate', () => {
-  function makeEnforceGate() {
-    const seed = JSON.parse(
-      readFileSync(join(process.cwd(), 'config', 'intake-policy.seed.json'), 'utf8'),
-    ) as Record<string, unknown>;
-    return createIntakeSinkGate({
-      policy: validateIntakePolicy({ ...seed, mode: 'strict' }, 'intake-policy.bond-test'),
-      actor: 'test:bond-sink-gate',
-    });
-  }
-
-  function quarantinedSnapshot(): IntakeEnvelopeSnapshot {
-    return {
-      envelopeId: 'bond-held-envelope-001',
-      sourceClass: 'document',
-      sourceRiskTier: 'untrusted',
-      state: 'quarantined',
-      riskLabels: ['injection/override_attempt'],
-      subject: { kind: 'attachment', index: 0 },
-    };
-  }
-
-  it('suppresses the [via] source annotation when the sink gate withholds a foreign entry', async () => {
-    const screeningMetadata = buildSessionMetadataWithIntakeScreening(
-      bondMarkerMetadata(TELEGRAM_CHANNEL),
-      { mode: 'enforce', withheld: true, envelopes: [quarantinedSnapshot()] },
-    );
-    const foreign: SessionEntry = {
-      ...foreignEntry(7, 'private confession that must be withheld'),
-      metadata: screeningMetadata,
-    };
-    const recentEntries = [ownEntry(1, 'phone text'), foreign];
-    const store = makeStore({ [DM_CHANNEL]: [], [TELEGRAM_CHANNEL]: [] });
-    const context = await buildSessionContext({
-      channelId: DM_CHANNEL,
-      sourceChannelId: DM_CHANNEL,
-      systemPrompt: 'System prompt.',
-      coreMemoryBlock: '',
-      memoriesBlock: '',
-      userId: 'contact-1',
-      channelMeta: { isDirectMessage: true },
-      continuityFallbackUserIds: [],
-      store,
-      config: makeConfig(),
-      eventBus: null,
-      promptRegistry: null,
-      preCompactionExtractionHandler: null,
-      crossChannelContinuity: makePort([]),
-      wakeReturnArtifacts: [],
-      turnSessionContext: snapshotWith(recentEntries),
-      intakeSinkGate: makeEnforceGate(),
-    });
-    const allContent = context.messages.map(message => message.content).join('\n');
-    // Content is withheld and its source channel is NOT disclosed.
-    expect(allContent).toContain(INTAKE_FIREWALL_NOTICE_TEMPLATES.withheldContent);
-    expect(allContent).not.toContain('private confession');
-    expect(allContent).not.toContain(`[via ${TELEGRAM_CHANNEL}]`);
-  });
-
-  it('still annotates a non-withheld foreign entry with its source channel', async () => {
-    const foreign = foreignEntry(8, 'ordinary bonded message');
-    const recentEntries = [ownEntry(1, 'phone text'), foreign];
-    const store = makeStore({ [DM_CHANNEL]: [], [TELEGRAM_CHANNEL]: [] });
-    const context = await buildSessionContext({
-      channelId: DM_CHANNEL,
-      sourceChannelId: DM_CHANNEL,
-      systemPrompt: 'System prompt.',
-      coreMemoryBlock: '',
-      memoriesBlock: '',
-      userId: 'contact-1',
-      channelMeta: { isDirectMessage: true },
-      continuityFallbackUserIds: [],
-      store,
-      config: makeConfig(),
-      eventBus: null,
-      promptRegistry: null,
-      preCompactionExtractionHandler: null,
-      crossChannelContinuity: makePort([]),
-      wakeReturnArtifacts: [],
-      turnSessionContext: snapshotWith(recentEntries),
-      intakeSinkGate: makeEnforceGate(),
-    });
-    const allContent = context.messages.map(message => message.content).join('\n');
-    expect(allContent).toContain(`[via ${TELEGRAM_CHANNEL}] ordinary bonded message`);
   });
 });

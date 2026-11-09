@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { envCredential, createStaticCredentialVault } from '../../boundary/custody/credential-vault.js';
+import { envCredential } from '../../shared/contracts/credential-contracts.js';
+import { createStaticCredentialVault } from '../../test-support/static-credential-vault.js';
 import {
   PiProviderRuntime,
   resolveConfiguredProviderCredential,

@@ -7,18 +7,12 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { authorizeArtifactEgress, authorizeRecoveredArtifactEgress } from './sensitivity-egress.js';
 import { classifyArtifactSensitivity } from '../../shared/contracts/artifact-sensitivity.js';
-import { EgressDeliveryRecorder } from '../cogsec/disclosure/index.js';
-import type {
-  EgressDeliveryRecord,
-  TurnEgressCustodyProof,
-} from '../cogsec/disclosure/egress-delivery-record.js';
 import { createApprovalQueuePortFromConfirmationQueue } from '../../system/capabilities/approval-queue-port.js';
 import { ConfirmationQueue } from '../../system/capabilities/confirmation-queue.js';
 import type { CogSecMode } from '../../shared/contracts/cogsec-mode.js';
 import type { Attachment } from '../../shared/contracts/runtime.js';
 
 const TURN_ID = '01936f2c-4a1b-7c3d-8e5f-0a1b2c3d4e5f';
-const COMPANION_A = '3f2a1c88-5d4e-4a7b-9c3d-1e2f3a4b5c6d';
 const ROOM_CHANNEL = 'discord:public-room';
 
 const attachment: Attachment = {
@@ -33,7 +27,7 @@ const publicClassification = classifyArtifactSensitivity(
   new Date('2026-07-16T12:00:00.000Z'),
 );
 
-const PROVEN: TurnEgressCustodyProof = {
+const PROVEN = {
   custodySnapshotRef: `turn:${TURN_ID}`,
   sourceCount: 2,
   hasUnclassifiedSource: false,
@@ -42,11 +36,11 @@ const PROVEN: TurnEgressCustodyProof = {
 };
 
 function fakeStore() {
-  const rows: EgressDeliveryRecord[] = [];
+  const rows: unknown[] = [];
   return {
     rows,
     port: {
-      record: vi.fn(async (record: EgressDeliveryRecord) => {
+      record: vi.fn(async (record: unknown) => {
         rows.push(record);
         return 'recorded' as const;
       }),
@@ -59,16 +53,10 @@ function fakeStore() {
 
 function custodyDeps(input: {
   store: ReturnType<typeof fakeStore>;
-  proof: TurnEgressCustodyProof | undefined;
+  proof: typeof PROVEN | undefined;
   mode: CogSecMode;
 }) {
   return {
-    recorder: new EgressDeliveryRecorder({
-      store: input.store.port,
-      companionId: COMPANION_A,
-      getCogSecMode: () => input.mode,
-      now: () => 1_800_000_000_000,
-    }),
     turnId: TURN_ID,
     proof: input.proof,
     resolveChannel: () => ({ channelPrivacy: 'public', broadcast: false }),

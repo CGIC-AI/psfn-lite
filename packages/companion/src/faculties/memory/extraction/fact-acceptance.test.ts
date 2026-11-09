@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { SessionEntry } from '../../../core/session/types.js';
-import type { IntakeSinkGate } from '../../../core/cogsec/intake/sink-gates.js';
+import type { IntakeSinkGate } from '../../../shared/contracts/intake-sink-gate-port.js';
 import type { ExtractedFact } from '../types.js';
 import {
   buildAcceptedFactCandidates,

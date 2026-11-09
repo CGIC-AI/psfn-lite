@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
-import { createEnvCredentialVault, envCredential } from '../../boundary/custody/credential-vault.js';
+import { envCredential } from '../../shared/contracts/credential-contracts.js';
+import { createEnvCredentialVault } from '../../test-support/static-credential-vault.js';
 import {
   DEFAULT_PROJECT_TRANSFORMERS_CACHE_DIR,
   STARTUP_EMBEDDING_WARMUP_TEXT,

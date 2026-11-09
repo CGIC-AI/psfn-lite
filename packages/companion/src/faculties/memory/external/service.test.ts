@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { PostTurnActionHandler } from '../../../core/agent/post-turn-action-runtime.js';
 import type { InferredPostTurnAction } from '../../../shared/contracts/runtime.js';
-import type { IntakeScreeningInput } from '../../../core/cogsec/intake/screening.js';
+import type { IntakeScreeningInput } from '../../../shared/contracts/intake-screening-port.js';
 import type { ExternalMemoryExecuteParams } from '../../../shared/contracts/external-memory.js';
 import { externalMemorySessionId } from '../../../shared/contracts/external-memory.js';
 import { classifyConversationalActivity } from '../../../core/session/conversational-activity.js';
@@ -14,7 +14,6 @@ import { resolveSessionEntryTurnContext } from '../../../core/session/turn-prove
 import { SessionStore } from '../../../persistence/sessions/store.js';
 import { ExternalMemoryService } from './service.js';
 import { ExternalMemoryIntakeStore } from './intake-store.js';
-import { getStableLinkedContactForSession } from '../../../operator/garden/services/contact-session-linker.js';
 
 const binding = {
   companionId: '11111111-1111-4111-8111-111111111111',
@@ -165,11 +164,6 @@ describe('external companion memory service', () => {
     const channelId = externalMemorySessionId(binding, input.request.sessionId);
     await h.service.execute(input);
     expect(h.recordChannelActivity).toHaveBeenCalledWith(binding.contactId, 'api:hermes', channelId, 'private');
-    const [contactId, channel, recordedChannelId, privacyLevel] = h.recordChannelActivity.mock.calls[0]!;
-    const contact = fromAny({ id: contactId, displayName: 'Alex', conversationChannels: [
-      { channel, channelId: recordedChannelId, privacyLevel },
-    ] });
-    expect(getStableLinkedContactForSession({ channelId, contacts: [contact], sessionStore: h.sessions })).toBe(contact);
   });
 
   it('withholds acknowledgment on contact-link failure and recovers without duplicating the archived pair', async () => {

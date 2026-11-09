@@ -1,12 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { SETTINGS_GARDEN_FIELD_EXPOSURE } from '../../shared/contracts/settings-garden-contract.js';
-import { normalizeEditableSettings, RUNTIME_SETTINGS_KEYS } from '../settings.js';
 import {
   createDefaultBiographicalCandidatePolicy,
   normalizeBiographicalCandidatePolicy,
 } from './biographical-candidate-policy.js';
-import { resolveSettingsDomainForField } from './settings-domain-registry.js';
 
 describe('biographical candidate owner policy', () => {
   it('keeps the companion portability choice off by default and absent-means-off for older owners', () => {
@@ -56,17 +53,5 @@ describe('biographical candidate owner policy', () => {
     const valid = createDefaultBiographicalCandidatePolicy();
     expect(() => normalizeBiographicalCandidatePolicy({ ...valid, ...patch }))
       .toThrow(/Invalid settings at biographicalCandidatePolicy/u);
-  });
-
-  it('is a canonical settings.json owner field exposed read-only in Garden', () => {
-    const policy = createDefaultBiographicalCandidatePolicy();
-    expect(normalizeEditableSettings({ biographicalCandidatePolicy: policy }))
-      .toEqual({ biographicalCandidatePolicy: policy });
-    expect(RUNTIME_SETTINGS_KEYS).toContain('biographicalCandidatePolicy');
-    expect(SETTINGS_GARDEN_FIELD_EXPOSURE.biographicalCandidatePolicy).toEqual({
-      sectionId: 'memory',
-      surface: 'advanced',
-    });
-    expect(resolveSettingsDomainForField('biographicalCandidatePolicy')).toBe('memory');
   });
 });

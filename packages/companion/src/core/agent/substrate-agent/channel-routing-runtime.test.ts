@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ChannelPromptRegistryPort } from '../../../channels/backplane/registry-port.js';
+import type { ChannelPromptRegistryPort } from '../../../shared/contracts/channel-prompt-port.js';
 import type { SubstrateMessage } from '../../../shared/contracts/runtime.js';
 import { resolveTaskKind } from './channel-routing-runtime.js';
 import { createIcpAutonomyCandidateSchedulerMessage } from '../../icp/candidate-scheduler-origin.js';

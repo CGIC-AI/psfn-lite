@@ -46,7 +46,7 @@ import {
   createDefaultGroupMemorySettings,
   normalizeGroupMemorySettings,
 } from './group-memory-config.js';
-import { loadRequiredJson } from './load-or-seed.js';
+import { loadRequiredJson, loadSeedJson } from './load-or-seed.js';
 import { normalizeMemoryDeletionPolicy } from './memory-deletion-policy.js';
 import {
   createDefaultMemoryPresentationProfile,
@@ -224,6 +224,20 @@ export function loadAutomataPolicyConfig(
     assertAutomataReviewerModelResolvable(policy, options.modelRegistry ?? { schemaVersion: 1, models: [] });
   }
   return policy;
+}
+
+/**
+ * Copy of donor system/config/automata-policy-config.ts:31-39 at e6a9546: the
+ * shipped seed policy, parsed, without reading or writing the data root.
+ */
+export function loadAutomataPolicySeedDefaults(
+  options: { seedDir?: string } = {},
+): AutomataOwnerPolicy {
+  const seedDir = options.seedDir ?? process.env.CONFIG_DIR ?? './config';
+  return loadSeedJson({
+    seedPath: join(seedDir, AUTOMATA_SEED_FILE_NAME),
+    validate: (raw, sourcePath) => parseAutomataOwnerPolicy(raw, sourcePath),
+  });
 }
 
 /** Copy of donor system/config/automata-reviewer-model-contract.ts:7-21 at e6a9546. */

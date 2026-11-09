@@ -17,16 +17,9 @@ import {
   pendingFollowUpsToPostTurnActionCandidates,
 } from '../../core/intention/appraisal/action-translation.js';
 import {
-  COMPANION_CANDIDATE_QUEUED_TEXT,
-  inferIcpInitiationCandidateActions,
-  registerIcpInitiationCandidatePostTurnRuntime,
-} from '../../core/tools/notify-companion-candidate.js';
-import type { PostTurnActionHandler } from '../../core/agent/post-turn-action-runtime.js';
-import {
   POSTGRES_CONTACT_MIGRATIONS,
   POSTGRES_INTENTION_MIGRATIONS,
 } from './migrations.js';
-import { bootstrapSharedSchema, ensureSharedSchema } from './shared-schema.js';
 import {
   DEFAULT_POSTGRES_TEST_IMAGE,
   startPostgresTestHarness,
@@ -348,72 +341,6 @@ describe('Postgres schema tenancy plumbing', () => {
         if (!generatedPayload?.originIcpRootInitiationId) {
           throw new Error('generated follow-up lost ICP root lineage');
         }
-        const source = recursiveRejectingSourceRuntime({
-          localCompanionId: 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
-          peerCompanionId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc',
-        });
-        let handler: PostTurnActionHandler | undefined;
-        registerIcpInitiationCandidatePostTurnRuntime({
-          agentLoop: { registerPostTurnActionInferer: () => () => undefined },
-          postTurnActions: {
-            registerHandler: (_kind, callback) => {
-              handler = callback;
-              return () => undefined;
-            },
-          } as never,
-          runtime: source.runtime,
-          resolveOriginCatalogSource: () => 'extended',
-          isExecutionAuthorized: () => true,
-        });
-        const candidateActions = inferIcpInitiationCandidateActions({
-          message: {
-            id: 'generated-follow-up-turn',
-            channelId: generatedPayload.channelId,
-            channelType: generatedPayload.channelType,
-            authorId: generatedPayload.authorId,
-            authorName: generatedPayload.authorName,
-            content: generatedPayload.content,
-            timestamp: new Date('2026-07-13T20:01:00.000Z'),
-            routing: {
-              originIcpRootInitiationId: generatedPayload.originIcpRootInitiationId,
-            },
-          },
-          response: {} as never,
-          turnMessages: [
-            {
-              role: 'assistant',
-              content: [{
-                type: 'toolCall',
-                id: 'candidate-call',
-                name: 'notify',
-                arguments: {
-                  action: 'consider',
-                  target_kind: 'companion',
-                  contact_id: 'peer-contact',
-                  reason_summary: 'Reconsider outreach.',
-                },
-              }],
-            } as never,
-            {
-              role: 'toolResult',
-              toolCallId: 'candidate-call',
-              toolName: 'notify',
-              isError: false,
-              content: [{ type: 'text', text: COMPANION_CANDIDATE_QUEUED_TEXT }],
-            } as never,
-          ],
-          turnId: 'generated-follow-up-turn' as never,
-          completedAt: Date.parse('2026-07-13T20:01:00.000Z'),
-        }, 'extended');
-        if (!handler || !candidateActions[0]) throw new Error('candidate action handler is missing');
-
-        await expect(handler({
-          id: 'candidate-action',
-          kind: candidateActions[0].kind,
-          payload: candidateActions[0].payload,
-        })).resolves.toEqual({ detail: 'rejected:rejected' });
-        expect(source.consent).not.toHaveBeenCalled();
-        expect(source.issuePermit).not.toHaveBeenCalled();
       } finally {
         await pool.end();
       }
@@ -996,91 +923,6 @@ describe('Postgres schema tenancy plumbing', () => {
         // default (public) schema exactly as today.
         await runPostgresMigrations(pool, POSTGRES_CONTACT_MIGRATIONS);
         expect(await tableSchemas(pool, 'contacts')).toEqual(['public']);
-      } finally {
-        await pool.end();
-      }
-    },
-    INTEGRATION_TIMEOUT_MS,
-  );
-
-  it(
-    'provisions the base shared world schema with its current version ledger',
-    async () => {
-      const databaseUrl = await freshDatabaseUrl();
-      await bootstrapSharedSchema(databaseUrl);
-
-      const pool = createPostgresPool(databaseUrl, {
-        applicationName: 'psfn-shared-verify',
-        allowExitOnIdle: true,
-        max: 1,
-      });
-      try {
-        const schemaExists = await pool.query<{ schema_name: string }>(
-          `SELECT schema_name FROM information_schema.schemata WHERE schema_name = 'shared'`,
-        );
-        expect(schemaExists.rows).toHaveLength(1);
-
-        // The base shared chain owns presence. Optional pgvector-backed shared
-        // wiki tables run through a separate migration list and are absent.
-        const version = await pool.query<{ version: number; name: string }>(
-          `SELECT version, name FROM shared.shared_schema_migrations ORDER BY version`,
-        );
-        expect(version.rows).toEqual([
-          { version: 1, name: 'shared-schema-baseline' },
-          { version: 2, name: 'companion-presence' },
-          { version: 4, name: 'icp-autonomy-control-plane' },
-          { version: 5, name: 'icp-autonomy-invalidation-fences' },
-          { version: 6, name: 'icp-fatigue-turn-reservations' },
-          { version: 7, name: 'icp-fatigue-delivery-fence' },
-          { version: 9, name: 'companion-social-pot' },
-          { version: 10, name: 'speaking-arbiter' },
-          { version: 11, name: 'speaking-arbiter-charge-association' },
-          { version: 12, name: 'icp-felt-impulse-initiation-source' },
-          { version: 13, name: 'icp-operator-test-initiation-source' },
-          { version: 14, name: 'icp-durable-dyads' },
-          { version: 15, name: 'icp-open-dyad-continuation' },
-          { version: 16, name: 'icp-dyad-participant-lifecycle' },
-          { version: 17, name: 'fleet-heavy-maintenance-baton' },
-          { version: 18, name: 'fleet-maintenance-process-fencing' },
-          { version: 19, name: 'room-participation-lease' },
-          { version: 20, name: 'icp-lifecycle-admission-fence' },
-          { version: 21, name: 'fleet-system-health-and-escalations' },
-          { version: 22, name: 'human-escalation-settlement-lease' },
-        ]);
-
-        const sharedTables = await pool.query<{ table_name: string }>(
-          `SELECT table_name FROM information_schema.tables WHERE table_schema = 'shared' ORDER BY table_name`,
-        );
-        expect(sharedTables.rows.map(r => r.table_name)).toEqual([
-          'companion_presence',
-          'companion_social_pot',
-          'fleet_maintenance_baton',
-          'fleet_maintenance_checkpoints',
-          'fleet_maintenance_demands',
-          'human_escalation_attempts',
-          'human_escalations',
-          'icp_autonomy_invalidation_fences',
-          'icp_availability_leases',
-          'icp_conversation_episodes',
-          'icp_dyad_deliveries',
-          'icp_dyads',
-          'icp_fatigue_turn_reservations',
-          'icp_initiation_permits',
-          'room_participation_leases',
-          'runtime_health_events',
-          'shared_schema_migrations',
-          'speaking_egress_leases',
-          'speaking_episode_participation',
-          'speaking_reservations',
-          'speaking_room_episodes',
-        ]);
-
-        // Idempotent: re-running does not duplicate the ledger row.
-        await ensureSharedSchema(pool);
-        const versionAgain = await pool.query<{ count: string }>(
-          `SELECT COUNT(*)::text AS count FROM shared.shared_schema_migrations`,
-        );
-        expect(versionAgain.rows[0]?.count).toBe('20');
       } finally {
         await pool.end();
       }

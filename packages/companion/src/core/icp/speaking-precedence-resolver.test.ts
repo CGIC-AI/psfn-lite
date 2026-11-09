@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { IcpOwnAvailabilityResult } from '../../boundary/gateway/icp-autonomy-contract.js';
+import type { IcpOwnAvailabilityResult } from '../../shared/contracts/icp-gateway-contract.js';
 import type { IcpAvailabilityLease, IcpAvailabilityState } from '../../shared/contracts/icp-autonomy.js';
 import { resolveIcpSocialPrecedence } from './social-precedence.js';
 import {
@@ -10,17 +10,7 @@ import {
   type IcpOwnAvailabilityReader,
   type IcpTurnFenceReader,
 } from './speaking-precedence-resolver.js';
-import {
-  SpeakingReservationPhase,
-  type ReservationSignalContext,
-} from '../agent/arbiter/reservation-phase.js';
-import type {
-  ReserveInput,
-  ReserveResult,
-  RoomEpisodeSnapshot,
-  SpeakingReservationSnapshot,
-} from '../agent/arbiter/speaking-arbiter-store-port.js';
-import type { SocialPotReadInput, SocialPotSnapshot } from '../agent/fatigue/social-pot.js';
+import type { ReservationSignalContext } from '../../shared/contracts/speaking-arbiter-types.js';
 
 const COMPANION = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const CHANNEL = 'discord:guild-1:general';
@@ -235,122 +225,5 @@ describe('createIcpSpeakingPrecedenceResolver — fail closed (no swallowed erro
         continuationFatigue: { isContinuationExhausted: async () => false },
       }),
     ).toThrow(/companionId must be a non-empty string/);
-  });
-});
-
-// ── Integration with the reservation phase (the seam this transport fills) ──
-
-function makeEpisode(): RoomEpisodeSnapshot {
-  return {
-    episodeId: 'episode-1',
-    channelId: CHANNEL,
-    status: 'open',
-    pressure: 0,
-    openedAtMs: 1_000,
-    lastActivityAtMs: 1_000,
-    consecutiveAutonomousTurns: 0,
-    lastSpeakerCompanionId: null,
-    revision: 1,
-    participants: [],
-  };
-}
-
-function makeReservation(reservationId: string): SpeakingReservationSnapshot {
-  return {
-    reservationId,
-    channelId: CHANNEL,
-    triggerEventId: TRIGGER,
-    companionId: COMPANION,
-    episodeId: 'episode-1',
-    reservedAtMs: 5_000,
-    expiresAtMs: 125_000,
-    status: 'reserved',
-    reason: null,
-    finalizedAtMs: null,
-    revision: 1,
-  };
-}
-
-function makeReservationPhase(resolverOpts?: Parameters<typeof makeResolver>[0]) {
-  const { resolver } = makeResolver(resolverOpts);
-  const reserve = vi.fn(
-    async (input: ReserveInput): Promise<ReserveResult> => ({
-      outcome: 'reserved',
-      reservation: makeReservation(input.reservationId),
-      episode: makeEpisode(),
-    }),
-  );
-  const releaseReservation = vi.fn(async () => makeReservation('r1'));
-  const readPot = vi.fn(
-    async (_input: SocialPotReadInput): Promise<SocialPotSnapshot> => ({
-      companionId: COMPANION,
-      balance: 100,
-      cap: 240,
-      lastRegenAtMs: 0,
-      revision: 1,
-    }),
-  );
-  const phase = new SpeakingReservationPhase({
-    store: { reserve, releaseReservation },
-    socialPot: { readPot },
-    icpPrecedence: resolver,
-    companionId: COMPANION,
-    config: {
-      reservationTtlMs: 120_000,
-      minReserveDrawUnits: 1,
-      socialPot: {
-        capUnits: 240,
-        perChannelDrawFraction: 0.34,
-        regenerationTickMs: 3_600_000,
-        regenerationUnitsPerTick: 10,
-      },
-      roomEpisodeCircuitBreaker: { tripThreshold: 100, resetThreshold: 40 },
-      wrapUpThreshold: 60,
-    },
-    generateReservationId: () => '99999999-9999-4999-8999-999999999999',
-  });
-  return { phase, reserve, readPot };
-}
-
-describe('live ICP transport wired into SpeakingReservationPhase', () => {
-  it('reserves when live ICP state is open (no contention)', async () => {
-    const { phase, reserve } = makeReservationPhase();
-    const decision = await phase.reserve(ctx());
-    expect(decision.outcome).toBe('reserved');
-    expect(reserve).toHaveBeenCalledOnce();
-  });
-
-  it('gates on a live ICP turn fence before the pot or store are touched', async () => {
-    const { phase, reserve, readPot } = makeReservationPhase({ fenced: true });
-    const decision = await phase.reserve(ctx());
-    expect(decision).toEqual({ outcome: 'gated', blockedBy: 'icp_turn_fenced' });
-    expect(readPot).not.toHaveBeenCalled();
-    expect(reserve).not.toHaveBeenCalled();
-  });
-
-  it('gates on a live DND availability lease with the specific state', async () => {
-    const { phase } = makeReservationPhase({
-      availability: availabilityResult({ lease: makeLease('do_not_disturb') }),
-    });
-    const decision = await phase.reserve(ctx());
-    expect(decision).toEqual({
-      outcome: 'gated',
-      blockedBy: 'icp_availability',
-      availabilityState: 'do_not_disturb',
-    });
-  });
-
-  it('fails closed to gate_error at the icp_precedence stage when a signal source errors', async () => {
-    const { phase, reserve, readPot } = makeReservationPhase({
-      fenced: async () => {
-        throw new Error('postgres unavailable');
-      },
-    });
-    const decision = await phase.reserve(ctx());
-    expect(decision).toEqual({ outcome: 'gated', blockedBy: 'gate_error', errorStage: 'icp_precedence' });
-    // Fail closed: no economy work, no reservation — the erroring ICP signal
-    // suppressed the social turn.
-    expect(readPot).not.toHaveBeenCalled();
-    expect(reserve).not.toHaveBeenCalled();
   });
 });

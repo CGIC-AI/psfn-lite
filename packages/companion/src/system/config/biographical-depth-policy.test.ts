@@ -1,8 +1,5 @@
 import { describe, expect, it } from 'vitest';
 
-import { SETTINGS_GARDEN_FIELD_EXPOSURE } from '../../shared/contracts/settings-garden-contract.js';
-import { normalizeEditableSettings, RUNTIME_SETTINGS_KEYS } from '../settings.js';
-import { resolveSettingsDomainForField } from './settings-domain-registry.js';
 import {
   createDefaultBiographicalDepthPolicy,
   normalizeBiographicalDepthPolicy,
@@ -32,17 +29,5 @@ describe('biographical depth owner setting', () => {
       ...policy,
       full: { ...policy.full, retentionClaimLimit: 100 },
     })).toThrow(/full depth must be null/);
-  });
-
-  it('is normalized through settings.json and exposed in Garden memory settings', () => {
-    const policy = createDefaultBiographicalDepthPolicy();
-    expect(normalizeEditableSettings({ biographicalDepthPolicy: policy }))
-      .toEqual({ biographicalDepthPolicy: policy });
-    expect(RUNTIME_SETTINGS_KEYS).toContain('biographicalDepthPolicy');
-    expect(SETTINGS_GARDEN_FIELD_EXPOSURE.biographicalDepthPolicy).toEqual({
-      sectionId: 'memory',
-      surface: 'advanced',
-    });
-    expect(resolveSettingsDomainForField('biographicalDepthPolicy')).toBe('memory');
   });
 });

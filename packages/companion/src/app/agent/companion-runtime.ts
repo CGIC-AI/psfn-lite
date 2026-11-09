@@ -229,7 +229,6 @@ import {
   createBackupFailureAlertHandler,
   createPromptGenerationFailureAlertHandler,
   createQuarantineExpiryAlertHandler,
-  createRepeatedScreeningFailureAlertHandler,
   createScheduledTaskFailureAlertHandler,
   createSleepConsolidationFailureAlertHandler,
 } from '../startup/support/operator-alerts.js';
@@ -404,7 +403,9 @@ async function composeCompanionRuntime(
   const { llmClient, embeddingProvider } = providerServices;
   const llmProvider = createLLMProviderPort(llmClient);
   const embeddingDims = embeddingProvider.dims;
-  const primaryUserId = options.primaryUserId ?? (config.voiceTargetUserId?.trim() || env.PRIMARY_USER_ID);
+  // donor main.ts preferred settings.json voiceTargetUserId; voice is cut, so the
+  // primary user comes from the host option or PRIMARY_USER_ID (B7).
+  const primaryUserId = options.primaryUserId ?? env.PRIMARY_USER_ID;
 
   // donor main.ts:405-445 (persistence runtime; the gateway contact-lifecycle port is cut)
   assertBackgroundWorkFitsTurnRecordFenceLane(
@@ -768,14 +769,9 @@ async function composeCompanionRuntime(
     createSleepConsolidationFailureAlertHandler(operatorNotifier, card.data.name),
   );
   eventBus.on('intake.quarantine.expired', createQuarantineExpiryAlertHandler(operatorNotifier, card.data.name));
-  eventBus.on(
-    'intake.screening.fail_closed',
-    createRepeatedScreeningFailureAlertHandler({
-      notifier: operatorNotifier,
-      companionName: card.data.name,
-      failureThreshold: coreConfig.intakeScreeningFailureAlertThreshold,
-    }),
-  );
+  // The repeated intake-screening failure alert is cut with the CogSec intake
+  // firewall (seam 3.4): nothing in Lite emits intake.screening.fail_closed, and
+  // its threshold is a cut settings.json key (B7).
   // donor core-runtime.ts:558-573 (doing mirror; the wishlist source is cut with the wiki)
   const doingMirrorService = new DoingMirrorService({
     store: persistenceRuntime.doingMirrorStore,

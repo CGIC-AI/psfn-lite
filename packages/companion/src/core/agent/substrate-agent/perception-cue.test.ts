@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ImageEmbodimentConsistency } from '../../../primitives/images/types.js';
+import type { ImageEmbodimentConsistency } from '../../../shared/contracts/image-vision-review.js';
 import {
   applyPerceptionCueToRetrievalQuery,
   buildPerceptionEvidencePriorityBlock,

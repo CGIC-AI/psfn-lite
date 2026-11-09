@@ -6,7 +6,7 @@ import { TurnPromptVariableNamespace } from '../../identity/prompt-variable-name
 import { composeDefaultRuntimePromptTemplate } from '../../identity/runtime-prompt-layers.js';
 import { buildActiveConcernsRuntimeData } from '../../intention/concerns.js';
 import type { SubstrateMessage } from '../../../shared/contracts/runtime.js';
-import type { ApiHealthResponse, ApiHealthSubsystemStatus } from '../../../channels/api/types.js';
+import type { ApiHealthResponse, ApiHealthSubsystemStatus } from '../../../shared/contracts/api-health.js';
 import type { SessionEntry } from '../../session/types.js';
 import {
   createGroupConversationScope,

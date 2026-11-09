@@ -14,7 +14,6 @@ import {
 import { emitConcernResolutionAppraisal } from './concern-resolution-appraisal.js';
 import type { ActiveConcern } from './concerns.js';
 import { createTestPostgresIntentionPorts } from '../../test-support/postgres-intention-ports.js';
-import { AdminConcernDataService } from '../../operator/garden/services/concern-service.js';
 
 function concernFixture(overrides: Partial<ActiveConcern> = {}): ActiveConcern {
   return {
@@ -256,10 +255,14 @@ describe('createConcernResolutionArcRecorder', () => {
       source: 'decision',
     });
 
-    const query = new AdminConcernDataService(concernStore, journal);
-    const result = await query.listConcernArcs(created.id, {
-      provenanceRef: `concern:${created.id}`,
-    });
+    // The arc query the donor's Garden concern service forwards to the journal
+    // (operator/garden/services/concern-service.ts:49-60, vendored scaffolding).
+    const result = {
+      arcs: await journal.listConcernArcs({
+        concernId: created.id,
+        provenanceRef: `concern:${created.id}`,
+      }),
+    };
     expect(observedEvents).toEqual([resolved!.resolutionGenerationId]);
     expect(result.arcs).toEqual([
       expect.objectContaining({

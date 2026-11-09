@@ -1,7 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { createPostgresPool } from '../../../persistence/postgres.js';
-import { quarantineRestoredContactLifecycleAuthority } from '../../../persistence/backups/contact-lifecycle-restore.js';
 import {
   DEFAULT_POSTGRES_TEST_IMAGE,
   startPostgresTestHarness,
@@ -344,53 +343,6 @@ describe('Postgres companion contact lifecycle ledger', () => {
       expect(new Set(lock.rows.map(row => row.lock_state))).toEqual(new Set(['active']));
     } finally {
       await Promise.all([pool.end(), secondPool.end()]);
-    }
-  }, TIMEOUT_MS);
-
-  it('quarantines restored ownership and intents before startup recovery can claim them', async () => {
-    const databaseUrl = await freshDatabaseUrl();
-    const { pool, store } = await createVerifiedOwner(databaseUrl);
-    try {
-      const intentId = 'aba7b810-9dad-41d1-80b4-00c04fd430c8';
-      await store.prepareContactLifecycleIntent(prepareRequest(intentId));
-      await quarantineRestoredContactLifecycleAuthority({ databaseUrl }, ['public']);
-      await expect(store.assertContactLifecycleLedgerHealthy()).resolves.toBeUndefined();
-      await expect(store.claimContactLifecycleRecovery({ leaseOwner: 'startup-worker' }))
-        .resolves.toEqual([]);
-      await expect(store.prepareContactLifecycleIntent(prepareRequest(intentId)))
-        .rejects.toThrow(/restored_intent_quarantined/);
-      const state = await pool.query<{
-        ownership_state: string;
-        ownership_restore_state: string;
-        contact_lifecycle_state: string;
-        contact_restore_state: string;
-        phase: string;
-        intent_restore_state: string;
-        lock_state: string;
-      }>(`
-        SELECT ownership.ownership_state,
-               ownership.restore_state AS ownership_restore_state,
-               contact.contact_lifecycle_state, contact.contact_restore_state,
-               intent.phase, intent.restore_state AS intent_restore_state,
-               lock.lock_state
-        FROM contact_channel_ids AS ownership
-        JOIN contacts AS contact ON contact.id = ownership.contact_id
-        JOIN contact_lifecycle_intents AS intent ON intent.intent_id = $1
-        JOIN contact_lifecycle_target_locks AS lock ON lock.intent_id = intent.intent_id
-        WHERE ownership.channel = 'discord'
-        LIMIT 1
-      `, [intentId]);
-      expect(state.rows[0]).toEqual({
-        ownership_state: 'quarantined',
-        ownership_restore_state: 'quarantined',
-        contact_lifecycle_state: 'quarantined',
-        contact_restore_state: 'quarantined',
-        phase: 'quarantined',
-        intent_restore_state: 'quarantined',
-        lock_state: 'quarantined',
-      });
-    } finally {
-      await pool.end();
     }
   }, TIMEOUT_MS);
 

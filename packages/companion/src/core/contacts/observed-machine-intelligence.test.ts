@@ -6,7 +6,6 @@ import {
   isDeliberateMachineIntelligenceCorrection,
   observedMachineIntelligenceActor,
 } from './observed-machine-intelligence.js';
-import { resolveFatigueRelationshipClass } from '../agent/fatigue/policy.js';
 
 const PRIMARY_USER_ID = 'owner-1';
 
@@ -135,33 +134,6 @@ describe('applyObservedMachineIntelligence (E7.3 auto-tagging)', () => {
     expect(result.disposition).toBe('operator_override');
     const reloaded = await store.getById(contact.id);
     expect(reloaded?.isMachineIntelligence).not.toBe(true);
-  });
-
-  it('feeds fatigue relationship-class resolution once marked', async () => {
-    const contact = await store.resolveChannelIdentity('discord', 'peer-bot-5', 'PeerBot5');
-    // Before marking: not a machine intelligence -> the non-MI class.
-    expect(resolveFatigueRelationshipClass({
-      contactId: contact.id,
-      isMachineIntelligence: contact.isMachineIntelligence === true,
-      relationshipType: contact.relationshipType,
-      trustLevel: contact.trustLevel,
-    })).toBe('non_machine_intelligence');
-
-    const marked = (await applyObservedMachineIntelligence({
-      contactStore: store,
-      contact,
-      observedIsMachineIntelligence: true,
-      channelType: 'discord',
-      logger: silentLogger,
-    })).contact;
-
-    const relationshipClass = resolveFatigueRelationshipClass({
-      contactId: marked.id,
-      isMachineIntelligence: marked.isMachineIntelligence === true,
-      relationshipType: marked.relationshipType,
-      trustLevel: marked.trustLevel,
-    });
-    expect(relationshipClass).not.toBe('non_machine_intelligence');
   });
 
   it('preserves an operator correction that lands concurrently with the observation (TOCTOU regression)', async () => {

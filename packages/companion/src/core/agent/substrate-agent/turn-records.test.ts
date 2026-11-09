@@ -13,18 +13,6 @@ import type { AgentMessage } from '../../../boundary/pi-agent/index.js';
 import { executeToolCallsWithScheduler } from '../tool-call-scheduler.js';
 import type { ToolResultMessage } from '@earendil-works/pi-ai';
 import { createHash } from 'node:crypto';
-import {
-  accumulateDisclosureSource,
-  beginDisclosureAccumulation,
-} from '../../cogsec/disclosure/decision.js';
-import {
-  DISCLOSURE_CLASSIFIER_VERSION,
-  toolResultDisclosureContribution,
-} from '../../cogsec/disclosure/generation-lineage.js';
-import {
-  buildCustodySnapshot,
-  custodySnapshotRefForTurn,
-} from '../../cogsec/disclosure/custody-snapshot.js';
 
 const AUDIT_TURN_ID = '019d2326-d9e1-701d-bcee-250d2cbb0e4e';
 const AUDIT_REQUEST_ID = 'request-audit-privacy';
@@ -2043,48 +2031,6 @@ describe('tool-call custody edge', () => {
     const turnRecord = buildCustodyTurnRecord([message], new Map());
     expect(turnRecord.toolCalls[0]?.resultCustody).toBeUndefined();
     expect(turnRecord.toolCalls[0]?.intakeEnvelope).toBeUndefined();
-  });
-
-  it('matches the custody snapshot tool-result contributions exactly', () => {
-    const first = toolResultMessage({
-      toolCallId: 'call-a',
-      toolName: 'wiki_read',
-      text: 'first result',
-      screening: { withheld: false, envelopeId: 'env-a' },
-    });
-    const second = toolResultMessage({
-      toolCallId: 'call-b',
-      toolName: 'shell',
-      text: 'second result',
-    });
-    const records = observeToolResults([first, second], [toolEnvelope('env-a'), null]);
-    const custodyByRef = new Map(records.map(record => [record.ref, record]));
-    const turnRecord = buildCustodyTurnRecord([first, second], custodyByRef);
-
-    let lineage = beginDisclosureAccumulation({
-      generationContextRef: custodySnapshotRefForTurn(CUSTODY_TURN_ID),
-      classifierVersion: DISCLOSURE_CLASSIFIER_VERSION,
-      classifiedAt: new Date(1_700_000_000_000).toISOString(),
-    });
-    for (const record of records) {
-      lineage = accumulateDisclosureSource(
-        lineage,
-        toolResultDisclosureContribution(record.disclosureSource),
-      );
-    }
-    const snapshot = buildCustodySnapshot({
-      lineage,
-      turnId: CUSTODY_TURN_ID,
-      requestId: CUSTODY_REQUEST_ID,
-      toolResultEdges: new Map(records.map(record => [record.ref, record.custody])),
-    });
-
-    const snapshotEdges = snapshot.sources
-      .filter(source => source.kind === 'tool')
-      .map(source => source.toolResult);
-    const turnRecordEdges = turnRecord.toolCalls.map(call => call.resultCustody);
-    expect(snapshotEdges).toEqual(turnRecordEdges);
-    expect(snapshotEdges).toHaveLength(2);
   });
 
   it('keeps one edge per tool call id when a retried result replaces an earlier one', () => {

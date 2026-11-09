@@ -43,13 +43,12 @@ const SELFHOOD_PATHS = [
   'src/core/self-model',
 ];
 
+// Lite Step B7: src/boundary/gateway/filesystem-paths.ts, methods/fs.ts and
+// src/persistence/pinned-filesystem.ts were vendored scaffolding and are deleted.
 const NATIVE_BASELINE_PATHS = [
   'src/faculties/memory',
   'src/system/config',
   'src/boundary/integrations/filesystem',
-  'src/boundary/gateway/filesystem-paths.ts',
-  'src/boundary/gateway/methods/fs.ts',
-  'src/persistence/pinned-filesystem.ts',
   'src/shared/utils/fs.ts',
 ];
 

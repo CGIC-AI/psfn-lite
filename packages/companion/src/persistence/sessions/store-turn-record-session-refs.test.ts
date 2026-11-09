@@ -12,15 +12,8 @@ import {
   REDACTED_MESSAGE_PLACEHOLDER,
   WITHHELD_WIRE_BODY_MARKER,
 } from './turn-record-session-refs.js';
-import {
-  AdminSessionTurnObservabilityStore,
-  buildPromptLoomData,
-} from '../../operator/garden/services/session-turn-observability.js';
-import type { AdminTurnSnapshotData } from '../../operator/garden/services/types.js';
 import { EventBus } from '../../shared/event-bus.js';
 import { createTurnRecordIntrospectionSource } from '../../faculties/introspection/source.js';
-import { CogSecEventStore } from '../../core/cogsec/events.js';
-import { CogSecForensicArchive } from '../../core/cogsec/forensic-archive.js';
 import {
   resolveCogSecEventsPath,
   resolveCogSecForensicArchiveDir,

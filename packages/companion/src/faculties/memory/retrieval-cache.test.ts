@@ -4,9 +4,6 @@ import type { EmbeddingProviderPort } from '../../shared/contracts/embedding-pro
 import type { MemoryStorePort } from './memory-store-port.js';
 import { MemoryRetriever } from './retrieval.js';
 import type { PurrMemory } from './types.js';
-import type { SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
-import { WikiRetrievalService } from '../wiki/retrieval.js';
-import { resolveEmbeddingProviderProvenanceFromConfig } from './embedding.js';
 import type { ContactStorePort } from '../../core/contacts/contact-store-port.js';
 import type { Contact } from '../../core/contacts/types.js';
 import { keysetActiveMemoryPages, recentlyAccessedMemories } from '../../test-support/active-memory-pages.js';
@@ -66,17 +63,6 @@ function makeEmbedding(): EmbeddingProviderPort {
     embedBatch: vi.fn(async () => []),
     dims: 3,
   };
-}
-
-function makeRuntimeConfig(): SubstrateConfig {
-  return {
-    defaultContextWindow: 128_000,
-    modelRoster: {},
-    memoryRetrievalBudgetPct: 2,
-    embeddingProvider: 'api',
-    embeddingApiModel: 'test-embedding-v1',
-    embeddingApiDims: 3,
-  } as unknown as SubstrateConfig;
 }
 
 describe('active-memory refresh cache', () => {
@@ -267,123 +253,5 @@ describe('active-memory refresh cache', () => {
     expect(withdrawn?.manifestSeed?.roomVisibilityRejectedCount).toBe(1);
     expect(embedding.embed).toHaveBeenCalledTimes(2);
     expect(store.searchByEmbedding).toHaveBeenCalledTimes(2);
-  });
-
-});
-
-describe('shared per-turn retrieval embedding', () => {
-  it('shares one query embedding between memory and wiki without changing either result', async () => {
-    const recalled = makeMemory('memory-1', 'Morgan prefers oolong tea.');
-    const sharedFixture = makeStore([recalled]);
-    const sharedEmbedding = makeEmbedding();
-    const config = makeRuntimeConfig();
-    const sharedRetriever = new MemoryRetriever(sharedFixture.store, sharedEmbedding, config);
-    const queryText = 'tea preference';
-    const sharedValue = sharedRetriever.createTurnRetrievalQueryEmbedding({
-      turnId: 'turn-1',
-      requestId: 'request-1',
-      companionId: 'companion-a',
-      channelId: 'api:test',
-      canonicalContactId: 'contact-a',
-      queryText,
-    });
-    const wikiMatches = [{
-        documentId: 'tea-guide',
-        title: 'Tea Guide',
-        path: 'documents/tea-guide.md',
-        sourceClass: 'companion_authored_note' as const,
-        sensitivity: 'personal' as const,
-        scope: 'personal' as const,
-        chunkIndex: 0,
-        chunkText: 'Oolong is partially oxidized.',
-        score: 0.9,
-      }];
-    const sharedProjection = {
-      search: vi.fn(async () => wikiMatches),
-    };
-    const sharedWiki = new WikiRetrievalService({
-      projection: sharedProjection,
-      embedding: sharedEmbedding,
-      embeddingProvenance: resolveEmbeddingProviderProvenanceFromConfig(config, sharedEmbedding.dims),
-      getSettings: () => ({
-        enabled: true,
-        chatTokenCap: 1000,
-        groupTokenCap: 400,
-        focusTokenCap: 2000,
-        similarityThreshold: 0.6,
-        groupSimilarityThreshold: 0.78,
-      }),
-    });
-    const memoryRequest = {
-      contextText: queryText,
-      channelId: 'api:test',
-      trustLevel: 'regular' as const,
-      canonicalContactId: 'contact-a',
-      turnId: 'turn-1',
-      requestId: 'request-1',
-      companionId: 'companion-a',
-      retrievalQueryEmbedding: sharedValue,
-    };
-    const wikiRequest = {
-      channelId: 'api:test',
-      queryText,
-      isDirectMessage: true,
-      focusActive: false,
-      turnId: 'turn-1',
-      requestId: 'request-1',
-      companionId: 'companion-a',
-      canonicalContactId: 'contact-a',
-      retrievalQueryEmbedding: sharedValue,
-    };
-
-    const [sharedMemoryResult, sharedWikiResult] = await Promise.all([
-      sharedRetriever.refreshActiveMemoryContext(memoryRequest),
-      sharedWiki.refreshWikiContextBlock(wikiRequest),
-    ]);
-
-    const baselineFixture = makeStore([recalled]);
-    const baselineEmbedding = makeEmbedding();
-    const baselineRetriever = new MemoryRetriever(baselineFixture.store, baselineEmbedding, config);
-    const baselineProjection = { search: vi.fn(async () => wikiMatches) };
-    const baselineWiki = new WikiRetrievalService({
-      projection: baselineProjection,
-      embedding: baselineEmbedding,
-      getSettings: () => ({
-        enabled: true,
-        chatTokenCap: 1000,
-        groupTokenCap: 400,
-        focusTokenCap: 2000,
-        similarityThreshold: 0.6,
-        groupSimilarityThreshold: 0.78,
-      }),
-    });
-    const [baselineMemoryResult, baselineWikiResult] = await Promise.all([
-      baselineRetriever.refreshActiveMemoryContext({
-        contextText: queryText,
-        channelId: 'api:test',
-        trustLevel: 'regular',
-        canonicalContactId: 'contact-a',
-      }),
-      baselineWiki.refreshWikiContextBlock({
-        channelId: 'api:test',
-        queryText,
-        isDirectMessage: true,
-        focusActive: false,
-      }),
-    ]);
-
-    expect(sharedEmbedding.embed).toHaveBeenCalledTimes(1);
-    expect(sharedFixture.store.searchByEmbedding).toHaveBeenCalledTimes(1);
-    expect(sharedProjection.search).toHaveBeenCalledTimes(1);
-    expect(sharedProjection.search.mock.calls[0]?.[0]).not.toBe(
-      vi.mocked(sharedFixture.store.searchByEmbedding).mock.calls[0]?.[0],
-    );
-    expect(Array.from(sharedProjection.search.mock.calls[0]![0])).toEqual(
-      Array.from(vi.mocked(sharedFixture.store.searchByEmbedding).mock.calls[0]![0]),
-    );
-    expect(sharedMemoryResult?.contextBlock).toBe(baselineMemoryResult?.contextBlock);
-    expect(sharedMemoryResult?.selectedMemoryIds).toEqual(baselineMemoryResult?.selectedMemoryIds);
-    expect(sharedWikiResult?.block).toBe(baselineWikiResult?.block);
-    expect(baselineEmbedding.embed).toHaveBeenCalledTimes(2);
   });
 });

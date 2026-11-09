@@ -1,32 +1,16 @@
 import type { AgentTool } from '../../../boundary/pi-agent/index.js';
-import { createBeadsTool } from '../../../boundary/integrations/beads/tools.js';
-import { createFsTool } from '../../../boundary/integrations/filesystem/tools.js';
-import { createRepoTool } from '../../../boundary/integrations/git/tools.js';
 import { createJournalTool } from '../../../boundary/integrations/journal/tools.js';
 import { createAutomataBusTool } from '../../../faculties/automata/bus/worker-access.js';
-import { createMcpTool } from '../../../boundary/integrations/mcp/tools.js';
-import { createShellTool } from '../../../boundary/integrations/shell/tools.js';
-import { createVaultTool } from '../../../boundary/integrations/vault/tools.js';
-import { createWebTool } from '../../../boundary/integrations/web/tools.js';
-import { createWorldTool } from '../../../boundary/integrations/world/tools.js';
 import { createContactTool } from '../../contacts/tools.js';
 import { createIdentityTool } from '../../identity/prompt-tools.js';
 import { createScheduleTool } from '../../scheduler/schedule-tool.js';
-import { createAnalysisWorkbenchTool } from '../../tools/analysis-workbench/tools.js';
-import { createSystemTool } from '../../tools/lifecycle.js';
-import { createNotifyTool } from '../../tools/ntfy.js';
-import { createSelfStatusTool } from '../../tools/self-status.js';
 import { createSessionTool } from '../../tools/session.js';
 import { createLetterTool } from '../../tools/letter.js';
 import { createOrientTool } from '../../../faculties/core-memory/tools.js';
 import { createMemoryTool } from '../../../faculties/memory/tools.js';
 import { createScratchpadTool } from '../../../faculties/memory/tools/scratchpad.js';
 import { createNorthStarTool } from '../../../faculties/north-star/tools.js';
-import { createSkillTool } from '../../../faculties/skills/tools.js';
 import { createSubagentTool } from '../../../faculties/subagents/tools.js';
-import { createWikiTool } from '../../../faculties/wiki/tools.js';
-import { createPublicationTool } from '../../cogsec/disclosure/publication-tool.js';
-import { createGenerateImageTool, createSelfieTool } from '../../../primitives/images/tools.js';
 import { createResponseControlTool } from '../no-reply-tool.js';
 import { createToolSearchTool, createToolsetTool } from '../substrate-agent/adaptive-tools-runtime.js';
 import { INTAKE_FIREWALL_OFF_SELF_AUTHORED_MUTATION_RUNTIME } from '../../session/intake-sink-gating.js';
@@ -39,6 +23,18 @@ function testBound(value: string): number {
 function testSensitivity(value: SensitivityLevel): SensitivityLevel {
   return value;
 }
+
+/**
+ * Registry surfaces whose donor factories were vendored scaffolding and were
+ * deleted in Lite Step B7 (the host owns or excludes these tools; see
+ * docs/tool-inventory.md "Deliberately excluded donor surfaces"). The core
+ * registry still describes them; no Lite factory builds them.
+ */
+export const SCAFFOLDING_HOSTED_TOOL_SURFACES: ReadonlySet<string> = new Set([
+  'fs', 'repo', 'shell', 'web', 'mcp', 'world', 'analysis_workbench', 'self_status',
+  'system', 'skill', 'wiki', 'beads', 'notify', 'generate_image', 'selfie_create',
+  'publication', 'vault',
+]);
 
 export function createProviderFactoryToolCatalog(): AgentTool<any>[] {
   const inert = {} as never;
@@ -81,21 +77,16 @@ export function createProviderFactoryToolCatalog(): AgentTool<any>[] {
   });
   return [
     createToolSearchTool(inert), createToolsetTool(inert),
-    createResponseControlTool(() => null), createFsTool(inert), createRepoTool(inert),
-    createShellTool(inert), createWebTool(inert), createWorldTool(inert, inert),
-    createMcpTool({ gateway: inert }),
-    createAnalysisWorkbenchTool(inert), createOrientTool(inert), createIdentityTool(inert, {
+    createResponseControlTool(() => null),
+    createOrientTool(inert), createIdentityTool(inert, {
       intake: INTAKE_FIREWALL_OFF_SELF_AUTHORED_MUTATION_RUNTIME,
     }),
     createMemoryTool(inert, inert), automataBus, createScratchpadTool(inert), createContactTool(inert, {
       intake: INTAKE_FIREWALL_OFF_SELF_AUTHORED_MUTATION_RUNTIME,
     }),
-    createSessionTool(inert), createLetterTool(inert), createSelfStatusTool(inert), createSystemTool(inert),
-    createSkillTool(inert), createWikiTool(inert, {
-      intake: INTAKE_FIREWALL_OFF_SELF_AUTHORED_MUTATION_RUNTIME,
-    }), createScheduleTool(inert),
-    createNorthStarTool(inert), createBeadsTool(inert), createNotifyTool(inert),
-    createGenerateImageTool(inert), createSelfieTool(inert), createSubagentTool(inert),
-    createVaultTool(inert), createJournalTool(inert), createPublicationTool(inert),
+    createSessionTool(inert), createLetterTool(inert),
+    createScheduleTool(inert),
+    createNorthStarTool(inert), createSubagentTool(inert),
+    createJournalTool(inert),
   ];
 }
