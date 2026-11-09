@@ -55,6 +55,7 @@ import {
   type EmbeddingPort,
   type PiModelRuntime,
 } from './pi.ts';
+import { createModelUsageLedger, type ModelUsageSnapshot } from './model-usage.ts';
 import { buildSubstrateConfig } from './substrate-config.ts';
 
 /** The contact key of the configured operator. */
@@ -90,6 +91,8 @@ export interface LiteRuntime {
   converse(text: string): Promise<AgentResponse>;
   /** Aborts the operator's running turn (donor SubstrateAgent.abort). */
   interrupt(): void;
+  /** Model and embedding usage since start, from the host's model-usage recorder (seam 3.1). */
+  modelUsage(): ModelUsageSnapshot;
   close(): Promise<void>;
 }
 
@@ -157,6 +160,7 @@ export async function createLiteRuntime(input: {
   process.env['CONFIG_DIR'] ??= seedDir;
   const registry = { models: [companionModelRegistryEntryOf(model.value, HOST_MODEL_ENTRY)] };
   const relay = config.lifecycle === null ? null : new HostTurnRelay();
+  const modelUsage = createModelUsageLedger();
   // Hosted automata: spawned automata run as host subagents, attempt by attempt (docs/extraction.md, operator automata rules).
   const automata = config.lifecycle?.automata == null
     ? null
@@ -184,6 +188,7 @@ export async function createLiteRuntime(input: {
       }),
       innerLife,
       providerRuntime: companionProviderRuntimeOf(model.value) as unknown as ProviderRuntime,
+      modelUsageRecorder: modelUsage,
       embeddingProvider: companionEmbeddingProviderOf(embeddings, { model: config.embedding.model, dimensions: config.embedding.dimensions }) as EmbeddingRuntimeProvider,
       ...(overrides.textEmotionClassifier === undefined ? {} : { textEmotionClassifier: overrides.textEmotionClassifier }),
       sessionIntegrityProvider,
@@ -315,6 +320,7 @@ export async function createLiteRuntime(input: {
     interrupt: () => {
       companion.agentLoop.abort();
     },
+    modelUsage: () => modelUsage.snapshot(),
     close: () => (closed ??= closeAll()),
   });
 }

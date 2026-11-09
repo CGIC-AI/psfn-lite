@@ -5,13 +5,15 @@
 // companionProviderRuntimeOf / companionModelRegistryEntryOf and a
 // deterministic embedding port behind companionEmbeddingProviderOf. It proves
 // a turn through SubstrateAgent.handleMessage, the scheduler heartbeat, the
-// registered background lanes and that no scaffolding schema is created.
+// registered background lanes, that autonomous lanes reach the model through
+// the host's model-usage recorder (seam 3.1) and that no scaffolding schema is
+// created.
 // A Lite addition: listed in extraction/added-tests.tsv.
 
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   createModels,
   fauxAssistantMessage,
@@ -33,6 +35,8 @@ import {
   type PostgresTestHarness,
 } from '../../test-support/postgres-test-harness.js';
 import { EventBus } from '../../shared/event-bus.js';
+import { getRecentDiagnosticLogRecords } from '../../shared/logger.js';
+import type { ModelUsageEventInput } from '../../shared/telemetry/model-usage.js';
 import { loadInnerLifeConfig } from '../../system/config/inner-life-config.js';
 import type { SubstrateConfig } from '../../system/config/runtime-config-contracts.js';
 import type { ProviderRuntime } from '../../primitives/llm/provider-runtime.js';
@@ -54,6 +58,9 @@ let dataDir = '';
 let runtime: CompanionRuntime | null = null;
 const eventBus = new EventBus();
 const modelContexts: Context[] = [];
+const usageEvents: ModelUsageEventInput[] = [];
+/** client.ts assertAutonomousCallAccountable: the refusal an autonomous call gets without a recorder. */
+const UNACCOUNTED_REFUSAL = 'has no usageRecorder configured';
 const healthchecks: { timestamp: number; taskCount: number }[] = [];
 const lifecycle: string[] = [];
 let firstHealthcheck: Promise<void> = Promise.resolve();
@@ -243,6 +250,12 @@ beforeAll(async () => {
       { embed: texts => Promise.resolve(ok(texts.map(vectorFor))) },
       { model: 'boot-test-embedding', dimensions: EMBEDDING_DIMS },
     ) as EmbeddingRuntimeProvider,
+    modelUsageRecorder: {
+      recordUsageEvent: event => {
+        usageEvents.push(event);
+        return Promise.resolve();
+      },
+    },
     textEmotionClassifier: {
       preload: () => Promise.resolve(),
       classify: () => Promise.resolve([{ label: 'neutral', score: 1 }]),
@@ -289,6 +302,36 @@ describe('startCompanionRuntime (Lite boot over PostgreSQL)', () => {
     const ids = runtime!.scheduler.listTasks().map(task => task.id).sort();
     expect(ids).toEqual(EXPECTED_TASK_IDS);
   });
+
+  it('runs autonomous lanes through the host model-usage recorder', async () => {
+    // Turns record foreground usage. Their post-turn intention appraisal is an
+    // autonomous work-spec call (lane post_turn_appraisal), which the
+    // LLMClient refuses without a recorder (seam 3.1). It runs once the turns
+    // since the last appraisal reach the seed appraisal frequency
+    // (core/intention/appraisal/classification.ts).
+    for (let n = 2; n <= 4; n += 1) {
+      await runtime!.agentLoop.handleMessage({
+        id: `boot-msg-${n}`,
+        channelId: 'terminal:boot',
+        channelType: 'terminal',
+        authorId: 'boot-user',
+        authorName: 'Boot User',
+        content: `I am Sam and I love sailing on lake number ${n}.`,
+        timestamp: new Date(),
+      });
+    }
+    await vi.waitFor(() => {
+      expect(usageEvents.some(event => (
+        event.attribution.runtimeLaneClass === 'post_turn_appraisal'
+        && event.callKind === 'completion'
+        && event.status === 'success'
+      ))).toBe(true);
+    }, { timeout: 30_000, interval: 100 });
+    expect(usageEvents.filter(event => event.attribution.runtimeLaneClass === 'foreground_chat').length).toBeGreaterThanOrEqual(4);
+    const refusals = getRecentDiagnosticLogRecords({ limit: 5_000 })
+      .filter(record => JSON.stringify(record).includes(UNACCOUNTED_REFUSAL));
+    expect(refusals).toEqual([]);
+  }, INTEGRATION_TIMEOUT_MS);
 
   it('creates no scaffolding schema or table', async () => {
     const pool = createPostgresPool(databaseUrl, { applicationName: 'lite-boot-inspect', max: 1 });
