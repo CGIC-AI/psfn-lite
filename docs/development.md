@@ -76,7 +76,10 @@ mise exec node@24.22.1 -- node packages/companion/extraction/compare-baseline.mj
 ```
 
 The donor Postgres-harness tests need Docker. Each run gets its own harness
-profile and temp directory, and removes exactly its own containers. Both vitest
+profile and temp directory, and removes exactly its own containers. The temp
+directory goes under `$TMPDIR` when it is set, else `/tmp`; every test temp file
+lands there, so point `TMPDIR` at a short disk-backed path (for example
+`TMPDIR=/var/tmp/lv`) when `/tmp` is a small tmpfs. Both vitest
 configs cap the run at 16 forks (`maxWorkers`), the shared-workstation budget. Do
 not raise it with `--maxWorkers`: uncapped runs lost forks there (see
 [extraction](extraction.md)).
