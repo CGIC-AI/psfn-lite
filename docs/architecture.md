@@ -24,9 +24,10 @@ and documents are the spec. That earlier core (`packages/core`,
 | Model | `packages/pi` | The Pi model runtime (a pi-ai model collection, one model, the host's key) that the core's provider port takes, and the adapter for a host that supplies its own embedding port. |
 | Embeddings | `packages/companion` | The donor's own embedding providers (`src/faculties/memory/embedding.ts`), which the core builds from the substrate config: `transformers` (in-process `@huggingface/transformers`, local and keyless, the default), `ollama` or `api` (docs/extraction.md, "Donor embedding providers restored"). |
 | Tool transport | `packages/mcp` | MCP over streamable HTTP or stdio. It serves the donor tool catalog and binds the caller from the transport credential. |
+| Operator surface | `packages/operator` | The light Garden: the donor Garden routes and services of its eight screens, plus Lite routes for what no kept donor route serves, on a loopback port behind the operator's own bearer ([extraction](extraction.md), "S8: the light Garden"). |
 | Lifecycle bridge | `packages/lifecycle` | Host-driven turns for an external host that runs its own model loop: `prepare`, `settle`, `checkpoint`, and the host tool port the MCP transport hands calls to. |
 | Standalone host | `apps/standalone` | The config document, the CLI (`init`, `once`, `chat`, `serve`) and the composition of the parts above. |
-| Hermes plugin | `integrations/hermes` | A Python Hermes plugin that turns every root Hermes turn into a host-driven Lite turn ([its README](../integrations/hermes/README.md)). |
+| Hermes plugin | `integrations/hermes` | A Python Hermes plugin that turns every root Hermes turn into a host-driven Lite turn ([its README](../integrations/hermes/README.md)). It also ships the light Garden: a dashboard backend that proxies to the operator surface, and a Hermes Desktop half built from `integrations/hermes/desktop`. |
 
 Each host package reaches the companion core through exactly one module
 (`companion.ts`), and another host package only through its public entry.
@@ -47,7 +48,7 @@ subsystems out ([conformance](conformance.md)).
    the donor's seeded default, `transformers` with `Xenova/all-MiniLM-L6-v2`
    at 384 dimensions, cached in `dataDir/models/transformers`),
    session-journal integrity (the donor HMAC keyring, or
-   unsigned), and the optional `mcp` and `lifecycle` endpoints. The
+   unsigned), and the optional `mcp`, `lifecycle` and `garden` endpoints. The
    `lifecycle` endpoint names the Hermes install it serves
    (`hermesInstallId`). Unknown keys are refused. Secrets are never in the
    file.
