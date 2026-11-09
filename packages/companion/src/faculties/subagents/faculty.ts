@@ -75,6 +75,7 @@ import {
 } from './tool-governance.js';
 import type { SubagentControlPort } from './port.js';
 import { SubagentTaskRegistry } from './task-registry.js';
+import type { HostedAutomatonOutcome, SubagentHostExecutionPort } from './host-execution.js';
 import type { AutomataRunRegistry } from '../automata/run-registry.js';
 import type { AutomataArtifactRef } from '../automata/registry-contract.js';
 import type { AutomataSessionClassificationService } from '../automata/session-classification.js';
@@ -250,6 +251,12 @@ export interface SubagentFacultyDeps {
   automataBusWorkerAccess?: AutomataBusWorkerAccess | null;
   /** Durable terminal handoff/inspection adapter; receives references, never raw worker text. */
   automataLifecyclePort?: AutomataTerminalLifecyclePort | null;
+  /**
+   * Lite (operator automata rule 4): run each spawned automaton's attempts on
+   * the host (Hermes subagents) instead of the in-core agent loop. Absent,
+   * every spawn runs in core exactly as in the donor.
+   */
+  hostExecution?: SubagentHostExecutionPort | null;
 }
 
 export interface WyomingSubagentDelegationResult {
@@ -279,6 +286,8 @@ interface ActiveSubagentHandle {
   systemPrompt: string;
   /** Governed Bus lifecycle owning this run's briefing, tool, and terminal. */
   automataRun: AutomataBusWorkerRun;
+  /** Lite: the attempts run on the host (deps.hostExecution), not in an in-core agent loop. */
+  hosted: boolean;
   /** bead 7ym.2.2 — role wall-clock deadline (ms), enforced as a turn-boundary budget ceiling. */
   roleTimeoutMs?: number;
   capabilities: string[];
@@ -581,6 +590,7 @@ export class SubagentFaculty implements SubagentControlPort {
       resolvedRole,
       systemPrompt,
       automataRun,
+      hosted: this.deps.hostExecution != null,
       ...(resolvedRole?.definition.timeoutMs !== undefined
         ? { roleTimeoutMs: resolvedRole.definition.timeoutMs }
         : {}),
@@ -603,8 +613,9 @@ export class SubagentFaculty implements SubagentControlPort {
         (this.roleActiveCounts.get(resolvedRole.name) ?? 0) + 1,
       );
     }
+    const hostExecution = this.deps.hostExecution;
     queueMicrotask(() => {
-      void this.runHandle(handle);
+      void (hostExecution ? this.runHostedHandle(handle, hostExecution) : this.runHandle(handle));
     });
     return task;
   }
@@ -613,6 +624,10 @@ export class SubagentFaculty implements SubagentControlPort {
     const handle = this.requireActiveHandle(subagentId);
     if (this.isCancellationRequested(handle)) {
       throw new Error(`Automaton "${subagentId}" is cancelling and cannot accept new messages.`);
+    }
+    if (handle.hosted) {
+      // A host subagent takes its task once, at launch (Hermes's lifecycle API has no follow-up message).
+      throw new Error(`Automaton "${subagentId}" runs on the host and cannot accept follow-up messages.`);
     }
     const content = normalizeRequiredText(message, 'message');
     const followUp = this.buildControlMessage(handle.channelId, content);
@@ -666,6 +681,10 @@ export class SubagentFaculty implements SubagentControlPort {
       });
       if (handle.agentLoop) {
         handle.agentLoop.abort();
+      } else if (handle.hosted && this.deps.hostExecution) {
+        // The host attempt ends at its next heartbeat, or a waiting task at once;
+        // runHostedHandle settles the handle with the cancelled outcome.
+        this.deps.hostExecution.cancel(subagentId, handle.cancelReason);
       } else {
         await this.finishHandle(handle, this.finalizeCancelled(handle, 0, 0, '', '', 0));
       }
@@ -900,6 +919,67 @@ export class SubagentFaculty implements SubagentControlPort {
           lastContent,
           turns,
         ));
+        return;
+      }
+      await this.finishHandle(handle, this.finalizeFailed(handle, toErrorMessage(error)));
+    }
+  }
+
+  /**
+   * Lite (operator automata rule 4): the automaton's attempts run on the host.
+   * Core derived the task (the spawn request's task), its scope (the governed
+   * run and its bound `automata_bus` tool) and the worker posture (the role
+   * layered over the Bus briefing, without the companion identity: a host
+   * subagent is a shared worker, not the companion). The host child persists
+   * only through that tool; its summary is the result.
+   */
+  private async runHostedHandle(
+    handle: ActiveSubagentHandle,
+    host: SubagentHostExecutionPort,
+  ): Promise<void> {
+    if (handle.settled) return;
+    try {
+      if (this.isCancellationRequested(handle)) {
+        await this.finishHandle(handle, this.finalizeCancelled(handle, 0, 0, '', '', 0));
+        return;
+      }
+      await this.transitionTask(handle.subagentId, 'running', 'agent_initialized', handle.startTime);
+      await this.emitLifecycleProgressHandoff(handle, 'started', 0);
+      const lineage = handle.automataRun.binding.lineage;
+      const context = layerRoleSystemPrompt(
+        '',
+        handle.request.systemPrompt,
+        handle.resolvedRole,
+        handle.automataRun.promptBlock ?? undefined,
+      ).trim();
+      const outcome: HostedAutomatonOutcome = await host.execute({
+        subagentId: handle.subagentId,
+        runId: lineage.runId,
+        taskId: lineage.taskId,
+        automatonClass: lineage.automatonClass,
+        name: handle.request.name,
+        goal: handle.request.task,
+        context: context.length > 0 ? context : null,
+        busTool: handle.automataRun.tool,
+      });
+      this.auditTrail?.append('subagent.host_execution.end', {
+        subagentId: handle.subagentId,
+        outcome: outcome.kind,
+        attempts: outcome.attempts,
+      });
+      if (outcome.kind === 'completed') {
+        await this.finishHandle(handle, this.finalizeCompleted(handle, 0, 0, outcome.model, outcome.summary, 1));
+      } else if (outcome.kind === 'cancelled') {
+        await this.finishHandle(handle, this.finalizeCancelled(handle, 0, 0, '', '', 0));
+      } else {
+        await this.finishHandle(handle, this.finalizeFailed(
+          handle,
+          `${outcome.reason} after ${outcome.attempts} host attempts: ${outcome.lastFailure}`,
+        ));
+      }
+    } catch (error) {
+      if (this.isCancellationRequested(handle)) {
+        await this.finishHandle(handle, this.finalizeCancelled(handle, 0, 0, '', '', 0));
         return;
       }
       await this.finishHandle(handle, this.finalizeFailed(handle, toErrorMessage(error)));

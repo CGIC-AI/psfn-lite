@@ -60,6 +60,7 @@ import type { CapabilityGrantSnapshot } from '../../../system/capabilities/acces
 import type { AutomataTerminalLifecyclePort } from '../../../faculties/automata/terminal-lifecycle.js';
 import { ShardFoldReviewController } from '../../../faculties/shards/fold-review.js';
 import { SubagentFaculty, type SubagentAuditTrail } from '../../../faculties/subagents/faculty.js';
+import type { SubagentHostExecutionPort } from '../../../faculties/subagents/host-execution.js';
 import { createSubagentTool } from '../../../faculties/subagents/tools.js';
 import { CoreMemoryStore } from '../../../faculties/core-memory/store.js';
 import { createOrientTool } from '../../../faculties/core-memory/tools.js';
@@ -655,6 +656,8 @@ export interface SubagentRuntimeOptions {
   automataSessionClassification?: Pick<AutomataSessionClassificationService, 'classifyAtCreation'>;
   automataBusWorkerAccess?: AutomataBusWorkerAccess | null;
   automataLifecyclePort?: AutomataTerminalLifecyclePort | null;
+  /** Lite (operator automata rule 4): see SubagentFacultyDeps.hostExecution. */
+  hostExecution?: SubagentHostExecutionPort | null;
 }
 
 /**
@@ -718,6 +721,7 @@ export function wireSubagentRuntime(options: SubagentRuntimeOptions): SubagentRu
     automataSessionClassification: options.automataSessionClassification,
     automataBusWorkerAccess: options.automataBusWorkerAccess,
     automataLifecyclePort: options.automataLifecyclePort,
+    hostExecution: options.hostExecution ?? null,
   });
   options.agentLoop.registerTool(createSubagentTool(subagentFaculty), 'core');
   return { subagentFaculty, foldReviewController };

@@ -216,6 +216,7 @@ import {
   wireSelfModelRuntime,
   wireSubagentRuntime,
 } from '../startup/composition/composition.js';
+import type { SubagentHostExecutionPort } from '../../faculties/subagents/host-execution.js';
 import {
   buildCharacterPromptVariablesProvider,
   wireCharacterCardRuntime,
@@ -306,6 +307,11 @@ export interface StartCompanionRuntimeOptions {
    * host-driven turns and delegate every other call. Default: that port's stream.
    */
   wrapStreamTransport?: (base: SubstrateStreamTransport) => SubstrateStreamTransport;
+  /**
+   * Lite (operator automata rule 4): run spawned automata as host subagents
+   * (SubagentFacultyDeps.hostExecution). Default: in core, as the donor.
+   */
+  automataHostExecution?: SubagentHostExecutionPort | null;
 }
 
 export interface CompanionRuntime {
@@ -1134,6 +1140,7 @@ async function composeCompanionRuntime(
     automataSessionClassification: persistenceRuntime.automataSessionClassification,
     automataBusWorkerAccess: automataWorkerAccess,
     automataLifecyclePort: automataTerminalLifecycle,
+    hostExecution: options.automataHostExecution ?? null,
   });
   doingMirrorService.registerSource(new FoldPackageDoingMirrorSource(
     {

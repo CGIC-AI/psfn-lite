@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 import { createComponentLogger } from '../../../shared/logger.js';
 import {
@@ -56,6 +56,7 @@ import type {
   AutomataBusWorkerScope,
 } from './worker-access.js';
 import { AUTOMATA_BUS_WORKER_BRIEFING_SCHEMA_VERSION } from './worker-access.js';
+import { automataBusWorkerWriteKey } from './worker-access-operation.js';
 
 interface CanonicalAppendInput {
   eventId: string;
@@ -65,6 +66,15 @@ interface CanonicalAppendInput {
   body: AutomataBusFindingBody | AutomataBusRelationBody;
   audiences: readonly AutomataBusAudience[];
   sensitivity: SensitivityLevel;
+  /**
+   * Lite (operator automata rule 1): the eventId is a worker write's stable
+   * write key, so an event already stored under it IS this write, made by an
+   * earlier call or an earlier attempt of the same task. It is returned as the
+   * write (inserted: false) instead of being compared byte-wise: its run
+   * context and time are the first attempt's, which a later attempt's event
+   * cannot reproduce.
+   */
+  replayIncumbent?: boolean;
 }
 
 interface CanonicalAppendResult {
@@ -124,7 +134,7 @@ export class CanonicalAutomataBusWriter {
 
   constructor(private readonly options: {
     companionId: string;
-    store: Pick<PostgresAutomataBusRuntimeStore, 'appendAllocated'>;
+    store: Pick<PostgresAutomataBusRuntimeStore, 'appendAllocated' | 'readEventById'>;
     runtime: AutomataBusProductionRuntime;
   }) {
     requiredText(options.companionId, 'writer companionId');
@@ -137,6 +147,19 @@ export class CanonicalAutomataBusWriter {
   }
 
   private async appendSerialized(input: CanonicalAppendInput): Promise<CanonicalAppendResult> {
+    if (input.replayIncumbent === true) {
+      // Read inside the in-process append serialization, so two calls of one
+      // write in this process cannot both miss it. A concurrent writer in
+      // another process that wins the race makes this append fail the store's
+      // reused-id check: the write still exists exactly once.
+      const incumbent = await this.options.store.readEventById({
+        companionId: this.options.companionId,
+        audience: 'eligible-automata',
+        maxSensitivity: SENSITIVITY_LEVELS.at(-1)!,
+        eventId: requiredText(input.eventId, 'eventId'),
+      });
+      if (incumbent) return await this.indexPersisted(incumbent, false);
+    }
     const persisted = await this.options.store.appendAllocated({
       companionId: this.options.companionId,
       eventId: requiredText(input.eventId, 'eventId'),
@@ -187,6 +210,28 @@ export class CanonicalAutomataBusWriter {
     const indexed = await this.options.runtime.indexing.indexCurrentFinding(finding);
     return { event, inserted, indexStatus: indexed.status };
   }
+}
+
+/**
+ * Lite (operator automata rule 1): the Bus event id of one worker write. The
+ * donor minted a random id per call, so a repeated write (the model calling
+ * again, or a later attempt of the same task) became a second event. The id
+ * is now the write's stable key scoped to the companion, class and task: the
+ * same write from any attempt of the task is one event.
+ */
+function workerWriteEventId(
+  namespace: 'automata-bus-finding' | 'automata-bus-relation' | 'automata-bus-handoff',
+  companionId: string,
+  run: AutomataRunRecord,
+  writeKey: string,
+): string {
+  return stableId(namespace, [companionId, run.automatonClass, run.taskId, writeKey]);
+}
+
+function derivedWriteKey(kind: string, input: { scope: unknown; writeKey?: string }): string {
+  if (input.writeKey !== undefined) return requiredText(input.writeKey, 'writeKey');
+  const { scope: _scope, writeKey: _writeKey, ...write } = input;
+  return automataBusWorkerWriteKey({ kind, ...write });
 }
 
 function evidenceForRefs(
@@ -263,13 +308,14 @@ export function createProductionAutomataBusWorkerAccess(options: {
     append: async input => {
       const run = exactRunForScope(options.registry, companionId, input.scope);
       return await options.writer.append({
-        eventId: `automata-bus-finding:${randomUUID()}`,
+        eventId: workerWriteEventId('automata-bus-finding', companionId, run, derivedWriteKey('append', input)),
         occurredAt: new Date().toISOString(),
         run,
         type: 'finding',
         body: workerFindingBody(input),
         audiences: ['eligible-automata', 'operator'],
         sensitivity: input.scope.maxSensitivity,
+        replayIncumbent: true,
       });
     },
     correct: async input => {
@@ -305,7 +351,7 @@ export function createProductionAutomataBusWorkerAccess(options: {
               : {}),
           };
       return await options.writer.append({
-        eventId: `automata-bus-relation:${randomUUID()}`,
+        eventId: workerWriteEventId('automata-bus-relation', companionId, run, derivedWriteKey('correct', input)),
         occurredAt: new Date().toISOString(),
         run,
         type: 'relation',
@@ -317,6 +363,7 @@ export function createProductionAutomataBusWorkerAccess(options: {
         },
         audiences: target.audiences,
         sensitivity: target.sensitivity,
+        replayIncumbent: true,
       });
     },
     handoff: async input => {
@@ -327,7 +374,7 @@ export function createProductionAutomataBusWorkerAccess(options: {
       const references = [...input.outputRefs, ...validationRefs];
       if (references.length === 0) references.push(`automata-run:${run.runId}`);
       return await options.writer.append({
-        eventId: `automata-bus-handoff:${randomUUID()}`,
+        eventId: workerWriteEventId('automata-bus-handoff', companionId, run, derivedWriteKey('handoff', input)),
         occurredAt: new Date().toISOString(),
         run,
         type: 'finding',
@@ -344,6 +391,7 @@ export function createProductionAutomataBusWorkerAccess(options: {
         },
         audiences: ['eligible-automata', 'operator'],
         sensitivity: input.scope.maxSensitivity,
+        replayIncumbent: true,
       });
     },
     runs: async input => {
