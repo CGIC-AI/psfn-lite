@@ -1,9 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { isRecord } from '../../../shared/utils/types.js';
-import {
-  SCAFFOLDING_HOSTED_TOOL_SURFACES,
-  createProviderFactoryToolCatalog,
-} from './canonical-tool-catalog.test-support.js';
+import { createProviderFactoryToolCatalog } from './canonical-tool-catalog.test-support.js';
 import {
   CANONICAL_TOOL_SURFACE_CONTRACTS,
   CANONICAL_TOOL_SURFACE_DESCRIPTIONS,
@@ -82,13 +79,7 @@ function countCompleteSentences(description: string): number {
 describe('canonical first-party tool factories', () => {
   it('enumerates every canonical registry surface exactly once', () => {
     const factoryNames = createProviderFactoryToolCatalog().map(tool => tool.name).sort();
-    const allRegistryNames = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map(entry => entry.name);
-    for (const name of SCAFFOLDING_HOSTED_TOOL_SURFACES) {
-      expect(allRegistryNames, `excluded surface ${name} is not a registry surface`).toContain(name);
-    }
-    const registryNames = allRegistryNames
-      .filter(name => !SCAFFOLDING_HOSTED_TOOL_SURFACES.has(name))
-      .sort();
+    const registryNames = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map(entry => entry.name).sort();
 
     expect(factoryNames).toEqual(registryNames);
   });

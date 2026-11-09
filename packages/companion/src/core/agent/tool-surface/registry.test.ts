@@ -71,7 +71,7 @@ describe('first-party tool surface registry', () => {
   it('keeps canonical tool names unique and self-describing', () => {
     const names = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map(entry => entry.name);
     expect(new Set(names).size).toBe(names.length);
-    expect(Object.keys(CANONICAL_TOOL_SURFACE_DESCRIPTIONS).sort()).toEqual([...names].sort());
+    expect(Object.keys(CANONICAL_TOOL_SURFACE_DESCRIPTIONS).filter(name => name !== 'notify').sort()).toEqual([...names].sort());
 
     for (const entry of CANONICAL_FIRST_PARTY_TOOL_SURFACES) {
       expect(entry.name).toMatch(/^[a-z][a-z0-9_]*$/u);
@@ -119,7 +119,7 @@ describe('first-party tool surface registry', () => {
   });
 
   it('keeps companion-autonomy registry descriptions free of sensitive control-plane details', () => {
-    for (const toolName of ['contact', 'self_status', 'notify']) {
+    for (const toolName of ['contact']) {
       expect(getCanonicalToolSurface(toolName)?.description).not.toMatch(/\b(?:permit|private|fleet)\b/iu);
     }
   });
@@ -181,12 +181,6 @@ describe('first-party tool surface registry', () => {
     );
   });
 
-  it('declares virtual navigation on the canonical world surface', () => {
-    expect(getCanonicalToolSurface('world')?.actions).toEqual(
-      expect.arrayContaining(['perceive', 'list', 'control', 'move', 'act']),
-    );
-  });
-
   it('does not publish an unregistered shard control plane as canonical', () => {
     expect(getCanonicalToolSurface('shard')).toBeUndefined();
     expect(isCanonicalFirstPartyToolName('shard')).toBe(false);
@@ -231,10 +225,9 @@ describe('first-party tool surface registry', () => {
     expect(() => assertNoRetiredFirstPartyToolAliases([
       'tool_search',
       'session_new',
-      'media',
       'spawn_subagent',
     ], 'test surface')).toThrow(
-      'test surface includes retired first-party tool aliases: session_new->session, media->generate_image, spawn_subagent->subagent',
+      'test surface includes retired first-party tool aliases: session_new->session, spawn_subagent->subagent',
     );
   });
 
@@ -249,30 +242,6 @@ describe('first-party tool surface registry', () => {
       replacementAction: 'values_add',
       exposure: 'retired',
     });
-    expect(getRetiredToolAlias('image_analyze')).toMatchObject({
-      canonicalName: 'generate_image',
-      replacementAction: 'analyze',
-      exposure: 'retired',
-    });
-    expect(getRetiredToolAlias('image_edit')).toMatchObject({
-      canonicalName: 'generate_image',
-      replacementAction: 'edit',
-      exposure: 'retired',
-    });
-    expect(getRetiredToolAlias('image_create')).toMatchObject({
-      canonicalName: 'generate_image',
-      replacementAction: 'generate',
-      exposure: 'retired',
-    });
-    expect(getRetiredToolAlias('media')).toMatchObject({
-      canonicalName: 'generate_image',
-      replacementAction: 'generate',
-      exposure: 'retired',
-    });
-    expect(isCanonicalFirstPartyToolName('media')).toBe(false);
-    expect(isCanonicalFirstPartyToolName('generate_image')).toBe(true);
-    expect(isCanonicalFirstPartyToolName('selfie_create')).toBe(true);
-    expect(getRetiredToolAlias('selfie_create')).toBeUndefined();
   });
 
   it('keeps the audited img2 default stack: social/self/expressive core, dev/admin/heavy extended', () => {
@@ -280,17 +249,15 @@ describe('first-party tool surface registry', () => {
     // interaction, plus the discovery/control surfaces that reach everything else.
     const expectedCore = [
       'tool_search', 'toolset', 'response_control',
-      'selfie_create', 'generate_image',
       'memory', 'scratchpad', 'journal',
-      'orient', 'contact', 'session', 'self_status', 'system', 'identity',
-      'fs', 'web', 'mcp',
-      'skill', 'wiki', 'schedule', 'subagent', 'analysis_workbench',
+      'orient', 'contact', 'session', 'identity',
+      'schedule', 'subagent',
     ];
     for (const name of expectedCore) {
       expect(getCanonicalToolSurface(name)?.exposure, `${name} should be core`).toBe('core');
     }
     // Extended = dev / admin / infrequent / heavy, reached via toolset + promotion.
-    const expectedExtended = ['repo', 'shell', 'north_star', 'beads', 'notify', 'vault'];
+    const expectedExtended = ['north_star'];
     for (const name of expectedExtended) {
       expect(getCanonicalToolSurface(name)?.exposure, `${name} should be extended`).toBe('extended');
     }
@@ -299,48 +266,33 @@ describe('first-party tool surface registry', () => {
   it('ranks unknown/plugin tools behind every audited first-party domain', () => {
     // psfn img2 audit decision: unaudited third-party/plugin verbs sort to the
     // very tail, after boundary and system, so audited tools present first.
-    const tailCanonicalRanks = ['system', 'shell', 'repo', 'web', 'fs'].map(resolveToolPresentationRank);
+    const tailCanonicalRanks = ['response_control'].map(resolveToolPresentationRank);
     const unknownRank = resolveToolPresentationRank('some_plugin_tool_xyz');
     for (const rank of tailCanonicalRanks) {
       expect(unknownRank).toBeGreaterThan(rank);
-    }
-  });
-
-  it('registers the image tools as core surfaces ranked before admin/dev domains', () => {
-    expect(getCanonicalToolSurface('generate_image')?.exposure).toBe('core');
-    expect(getCanonicalToolSurface('selfie_create')?.exposure).toBe('core');
-    // Social/expressive tools present before admin/boundary/system machinery;
-    // selfie_create (self_expression) leads generate_image (media).
-    expect(resolveToolPresentationRank('selfie_create'))
-      .toBeLessThan(resolveToolPresentationRank('generate_image'));
-    for (const adminToolName of ['fs', 'repo', 'shell', 'web', 'system', 'self_status', 'toolset', 'tool_search']) {
-      expect(resolveToolPresentationRank('generate_image'))
-        .toBeLessThan(resolveToolPresentationRank(adminToolName));
-      expect(resolveToolPresentationRank('selfie_create'))
-        .toBeLessThan(resolveToolPresentationRank(adminToolName));
     }
   });
 });
 
 describe('resolveToolAliasMatchers (pre_tool_use hook alias equivalence, psfn-framework-816w)', () => {
   it('lists the retired aliases when invoked by the canonical name', () => {
-    // `web` retires `web_fetch` / `crawler_fetch` / `web_research`; a policy
+    // `toolset` retires `load_tools` / `promoted_tools_list` / `promoted_tools_add`; a policy
     // written against any of those must be able to match the canonical call.
-    const matchers = resolveToolAliasMatchers('web');
+    const matchers = resolveToolAliasMatchers('toolset');
     expect(matchers).toEqual(
-      expect.arrayContaining(['web_fetch', 'crawler_fetch', 'web_research']),
+      expect.arrayContaining(['load_tools', 'promoted_tools_list', 'promoted_tools_add']),
     );
     // The invoked name is never included in its own alias set.
-    expect(matchers).not.toContain('web');
+    expect(matchers).not.toContain('toolset');
   });
 
   it('lists the canonical name plus sibling aliases when invoked by a retired alias', () => {
-    // An alias-form invocation (`web_fetch`) must expose the canonical `web`
+    // An alias-form invocation (`load_tools`) must expose the canonical `toolset`
     // (so a canonical policy matches) and its siblings, but not itself.
-    const matchers = resolveToolAliasMatchers('web_fetch');
-    expect(matchers).toContain('web');
-    expect(matchers).toEqual(expect.arrayContaining(['crawler_fetch', 'web_research']));
-    expect(matchers).not.toContain('web_fetch');
+    const matchers = resolveToolAliasMatchers('load_tools');
+    expect(matchers).toContain('toolset');
+    expect(matchers).toEqual(expect.arrayContaining(['promoted_tools_list', 'promoted_tools_add']));
+    expect(matchers).not.toContain('load_tools');
   });
 
   it('returns an empty set for third-party / unknown tool names (not a bypass)', () => {

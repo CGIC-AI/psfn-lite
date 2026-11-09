@@ -423,39 +423,6 @@ describe('governed Automata lifecycle restart certification', () => {
     INTEGRATION_TIMEOUT_MS,
   );
 
-  it('fails an orphaned shard run at restart instead of leaving it running forever', async () => {
-    await withDatabase(async databaseUrl => {
-      // A shard's execution lives only in the process that spawned it, so a
-      // restart can never re-enter its run.
-      const spec: AutomataClassRunSpec = {
-        automatonClass: 'shard.long_horizon',
-        runId: 'shard-public-example-orphan',
-        workerId: 'shard-public-example-orphan',
-        taskId: 'shard-public-example-orphan',
-        taskLabel: 'Long-horizon shard',
-        taskSummary: 'Execute one long-horizon shard workload to a terminal outcome.',
-        sessionIds: ['shard:shard-public-example-orphan'],
-      };
-      const crashed = await startProcess(databaseUrl, COMPANION_A);
-      await createAutomataClassRunPort(crashed.registry, spec, crashed.terminal).begin();
-      expect(crashed.registry.getRun(spec.runId)).toMatchObject({ status: 'running' });
-      await crashed.close();
-
-      const restarted = await startProcess(databaseUrl, COMPANION_A);
-      expect(restarted.registry.getRun(spec.runId)).toMatchObject({
-        status: 'failed',
-        statusReason: AUTOMATA_RUN_PROCESS_RESTART_REASON,
-        outcome: 'blocked',
-      });
-      await restarted.close();
-
-      // Durable: a later process hydrates the terminal run, not a stuck one.
-      const later = await startProcess(databaseUrl, COMPANION_A);
-      expect(later.registry.getRun(spec.runId)?.status).toBe('failed');
-      await later.close();
-    });
-  }, INTEGRATION_TIMEOUT_MS);
-
   it('does not re-run work after a crash between the handoff commit and terminalization', async () => {
     await withDatabase(async databaseUrl => {
       const spec: AutomataClassRunSpec = {

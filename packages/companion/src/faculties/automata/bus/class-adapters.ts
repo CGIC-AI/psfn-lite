@@ -90,15 +90,6 @@ export const AUTOMATA_CLASS_GOVERNED_ADAPTERS = [
     allowedActions: ['brief', 'search', 'runs', 'inspect'],
   },
   {
-    automatonClass: 'shard.long_horizon',
-    adapterModule: 'src/faculties/shards/manager.ts',
-    busMode: 'single_pass',
-    exclusion: 'companion_identity_turn',
-    exclusionRationale:
-      'A shard runs its own companion-identity prompt stack, tools, and turn budget; '
-      + 'worker notes must not steer that identity, so only counts reach the handoff.',
-  },
-  {
     automatonClass: 'memory.sleeptime',
     adapterModule: 'src/core/scheduler/post-turn-runtime/scheduler-lanes.ts',
     busMode: 'single_pass',

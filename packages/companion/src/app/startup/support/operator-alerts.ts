@@ -36,10 +36,6 @@ const QUARANTINE_EXPIRY_SENDER: NotificationSenderMetadata = Object.freeze({
   kind: 'system',
   provenance: 'system.operator_alert.quarantine_expiry',
 });
-const REPEATED_SCREENING_FAILURE_SENDER: NotificationSenderMetadata = Object.freeze({
-  kind: 'system',
-  provenance: 'system.operator_alert.repeated_screening_failure',
-});
 const MODEL_BUDGET_THRESHOLD_SENDER: NotificationSenderMetadata = Object.freeze({
   kind: 'system',
   provenance: 'system.operator_alert.model_budget_threshold',
@@ -173,7 +169,6 @@ type BackupFailureEvent = EventMap['backup.failed'];
 type ScheduledTaskFailureEvent = EventMap['schedule.task.failed'];
 type SleepConsolidationFailureEvent = EventMap['memory.sleep_consolidation.failure'];
 type QuarantineExpiryEvent = EventMap['intake.quarantine.expired'];
-type FailClosedScreeningEvent = EventMap['intake.screening.fail_closed'];
 
 export function createBackupFailureAlertHandler(
   notifier: NotificationPort,
@@ -256,49 +251,6 @@ export function createQuarantineExpiryAlertHandler(
         `Reason: ${event.reason}`,
       ].join('\n'),
     }, { alertKind: 'quarantine_expiry', envelopeId: event.envelopeId });
-  };
-}
-
-export function createRepeatedScreeningFailureAlertHandler(options: {
-  notifier: NotificationPort;
-  companionName: string;
-  /** settings.json-owned threshold, counted independently per stage/source class. */
-  failureThreshold: number | undefined;
-}): (event: FailClosedScreeningEvent) => Promise<void> {
-  const name = requireOperatorAlertCompanionName(options.companionName);
-  const failureThreshold = options.failureThreshold;
-  if (
-    typeof failureThreshold !== 'number'
-    || !Number.isInteger(failureThreshold)
-    || failureThreshold < 1
-  ) {
-    throw new Error(
-      'Invalid intakeScreeningFailureAlertThreshold: expected a positive integer, '
-      + `got ${String(failureThreshold)}`,
-    );
-  }
-  const counts = new Map<string, number>();
-  const alerted = new Set<string>();
-  return async (event) => {
-    const key = `${event.stage}:${event.sourceClass}`;
-    const count = (counts.get(key) ?? 0) + 1;
-    counts.set(key, count);
-    if (count < failureThreshold || alerted.has(key)) return;
-
-    const delivered = await deliverOperatorAlert(options.notifier, {
-      sender: REPEATED_SCREENING_FAILURE_SENDER,
-      title: `${name} repeated intake screening failures`,
-      priority: 5,
-      message: [
-        `${name} intake screening has failed closed repeatedly.`,
-        `Stage: ${event.stage}`,
-        `Source class: ${event.sourceClass}`,
-        `Observed runtime failures: ${count}`,
-        `Configured alert threshold: ${failureThreshold}`,
-        `Last error: ${event.error}`,
-      ].join('\n'),
-    }, { alertKind: 'repeated_screening_failure', stage: event.stage });
-    if (delivered) alerted.add(key);
   };
 }
 

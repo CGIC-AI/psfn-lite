@@ -5,11 +5,9 @@
 // being there — the landmarks it saw and where, the rooms it entered, which
 // place led to which, who it ran into near what — is its own knowledge of that
 // world, kept per world and per companion. A MUD player builds a map from text
-// the same way. These are the shapes; the wiki-backed library that maintains
-// them lives in `src/faculties/wiki/world-notes.ts` and the world tool feeds it
-// from perception and movement so a nursery-tier companion accumulates its
-// map without any model-authored write. Federation groundwork: a companion
-// that travels between linked worlds remembers each one by these notes.
+// the same way. These are the shapes. In the donor a wiki-backed library kept
+// them and the world tool fed it; PSFN Lite cut both (Step B7, docs/extraction.md),
+// so no Lite composition supplies a WorldNotesReader.
 
 type WorldLandmarkKind = 'thing' | 'room' | 'place';
 

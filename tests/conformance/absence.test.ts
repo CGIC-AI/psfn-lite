@@ -27,9 +27,15 @@ import { join, posix, relative, sep } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
 import { CANONICAL_FIRST_PARTY_TOOL_SURFACES } from '../../packages/companion/src/core/agent/tool-surface/registry.js';
-import { SCAFFOLDING_HOSTED_TOOL_SURFACES } from '../../packages/companion/src/core/agent/tool-surface/canonical-tool-catalog.test-support.js';
 import { collectSpecifiers } from '../boundary/import-checker.ts';
 import { excludedName } from './excluded-names.ts';
+
+/** Donor tool surfaces whose factories were scaffolding; cut, not rebuilt (docs/tool-inventory.md). */
+const CUT_TOOL_SURFACES: readonly string[] = [
+  'fs', 'repo', 'shell', 'web', 'mcp', 'world', 'analysis_workbench', 'self_status',
+  'system', 'skill', 'wiki', 'beads', 'notify', 'generate_image', 'selfie_create',
+  'publication', 'vault',
+];
 
 const REPO = join(import.meta.dirname, '..', '..');
 const SELF = relative(REPO, import.meta.filename).split(sep).join('/');
@@ -320,11 +326,16 @@ describe('excluded subsystems are absent from Lite', () => {
   });
 
   it('no companion tool Lite serves is one of them', () => {
-    // The donor registry still describes the cut surfaces (the companion keeps donor text verbatim); no Lite factory builds them.
     // The live catalog the MCP transport serves is checked the same way by the inventory test of conformance.integration.test.ts.
-    const served = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name).filter((n) => !SCAFFOLDING_HOSTED_TOOL_SURFACES.has(n));
+    const served = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name);
     expect(served.length).toBeGreaterThanOrEqual(15);
     expect(served.filter((n) => excludedName(n) !== null)).toEqual([]);
+  });
+
+  it('the donor registry no longer lists the tool surfaces whose factories were scaffolding', () => {
+    // Native host tools (Pi, Hermes) do this work; the donor rebuilt them only for its own deployment (docs/extraction.md, Step E1).
+    const registry = new Set(CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name));
+    expect(CUT_TOOL_SURFACES.filter((n) => registry.has(n))).toEqual([]);
   });
 });
 

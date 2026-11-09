@@ -830,17 +830,9 @@ describe('ToolRuntimeFacade maintenance core tool policy', () => {
 
   it('rejects high-risk retired first-party aliases at the model-facing registration boundary', () => {
     const { facade } = createFacade(null);
-    expect(() => facade.registerTool(makeTool('fs_read'), 'core')).toThrow(
-      'core tool registration includes retired first-party tool aliases: fs_read->fs',
-    );
     expect(() => facade.registerTool(makeTool('session_new'), 'core')).toThrow(
       'core tool registration includes retired first-party tool aliases: session_new->session',
     );
-    // The retired media name can never re-enter the model-facing surface.
-    expect(() => facade.registerTool(makeTool('media'), 'core')).toThrow(
-      'core tool registration includes retired first-party tool aliases: media->generate_image',
-    );
-    expect(() => facade.registerTool(makeTool('selfie_create'), 'core')).not.toThrow();
   });
 
   it('rejects retired split-surface aliases with live factories that the narrow drift guard omitted (as1wr)', () => {
@@ -874,36 +866,6 @@ describe('ToolRuntimeFacade maintenance core tool policy', () => {
     }
   });
 
-  it('presents social/expressive tools before admin and boundary tools', () => {
-    const { facade, agent, correlation } = createFacade(null);
-    facade.registerTool(makeTool('system'), 'core');
-    facade.registerTool(makeTool('fs'), 'core');
-    facade.registerTool(makeTool('memory'), 'core');
-    facade.registerTool(makeTool('generate_image'), 'core');
-    facade.registerTool(makeTool('contact'), 'core');
-    facade.registerTool(makeTool('selfie_create'), 'core');
-
-    facade.applyActiveToolsToAgentForTurn({
-      id: 'msg-ordering-1',
-      channelId: 'discord:general',
-      channelType: 'discord',
-      authorId: 'primary-user',
-      authorName: 'Primary User',
-      content: 'hey there',
-      timestamp: new Date('2026-04-23T12:00:00Z'),
-    } as never, undefined, 'chat', correlation, { intent: null });
-
-    const tools = agent.state.tools;
-    expect(tools.map(tool => tool.name)).toEqual([
-      'selfie_create',
-      'generate_image',
-      'contact',
-      'memory',
-      'fs',
-      'system',
-    ]);
-  });
-
   it('rejects widened drift-guard aliases for concerns, north_star, and lifecycle', () => {
     const { facade } = createFacade(null);
     expect(() => facade.registerTool(makeTool('create_concern'), 'core')).toThrow(
@@ -926,24 +888,15 @@ describe('ToolRuntimeFacade maintenance core tool policy', () => {
         `extended tool registration includes retired first-party tool aliases: ${alias}->north_star`,
       );
     }
-    expect(() => facade.registerTool(makeTool('self_restart'), 'core')).toThrow(
-      'core tool registration includes retired first-party tool aliases: self_restart->system',
-    );
-    expect(() => facade.registerTool(makeTool('self_rebuild'), 'core')).toThrow(
-      'core tool registration includes retired first-party tool aliases: self_rebuild->system',
-    );
   });
 
   it('keeps all registered core tools active for reflection turns', () => {
     const { facade, agent, emitTelemetry, correlation } = createFacade('reflection');
     facade.registerTool(makeTool('identity'), 'core');
-    facade.registerTool(makeTool('system'), 'core');
-    facade.registerTool(makeTool('self_status'), 'core');
     facade.registerTool(makeTool('session'), 'core');
     facade.registerTool(makeTool('memory'), 'core');
     facade.registerTool(makeTool('contact'), 'core');
     facade.registerTool(makeTool('subagent'), 'core');
-    facade.registerTool(makeTool('analysis_workbench'), 'core');
 
     facade.applyActiveToolsToAgentForTurn({
       id: 'msg-1',
@@ -961,10 +914,7 @@ describe('ToolRuntimeFacade maintenance core tool policy', () => {
       'memory',
       'session',
       'identity',
-      'analysis_workbench',
       'subagent',
-      'self_status',
-      'system',
     ]);
 
     const skippedEvents = emitTelemetry.mock.calls
@@ -1151,44 +1101,6 @@ describe('ToolRuntimeFacade maintenance core tool policy', () => {
     expect(names).toContain('selfie_create');
     expect(names).toContain('generate_image');
     expect(names).toContain('self_status');
-  });
-
-  it('allows direct analysis_workbench use from a parent turn', () => {
-    const { facade, agent, emitTelemetry, correlation } = createFacade(null);
-    facade.registerTool(makeTool('identity'), 'core');
-    facade.registerTool(makeTool('system'), 'core');
-    facade.registerTool(makeTool('session'), 'core');
-    facade.registerTool(makeTool('contact'), 'core');
-    facade.registerTool(makeTool('subagent'), 'core');
-    facade.registerTool(makeTool('analysis_workbench'), 'core');
-
-    facade.applyActiveToolsToAgentForTurn({
-      id: 'msg-2',
-      channelId: 'ch-1',
-      channelType: 'api',
-      authorId: 'user-1',
-      authorName: 'User',
-      content: 'hello',
-      timestamp: new Date('2026-04-23T12:00:00Z'),
-    }, undefined, 'chat', correlation, { intent: null });
-
-    const tools = agent.setTools.mock.calls.at(-1)?.[0] as Array<{ name: string }>;
-    expect(tools.map(tool => tool.name)).toEqual([
-      'contact',
-      'session',
-      'identity',
-      'analysis_workbench',
-      'subagent',
-      'system',
-    ]);
-    expect(emitTelemetry).not.toHaveBeenCalledWith(
-      'agent.tools.core_guardrail.skipped',
-      expect.objectContaining({
-        toolName: 'analysis_workbench',
-        reason: 'analysis_workbench_worker_context_required',
-        recommendation: 'delegate_large_evidence_analysis_to_subagent_or_shard',
-      }),
-    );
   });
 
   it('removes analysis_workbench from routine memory-intent concern turns', () => {

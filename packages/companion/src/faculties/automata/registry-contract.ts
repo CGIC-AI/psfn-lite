@@ -78,16 +78,6 @@ export const PRODUCTION_AUTOMATA_CLASSES = [
     retentionClass: 'standard',
   },
   {
-    id: 'shard.long_horizon',
-    workerKind: 'shard',
-    trigger: 'internal-shard-execution-port',
-    promptPolicy: INHERITANCE_MODES.task,
-    chargeClass: 'shard',
-    concurrencyClass: EXECUTION_MODES.bounded,
-    failureClass: 'terminal',
-    retentionClass: 'extended',
-  },
-  {
     id: 'memory.retrieval',
     workerKind: 'background',
     trigger: 'foreground-context-retrieval',

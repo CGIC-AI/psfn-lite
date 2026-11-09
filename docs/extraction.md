@@ -30,6 +30,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | C swap Lite onto the extracted core | Done (Step C, below): `apps/standalone` wraps `startCompanionRuntime`, MCP serves the donor tool catalog, the lifecycle bridge and the Hermes plugin drive host-driven donor turns, `packages/pi` keeps only the model and embedding adapters, `packages/core` and `packages/adapters` are deleted, and conformance runs on donor behaviour. |
 | Operator automata rules | Done (Operator automata rules, below): stable worker write keys; hosted automata as Hermes subagents. |
 | Review fixes after Step D | Done (Review fixes after Step D, below): the model-usage recorder port, the promoted donor tests, exactly-once corrections, and the Step D records and provenance. |
+| E operator rulings 2026-11-08/09 | Done (Step E, below): cut tool surfaces pruned from the registry, host-bound session integrity, host approval of memory deletion, the capability tier as an owner file (default `autonomous`), fatigue deferred, model usage in memory. |
 
 ## Closure (Step A0)
 
@@ -1017,7 +1018,8 @@ deleted path as data, not as a module reference: the consumer metadata in
 comments in `shared/contracts/world-notes.ts:9` and
 `system/config/companions-config.ts:33`. The core tool registry still lists
 the 17 surfaces whose factories were scaffolding. These are open questions
-for Step C, not imports. Step C left them as they are (below).
+for Step C, not imports. Step C left them as they are (below); Step E1
+removed them (Step E, below).
 
 ## Step C: Lite over the extracted core
 
@@ -1098,7 +1100,8 @@ Lite-side code that remains is host adapters around
   so they are not in the live catalog. The conformance inventory test
   checks that the MCP list equals the live donor catalog and that no served
   tool or action names an excluded subsystem. The four data references to
-  deleted paths stay as donor text.
+  deleted paths stay as donor text. Step E1 later deleted
+  them from the registry (Step E, below).
 
 ### Lite-new behaviour removed
 
@@ -1608,6 +1611,60 @@ promoted selection). The edited tests are among the matched. The Hermes
 plugin suite (`integrations/hermes/.venv`, Hermes `f0187332`) passed 64 of
 64. Afterwards, the set of running Docker containers was the same as
 before the run, and no `/tmp/lc-*` directories were left.
+
+## Step E: operator rulings (2026-11-08/09)
+
+Seven operator rulings, applied in order. Rows in `cuts.tsv` carry seam
+`E<n>`. Deleted and edited donor tests are in `deleted-tests.tsv` and
+`modified-tests.tsv` with the same label.
+
+### E1: cut tool surfaces stay cut
+
+Native Pi and Hermes tools already do filesystem, shell, web, skills, wiki
+and the rest. The donor rebuilt them only for its own closed deployment.
+B7 deleted the factories of 17 surfaces. E1 deletes what still named them,
+and rebuilds nothing:
+
+- the 17 entries of `CANONICAL_FIRST_PARTY_TOOL_SURFACES`
+  (`core/agent/tool-surface/registry.ts`), with their retired aliases. The
+  registry is now exactly the 15 surfaces Lite factories build. So
+  `factory-descriptions.test.ts` is the donor's text again, and the B7
+  exclusion set (`SCAFFOLDING_HOSTED_TOOL_SURFACES`) is gone;
+- 16 description contracts (`tool-surface/descriptions/*`) and the
+  `read_only` variant of `repo`. The `notify` contract stays, because the
+  kept ICP candidate projection (`icp-candidate-notify-tool.ts:71`) renders
+  its narrowed description from it. No `notify` tool is built, so it is
+  never served;
+- the 17 rows of `TOOL_VIEWER_GATE_DECISIONS` (`viewer-gates.ts`);
+- the `shard.long_horizon` automata class, whose adapter pointed at the
+  deleted `faculties/shards/manager.ts` (`class-adapters.ts:94`): its
+  adapter, its `PRODUCTION_AUTOMATA_CLASSES` entry, its spawn path, its
+  Bus eligibility in `automata-policy.seed.json` and its retention rule.
+  The certification test is the donor's text again (since B7 it had
+  treated the class as absent). An owner `automata-policy.json` that still
+  lists the class is now refused at start (unknown automata class);
+- the data references to the deleted wiki pass: the `memory.sleeptime.wiki`
+  prompt (`prompt-registry.ts:276`) and the `wiki_curation` persona seed
+  (`persona-preamble-seeds.ts:146`). The disabled sleeptime wiki stage
+  reads neither. Two comments that named deleted files
+  (`shared/contracts/world-notes.ts:9`,
+  `system/config/companions-config.ts:33`) are rewritten;
+- `createRepeatedScreeningFailureAlertHandler` (`operator-alerts.ts`),
+  unused since B7.
+
+Kept on purpose: `system/capabilities/requirements.ts` still maps the cut
+names to their donor tokens, so a host tool registered under one of them is
+still held to those tokens (fail closed).
+
+Behaviour change: none for any served tool. A host tool named like a cut
+surface would now be an ordinary unknown tool: last in presentation order,
+not viewer-gated, and its old alias names are not refused or corrected.
+No Lite host registers one. Tests: 13 deleted (their subject is a cut
+surface or the cut class) and 22 rows edited. Where the subject is a kept
+mechanism (alias correction, presentation rank, viewer ceiling), the
+fixture is re-pointed from the cut surface to a kept one, and the
+assertions keep their shape. `tests/conformance/absence.test.ts` now also
+fails if the registry lists one of the 17 again.
 
 ## Measured size
 

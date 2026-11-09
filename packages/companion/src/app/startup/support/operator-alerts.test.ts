@@ -4,7 +4,6 @@ import {
   createBackupFailureAlertHandler,
   createPromptGenerationFailureAlertHandler,
   createQuarantineExpiryAlertHandler,
-  createRepeatedScreeningFailureAlertHandler,
   createScheduledTaskFailureAlertHandler,
   createSleepConsolidationFailureAlertHandler,
   formatActiveMemoryRefreshFailureAlert,
@@ -174,76 +173,6 @@ describe('scheduled operator alerts', () => {
       title: 'PSFN sleeptime failure',
       message: expect.stringContaining('malformed model response'),
     }));
-  });
-
-  it('alerts once when fail-closed screening reaches the configured repetition threshold', async () => {
-    const { notifier, notify } = makeFakeNotifier();
-    const handler = createRepeatedScreeningFailureAlertHandler({
-      notifier,
-      companionName: 'PSFN',
-      failureThreshold: 3,
-    });
-    const event = {
-      stage: 'l3' as const,
-      sourceClass: 'image_ocr',
-      error: 'L3 verdict failed schema validation',
-      timestamp: 4,
-    };
-
-    await handler(event);
-    expect(notify).not.toHaveBeenCalled();
-    await handler(event);
-    expect(notify).not.toHaveBeenCalled();
-    await handler(event);
-    await handler(event);
-
-    expect(notify).toHaveBeenCalledOnce();
-    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
-      sender: {
-        kind: 'system',
-        provenance: 'system.operator_alert.repeated_screening_failure',
-      },
-      message: expect.stringMatching(
-        /Stage: l3.*Observed runtime failures: 3.*Configured alert threshold: 3/s,
-      ),
-    }));
-  });
-
-  it('counts repeated screening failures independently per source class', async () => {
-    const { notifier, notify } = makeFakeNotifier();
-    const handler = createRepeatedScreeningFailureAlertHandler({
-      notifier,
-      companionName: 'PSFN',
-      failureThreshold: 2,
-    });
-    const event = {
-      stage: 'l3' as const,
-      sourceClass: 'image_ocr',
-      error: 'invalid JSON',
-      timestamp: 4,
-    };
-
-    await handler(event);
-    await handler({ ...event, sourceClass: 'web_fetch' });
-    expect(notify).not.toHaveBeenCalled();
-    await handler(event);
-    await handler(event);
-
-    expect(notify).toHaveBeenCalledOnce();
-    expect(notify).toHaveBeenCalledWith(expect.objectContaining({
-      message: expect.stringContaining('Source class: image_ocr'),
-    }));
-  });
-
-  it('fails closed when the screening repetition threshold is missing or invalid', () => {
-    const { notifier } = makeFakeNotifier();
-    for (const failureThreshold of [undefined, 0, -1, 1.5, Number.NaN]) {
-      expect(() => createRepeatedScreeningFailureAlertHandler({
-        notifier,
-        companionName: 'PSFN',
-        failureThreshold: failureThreshold as number | undefined,
-      })).toThrow(/intakeScreeningFailureAlertThreshold/);
-    }
   });
 
   it('makes a quarantine TTL expiry operator-visible through the notification path', async () => {

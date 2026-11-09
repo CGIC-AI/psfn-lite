@@ -21,11 +21,6 @@ export const PRODUCTION_AUTOMATA_SPAWN_PATHS = [
     launchMarker: 'queueMicrotask',
   },
   {
-    id: 'shard-execution-port',
-    classId: 'shard.long_horizon',
-    sourcePath: 'src/app/startup/composition/composition.ts',
-  },
-  {
     id: 'foreground-memory-retrieval',
     classId: 'memory.retrieval',
     sourcePath: 'src/faculties/memory/runtime-wiring.ts',

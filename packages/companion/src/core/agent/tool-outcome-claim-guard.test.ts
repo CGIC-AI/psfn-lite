@@ -155,7 +155,7 @@ describe('tool outcome final-response conformance', () => {
 
   it('rejects success for a known requested tool missing from the active catalog', () => {
     expect(rejectsUnconfirmedToolExecutionClaim({
-      requestText: 'Call beads to create the issue.',
+      requestText: 'Call journal to create the issue.',
       activeToolNames: ['memory'],
       responseText: 'Done. I created it.',
       turnMessages: [],
