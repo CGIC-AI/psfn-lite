@@ -169,6 +169,16 @@ def _node_argv(entry: Path) -> list:
     return [node, "--import", "tsx", str(entry)]
 
 
+def hermes_mcp():
+    """Hermes's MCP client entry points: tools/mcp_tool.py at f0187332, its discovery and lifecycle modules at 2bd378e."""
+    try:
+        from tools.mcp_tool import discover_mcp_tools, shutdown_mcp_servers
+    except ImportError:
+        from tools.mcp_tool_discovery import discover_mcp_tools
+        from tools.mcp_tool_lifecycle import shutdown_mcp_servers
+    return discover_mcp_tools, shutdown_mcp_servers
+
+
 class HostGone(RuntimeError):
     pass
 
@@ -378,7 +388,7 @@ class HermesSurface:
         self._unload()
 
     def disconnect(self) -> None:
-        from tools.mcp_tool import shutdown_mcp_servers
+        _, shutdown_mcp_servers = hermes_mcp()
 
         if self._connected is not None:
             shutdown_mcp_servers()
@@ -386,8 +396,8 @@ class HermesSurface:
 
     def use(self, name: str) -> Profile:
         from plugins.memory import load_memory_provider
-        from tools.mcp_tool import discover_mcp_tools
 
+        discover_mcp_tools, _ = hermes_mcp()
         profile = self.profiles[name]
         if self._connected != name:
             self.disconnect()
@@ -412,10 +422,14 @@ class HermesSurface:
     def _unload(self) -> None:
         if self._loaded is None:
             return
-        runtime = sys.modules.get(f"{self._namespace}.psfn_lite.runtime")
-        if runtime is not None:
-            runtime.reset_for_tests()
-        for module in [m for m in sys.modules if m == f"{self._namespace}.psfn_lite" or m.startswith(f"{self._namespace}.psfn_lite.")]:
+        # Hermes names a user provider's package <ns>.psfn_lite (f0187332) or <ns>.psfn_lite__source_<digest> (2bd378e).
+        prefix = f"{self._namespace}.psfn_lite"
+        ours = lambda module: (lambda package: package == prefix or package.startswith(prefix + "__source_"))(".".join(module.split(".")[:2]))
+        for package in [m for m in sys.modules if m.count(".") == 1 and ours(m)]:
+            runtime = sys.modules.get(f"{package}.runtime")
+            if runtime is not None:
+                runtime.reset_for_tests()
+        for module in [m for m in sys.modules if ours(m)]:
             del sys.modules[module]
         self._loaded = None
 

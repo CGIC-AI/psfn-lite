@@ -52,7 +52,7 @@ class PsfnLiteProvider(MemoryProvider):
         return ""
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        runtime.add_warning_callback(kwargs.get("warning_callback"))
+        runtime.add_warning_callback(kwargs.get("warning_callback"), kwargs.get("hermes_home"))
         issues = runtime.profile_issues()
         if issues:
             raise ConfigError("psfn_lite refuses to start: " + "; ".join(issues))
@@ -60,7 +60,7 @@ class PsfnLiteProvider(MemoryProvider):
         self._session_id = session_id
         pending = self._driver.ledger.pending()
         if pending:
-            runtime.notify(f"PSFN Lite has {len(pending)} unacknowledged lifecycle events in this profile's ledger; see the psfn_lite README.")
+            runtime.notify(f"PSFN Lite has {len(pending)} unacknowledged lifecycle events in this profile's ledger; see the psfn_lite README.", kwargs.get("hermes_home"))
 
     def system_prompt_block(self) -> str:
         return SYSTEM_PROMPT_BLOCK

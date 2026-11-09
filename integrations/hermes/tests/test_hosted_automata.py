@@ -118,7 +118,8 @@ def hosted(profile, bridge, monkeypatch):
 def bus_call(child, args):
     from model_tools import handle_function_call
 
-    return handle_function_call("automata_bus", args, task_id="child-task", session_id=child.session_id)
+    # A tool call id per call, as Hermes's loop gives every call (2bd378e keys its concurrent hook gate by it).
+    return handle_function_call("automata_bus", args, task_id="child-task", session_id=child.session_id, tool_call_id=f"call-{child.session_id}-{args.get('action')}")
 
 
 def completes(child):
