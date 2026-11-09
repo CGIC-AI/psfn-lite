@@ -49,8 +49,8 @@ Lite.
 The tables below are generated from the Git blobs of
 `packages/companion/{src,config}` at `HEAD` and the donor commit by
 `python3 -I packages/companion/extraction/provenance-tables.py <donor git
-dir>`, after Step E; the 2026-11-09 shakedown fixes (seams S1-S4) changed
-no file here. The tree has 2,003 files: 1,772 extracted
+dir>`, after Step E; the 2026-11-09 shakedown fixes (seams S1-S4) and the
+restored donor embedding providers (seam S5) changed no file here. The tree has 2,003 files: 1,772 extracted
 unchanged, 200 extracted with cuts, and 31 Lite. Seam D is the operator
 automata rules ([extraction](extraction.md), "Operator automata rules").
 Seams E1-E4 are the operator rulings of 2026-11-08/09 that changed files
