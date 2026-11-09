@@ -14,8 +14,8 @@
  * standalone Garden dispatched them (operator/garden/server-routes.ts:59-100):
  * the request is bound for the response, and the route gets the standalone
  * request context built from its catalogue entry, whose actor is the
- * standalone operator. A route's body is read up to its catalogue body
- * policy's limit. The Lite routes (`/api/lite/...`, lite-routes.ts) answer
+ * standalone operator. Every body is read up to the configured limit, as
+ * the donor's standalone Garden read it. The Lite routes (`/api/lite/...`, lite-routes.ts) answer
  * JSON results.
  */
 import { createServer, type IncomingMessage, type Server as HttpServer, type ServerResponse } from 'node:http';
@@ -47,7 +47,7 @@ export interface GardenServerOptions {
   /** Default 127.0.0.1. Anything that is not loopback needs `exposeBeyondLoopback`. */
   readonly listenHost?: string;
   readonly exposeBeyondLoopback?: { readonly allowedHosts: readonly string[] };
-  /** The largest body a Lite route reads; a donor route reads up to its catalogue body policy. */
+  /** The largest request body any route reads (the donor's standalone ADMIN_MAX_BODY_SIZE, server.ts:32, as config). */
   readonly maxBodyBytes: number;
   readonly onError: (report: GardenErrorReport) => void;
 }
@@ -72,10 +72,9 @@ export async function startGardenServer(options: GardenServerOptions): Promise<R
   if (options.exposeBeyondLoopback?.allowedHosts.length === 0) return invalid('exposeBeyondLoopback needs at least one allowed Host');
   const allowedHosts = options.exposeBeyondLoopback === undefined ? null : new Set(options.exposeBeyondLoopback.allowedHosts.map((h) => h.toLowerCase()));
 
-  // A donor route reads its body up to its own catalogue limit (the donor's withBody, server.ts:270-290).
-  const bodyLimits = new WeakMap<IncomingMessage, number>();
+  // The donor's standalone withBody (server.ts:270-290), with its flat limit (ADMIN_MAX_BODY_SIZE, server.ts:32) from config.
   const donorRoutes = buildDonorGardenRoutes(options.services, (req, res, cb) => {
-    readBodyWithLimit(req, res, { maxBytes: bodyLimits.get(req) ?? options.maxBodyBytes }).then(
+    readBodyWithLimit(req, res, { maxBytes: options.maxBodyBytes }).then(
       (body) => {
         if (body !== null) cb(body);
       },
@@ -83,7 +82,7 @@ export async function startGardenServer(options: GardenServerOptions): Promise<R
     );
   });
   const liteRoutes = buildLiteRoutes(options.services, options.host);
-  const context: ServeContext = { options, donorRoutes, liteRoutes, bodyLimits, allowedHosts };
+  const context: ServeContext = { options, donorRoutes, liteRoutes, allowedHosts };
 
   const server = createServer((req, res) => {
     void serve(req, res, context);
@@ -108,7 +107,6 @@ interface ServeContext {
   readonly options: GardenServerOptions;
   readonly donorRoutes: readonly DonorGardenRoute[];
   readonly liteRoutes: readonly LiteRoute[];
-  readonly bodyLimits: WeakMap<IncomingMessage, number>;
   readonly allowedHosts: ReadonlySet<string> | null;
 }
 
@@ -136,7 +134,6 @@ async function serve(req: IncomingMessage, res: ServerResponse, context: ServeCo
       if (params === null) continue;
       route = candidate.capability.id;
       bindRequestForResponse(res, req);
-      context.bodyLimits.set(req, candidate.capability.body.maxBytes);
       const requestContext = createStandaloneGardenRequestContext({
         authorization: candidate.capability.authorization,
         routeId: candidate.capability.id,
