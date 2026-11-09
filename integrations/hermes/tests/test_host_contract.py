@@ -68,6 +68,21 @@ def test_lifecycle_hooks_are_valid_and_registered_once_however_often_hermes_load
     assert all(len(hooks[name]) == 1 for name in registered)
 
 
+def test_listing_the_plugin_in_plugins_enabled_for_the_dashboard_backend_loads_it_no_second_way(profile):
+    from hermes_cli.plugins import discover_plugins
+
+    # The dashboard mounts a user plugin's backend only when plugins.enabled names it (README, Install).
+    with (profile / "config.yaml").open("a") as config:
+        config.write("plugins:\n  enabled:\n    - psfn_lite\n")
+    discover_plugins(force=True)
+    # The general loader still skips it (a memory provider): nothing of ours is registered yet.
+    assert not any(our_hooks()[0].values())
+    load_provider()
+    hooks, _ = our_hooks()
+    assert all(len(callbacks) == 1 for callbacks in hooks.values() if callbacks)
+    assert {name for name, callbacks in hooks.items() if callbacks} == {"pre_llm_call", "pre_tool_call", "post_tool_call", "post_llm_call", "on_session_end", "on_session_finalize", "subagent_start"}
+
+
 def test_the_manifest_declares_every_hook_and_middleware_the_plugin_registers(profile):
     from hermes_cli.plugins import get_plugin_manager
 

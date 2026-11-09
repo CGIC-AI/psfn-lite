@@ -1,0 +1,12 @@
+{
+  "name": "psfn_lite",
+  "label": "Garden",
+  "description": "The light Garden of the PSFN Lite companion: its backend for the Hermes Desktop sidebar.",
+  "icon": "Sprout",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/psfn_lite",
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}
