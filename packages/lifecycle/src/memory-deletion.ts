@@ -90,6 +90,18 @@ export class HostMemoryDeletionApprovals implements MemoryDeletionApprovalPort {
     return ok({ proposalId: approved.id, status: 'approved', deleteId: approved.deleteId });
   }
 
+  /**
+   * Read-only, for the light Garden (docs/extraction.md S8 decision a): true
+   * while a host turn that requested this proposal may still approve it
+   * (recorded, unexpired, its turn open). The Garden leaves such a proposal
+   * to the host's own approval gate.
+   */
+  awaiting(proposalId: string): boolean {
+    const requested = this.requested.get(proposalId);
+    if (requested === undefined || this.now() > requested.expiresAt) return false;
+    return this.options.relay.open().some((turn) => turn.turnId === requested.turnId && !turn.isEnded);
+  }
+
   private forgetExpired(): void {
     const now = this.now();
     for (const [id, entry] of this.requested) if (now > entry.expiresAt) this.requested.delete(id);

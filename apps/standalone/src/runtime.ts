@@ -45,6 +45,7 @@ import {
   unavailable,
   type McpErrorReport,
   type McpHttpServer,
+  type McpPrincipalBindings,
   type Result,
 } from './mcp.ts';
 import {
@@ -56,6 +57,7 @@ import {
   type PiModelRuntime,
 } from './pi.ts';
 import { createModelUsageLedger, type ModelUsageSnapshot } from './model-usage.ts';
+import { composeGardenServices, startGardenServer, type GardenErrorReport, type GardenServer } from './operator.ts';
 import { buildSubstrateConfig } from './substrate-config.ts';
 
 /** The contact key of the configured operator. */
@@ -69,6 +71,7 @@ export type LiteDiagnostic =
   | { readonly kind: 'outbound'; readonly channelId: string; readonly content: string }
   | { readonly kind: 'mcp'; readonly report: McpErrorReport }
   | { readonly kind: 'lifecycle'; readonly report: LifecycleErrorReport }
+  | { readonly kind: 'garden'; readonly report: GardenErrorReport }
   | { readonly kind: 'automata'; readonly event: HostedAutomataEvent }
   | { readonly kind: 'host_turn_timeout'; readonly turnId: string };
 
@@ -87,7 +90,7 @@ export interface LiteRuntime {
   readonly contactIds: ReadonlyMap<string, string>;
   /** The host-driven turn bridge; null without a lifecycle config. */
   readonly bridge: HostTurnBridge | null;
-  readonly transports: { readonly mcpUrl: string | null; readonly lifecycleUrl: string | null };
+  readonly transports: { readonly mcpUrl: string | null; readonly lifecycleUrl: string | null; readonly gardenUrl: string | null };
   /** One operator turn in the operator's terminal conversation, through the donor SubstrateAgent. */
   converse(text: string): Promise<AgentResponse>;
   /** Aborts the operator's running turn (donor SubstrateAgent.abort). */
@@ -146,6 +149,8 @@ export async function createLiteRuntime(input: {
   if (bindings !== null && !bindings.ok) return bindings;
   const unknownContacts = (bindings?.value.bindings ?? []).filter((b) => !contactKeys.has(b.contact));
   if (unknownContacts.length > 0) return invalid(...unknownContacts.map((b) => `binding ${b.principal} names an unknown contact ${b.contact}`));
+  const gardenBindings = loadGardenBindings(config, env);
+  if (!gardenBindings.ok) return gardenBindings;
 
   let sessionIntegrityProvider: StartCompanionRuntimeOptions['sessionIntegrityProvider'] = null;
   if (config.sessionIntegrity.kind === 'keyring') {
@@ -311,6 +316,31 @@ export async function createLiteRuntime(input: {
     }
   }
 
+  // The light Garden (docs/extraction.md, seam S8): the operator API over the running companion's own instances.
+  let gardenUrl: string | null = null;
+  if (gardenBindings.value !== null && config.garden !== null) {
+    const garden: Result<GardenServer> = await startGardenServer({
+      services: composeGardenServices(companion, { dataDir: config.dataDir, seedDir }, { contactId: contactIds.get(OPERATOR_CONTACT) ?? '' }),
+      host: {
+        model: { provider: model.value.model.provider, modelId: model.value.model.id },
+        awaitingHostTurn: (proposalId) => memoryDeletion?.awaiting(proposalId) ?? false,
+        recentTurnLimit: config.garden.recentTurnLimit,
+      },
+      identify: gardenBindings.value.identify,
+      port: config.garden.port,
+      listenHost: config.garden.host,
+      ...(config.garden.allowedHosts === null ? {} : { exposeBeyondLoopback: { allowedHosts: config.garden.allowedHosts } }),
+      maxBodyBytes: config.garden.maxBodyBytes,
+      onError: (report) => onDiagnostic({ kind: 'garden', report }),
+    });
+    if (!garden.ok) {
+      await closeAll();
+      return garden;
+    }
+    opened.push(garden.value);
+    gardenUrl = garden.value.url;
+  }
+
   const operatorContact = contactIds.get(OPERATOR_CONTACT) ?? '';
   let closed: Promise<void> | null = null;
   return ok({
@@ -318,7 +348,7 @@ export async function createLiteRuntime(input: {
     companion,
     contactIds,
     bridge,
-    transports: { mcpUrl, lifecycleUrl },
+    transports: { mcpUrl, lifecycleUrl, gardenUrl },
     converse: (text) =>
       companion.agentLoop.handleMessage({
         id: `cli:${createTurnId()}`,
@@ -337,4 +367,27 @@ export async function createLiteRuntime(input: {
     modelUsage: () => modelUsage.snapshot(),
     close: () => (closed ??= closeAll()),
   });
+}
+
+/**
+ * The Garden's principal bindings (seam S8). Each is bound to the primary
+ * contact, who is the donor's Garden operator. A Garden credential or
+ * principal is never also an MCP one, so a tool transport credential never
+ * opens the Garden: loading both lists together refuses a shared one.
+ */
+function loadGardenBindings(config: LiteConfig, env: Readonly<Record<string, string | undefined>>): Result<McpPrincipalBindings | null> {
+  if (config.garden === null) return ok(null);
+  const bindings = loadPrincipalBindings(config.garden.bindings, env);
+  if (!bindings.ok) return invalid(...prefixed('garden', bindings.error));
+  const strangers = bindings.value.bindings.filter((b) => b.contact !== OPERATOR_CONTACT);
+  if (strangers.length > 0) return invalid(...strangers.map((b) => `garden binding ${b.principal} must name the primary contact ${OPERATOR_CONTACT}, not ${b.contact}`));
+  if (config.mcp !== null) {
+    const together = loadPrincipalBindings([...config.mcp.bindings, ...config.garden.bindings], env);
+    if (!together.ok) return invalid(...prefixed('garden and mcp together', together.error));
+  }
+  return bindings;
+}
+
+function prefixed(at: string, error: { readonly kind: string; readonly issues?: readonly string[] }): string[] {
+  return (error.issues ?? [error.kind]).map((issue) => `${at}: ${issue}`);
 }

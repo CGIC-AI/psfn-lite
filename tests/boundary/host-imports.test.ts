@@ -82,6 +82,7 @@ const ROOT_MANIFEST = manifest('.');
 const MCP_MANIFEST = manifest('packages/mcp');
 const LIFECYCLE_MANIFEST = manifest('packages/lifecycle');
 const PI_MANIFEST = manifest('packages/pi');
+const OPERATOR_MANIFEST = manifest('packages/operator');
 const STANDALONE_MANIFEST = manifest('apps/standalone');
 
 const RULES: Readonly<Record<string, HostRules>> = {
@@ -106,12 +107,20 @@ const RULES: Readonly<Record<string, HostRules>> = {
     dependencies: Object.keys(PI_MANIFEST.dependencies ?? {}),
     dependencySite: 'packages/pi/src/pi.ts',
   },
+  operator: {
+    own: 'packages/operator/src/',
+    entries: { 'packages/mcp/src/index.ts': 'packages/operator/src/mcp.ts' },
+    companionShim: 'packages/operator/src/companion.ts',
+    dependencies: Object.keys(OPERATOR_MANIFEST.dependencies ?? {}),
+    dependencySite: null,
+  },
   standalone: {
     own: 'apps/standalone/src/',
     entries: {
       'packages/pi/src/index.ts': 'apps/standalone/src/pi.ts',
       'packages/mcp/src/index.ts': 'apps/standalone/src/mcp.ts',
       'packages/lifecycle/src/index.ts': 'apps/standalone/src/lifecycle.ts',
+      'packages/operator/src/index.ts': 'apps/standalone/src/operator.ts',
     },
     companionShim: 'apps/standalone/src/companion.ts',
     dependencies: Object.keys(STANDALONE_MANIFEST.dependencies ?? {}),
@@ -123,6 +132,7 @@ const DIRS: Readonly<Record<string, string>> = {
   mcp: 'packages/mcp/src',
   lifecycle: 'packages/lifecycle/src',
   pi: 'packages/pi/src',
+  operator: 'packages/operator/src',
   standalone: 'apps/standalone/src',
 };
 
@@ -134,7 +144,7 @@ describe('host adapter import boundaries', () => {
   });
 
   it('pins every declared dependency exactly, at the root manifest version', () => {
-    for (const pkg of [MCP_MANIFEST, LIFECYCLE_MANIFEST, PI_MANIFEST, STANDALONE_MANIFEST]) {
+    for (const pkg of [MCP_MANIFEST, LIFECYCLE_MANIFEST, PI_MANIFEST, OPERATOR_MANIFEST, STANDALONE_MANIFEST]) {
       for (const [name, version] of Object.entries(pkg.dependencies ?? {})) {
         expect(version, `${pkg.name} ${name}`).toMatch(/^\d+\.\d+\.\d+$/);
         expect(ROOT_MANIFEST.dependencies?.[name], `${pkg.name} ${name}`).toBe(version);
@@ -143,6 +153,7 @@ describe('host adapter import boundaries', () => {
     expect(MCP_MANIFEST.dependencies).toEqual({ '@modelcontextprotocol/server': '2.3.0' });
     expect(PI_MANIFEST.dependencies).toEqual({ '@earendil-works/pi-ai': '0.84.1' });
     expect(LIFECYCLE_MANIFEST.dependencies).toBeUndefined();
+    expect(OPERATOR_MANIFEST.dependencies).toBeUndefined();
     expect(STANDALONE_MANIFEST.dependencies).toBeUndefined();
   });
 
@@ -152,6 +163,8 @@ describe('host adapter import boundaries', () => {
     ['lifecycle', 'the MCP entry outside its shim', 'packages/lifecycle/src/x.ts', "import { publicError } from '../../mcp/src/index.ts';", 'must be reached through packages/lifecycle/src/mcp.ts'],
     ['lifecycle', 'the Pi adapters', 'packages/lifecycle/src/x.ts', "import '../../pi/src/index.ts';", 'host packages import only public entries'],
     ['lifecycle', 'an undeclared package', 'packages/lifecycle/src/x.ts', "import { createServer } from 'express';", 'not a declared dependency'],
+    ['operator', 'a companion module outside its shim', 'packages/operator/src/x.ts', "import '../../companion/src/operator/garden/services/memory-service.js';", 'must be reached through packages/operator/src/companion.ts'],
+    ['operator', 'the lifecycle bridge', 'packages/operator/src/x.ts', "import '../../lifecycle/src/index.ts';", 'host packages import only public entries'],
     ['mcp', 'the companion core', 'packages/mcp/src/x.ts', "import '../../companion/src/core/agent/substrate-agent.js';", 'which this package may not import'],
     ['mcp', 'an undeclared look-alike', 'packages/mcp/src/x.ts', "import '@modelcontextprotocol/server-extra';", 'not a declared dependency'],
     ['pi', 'the companion core', 'packages/pi/src/x.ts', "import '../../companion/src/primitives/llm/provider-runtime.js';", 'which this package may not import'],
@@ -170,7 +183,7 @@ describe('host adapter import boundaries', () => {
     expect(files.length).toBeGreaterThan(1000);
     for (const file of files) {
       const { specifiers } = collectSpecifiers(file.path, file.text);
-      const host = specifiers.filter((s) => /(^|\/)(mcp|lifecycle|pi|standalone)\/src\//.test(s) || s.includes('apps/'));
+      const host = specifiers.filter((s) => /(^|\/)(mcp|lifecycle|pi|operator|standalone)\/src\//.test(s) || s.includes('apps/'));
       expect(host, file.path).toEqual([]);
     }
   });

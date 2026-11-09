@@ -37,6 +37,8 @@ export function liteConfigDocument(dataDir: string, companionId: string) {
     sessionIntegrity: { kind: 'keyring' as 'keyring' | 'unsigned' },
     mcp: null as Record<string, unknown> | null,
     lifecycle: null as Record<string, unknown> | null,
+    // Left out (undefined), no light Garden is mounted.
+    garden: undefined as Record<string, unknown> | undefined,
   };
 }
 

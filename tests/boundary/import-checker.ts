@@ -2,7 +2,7 @@ import ts from 'typescript';
 
 /** Every module specifier in a file, including type-only, re-export and dynamic forms. */
 export function collectSpecifiers(path: string, text: string): { specifiers: string[]; nonLiteral: number } {
-  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const specifiers: string[] = [];
   let nonLiteral = 0;
   const literal = (node: ts.Node | undefined): void => {

@@ -191,8 +191,25 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
    with the session keyring in the environment
    (`GATEWAY_SESSION_HMAC_KEYS`), so the journals are signed. Then run
    `npm run standalone -- serve --config <file>`.
-2. Copy `psfn_lite/` to `$HERMES_HOME/plugins/psfn_lite/`. The plugin uses
-   only the standard library and Hermes itself.
+2. Install the plugin with
+   `python3 -I integrations/hermes/install_plugin.py "$HERMES_HOME"`. It
+   copies `psfn_lite/` to `$HERMES_HOME/plugins/psfn_lite/` and leaves out the
+   Desktop half (`psfn_lite/desktop/`, see [The light Garden](#the-light-garden)).
+   It also refuses a profile whose `psfn_lite` folder already holds one, and
+   it replaces only an earlier `psfn_lite` install. The plugin uses only the
+   standard library and Hermes itself.
+
+   The plugin is called `psfn_lite` everywhere: the folder, the `name` in
+   `plugin.yaml` and `dashboard/manifest.json`, the MCP server key, and the
+   `plugins.enabled` entry. The tool refuses a source where these names
+   disagree. A `plugins/psfn/` folder in an older profile is an earlier,
+   different plugin (`psfn`, 0.2.x). This install does not read it, replace
+   it or remove it.
+
+   `plugin.yaml` keeps `provides_middleware: [llm_request]` even though
+   Hermes's manifest parser does not read that key. It records the
+   middleware the plugin registers (`toolchoice.py`), and
+   `test_host_contract.py` checks it against what is actually registered.
 3. Put the credential in the profile's `.env` (`$HERMES_HOME/.env`), for
    example `PSFN_LITE_TOKEN=...`. The plugin and Hermes's MCP client read it
    through Hermes's profile secret scope. A Hermes gateway clears the
@@ -249,9 +266,12 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
      "senders": [{ "platform": "cli", "sender_id": "" }],
      "timeout_seconds": 30,
      "max_context_chars": 9000,
-     "automata": null
+     "automata": null,
+     "garden": null
    }
    ```
+
+   `garden` is `null` unless the profile serves the light Garden (step 6).
 
    `senders` names the Hermes `(platform, sender_id)` pairs this credential
    speaks for. The local CLI is `{"platform": "cli", "sender_id": ""}` when
@@ -265,6 +285,93 @@ Delete diagnostic rows once you have dealt with them. Leave `turn` and
    same mapping (`gateway/session_policy.py` `SURFACES`: the TUI is `tui`,
    Hermes Desktop is `desktop`), and a profile used from one of them needs
    a pair for it; only the CLI pair is tested here.
+6. Optional: the light Garden's backend. In the standalone config, add
+   `garden` with its own binding:
+   `{"host": "127.0.0.1", "port": <garden port>, "allowedHosts": null, "maxBodyBytes": 65536, "recentTurnLimit": 12, "bindings": [{"principal": "garden-operator", "credential": {"env": "LITE_GARDEN_TOKEN"}, "contact": "operator"}]}`
+   (every key is required; `maxBodyBytes` is the largest request body a
+   Garden route reads, `recentTurnLimit` the recent turns the Overview lists).
+   The binding must be the `operator` contact, and its credential and
+   principal must differ from every MCP binding's. Lite prints
+   `garden <url>` on `serve`. Put the same credential in the profile's
+   `.env` (for example `PSFN_LITE_GARDEN_TOKEN=...`; the variable must not
+   be the bridge's), and set `garden` in `psfn-lite.json`:
+   `{"url": "http://127.0.0.1:<garden port>", "credential_env": "PSFN_LITE_GARDEN_TOKEN", "timeout_seconds": 30}`.
+   Then add the plugin to `plugins.enabled`:
+   `hermes -p <profile> plugins enable psfn_lite`. The dashboard mounts a
+   user plugin's backend only when `plugins.enabled` names it. Restart the
+   profile's dashboard so it mounts the backend at `/api/plugins/psfn_lite/`.
+   Because the plugin is a memory provider, the general plugin loader still
+   does not load it a second time (`test_host_contract.py`).
+
+## The light Garden
+
+The light Garden is the operator's view of the companion: Overview,
+Memories, Persona & prompts, People, Sessions, Inner life, Automata and
+Settings. It has three parts:
+
+- **The Garden itself** runs inside Lite (`packages/operator`, described in
+  `docs/extraction.md`, "The operator surface"). It serves the donor's Garden
+  routes (`/api/admin/...`) and the Lite routes (`/api/lite/...`) on its own
+  loopback port, behind its own bearer. It refuses any browser Origin and
+  any foreign Host.
+- **The dashboard backend** (`psfn_lite/dashboard/plugin_api.py`) is a thin
+  proxy that Hermes mounts at `/api/plugins/psfn_lite/`. Hermes
+  authenticates each request with its session token or OAuth and scopes it
+  to the profile. The proxy then forwards it with the Garden credential,
+  read through the profile's secret scope. Only the two Garden route
+  families pass; every other path gets 404. The proxy builds each outbound
+  request fresh (method, path, query without Hermes's `profile`, JSON
+  body, bearer), so the browser's Origin, cookies and Host never reach
+  Lite. With no `garden` in `psfn-lite.json` it answers 404. With a missing
+  credential it answers 503 and names the variable. When Lite cannot be
+  reached it answers 502. Every request carries the one Garden credential,
+  so the donor's memory body-gate grants (keyed by that credential) are
+  shared by everyone who can open this profile's dashboard.
+- **The Desktop half** (`psfn_lite/desktop/plugin.js`) is the Garden UI for
+  Hermes Desktop. The install tool never copies it; you load it yourself
+  (below).
+
+### Loading the Desktop half
+
+Hermes Desktop loads desktop plugins from one place: `desktop-plugins/` in
+the Hermes root (`apps/desktop/electron/desktop-plugins-root.ts` at
+2bd378e). It also copies any `plugins/<name>/desktop/plugin.js` that it
+finds in the root or in any profile into that folder, so a Desktop half
+placed under `plugins/` loads too. That is why the install tool never copies
+the file, and why the tests never create one under `~/.hermes`.
+
+You load the Desktop half yourself, once the profile Desktop uses serves the
+backend (step 6). Copy the built file into Desktop's own folder:
+
+```bash
+mkdir -p ~/.hermes/desktop-plugins/psfn_lite
+cp integrations/hermes/psfn_lite/desktop/plugin.js ~/.hermes/desktop-plugins/psfn_lite/plugin.js
+```
+
+Desktop picks it up within a few seconds (it rescans the folder) or at its
+next start. You can also switch it on or off in Capabilities ▸ Plugins.
+This keeps `plugins/psfn_lite` free of a Desktop half, so
+`install_plugin.py` keeps working. To unload it, remove
+`~/.hermes/desktop-plugins/psfn_lite`.
+
+The alternative is Desktop's paired layout. Put the file at
+`<profile home>/plugins/psfn_lite/desktop/plugin.js`, and Desktop copies it
+to `desktop-plugins/psfn_lite/` with a marker that names the source. Desktop
+removes that copy itself once the source file is gone. While the file is
+there, `install_plugin.py` refuses that profile.
+
+Desktop shows a "Garden" entry in the sidebar, with one page per screen. It
+also shows a "Memory deletions" side pane when the Memories screen opens it,
+and two transcript directives a reply can use:
+`::garden-memory{id="<memory id>"}` and `::garden-layer-diff{layer="<layer id>"}`.
+Every request goes through Desktop's authenticated REST client to
+`/api/plugins/psfn_lite/...` on the active profile's dashboard. A profile
+without the backend answers 404, and the screens say so.
+
+`psfn_lite/desktop/plugin.js` is built from `integrations/hermes/desktop/src`
+by `integrations/hermes/desktop/build.mjs` (see `docs/development.md`), and
+the built file is committed. `tests/desktop/bundle.test.ts` rebuilds it and
+fails if the committed file differs.
 
 ## Hermes with a gateway (2bd378e)
 
@@ -323,8 +430,8 @@ exact commands, see `docs/development.md`.
 
 - `test_config.py` checks strict configuration.
 - `test_host_contract.py` runs the plugin inside the pinned Hermes against
-  a scripted bridge. It covers discovery through the memory slot, hooks
-  registered once, labelled context, every outcome, review and subagent
+  a scripted bridge. It covers discovery through the memory slot (also with
+  the plugin in `plugins.enabled`), hooks registered once, labelled context, every outcome, review and subagent
   guards, unbound senders, undeliverable events, compaction refusal and
   ownership checks, and the memory delete approval (the `approve`
   directive, the resolve after an approved call, nothing after a blocked
@@ -386,6 +493,14 @@ exact commands, see `docs/development.md`.
     turn, 1 for Lite's own refusal);
   - a forced step with exact arguments, read back from the schema the real
     Lite hands over.
+  - the light Garden's dashboard backend, mounted by Hermes's own
+    dashboard loader (at 2bd378e only when `plugins.enabled` names it), in
+    front of the real Lite Garden: every screen's read, the browser's Origin
+    and cookies not forwarded, only the Garden routes passed, a memory
+    delete and restore, a settings write and a refused one, and a missing
+    Garden credential named in a 503;
+  - the install tool: no Desktop half copied, and a profile that already
+    holds one refused.
 
   It needs Docker and Node, like the TypeScript integration suites.
   `LITE_SKIP_DOCKER_TESTS=1` opts out explicitly.

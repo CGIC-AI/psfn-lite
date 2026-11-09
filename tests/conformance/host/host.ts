@@ -51,6 +51,8 @@ export interface Ready {
   readonly mcpUrl: string;
   readonly lifecycleUrl: string;
   readonly credentials: Readonly<Record<Principal, string>>;
+  /** The light Garden and its own operator credential, when the host was opened with `garden: true`. */
+  readonly garden: { readonly url: string; readonly credential: string } | null;
   readonly vars: Vars;
   readonly state: HostState;
 }
@@ -71,6 +73,7 @@ interface PiPlan {
 }
 
 const envName = (principal: string) => `LITE_CONFORMANCE_${principal.toUpperCase().replace(/-/g, '_')}`;
+const GARDEN_ENV = 'LITE_CONFORMANCE_GARDEN';
 
 export class ConformanceHost {
   private runtime: LiteRuntime | null = null;
@@ -78,10 +81,15 @@ export class ConformanceHost {
   private lastOffered: readonly string[] = [];
   private readonly model: ReturnType<typeof fauxModel>;
   private state: HostState;
+  private readonly garden: boolean;
 
-  /** `options.modelApi`: the pi-ai API the faux model reports (tests/support/faux-model.ts FauxModelOptions). */
-  constructor(state: HostState, options: { readonly modelApi?: string } = {}) {
+  /**
+   * `options.modelApi`: the pi-ai API the faux model reports (tests/support/faux-model.ts FauxModelOptions).
+   * `options.garden`: also mount the light Garden, with a fresh credential bound to the operator.
+   */
+  constructor(state: HostState, options: { readonly modelApi?: string; readonly garden?: boolean } = {}) {
     this.state = state;
+    this.garden = options.garden === true;
     this.model = fauxModel((call) => this.answer(call), options.modelApi === undefined ? {} : { api: options.modelApi });
   }
 
@@ -106,11 +114,17 @@ export class ConformanceHost {
       bindings: Object.entries(PRINCIPALS).map(([principal, contact]) => ({ principal, credential: { env: envName(principal) }, contact })),
     };
     document.lifecycle = { host: '127.0.0.1', port: this.state.ports?.lifecycle ?? 0, allowedHosts: null, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS, hermesInstallId: HERMES_TEST_INSTALL_ID, automata: null };
+    const gardenCredential = this.garden ? newCredential() : null;
+    if (gardenCredential !== null) {
+      document.garden = { host: '127.0.0.1', port: 0, allowedHosts: null, maxBodyBytes: 65_536, recentTurnLimit: 12,
+        bindings: [{ principal: 'garden-operator', credential: { env: GARDEN_ENV }, contact: 'operator' }] };
+    }
     const sessionKeys = this.state.sessionKeys ?? newSessionKeys();
     const env: Record<string, string> = {
       [DATABASE_URL_ENV]: this.state.databaseUrl,
       [SESSION_KEYS_ENV]: sessionKeys,
       ...Object.fromEntries(Object.entries(credentials).map(([p, c]) => [envName(p), c])),
+      ...(gardenCredential === null ? {} : { [GARDEN_ENV]: gardenCredential }),
     };
     if (first) await this.install(document, env);
     const config = parseLiteConfig(document);
@@ -128,11 +142,12 @@ export class ConformanceHost {
     });
     if (!runtime.ok) throw new Error(JSON.stringify(runtime.error));
     this.runtime = runtime.value;
-    const { mcpUrl, lifecycleUrl } = runtime.value.transports;
+    const { mcpUrl, lifecycleUrl, gardenUrl } = runtime.value.transports;
     if (mcpUrl === null || lifecycleUrl === null) throw new Error('transports were not mounted');
+    const garden = gardenUrl === null || gardenCredential === null ? null : { url: gardenUrl, credential: gardenCredential };
     this.state = { ...this.state, companionId, credentials, sessionKeys, ports: { mcp: Number(new URL(mcpUrl).port), lifecycle: Number(new URL(lifecycleUrl).port) } };
     const contact = (key: string) => runtime.value.contactIds.get(key) ?? '';
-    return { mcpUrl, lifecycleUrl, credentials, vars: { 'contact.operator': contact('operator'), 'contact.friend': contact('sam') }, state: this.state };
+    return { mcpUrl, lifecycleUrl, credentials, garden, vars: { 'contact.operator': contact('operator'), 'contact.friend': contact('sam') }, state: this.state };
   }
 
   /** The real `init` seeds the data directory; the database gets the donor's extension schema. */

@@ -340,11 +340,41 @@ export interface CompanionRuntime {
    * (docs/extraction.md, seam 3.17).
    */
   readonly subagentFaculty: SubagentControlPort;
+  /**
+   * Lite seam S8: the in-process instances the light Garden's donor services
+   * read. The donor handed the same instances to its Garden composition
+   * (app/agent/main.ts:784-789, 1940; admin-surface.ts:195-215, 272;
+   * operator/garden/local-admin-contract.ts:779-1067), so a Garden write goes
+   * through the store the running companion uses, never a second copy.
+   */
+  readonly garden: CompanionGardenHandles;
   /** Stops the scheduler, the availability runtime and the database pools. */
   stop(): Promise<void>;
 }
 
+/** The stores and state the light Garden composes its donor services over (seam S8). */
+export interface CompanionGardenHandles {
+  readonly config: SubstrateConfig;
+  readonly companionId: string;
+  readonly companionDataDir: string;
+  readonly characterCard: ReturnType<typeof composeIdentity>['card'];
+  readonly cardVersionStore: CharacterCardVersionStore;
+  readonly promptStore: ReturnType<typeof wirePromptRuntime>;
+  readonly promptRegistry: ReturnType<typeof wireStaticPromptRegistry>;
+  readonly memoryStore: ReturnType<typeof createMemoryStorePort>;
+  readonly contactStore: Awaited<ReturnType<typeof registerContactRuntime>>;
+  readonly sessionStore: SubstrateAgentSessionStore;
+  readonly concernStore: NonNullable<AgentPersistenceRuntime['intentionRuntime']>['concernStore'];
+  readonly embeddingService: ReturnType<typeof createProviderRuntimeServices>['embeddingProvider'];
+  readonly socialGraphProposalStore: ReturnType<typeof createFileSocialGraphProposalStore>;
+  readonly biographicalStore: Awaited<ReturnType<typeof createPostgresBiographicalProfileStore>>;
+  readonly emotionState: EmotionState;
+  readonly introspectionConsentStore: IntrospectionConsentStore;
+  readonly automataBusVector: ReturnType<typeof createAutomataBusProductionRuntime>['vector'];
+}
+
 type SubstrateAgentSessionManager = Awaited<ReturnType<typeof composeSessionRuntimeAsync>>['sessionManager'];
+type SubstrateAgentSessionStore = Awaited<ReturnType<typeof composeSessionRuntimeAsync>>['sessionStore'];
 
 /** Donor operator alerting "unconfigured" (main.ts:375-381): a missing sink is logged, never silent. */
 function createLoggingOperatorNotifier(): NotificationPort {
@@ -1691,6 +1721,25 @@ async function composeCompanionRuntime(
     persistence: persistenceRuntime,
     sessionManager,
     subagentFaculty,
+    garden: {
+      config: coreConfig,
+      companionId,
+      companionDataDir: pathSnapshot.companionDataDir,
+      characterCard: card,
+      cardVersionStore,
+      promptStore,
+      promptRegistry,
+      memoryStore,
+      contactStore,
+      sessionStore,
+      concernStore: intentionRuntime.concernStore,
+      embeddingService: embeddingProvider,
+      socialGraphProposalStore,
+      biographicalStore,
+      emotionState,
+      introspectionConsentStore,
+      automataBusVector: automataBusProductionRuntime.vector,
+    },
     stop: stopSequence,
   };
 }

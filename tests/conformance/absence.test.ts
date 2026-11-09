@@ -68,7 +68,7 @@ export function donorSpecifier(specifier: string): boolean {
 
 /** Every name a TypeScript file declares: functions, classes, interfaces, types, enums, variables, parameters, properties and members. */
 export function declaredNames(path: string, text: string): string[] {
-  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const names: string[] = [];
   const visit = (node: ts.Node): void => {
     const named = node as ts.Node & { readonly name?: ts.Node };
@@ -139,7 +139,7 @@ const VI_MODULE_CALLS = new Set(['mock', 'doMock', 'unmock', 'doUnmock', 'import
  */
 export function moduleReferences(path: string, text: string): string[] {
   const out = [...collectSpecifiers(path, text).specifiers];
-  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+  const source = ts.createSourceFile(path, text, ts.ScriptTarget.Latest, true, path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
   const visit = (node: ts.Node): void => {
     const first = (ts.isCallExpression(node) || ts.isNewExpression(node)) ? node.arguments?.[0] : undefined;
     if (first !== undefined && ts.isStringLiteralLike(first)) {
@@ -187,7 +187,7 @@ function walk(dir: string, skip: (path: string) => boolean): string[] {
 const skipped = (rel: string) => /(^|\/)(node_modules|\.git|\.venv|__pycache__|\.pytest_cache|dist|coverage)(\/|$)/.test(rel);
 const SOURCE_ROOTS = ['packages', 'apps', 'integrations', 'tests', 'scripts'];
 const sources = SOURCE_ROOTS.flatMap((root) => walk(join(REPO, root), skipped));
-const codeFiles = sources.filter((f) => /\.(ts|mts|cts|js|mjs|cjs)$/.test(f));
+const codeFiles = sources.filter((f) => /\.(ts|tsx|mts|cts|js|mjs|cjs)$/.test(f));
 const pythonFiles = sources.filter((f) => f.endsWith('.py'));
 /**
  * Product code: what Lite ships. Tests are checked for imports, not for the words their fixtures and assertions use.
@@ -201,9 +201,11 @@ const pythonFiles = sources.filter((f) => f.endsWith('.py'));
  */
 const DONOR_CONTRACT_KEYS: readonly (readonly [file: string, key: string, reason: string])[] = [
   ['apps/standalone/src/runtime.ts', 'channels', 'Contact.channels (packages/companion/src/core/contacts/types.ts:333): a contact\'s identity links, not the cut channel adapters'],
+  ['integrations/hermes/desktop/src/api.ts', 'channels', 'AdminSessionListData.channels (packages/companion/src/operator/garden/services/types/sessions.ts:29): the donor Garden session list the Sessions screen reads, not the cut channel adapters'],
+  ['packages/operator/src/garden.ts', 'fleetMemoryStore', 'AdminMemoryDataService and AdminContactsDataService deps (packages/companion/src/operator/garden/services/memory-service.ts:211, contacts-service.ts:181): the raw memory store beside the subject-authorized one, filled as the donor composition filled it (local-admin-contract.ts:783, 997)'],
 ];
 
-const productFiles = sources.filter((f) => /^(packages|apps|integrations\/hermes\/psfn_lite)\//.test(f) && !f.startsWith(COMPANION));
+const productFiles = sources.filter((f) => /^(packages|apps|integrations\/hermes\/(psfn_lite|desktop))\//.test(f) && !f.startsWith(COMPANION));
 
 describe('the checker itself', () => {
   it('flags each kind of excluded reference and passes look-alikes', () => {
@@ -316,7 +318,7 @@ describe('excluded subsystems are absent from Lite', () => {
     expect(paths.map(([f, segment, w]) => `${f}: ${segment} (${String(w)})`)).toEqual([]);
     const names = productFiles.flatMap((file) => {
       const text = readFileSync(join(REPO, file), 'utf8');
-      const declared = file.endsWith('.py') ? pythonNames(text) : /\.(ts|mts|cts|js|mjs|cjs)$/.test(file) ? declaredNames(file, text) : [];
+      const declared = file.endsWith('.py') ? pythonNames(text) : /\.(ts|tsx|mts|cts|js|mjs|cjs)$/.test(file) ? declaredNames(file, text) : [];
       return declared
         .filter((n) => !DONOR_CONTRACT_KEYS.some(([f, key]) => f === file && key === n))
         .map((n) => [file, n, excludedName(n)] as const)
@@ -343,9 +345,10 @@ describe('the donor scaffolding cut from packages/companion stays gone', () => {
   const deleted = deletedScaffolding(readFileSync(join(REPO, VENDORED_FILES), 'utf8'));
 
   it('no deleted file exists', () => {
-    // The B7 record: 732 scaffolding, 26 cut, 2 source-text, 1 test-support, 23 asset and 11 seed rows.
+    // The B7 record: 732 scaffolding, 26 cut, 2 source-text, 1 test-support, 23 asset and 11 seed rows,
+    // less the 24 scaffolding rows seam S8 re-vendored as kind garden (769 rows).
     // A truncated listing must not pass.
-    expect(deleted.length).toBeGreaterThan(790);
+    expect(deleted.length).toBeGreaterThan(760);
     expect(new Set(deleted).size).toBe(deleted.length);
     expect(deleted.filter((path) => existsSync(join(REPO, COMPANION, path)))).toEqual([]);
   });
