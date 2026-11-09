@@ -11,7 +11,6 @@ VALID = {
     "senders": [{"platform": "cli", "sender_id": ""}],
     "timeout_seconds": 30,
     "max_context_chars": 9000,
-    "internal_turns": None,
 }
 
 
@@ -30,11 +29,11 @@ def test_a_complete_config_parses():
         ({"senders": []}, "senders"),
         ({"senders": [{"platform": "cron", "sender_id": ""}]}, "interactive"),
         ({"timeout_seconds": 0}, "timeout_seconds"),
-        ({"internal_turns": {"command": ["hermes", "chat"], "poll_wait_ms": 0, "run_timeout_seconds": 60}}, "{prompt_file}"),
+        ({"internal_turns": None}, "unknown fields: internal_turns"),
     ],
 )
 def test_a_malformed_config_is_refused_by_field(change, message):
-    with pytest.raises(ConfigError, match=message.replace("{", r"\{").replace("}", r"\}")):
+    with pytest.raises(ConfigError, match=message):
         Config.parse({**VALID, **change})
 
 

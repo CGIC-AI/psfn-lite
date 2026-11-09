@@ -1,5 +1,5 @@
 """Turn integrity inside the pinned Hermes: paths where Hermes reports no end, session rotation, lost prepares,
-restarts, subagents inside internal turns, and the gate on Lite's governed tools.
+restarts, and the gate on Lite's governed tools.
 
 The failed-turn test runs Hermes's real ``AIAgent.run_conversation`` against a provider that answers HTTP 403,
 the shape of Hermes's own tests/run_agent/test_nonretryable_error_html_summary.py. That path returns before
@@ -91,17 +91,16 @@ def test_a_compression_that_rotates_the_session_mid_turn_keeps_the_turn(profile,
     load_provider()
     fire("pre_llm_call", **turn(session="C", turn_id="C:task:1"))
     # Hermes's compression set agent.session_id to C2 during the turn; the later hooks carry it.
-    fire("post_tool_call", tool_name="mcp__psfn_lite__memory", args={}, result="{}", task_id="task", session_id="C2", tool_call_id="c1", turn_id="C:task:1", api_request_id="", duration_ms=1, status="ok")
     fire("post_llm_call", session_id="C2", task_id="task", turn_id="C:task:1", user_message="q", assistant_response="after compression", conversation_history=[], model="m", platform="cli")
     fire("on_session_end", **end(session="C2", turn_id="C:task:1"))
     [settle] = bridge.bodies("settle")
-    assert settle["outcome"] == {"kind": "completed", "reply": "after compression", "delivery": "unknown"}
-    assert settle["toolCallCount"] == 1
-    # The next turn of the rotated session prepares normally, and checkpoint covers the earlier turn.
+    assert settle["outcome"] == {"kind": "completed", "reply": "after compression"}
+    # The next turn of the rotated session prepares normally in the same Lite session, and checkpoint covers the earlier turn.
     fire("pre_llm_call", **turn(session="C2", turn_id="C2:task:2", parent="C"))
     assert len(bridge.bodies("prepare")) == 2 and len(bridge.bodies("settle")) == 1
+    assert [b["sessionId"] for b in bridge.bodies("prepare")] == ["C", "C"]
     plugin_module("runtime").driver().checkpoint("C2")
-    assert bridge.bodies("checkpoint")[-1] == {"turnIds": ["turn-1", "turn-2"]}
+    assert bridge.bodies("checkpoint")[-1] == {"sessionId": "C", "turnIds": ["turn-1", "turn-2"]}
 
 
 def test_a_prepare_whose_answer_was_lost_is_prepared_again_under_the_same_key(profile, bridge):
@@ -140,22 +139,22 @@ def test_a_turn_lite_never_answered_is_found_by_its_key_and_settled_with_its_act
     assert routes[-3:] == ["prepare", "settle", "prepare"]
     late_prepare, _, current = bridge.bodies("prepare")[-3:]
     assert late_prepare["idempotencyKey"] == bridge.bodies("prepare")[0]["idempotencyKey"] != current["idempotencyKey"]
-    assert bridge.bodies("settle")[-1] == {"hostInstance": late_prepare["hostInstance"], "turnId": "turn-1", "outcome": {"kind": "completed", "reply": "answered without Lite", "delivery": "unknown"}, "toolCallCount": 0}
+    assert bridge.bodies("settle")[-1] == {"hostInstance": late_prepare["hostInstance"], "turnId": "turn-1", "outcome": {"kind": "completed", "reply": "answered without Lite"}}
     assert plugin_module("runtime").driver().ledger.pending() == []
 
 
 def test_a_restarted_process_settles_the_turns_an_exited_process_left_open(profile, bridge):
-    from psfn_lite.ledger import STANDING, Ledger
+    from psfn_lite.ledger import Ledger
 
     exited = subprocess.Popen([sys.executable, "-c", "pass"])
     exited.wait()
     ledger = Ledger(profile, bridge_url=bridge.url)
-    body = {"hostInstance": "hermes-old-1", "idempotencyKey": "hermes:" + "a" * 40, "message": "hi"}
-    known = ledger.open_turn(session_id="old-s", host_instance="hermes-old-1", scope=STANDING, pid=exited.pid, hermes_turn="old:1", prepare=body)
+    body = {"hostInstance": "hermes-old-1", "idempotencyKey": "hermes:" + "a" * 40, "sessionId": "old-s", "message": "hi"}
+    known = ledger.open_turn(session_id="old-s", host_instance="hermes-old-1", pid=exited.pid, hermes_turn="old:1", prepare=body)
     ledger.bind_turn(known, "turn-known")
-    ledger.open_turn(session_id="old-s", host_instance="hermes-old-1", scope=STANDING, pid=exited.pid, hermes_turn="old:2", prepare=body)
+    ledger.open_turn(session_id="old-s", host_instance="hermes-old-1", pid=exited.pid, hermes_turn="old:2", prepare=body)
     # A live process's turn is left alone.
-    ledger.open_turn(session_id="live-s", host_instance="hermes-live-1", scope=STANDING, pid=os.getpid(), hermes_turn="live:1", prepare=body)
+    ledger.open_turn(session_id="live-s", host_instance="hermes-live-1", pid=os.getpid(), hermes_turn="live:1", prepare=body)
 
     load_provider()
     fire("pre_llm_call", **turn())
@@ -164,24 +163,6 @@ def test_a_restarted_process_settles_the_turns_an_exited_process_left_open(profi
     # The unbound row was found by preparing its kept key again, with the exited process's instance.
     assert bridge.bodies("prepare")[0] == body
     assert [r["host_instance"] for r in plugin_module("runtime").driver().ledger.turns()] == ["hermes-live-1", plugin_module("runtime").driver().instance]
-
-
-def test_a_subagent_inside_an_internal_turn_never_drives_the_turn_or_uses_lite_tools(profile, bridge, monkeypatch):
-    monkeypatch.setenv("PSFN_LITE_INTERNAL_JOB", "1")
-    load_provider()
-    fire("pre_llm_call", **turn(session="job-s", turn_id="job:1", message="[system note: free_time]\nopen"))
-    fire("subagent_start", parent_session_id="job-s", parent_turn_id="job:1", parent_subagent_id=None, child_session_id="child-1", child_subagent_id="s1", child_role="leaf", child_goal="g")
-    assert fire("pre_llm_call", **turn(session="child-1", turn_id="c:1", platform="subagent", parent="job-s")) == []
-    assert gate("mcp__psfn_lite__free_time", session="child-1", turn_id="c:1") is not None
-    fire("post_llm_call", session_id="child-1", task_id="t", turn_id="c:1", user_message="x", assistant_response="SUBAGENT OUTPUT", conversation_history=[], model="m", platform="subagent")
-    fire("on_session_end", **end(session="child-1", turn_id="c:1"))
-    # The review fork shares the job's session and is skipped too.
-    assert fire("pre_llm_call", **turn(session="job-s", turn_id="review:1", parent="job-s")) == []
-    assert gate("mcp__psfn_lite__free_time", session="job-s", turn_id="job:1") is None
-    fire("post_llm_call", session_id="job-s", task_id="t", turn_id="job:1", user_message="x", assistant_response="my own time", conversation_history=[], model="m", platform="cli")
-    fire("on_session_end", **end(session="job-s", turn_id="job:1"))
-    assert len(bridge.bodies("prepare")) == 1
-    assert [b["outcome"] for b in bridge.bodies("settle")] == [{"kind": "completed", "reply": "my own time", "delivery": "unknown"}]
 
 
 def test_lite_tools_run_only_inside_an_open_lite_turn(profile, bridge):

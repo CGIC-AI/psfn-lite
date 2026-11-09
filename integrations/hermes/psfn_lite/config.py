@@ -11,7 +11,6 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 CONFIG_FILE = "psfn-lite.json"
 #: The Hermes revision this plugin's host contract tests ran against.
@@ -36,14 +35,6 @@ class Sender:
 
 
 @dataclass(frozen=True)
-class InternalTurns:
-    #: argv for one internal turn; "{prompt_file}" is replaced with the prompt file's path.
-    command: tuple
-    poll_wait_ms: int
-    run_timeout_seconds: float
-
-
-@dataclass(frozen=True)
 class Config:
     bridge_url: str
     credential_env: str
@@ -51,7 +42,6 @@ class Config:
     senders: tuple
     timeout_seconds: float
     max_context_chars: int
-    internal_turns: Optional[InternalTurns]
 
     def credential(self) -> str:
         value = os.environ.get(self.credential_env, "")
@@ -68,7 +58,7 @@ class Config:
 
     @classmethod
     def parse(cls, values) -> "Config":
-        fields = ("bridge_url", "credential_env", "mcp_server", "senders", "timeout_seconds", "max_context_chars", "internal_turns")
+        fields = ("bridge_url", "credential_env", "mcp_server", "senders", "timeout_seconds", "max_context_chars")
         _exact(values, fields, "config")
         url = values["bridge_url"]
         if not isinstance(url, str) or not re.match(r"^https?://[^\s/]+(/[^\s]*)?$", url) or not url.rstrip("/").endswith("/lifecycle/v1"):
@@ -97,7 +87,7 @@ class Config:
         limit = values["max_context_chars"]
         if type(limit) is not int or not 1_000 <= limit <= 1_000_000:
             raise ConfigError("max_context_chars must be an integer from 1000 to 1000000")
-        return cls(url.rstrip("/"), env, server, tuple(parsed), float(timeout), limit, _internal(values["internal_turns"]))
+        return cls(url.rstrip("/"), env, server, tuple(parsed), float(timeout), limit)
 
     @classmethod
     def load(cls, hermes_home) -> "Config":
@@ -125,22 +115,6 @@ def ownership_issues(hermes_config: dict) -> list:
     if compression.get("checkpoint_required") is not True:
         issues.append("compression.checkpoint_required must be true (compaction must not drop unproven turns)")
     return issues
-
-
-def _internal(raw) -> Optional[InternalTurns]:
-    if raw is None:
-        return None
-    _exact(raw, ("command", "poll_wait_ms", "run_timeout_seconds"), "internal_turns")
-    command = raw["command"]
-    if not isinstance(command, list) or not command or not all(isinstance(a, str) and a for a in command) or "{prompt_file}" not in command:
-        raise ConfigError("internal_turns.command must be a non-empty argv list containing the literal argument {prompt_file}")
-    wait = raw["poll_wait_ms"]
-    if type(wait) is not int or not 0 <= wait <= 60_000:
-        raise ConfigError("internal_turns.poll_wait_ms must be an integer from 0 to 60000")
-    timeout = raw["run_timeout_seconds"]
-    if type(timeout) not in (int, float) or not 0 < timeout <= 86_400:
-        raise ConfigError("internal_turns.run_timeout_seconds must be a number from 0 to 86400")
-    return InternalTurns(tuple(command), wait, float(timeout))
 
 
 def _exact(raw, fields, at: str) -> None:

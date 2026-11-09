@@ -4,17 +4,21 @@ It runs the scenario files of tests/conformance/scenarios against the same
 conformance host process the TypeScript runner drives
 (tests/conformance/fixtures/host-process.ts), with Hermes as the Hermes
 surface: the real psfn_lite plugin through Hermes's own hook dispatch
-(``pre_llm_call``, ``post_tool_call``, ``post_llm_call``, ``on_session_end``)
-and Hermes's own MCP client and tool dispatch (``handle_function_call``)
-for every governed call. The Pi surface and the host operations go to the
-host process, exactly as in the TypeScript runner.
+(``pre_llm_call``, ``post_llm_call``, ``on_session_end``) and Hermes's own
+MCP client and tool dispatch (``handle_function_call``) for every companion
+tool call, which the donor runs in its own tool loop inside the host-driven
+turn. The Pi surface and the host operations go to the host process,
+exactly as in the TypeScript runner. The operator's Hermes session is the
+conformance operator session, so its donor session is the one Pi turns join.
 
 What the companion is shown on Hermes is what Hermes sends: the participant's
 message, then the plugin's context appended to it (agent/turn_context.py),
 after the earlier messages of the same Hermes session.
 
-``resolve_templates``, ``capture_into``, ``canonical``, ``participant_blocks``
-and the checks mirror tests/conformance/scenario.ts; keep them in step.
+``resolve_templates``, ``capture_into``, ``canonical`` and the checks mirror
+tests/conformance/scenario.ts; keep them in step. Participant speech is what
+the plugin renders as ``[participant speech]`` (the donor context's
+user-role messages) and the Hermes session's own user messages.
 """
 
 import json
@@ -26,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -36,7 +40,6 @@ POSTGRES_ENTRY = REPO / "tests" / "conformance" / "fixtures" / "postgres.ts"
 SERVER = "psfn_lite"
 READY_TIMEOUT_SECONDS = 180
 REQUEST_TIMEOUT_SECONDS = 90
-EVENT_TIMEOUT_SECONDS = 30
 
 
 # -- the shared contract (mirrors tests/conformance/scenario.ts) ----------------
@@ -94,20 +97,12 @@ def participant_blocks(rendered: str) -> list:
 
 
 def check_result(expect, result: dict, at: str) -> list:
+    """A tool result as the donor returned it: its text, and whether it was an error result."""
     expect = expect or {}
-    issues = []
-    want_ok = expect.get("ok", "error" not in expect)
+    want_ok = expect.get("ok", True)
     if result["ok"] != want_ok:
-        got = canonical(result["content"])[:300] if result["ok"] else json.dumps(result["error"])
-        return [f"{at}: expected {'success' if want_ok else 'a refusal'}, got {got}"]
-    if not result["ok"]:
-        error = result["error"]
-        if "error" in expect and error.get("kind") != expect["error"]:
-            issues.append(f"{at}: expected error {expect['error']}, got {json.dumps(error)}")
-        if "reason" in expect and error.get("reason") != expect["reason"]:
-            issues.append(f"{at}: expected reason {expect['reason']}, got {json.dumps(error)}")
-        return issues
-    return check_text(expect, canonical(result["content"]), at)
+        return [f"{at}: expected {'success' if want_ok else 'an error result'}, got {result['text'][:300]}"]
+    return check_text(expect, result["text"], at)
 
 
 def check_text(expect, text: str, at: str) -> list:
@@ -155,7 +150,7 @@ def check_turn(step: dict, observed: dict, at: str) -> list:
             issues.append(f"{at}: {json.dumps(s)} was not shown at all")
         if any(s in t for t in speech):
             issues.append(f"{at}: {json.dumps(s)} was presented as participant speech")
-    if not step.get("abandon") and "crash" not in step:
+    if not step.get("abandon"):
         calls = step.get("calls", [])
         if len(observed["results"]) != len(calls):
             issues.append(f"{at}: {len(calls)} calls planned, {len(observed['results'])} results")
@@ -186,7 +181,6 @@ class HostProcess:
                                          text=True, env={"PATH": os.environ.get("PATH", "")})
         self._lock = threading.Condition()
         self._pending = {}
-        self._events = {}
         self._next = 1
         self._ready = None
         self._exited = False
@@ -216,8 +210,6 @@ class HostProcess:
                 if "event" in message:
                     if message["event"] == "ready":
                         self._ready = message
-                    else:
-                        self._events[message["event"]] = self._events.get(message["event"], 0) + 1
                 else:
                     future = self._pending.pop(message["id"], None)
                     if isinstance(message.get("state"), dict):
@@ -250,15 +242,6 @@ class HostProcess:
 
     def request(self, op: str, args: dict = None):
         return self.submit(op, args).result(timeout=REQUEST_TIMEOUT_SECONDS)
-
-    def event_count(self, event: str) -> int:
-        with self._lock:
-            return self._events.get(event, 0)
-
-    def wait_event(self, event: str, after: int) -> None:
-        with self._lock:
-            if not self._lock.wait_for(lambda: self._events.get(event, 0) > after, EVENT_TIMEOUT_SECONDS):
-                raise TimeoutError(f"no {event} event within {EVENT_TIMEOUT_SECONDS}s")
 
     def kill(self) -> dict:
         """SIGKILL: nothing in flight survives, as in a crash."""
@@ -335,28 +318,19 @@ def fire(name, **kwargs):
 
 
 def parse_tool_result(raw) -> dict:
-    """Hermes's MCP result string as the scenario's call result: core content, or core's error kind and reason."""
+    """Hermes's MCP result string as the scenario's call result: the donor's tool result text, and whether it was an error."""
     text = raw if isinstance(raw, str) else json.dumps(raw)
     try:
         payload = json.loads(text)
     except ValueError:
-        return {"ok": False, "error": {"kind": "unparsed", "reason": text[:200]}}
+        return {"ok": False, "text": text}
     if isinstance(payload, dict) and "error" in payload:
-        inner = payload["error"]
-        try:
-            core = json.loads(inner).get("error") if isinstance(inner, str) else None
-        except ValueError:
-            core = None
-        if not isinstance(core, dict):
-            # Not a Lite refusal: Hermes's gate, its MCP client, or a dead connection.
-            return {"ok": False, "error": {"kind": "transport", "reason": str(inner)[:300]}}
-        reason = core.get("reason", core.get("capability"))
-        return {"ok": False, "error": {"kind": str(core.get("kind")), **({"reason": reason} if isinstance(reason, str) else {})}}
-    structured = payload.get("structuredContent") if isinstance(payload, dict) else None
-    if structured is None and isinstance(payload, dict):
-        result = payload.get("result")
-        structured = result if isinstance(result, dict) else json.loads(result)
-    return {"ok": True, "content": structured.get("content")}
+        # The donor's error result, Hermes's gate, or its MCP client: Hermes reports each as its tool error text.
+        return {"ok": False, "text": str(payload["error"])}
+    structured = payload.get("structuredContent", payload.get("result")) if isinstance(payload, dict) else payload
+    if isinstance(structured, dict):
+        return {"ok": True, "text": structured["text"] if isinstance(structured.get("text"), str) else json.dumps(structured)}
+    return {"ok": True, "text": structured if isinstance(structured, str) else text}
 
 
 class Profile:
@@ -451,19 +425,15 @@ class HermesSurface:
         self._unload()
         profile.successor_pending = True
 
-    def tool_names(self, name: str = "operator") -> dict:
+    def tool_names(self, name: str = "operator") -> list:
+        """The companion tools Hermes registered from the Lite MCP server."""
         from tools.registry import registry
 
         self.use(name)
         prefix = f"mcp__{SERVER}__"
-        out = []
-        for entry in registry.get_all_entries():
-            if entry.name.startswith(prefix):
-                action = entry.schema.get("parameters", {}).get("properties", {}).get("action", {})
-                out.append({"name": entry.name[len(prefix):], "actions": list(action.get("enum", []))})
-        return out
+        return [entry.name[len(prefix):] for entry in registry.get_all_entries() if entry.name.startswith(prefix)]
 
-    def turn(self, step_key: str, as_: str, say: str, calls: list, reply: str, variables: dict, *, abandon: bool, on_call_error=None) -> dict:
+    def turn(self, step_key: str, as_: str, say: str, calls: list, reply: str, variables: dict, *, abandon: bool) -> dict:
         from model_tools import handle_function_call
 
         profile = self.use(as_)
@@ -496,14 +466,11 @@ class HermesSurface:
             tool = f"mcp__{SERVER}__{resolved['tool']}"
             raw = handle_function_call(tool, {"action": resolved["action"], **resolved.get("args", {})}, task_id="task", tool_call_id=f"call-{step_key}-{index}",
                                        session_id=profile.session, turn_id=turn_id)
-            # handle_function_call runs Hermes's own pre_tool_call gate and post_tool_call hook, as the agent loop does.
+            # handle_function_call runs Hermes's own pre_tool_call gate, as the agent loop does.
             outcome = parse_tool_result(raw)
             results.append(outcome)
             if outcome["ok"]:
-                capture_into(local, canonical(outcome["content"]), planned.get("capture"))
-            elif outcome["error"]["kind"] == "transport" and on_call_error is not None:
-                on_call_error()
-                break
+                capture_into(local, outcome["text"], planned.get("capture"))
         answer = resolve_templates(reply, local)
         fire("post_llm_call", session_id=profile.session, task_id="task", turn_id=turn_id, user_message="", assistant_response=answer, conversation_history=[], model="m", platform=profile.platform)
         fire("on_session_end", session_id=profile.session, task_id="task", turn_id=turn_id, completed=True, failed=False, interrupted=False,
@@ -513,14 +480,6 @@ class HermesSurface:
 
 
 # -- the runner -------------------------------------------------------------------
-
-def unsupported(scenario: dict):
-    """Why this runner cannot run the scenario on the real plugin, or None."""
-    if scenario["internalTurns"] == "delegated":
-        return ("delegated internal turns need a real internal-turn command (a Hermes process per claimed job, "
-                "PSFN_LITE_INTERNAL_HOST=1); the TypeScript protocol driver covers the bridge and MCP side of it")
-    return None
-
 
 def run_scenario(scenario: dict, order: tuple, initial_state: dict, hermes: HermesSurface) -> list:
     label = f"{scenario['name']} [a={order[0]}, b={order[1]}]"
@@ -541,18 +500,11 @@ def run_scenario(scenario: dict, order: tuple, initial_state: dict, hermes: Herm
                 relaunch()
                 continue
             if step["do"] == "host":
-                args = resolve_templates(step.get("args", {}), variables)
-                if step["op"] == "dispatch":
-                    result = box["host"].request("dispatch", args)
-                else:
-                    result = {"ok": True, "content": box["host"].request(step["op"], args)}
-                if step["op"] in ("restart", "backup_restore"):
-                    hermes.attach(box["host"].ready)
-                issues.extend(check_result(step.get("expect"), result, at))
-                if result["ok"]:
-                    capture_into(variables, canonical(result["content"]), step.get("capture"))
+                text = canonical(box["host"].request(step["op"], resolve_templates(step.get("args", {}), variables)))
+                issues.extend(check_result(step.get("expect"), {"ok": True, "text": text}, at))
+                capture_into(variables, text, step.get("capture"))
                 continue
-            observed = run_turn(step, order, variables, box, hermes, relaunch)
+            observed = run_turn(step, order, variables, box, hermes)
             variables.update(observed.get("vars") or {})
             issues.extend(check_turn(resolve_templates(step, variables), observed, at))
             if observed["turnId"] is not None:
@@ -563,45 +515,12 @@ def run_scenario(scenario: dict, order: tuple, initial_state: dict, hermes: Herm
     return issues
 
 
-_EMPTY = {"turnId": None, "refused": None, "seen": "", "speech": [], "results": []}
-
-
-def run_turn(step: dict, order: tuple, variables: dict, box: dict, hermes: HermesSurface, relaunch) -> dict:
+def run_turn(step: dict, order: tuple, variables: dict, box: dict, hermes: HermesSurface) -> dict:
     surface = surface_of(step["on"], order)
     say = resolve_templates(step["say"], variables)
     calls = step.get("calls", [])
     reply = step.get("reply", "ok")
     key = f"{step['id']}-{surface}"
-    as_ = step.get("as", "operator")
-    host = box["host"]
-    if step.get("crash") == "worker":
-        # The worker the turn spawns is mid model call when the Lite host dies.
-        before = host.event_count("worker_hang")
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            if surface == "hermes":
-                swapped = threading.Event()
-                running = pool.submit(hermes.turn, key, as_, say, calls, reply, variables, abandon=False, on_call_error=lambda: swapped.wait(60))
-            else:
-                running = pool.submit(lambda: host.request("pi_turn", {"say": say, "calls": calls, "reply": reply, "hang": False, "vars": variables, "key": key}))
-            host.wait_event("worker_hang", before)
-            relaunch()
-            if surface == "hermes":
-                swapped.set()
-            try:
-                return running.result(timeout=REQUEST_TIMEOUT_SECONDS)
-            except HostGone:
-                return dict(_EMPTY)
     if surface == "hermes":
-        return hermes.turn(key, as_, say, calls, reply, variables, abandon=bool(step.get("abandon")))
-    if step.get("abandon"):
-        # The Pi host dies while the companion's model call is in flight.
-        before = host.event_count("companion_hang")
-        pending = host.submit("pi_turn", {"say": say, "calls": calls, "reply": reply, "hang": True, "vars": variables, "key": key})
-        host.wait_event("companion_hang", before)
-        relaunch()
-        try:
-            pending.result(timeout=5)
-        except Exception:  # noqa: BLE001 - the killed host never answers
-            pass
-        return dict(_EMPTY)
-    return host.request("pi_turn", {"say": say, "calls": calls, "reply": reply, "hang": False, "vars": variables, "key": key})
+        return hermes.turn(key, step.get("as", "operator"), say, calls, reply, variables, abandon=bool(step.get("abandon")))
+    return box["host"].request("pi_turn", {"say": say, "calls": calls, "reply": reply, "vars": variables, "key": key})

@@ -70,7 +70,9 @@ def _classify(status: int, raw: bytes) -> BridgeError:
         error = None
     if isinstance(error, dict) and isinstance(error.get("kind"), str):
         kind = error["kind"]
-        reason = error.get("reason") if isinstance(error.get("reason"), str) else ""
+        # An unavailable refusal names the busy or missing capability; the others carry a reason.
+        raw_reason = error.get("reason", error.get("capability"))
+        reason = raw_reason if isinstance(raw_reason, str) else ""
         if kind == "invalid":
             issues = error.get("issues") if isinstance(error.get("issues"), list) else []
             # Core's own validation messages name fields, never content.
