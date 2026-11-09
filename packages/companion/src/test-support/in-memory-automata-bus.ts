@@ -2,8 +2,10 @@
  * Lite test support: an in-memory stand-in for the Postgres Automata Bus
  * store and the production runtime surfaces the worker port calls, with the
  * store's own eventId semantics (same id and same content is a replay, same
- * id and different content is refused). Used by the operator automata rule
- * tests (worker-write-keys.test.ts, host-execution.test.ts).
+ * id and different content is refused) and its current-findings projection
+ * (a relation removes its target, which must be current, and a supersede
+ * becomes current; postgres-store.ts appendAllocated). Used by the operator
+ * automata rule tests (worker-write-keys.test.ts, host-execution.test.ts).
  */
 import { vi } from 'vitest';
 
@@ -19,6 +21,7 @@ export interface InMemoryAutomataBus {
 
 export function createInMemoryAutomataBus(): InMemoryAutomataBus {
   const events: InMemoryAutomataBus['events'] = new Map();
+  const current = new Set<string>();
   const store = {
     appendAllocated: vi.fn(async (input: {
       eventId: string;
@@ -34,17 +37,30 @@ export function createInMemoryAutomataBus(): InMemoryAutomataBus {
         }
         return { event: incumbent.event, inserted: false };
       }
+      if (event.type === 'relation' && !current.delete(event.body.targetEventId)) {
+        throw new Error('Automata Bus current projection target was not current');
+      }
       events.set(event.eventId, { event, audiences: [...input.audiences].sort(), sensitivity: input.sensitivity });
+      if (event.type === 'finding' || event.body.relation !== 'retracts') current.add(event.eventId);
       return { event, inserted: true };
     }),
     readEventById: vi.fn(async (input: { eventId: string }) => events.get(input.eventId)?.event ?? null),
     readCurrentFindingsByEventIds: vi.fn(async (input: { eventIds: string[] }) => input.eventIds
-      .map(id => events.get(id))
-      .filter((entry): entry is NonNullable<typeof entry> => entry !== undefined && entry.event.type === 'finding')
-      .map(entry => ({
-        effectiveFinding: entry.event,
-        audiences: entry.audiences,
-        sensitivity: entry.sensitivity,
+      .filter(id => current.has(id))
+      .map(id => events.get(id)!)
+      .map(({ event, audiences, sensitivity }) => ({
+        effectiveFinding: {
+          eventId: event.eventId,
+          companionId: event.companionId,
+          sequence: event.sequence,
+          occurredAt: event.occurredAt,
+          context: event.context,
+          ...(event.type === 'finding'
+            ? { body: event.body, sourceEventType: 'finding' }
+            : { body: event.body.replacement, sourceEventType: 'relation' }),
+        },
+        audiences,
+        sensitivity,
       }))),
   } as unknown as PostgresAutomataBusRuntimeStore;
   const runtime = {
