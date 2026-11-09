@@ -201,6 +201,7 @@ const pythonFiles = sources.filter((f) => f.endsWith('.py'));
  */
 const DONOR_CONTRACT_KEYS: readonly (readonly [file: string, key: string, reason: string])[] = [
   ['apps/standalone/src/runtime.ts', 'channels', 'Contact.channels (packages/companion/src/core/contacts/types.ts:333): a contact\'s identity links, not the cut channel adapters'],
+  ['packages/operator/src/garden.ts', 'fleetMemoryStore', 'AdminMemoryDataService and AdminContactsDataService deps (packages/companion/src/operator/garden/services/memory-service.ts:211, contacts-service.ts:181): the raw memory store beside the subject-authorized one, filled as the donor composition filled it (local-admin-contract.ts:783, 997)'],
 ];
 
 const productFiles = sources.filter((f) => /^(packages|apps|integrations\/hermes\/psfn_lite)\//.test(f) && !f.startsWith(COMPANION));

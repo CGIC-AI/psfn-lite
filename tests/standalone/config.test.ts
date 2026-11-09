@@ -96,6 +96,29 @@ describe('standalone configuration', () => {
     ]);
   });
 
+  it('reads the light Garden block strictly, and leaves it off without one', () => {
+    expect(parseLiteConfig(document())).toMatchObject({ ok: true, value: { garden: null } });
+    const garden = {
+      host: '127.0.0.1',
+      port: 0,
+      allowedHosts: null,
+      maxBodyBytes: 65_536,
+      recentTurnLimit: 12,
+      bindings: [{ principal: 'garden', credential: { env: 'GARDEN_TOKEN' }, contact: 'operator' }],
+    };
+    const parsed = parseLiteConfig({ ...document(), garden });
+    if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
+    expect(parsed.value.garden).toEqual(garden);
+    expect(parseLiteConfig({ ...document(), garden: null })).toMatchObject({ ok: true, value: { garden: null } });
+    const { recentTurnLimit: _left, ...partial } = garden;
+    expect(issuesOf({ ...document(), garden: { ...partial, maxBodyBytes: 10, bindings: [], extra: 1 } })).toEqual([
+      'garden.extra is not a known setting',
+      'garden.recentTurnLimit is required',
+      'garden.bindings must be a non-empty list of principal bindings',
+      'garden.maxBodyBytes must be an integer from 1024 to 16777216',
+    ]);
+  });
+
   it('reads secrets from the named environment variables and names a missing one without its value', () => {
     const parsed = parseLiteConfig({ ...document(), model: { ...document().model, apiKeyEnv: 'LITE_MODEL_KEY' } });
     if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
