@@ -11,6 +11,7 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
+    "jsx": "react-jsx",
     "allowImportingTsExtensions": true,
     "noEmit": true,
     "types": [
@@ -22,6 +23,8 @@
     "apps/*/src/**/*.ts",
     "tests/**/*.ts",
     "scripts/**/*.ts",
+    "integrations/hermes/desktop/src/**/*.ts",
+    "integrations/hermes/desktop/src/**/*.tsx",
     "vitest.config.ts"
   ],
   "exclude": [

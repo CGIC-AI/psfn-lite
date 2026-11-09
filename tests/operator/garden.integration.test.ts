@@ -18,6 +18,7 @@ import type { Script } from '../support/faux-model.ts';
 import { dockerTestsOptedOut } from '../support/postgres-harness.ts';
 import { DATABASE_URL_ENV, RUNTIME_TIMEOUT_MS } from '../support/lite-world.ts';
 import { INSTALL, bridge, mcpClient, useBridgeWorld, type BridgeWorld } from '../lifecycle/bridge-world.ts';
+import { path as desktop } from '../../integrations/hermes/desktop/src/api.ts';
 
 const EXPLANATION = 'The stored number is incorrect.';
 const script: Script = () => null;
@@ -113,6 +114,40 @@ describe.skipIf(dockerTestsOptedOut('light Garden'))('the light Garden', () => {
     const missing = await garden(w, 'GET', '/api/admin/wiki');
     expect(missing.status).toBe(404);
     expect(missing.headers.get('cache-control')).toBe('no-store');
+  }, RUNTIME_TIMEOUT_MS);
+
+  it('serves every route the Desktop half calls', async () => {
+    // The paths come from the Desktop half's own builders (integrations/hermes/desktop/src/api.ts). The Garden answers
+    // a path no route serves with exactly `{"error":"not found"}`; any other answer means a route took the request.
+    // Every write here names something that does not exist or carries an invalid body, so nothing changes.
+    const w = world();
+    const ghost = '0193f1c2-0000-7000-8000-000000000000';
+    const sessions = (await garden(w, 'GET', desktop.sessions)).body['channels'] as { channelId: string }[];
+    const conversationKey = sessions[0]?.channelId ?? 'none';
+    const calls: [string, string, unknown?][] = [
+      ['GET', desktop.overview], ['GET', desktop.memories], ['GET', desktop.memorySearch('basil')], ['GET', desktop.memory(ghost)],
+      ['GET', desktop.memoryDeletions], ['GET', desktop.identity], ['GET', desktop.prompts], ['GET', desktop.layer('no-such-layer')],
+      ['GET', desktop.layerDiff('no-such-layer')], ['GET', desktop.constitution], ['GET', desktop.northStar], ['GET', desktop.contacts],
+      ['GET', desktop.claims], ['GET', desktop.graphProposals], ['GET', desktop.sessions], ['GET', desktop.sessionMessages(conversationKey)],
+      ['GET', desktop.sessionTurn(conversationKey, 'no-such-turn')], ['GET', desktop.concerns], ['GET', desktop.innerLife],
+      ['GET', desktop.schedule], ['GET', desktop.automata(null)], ['GET', desktop.automata('no-such-run')], ['GET', desktop.settings],
+      ['POST', desktop.deleteMemory(ghost), {}], ['POST', desktop.restoreMemory, { deleteId: 'no-such-checkpoint' }],
+      ['POST', desktop.decideDeletion('no-such-proposal', 'approve')], ['POST', desktop.decideDeletion('no-such-proposal', 'reject')],
+      ['POST', desktop.identityRollback, { version: 999_999 }], ['POST', desktop.layerRollback('no-such-layer'), { version: 999_999 }],
+      ['POST', desktop.decideGraphProposal('no-such-proposal', 'approve'), {}], ['POST', desktop.decideGraphProposal('no-such-proposal', 'reject')],
+      ['POST', desktop.resolveConcern('no-such-concern'), {}], ['POST', desktop.transitionConcern('no-such-concern'), { status: 'watching' }],
+      ['PATCH', desktop.patchMemory(ghost), { text: 'x', reason: 'x' }], ['PATCH', desktop.identityField, { field: 'no_such_field', value: 'x' }],
+      ['PATCH', desktop.layer('no-such-layer'), { content: 'x' }],
+      ['PUT', desktop.tier, { tier: 'omnipotent', customTokens: [] }], ['PUT', desktop.scheduler, { tickIntervalMs: 'never' }],
+    ];
+    const unserved: string[] = [];
+    for (const [method, target, body] of calls) {
+      const answer = await garden(w, method, target, body === undefined ? {} : { body });
+      if (answer.status === 404 && JSON.stringify(answer.body) === '{"error":"not found"}') unserved.push(`${method} ${target}`);
+    }
+    expect(unserved).toEqual([]);
+    // The guard itself: a path no route serves is told apart.
+    expect((await garden(w, 'GET', '/api/admin/no-such-screen')).body).toEqual({ error: 'not found' });
   }, RUNTIME_TIMEOUT_MS);
 
   it('serves the reads of every screen', async () => {
