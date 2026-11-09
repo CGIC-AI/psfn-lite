@@ -19,14 +19,14 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | Step | State |
 |---|---|
 | A0 baseline | Recorded (below). |
-| A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding; typechecks with the donor compiler options; the extracted tests reproduce the baseline in a clean full run (Equivalence, below). |
+| A path-preserving copy | Done: closure, selected tests, test-support and the temporarily vendored scaffolding (deleted in B7); typechecks with the donor compiler options; the extracted tests reproduce the baseline in a clean full run (Equivalence, below). |
 | B1 seam cuts (3.7, 3.8, 3.13, 3.14, 3.16, 3.18) | Done (Seam cuts, below). |
 | B2 seam cuts (3.4, 3.5, 3.6) | Done (Seam cuts, below). |
 | B3 seam cuts (3.2, 3.3, 3.12, 3.15) | Done (Seam cuts, below). |
 | B4 seam cut (3.9) | Done (Seam cuts, below). |
 | B5 seam cuts (3.10, 3.17) | Done (Seam cuts, below): no core import of vendored scaffolding remains. |
 | B6 seam cuts (3.1, 3.11) | Done (Seam cuts, below): the composition root boots over PostgreSQL (boot proof). |
-| B7 | Not started. |
+| B7 delete the vendored scaffolding | Done (Seam cuts, below): every vendored scaffolding file is deleted, nothing in `packages/companion` imports, mocks or reads one, and the packages only scaffolding used are removed. |
 
 ## Closure (Step A0)
 
@@ -166,7 +166,7 @@ blob-by-blob; the single modified file is listed below):
 |---|---:|---:|
 | Closure (minus the card importer) | 1,095 | 318,894 |
 | Selected tests (minus the card importer test) | 734 | 285,609 |
-| Vendored scaffolding (temporary) | 788 | 237,889 |
+| Vendored scaffolding (temporary; deleted in B7) | 788 | 237,889 |
 | Vendored test-support (`src/test-support`, `*.test-fixtures.ts`, `*.test-support.ts`) | 21 | 6,405 |
 | Donor non-TS assets under `src/` (goldens, conformance fixtures, JSON) | 46 | 8,338 |
 | Source-text fixtures (read by source-scan tests, never compiled) | 5 | 3,262 |
@@ -337,6 +337,25 @@ every remaining baseline test has its baseline status`. B6 deleted and edited
 no test; the one added file is the B6 boot proof. No `lite-companion-*`
 containers and no `/tmp/lc-*` directories were left.
 
+Step B7 seam-group run (`--project companion`, after the scaffolding was
+deleted): 8,496 tests passed and one of 683 files failed to load:
+`icp-fatigue-regulation-reservation.integration.test.ts` still imported the
+deleted `icp-shared-autonomy-store.ts`. The first import scan matched single
+quotes only and missed it. The file's subject is the fatigue reservation store
+(scaffolding), so it is deleted, and the scan now matches both quote styles
+and side-effect imports. Comparison: `deleted: 54 files, 994 tests; matched:
+8491; Lite additions: 1 files, 5 tests`.
+
+Step B7 result (the plain validation command with a JSON reporter,
+2026-11-09 02:11Z, after root tsc, companion tsc and eslint all exited 0, with every
+vendored scaffolding file deleted): exit 0, **734 files and 8,936 tests, all
+passed** (`lite` 52 files / 440 tests, `companion` 682 files / 8,496 tests).
+Comparison: `deleted: 54 files, 994 tests; matched: 8491; Lite additions: 1
+files, 5 tests`, `equivalent: every remaining baseline test has its baseline
+status`. That is the baseline's 9,485 tests minus 994 deleted (717 before B7,
+277 in B7). The B7 edits (below) are among the 8,491 matched. No
+`lite-companion-*` containers and no `/tmp/lc-*` directories were left.
+
 ## Deleted and modified tests
 
 Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
@@ -369,6 +388,16 @@ relaxed.
 | B5c: `core/agent/substrate-agent.test.ts`: "renders one atomic owner snapshot that agrees with self_status at the same turn boundary", "injected immutable custom access governs the capability seam over the disk runtime and tier defaults" | They assert the disk-backed `CapabilityRuntime` paths (`snapshotOwnerGrant`, precedence over the disk runtime), which are removed. The sibling "explicit custom access works without any disk-backed CapabilityRuntime" stays and passes. | 3.17 tiers |
 | B5c: `core/agent/substrate-agent.test.ts` "uses the exact notify surface for candidates while ordinary turns retain the full catalog" | **Not a clean scaffolding deletion.** Its subject is ICP candidate control-plane reachability (a candidate turn exposes only `notify`, an ordinary turn keeps the full catalog, the handoff is queued without the permit id or reason). The substrate-agent half is kept core; the control plane (`app/agent/control-plane.ts`) is vendored scaffolding that B6 recomposes. The test grants the custom `external.companion` tier through a disk-backed `CapabilityRuntime` and asserts on its `has`, which the tier stub removes. No other baseline test covers the candidate notify-only surface. Recorded as an open question. | 3.17 tiers |
 | B5d: `persistence/postgres/retired-fleet-grantees.test.ts` (6), `system/capabilities/shard-derivation.test.ts` (28) | Their subjects are now `cut` (closure recompute). | 3.10 recompute, 3.17 shards |
+| B7 (whole files, 30 files / 183 tests): `persistence/postgres/{model-usage-budget,model-usage-certification,model-usage-store.benchmark,icp-conversation-cost-breaker}.integration.test.ts` (3, 1, 1, 5), `shared/telemetry/model-usage-certification-properties.test.ts` (4) | The model-usage ledger and budget store and the charge-cost reconciliation are vendored scaffolding (charge is a stub, B5c). | B7 charge |
+| B7: `persistence/postgres/{fleet-system-observability,tenancy-boundary,named-tenant-store-boot,shared-schema-runtime-readiness,companion-presence}.integration.test.ts` (8, 5, 6, 6, 4), `persistence/system-owner-fleet-migration-evolution.test.ts` (13), `shared/observability/health-detectors/health-detectors.integration.test.ts` (4), `system/config/scheduler-per-companion.test.ts` (8) | Fleet tenancy, the shared world schema, the fleet migration, fleet health events and escalations, the runtime health detectors and the fleet owner-file layout are scaffolding. | B7 fleet |
+| B7: `persistence/postgres/{icp-autonomy,icp-candidate-lifecycle-supervisor,icp-intention-lifecycle,icp-intention-retry-lifecycle,icp-admin-projection-cost-scope,icp-fatigue-regulation-reservation,social-pot-enforcement}.integration.test.ts` (20, 8, 2, 4, 3, 11, 8) | Peer-companion ICP initiation, the gateway autonomy broker, the Garden ICP projection, the fatigue reservation store and the social pot are scaffolding (fatigue is types only since B5b). | B7 ICP, fatigue |
+| B7: `persistence/postgres/{egress-delivery-record,gateway-ingress-receipt}.integration.test.ts` (5, 3), `core/agent/substrate-agent/egress-tool-guard.test.ts` (2) | The custody snapshot and delivery record stores, the gateway CogSec receipt store and the real intake firewall are cut (seams 3.4 and 3.6). | B7 CogSec, custody |
+| B7: `core/participation/{appraiser-injection,room-signal-candidate}.test.ts` (27, 5), `faculties/shards/manager-{capability-launch,configuration-snapshot}.test.ts` (9, 2), `core/identity/persona-owner-path-registry.test.ts` (4), `core/agent/{autoresearch-ttft,tool-schema-token-cost}.test.ts` (1, 1) | Their subjects are vendored scaffolding: participation (types only), the shard manager, the gateway persona path registry, the TTFT benchmark harness, and the token cost of the full donor tool catalog (17 of its 32 tools come from scaffolding factories). | B7 |
+| B7 (94 tests in 31 files): CogSec intake firewall consumers: `core/session/intake-sink-gating.test.ts` (15), `manager-intake-screening.test.ts` (7), `context-builder.channel-bond.test.ts` (2), `faculties/memory/writer.test.ts` (3), `reflection-template-runtime/daily-review-evidence.test.ts` (1) | They assert a consumer's hold/withhold/audit behaviour under the real sink gate and screening service built from the intake-policy seed. The firewall is a stub (seam 3.4); Lite wires no gate, which is the donor's no-gate mode. The zero-string mutation check (rejected before any gate runs) is kept as an edited test. | B7 CogSec |
+| B7: Garden (operator) services: `core/contacts/contact-tracking-approval-flow.test.ts` (3), `contact-archive.integration.test.ts` (1), `postgres-adapter.integration.test.ts` graph proposal (1), `biographical/cross-channel-conformance.integration.test.ts` (1), `turn-record-slimming.test.ts` Loom read path (1), `persistence/ledger-bounded-hydration.test.ts` fatigue / human-attention / charge ledgers (4) | The subject is the operator Garden service or ledger, which is scaffolding; the core stores they call stay covered by the other tests in each file. | B7 Garden |
+| B7: backup, restore and repair: `contact-lifecycle-ledger.integration.test.ts` restore quarantine (1), `automata/bus/postgres-store.integration.test.ts` backup roles and tenancy grants (2), `biographical/postgres-store.integration.test.ts` backup (1), `memory/postgres-store.integration.test.ts` reattribution repair (1) | The backup service, the restore quarantine, the tenancy planner and the operator repair tool are scaffolding (Lite's continuity backup is its own, conformance scenario 09). | B7 backups |
+| B7: gateway and settings layer: `primitives/llm/client.test.ts` (7), `system/capabilities/gate.test.ts` hook registry (3), `system/config/subsystem-config.test.ts` models.json and providers.json (10), `owner-file-modes.test.ts` (8), `owner-file-contract-adaptation.test.ts` (5), `decision-backend-config.test.ts` (3), `biographical-{candidate,depth}-policy.test.ts` (1, 1), `persistence/postgres/runtime-readiness.test.ts` entrypoints (1), `core/scheduler/health-detector-task.test.ts` (1) | They drive the gateway JSON-RPC transport, cost capture, hook registry and fleet eligibility, or the vendored settings.json / owner-file / models.json / providers.json layers, or the gateway and operator entrypoints. The host supplies the config, model registry and provider runtime (B5d, B6). The kept tests in each file (normalisers, defaults, `canonicalOwnerFileMode`, the gate's own hook path, `providerCostResolver`, the watchdog task) still pass. | B7 gateway, settings |
+| B7: wiki, shards, fatigue, arbiter, custody: `situated-presence.test.ts` (1), `retrieval-cache.test.ts` shared memory / wiki embedding (1), `gate.test.ts` shard transport (1), `observed-machine-intelligence.test.ts` fatigue class (1), `speaking-precedence-resolver.test.ts` reservation phase (4), `turn-records.test.ts` custody snapshot parity (1), `schema-tenancy.integration.test.ts` shared world schema (1) | Their subjects (wiki retrieval, shard transport, fatigue class, the arbiter reservation phase, the CogSec custody snapshot builder, the shared world schema) are scaffolding; the resolver's signal matrix and fail-closed tests stay. | B7 |
 
 Edited (`modified-tests.tsv`): `turn-execution-runtime.test.ts` "moves system
 context into the prompt system lane instead of assistant history in
@@ -402,6 +431,52 @@ Import-only edits (B5c): `moa-turn.test.ts` and `turn-execution-runtime.test.ts`
 import `ChargePolicyConfig` from the contract it was re-exported from;
 `substrate-agent.test.ts` and `subsystem-config.test.ts` lost the imports only
 their deleted tests used.
+
+Edits (B7, 78 rows in `modified-tests.tsv`, 61 files). About 56 rows only
+remove an import or helper that only deleted tests used, or redirect an import
+to the core copy of the same symbol (the promoted CogSec decision and contract
+files, `shared/contracts/*` copies, `inner-life-config.ts`, the Lite
+credential-vault fake). 22 change a fixture or a test body, each without
+touching an assertion of the subject under test:
+
+- Fixtures of the port type instead of a scaffolding builder:
+  `substrate-agent.test.ts` builds the injected `CapabilityAccess` (tier
+  `custom`, `identity.read`, `shard.spawn`, `world.read`) by hand instead of
+  `deriveShardCapabilityGrant`, uses the donor `DEFAULT_SKILL_REUSE_CONFIG`
+  values as a literal and drops the `lifecycleKubernetes` config field;
+  `intake-sink-gating.test.ts` "rejects a zero-string mutation before gate
+  evaluation" gets a hand-built gate of the port type (no string is screened);
+  `turn-execution-runtime.test.ts` gets an inert fatigue harness (the runtime
+  has no fatigue port since B5b) and the console message literal that
+  `createInteractiveTerminalMessage` returned; the introspection store's
+  `makeTurnRecord` uses the message literal `buildSubstrateMessage` returned;
+  `owner-file-modes.test.ts` uses the donor file name `'fleet-auth.json'`.
+- Reads through a kept path instead of an operator service:
+  `concern-resolution-arc.test.ts` reads arcs with `journal.listConcernArcs`
+  (same concern id and provenance) instead of the Garden concern service.
+- Scaffolding tails removed from a kept test (the tail's expects go with it):
+  the Garden Loom tail of the turn-record slimming round trip, the
+  backup/restore tail of the biographical restart test, the Garden contact
+  linker tail of the external memory service test, the custody-chain reader
+  block of the memory consent test, the Garden health accumulator tail of the
+  background-work live drain, and the notify-companion candidate tail of the
+  schema-tenancy lineage test.
+- Source-reading tests: the tool catalog support file builds the 15 kept
+  factories and exports `SCAFFOLDING_HOSTED_TOOL_SURFACES` (the 17 registry
+  surfaces whose factories were scaffolding: fs, repo, shell, web, mcp, world,
+  analysis_workbench, self_status, system, skill, wiki, beads, notify,
+  generate_image, selfie_create, publication, vault).
+  `factory-descriptions.test.ts` now checks that the factories equal the
+  registry minus that set, and that each excluded name is a registry surface.
+  `automata-certification.test.ts` asserts that the `shard.long_horizon`
+  adapter module (the deleted shard manager) is absent
+  (`DELETED_SCAFFOLDING_ADAPTER_CLASSES`) and reads every other adapter as
+  before. `runtime-readiness.test.ts` and `selfhood-charge-boundary.test.ts`
+  read only the kept source files of their lists.
+
+Not clean, recorded as open questions: the per-lane success-rate expects of
+the live drain test and the Loom-view equality of the slimming test leave with
+their Garden subjects; the kept core paths in those tests are unchanged.
 
 ## Seam cuts
 
@@ -786,6 +861,60 @@ still fails the comparison.
   service, the gateway message handlers and the notify / clarify tools are
   not composed. A host calls `agentLoop.handleMessage` directly.
 
+### B7 (delete the vendored scaffolding)
+
+Every file of `vendored-files.txt` of kind `scaffolding` (732), `cut` (26) and
+`source-text` (2) is deleted: 760 files, 230,765 LOC. 23 of them,
+`src/persistence/backups/*`, were in the tree but never in Git, because the
+repository's `.gitignore` ignores `backups/`; they are deleted from disk the
+same way. Also deleted, because only deleted files read them (kinds
+`test-support-deleted`, `asset-deleted` and `seed-deleted`): the
+`lifecycle-kubernetes-settings.ts` test support; 23 assets (gateway goldens
+and images, the CogSec intake corpus, file-ingest fixtures, fleet SSO fixtures,
+`external-channel-limits.json`, and the donor timeout registry that was never
+copied); `extraction/inner-life-loader-probe.mts` (it compared against the
+deleted donor loaders, as planned under B5); and 11 seeds (backup,
+capability-tier, charge-policy, fleet-auth, intake-l1-rules, mcp-servers,
+models, partner-affect-shadow, places, providers, skills). The 8 seeds that
+core loaders read stay. The rows stay in `vendored-files.txt` as the record;
+the absence test fails if one comes back.
+
+Every reference was found with an import scan (both quote styles,
+side-effect, dynamic, `vi.mock`) and a scan for string paths that resolve to
+a deleted file. Then each kept file was handled in one of these ways: delete
+a dead import; redirect to the core copy; build a fixture of the port type;
+inline the literal a scaffolding helper returns; remove a scaffolding tail
+from a test; or delete the test (Deleted and modified tests, above). Core code
+changes (`cuts.tsv`, seam B7):
+
+- `src/app/agent/companion-runtime.ts`: the primary user no longer falls back
+  to `config.voiceTargetUserId`, and the root no longer registers the
+  `'intake.screening.fail_closed'` alert handler. Both read fields typed only
+  by the deleted `scaffolding-config-fields.ts` augmentation, and Lite emits
+  no screening failure since seam 3.4. The handler stays in the promoted
+  `operator-alerts.ts`, unused.
+- `src/system/config/inner-life-config.ts`: `loadAutomataPolicySeedDefaults`,
+  copied from donor `automata-policy-config.ts:31-39`, for six automata tests.
+- `src/test-support/static-credential-vault.ts` (Lite, test only): the donor
+  `createStaticCredentialVault` / `createEnvCredentialVault`
+  (`boundary/custody/credential-vault.ts:94-119`), unchanged, over the
+  credential contract.
+- `src/persistence/redis-cache.ts` was scaffolding (no core importer) and is
+  deleted with the rest.
+- `packages/companion/tsconfig.json` no longer excludes the deleted
+  gateway and operator entrypoints.
+
+`remaining-seams.mjs` reports 0 statements. Four core files still name a
+deleted path as data, not as a module reference: the consumer metadata in
+`core/identity/persona-preamble-seeds.ts:146` and `prompt-registry.ts:276`
+(`faculties/wiki/sleeptime-wiki-pass.ts`), the `shard.long_horizon`
+`adapterModule` in `faculties/automata/bus/class-adapters.ts:94`
+(`faculties/shards/manager.ts`, checked by the certification test above), and
+comments in `shared/contracts/world-notes.ts:9` and
+`system/config/companions-config.ts:33`. The core tool registry still lists
+the 17 surfaces whose factories were scaffolding. These are open questions
+for Step C, not imports.
+
 ## Package changes
 
 Exact donor versions. Root `package.json` (Lite installs at the root) and, for
@@ -798,16 +927,16 @@ the core set, `packages/companion/package.json`:
 | `js-tiktoken` | 1.0.21 | core |
 | `winston` | 3.19.0 | core |
 | `@huggingface/transformers` | 4.2.0 | core (operator ruling: allowed) |
-| `json-rpc-2.0` | 1.7.1 | temporary, vendored scaffolding |
-| `ws` | 8.21.0 | temporary, vendored scaffolding |
-| `yaml` | 2.9.0 | temporary, vendored scaffolding |
-| `ipaddr.js` | 2.2.0 | temporary, vendored scaffolding |
-| `discord.js` | 14.26.4 | temporary, vendored scaffolding |
-| `pdfjs-dist` | 5.4.394 | temporary, vendored scaffolding |
-| `@redis/client` | 6.0.1 | temporary, vendored scaffolding |
+| `json-rpc-2.0` | 1.7.1 | vendored scaffolding; removed in B7 |
+| `ws` | 8.21.0 | vendored scaffolding; removed in B7 |
+| `yaml` | 2.9.0 | vendored scaffolding; removed in B7 |
+| `ipaddr.js` | 2.2.0 | vendored scaffolding; removed in B7 |
+| `discord.js` | 14.26.4 | vendored scaffolding; removed in B7 |
+| `pdfjs-dist` | 5.4.394 | vendored scaffolding; removed in B7 |
+| `@redis/client` | 6.0.1 | vendored scaffolding; removed in B7 |
 | `@total-typescript/shoehorn` (dev) | 0.1.2 | donor tests |
 | `tsup` (dev) | 8.5.1 | donor test `persistence/sessions/turn-records.test.ts` compiles the recovery worker |
-| `@types/ws` (dev) | 8.18.1 | temporary, vendored scaffolding |
+| `@types/ws` (dev) | 8.18.1 | vendored scaffolding; removed in B7 |
 
 `@character-foundry/character-foundry` was not added (not allowed). B6 added
 no package: the boot proof uses `@earendil-works/pi-ai` (already a root
@@ -828,19 +957,38 @@ Donor overrides that would change packages Lite already had (`esbuild`,
 `minimatch`, `picomatch`, `postcss`, `protobufjs`, `flatted`,
 `@protobufjs/utf8`) were not applied.
 
+B7 removed the seven scaffolding packages and `@types/ws` from the root
+`package.json` (none was in `packages/companion/package.json`), and the
+`discord.js` / `@discordjs/rest` `undici` overrides and the `lodash` override,
+whose only consumer was discord.js. `npm install` removed 38 lockfile entries
+and added or changed none. `ws` and `yaml` stay in the tree as transitive
+dependencies of other packages. The `basic-ftp`, `fast-uri`, `fast-xml-*`,
+`ip-address` and `tar` overrides already matched nothing in the tree before
+B7; they are left as they were.
+
 ## Lite-side amendments
 
-- `tests/conformance/absence.test.ts`: the companion's classifier and logger
-  packages (`@huggingface/*`, `onnxruntime-*`, `winston`) are allowed (operator
-  ruling); the packages only the vendored scaffolding needs (`discord.js` and
-  its `@discordjs/{builders,collection,formatters,rest,util,ws}`,
-  `discord-api-types`, `@redis/client`, `pdfjs-dist`) are allowed in the
-  manifest, the lockfile and `packages/companion` imports until the vendored
-  scaffolding is cut; `packages/companion` is outside the name and path rule
-  because the extracted tree keeps donor names verbatim (for example
-  `SubstrateAgent`). Everything else the test bans stays banned
-  (`@discordjs/voice`, `@character-foundry/*`, Redis clients other than the
-  vendored one, and every name rule for Lite's own packages).
+- `tests/conformance/absence.test.ts` (rewritten in B7): the companion's
+  classifier and logger packages (`@huggingface/*`, `onnxruntime-*`, `winston`)
+  are allowed (operator ruling), and the Automata Bus and `SubstrateAgent`
+  are core, so their names are no longer excluded. The test still bans the
+  Discord, Redis, PDF and card-import packages (`@character-foundry/*`) and
+  the donor in the manifest, overrides, lockfile, node_modules and every
+  import. In Lite's own code it bans names whose words include wiki, shard,
+  fleet, charge, gateway, cogsec, channels, skill(s), discord or redis, or
+  the pairs findings bus, gateway server and cog sec, and governed tools of
+  those names. Hermes Python still may not import transformers, onnxruntime
+  or winston: the plugin has no such dependency. `packages/companion` keeps
+  donor names verbatim, so instead of the name rule it is held to the
+  deletion record: every deleted row of `vendored-files.txt` (scaffolding,
+  cut, source-text, test-support, asset, seed) is absent from disk, and no
+  file of the package imports, re-exports, dynamically imports, mocks
+  (`vi.mock`, `doMock`, `importActual` and the rest) or reads through `new
+  URL(..., import.meta.url)` a deleted path. A first block of tests checks
+  the checker on positive and negative cases, and each rule was checked by
+  mutation (a temporary import of a deleted path, a Lite identifier named
+  after an excluded subsystem, a deleted file restored); each failed the
+  test.
 - Root `tsconfig.json` excludes `packages/companion`; it has its own
   `tsconfig.json` with the donor's compiler options (no
   `exactOptionalPropertyTypes`, `esModuleInterop` on, tests excluded from the
@@ -850,5 +998,16 @@ Donor overrides that would change packages Lite already had (`esbuild`,
 
 ## Measured size
 
-Not measured yet: the tree still carries the vendored scaffolding. Measured at
-the end of the extraction.
+After B7 (`packages/companion`, without `node_modules`):
+
+| Part | Files | LOC |
+|---|---:|---:|
+| Core non-test TypeScript (closure, promoted files and Lite additions) | 1,189 | 335,123 |
+| Tests | 682 | 255,893 |
+| Test-support | 22 | 7,084 |
+| Non-TS assets under `src/` | 23 | 1,633 |
+| Seed config (`config/`) | 8 | 1,539 |
+| Extraction records (`extraction/`) | 12 | 4,704 |
+| Package files (`package.json`, configs, README, baseline) | 7 | 1,109 |
+
+The deleted vendored set was 760 files and 230,765 LOC.

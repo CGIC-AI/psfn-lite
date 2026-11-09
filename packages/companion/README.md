@@ -6,13 +6,16 @@ contacts, automata, subagents, journals), extracted path-preserving from the
 donor `psfn-framework` at `e6a9546051f4e92bf7218b133b4523ac53a797c0`.
 `src/<path>` here is donor `src/<path>`, so relative imports are unchanged.
 
-The extraction is in progress. `extraction/vendored-files.txt` lists the donor
-scaffolding files carried temporarily so the tree compiles and its tests run
-before the seams are cut; see `docs/extraction.md` at the repository root for
+The donor scaffolding that was carried temporarily while the seams were cut is
+deleted (Step B7). `extraction/vendored-files.txt` keeps its rows as the
+record, and `tests/conformance/absence.test.ts` fails if one comes back or is
+imported, mocked or read. See `docs/extraction.md` at the repository root for
 the record (closure, baseline, seams, deleted tests, package changes).
 
-`config/` holds the donor's seed files, which the runtime and the tests read
-from the working directory.
+`config/` holds the donor's seed files that core loaders read (automata-policy,
+companions, intake-policy, runtime-prompt-layers, scheduler, settings,
+subagent-roles, trust-policy); the runtime and the tests read them from the
+working directory.
 
 ### Self-Direction Tool Surfaces
 

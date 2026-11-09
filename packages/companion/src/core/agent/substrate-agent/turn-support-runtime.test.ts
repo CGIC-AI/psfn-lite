@@ -23,11 +23,6 @@ import {
   hashHealthEventSubject,
   type HealthEvent,
 } from '../../../shared/contracts/health-event.js';
-import {
-  custodySnapshotRefForTurn,
-  type CustodySnapshot,
-  type CustodySnapshotStorePort,
-} from '../../cogsec/disclosure/custody-snapshot.js';
 
 function flushAsyncWork(): Promise<void> {
   return Promise.resolve().then(() => undefined);

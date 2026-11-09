@@ -61,7 +61,11 @@ Lite's four runtime dependencies are `@earendil-works/pi-agent-core`,
 23 add, among others, Discord (discord.js, `@discordjs/voice`,
 `@snazzah/davey`, prism-media, opusscript), `@redis/client`,
 `@huggingface/transformers` (with onnxruntime), pdfjs-dist, winston, ws and
-undici. `tests/conformance/absence.test.ts` keeps them out of Lite.
+undici. `tests/conformance/absence.test.ts` keeps Discord, Redis and
+pdfjs-dist out of Lite. These numbers predate the donor extraction:
+`packages/companion` adds `@huggingface/transformers`, winston and a few
+other core packages (an operator ruling allows them; see
+[extraction](extraction.md), Package changes).
 
 Notes:
 

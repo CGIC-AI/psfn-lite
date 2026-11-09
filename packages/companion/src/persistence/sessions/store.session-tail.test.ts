@@ -10,7 +10,6 @@ import {
   type SessionTailRow,
 } from './session-tail-cache-port.js';
 import { createTurnId } from '../../core/turns/id.js';
-import { CogSecEventStore } from '../../core/cogsec/events.js';
 
 // In-memory fake of the tail port (no live Redis in unit tests). Mirrors the
 // Redis implementation's epoch fencing: rows live under a per-channel/epoch

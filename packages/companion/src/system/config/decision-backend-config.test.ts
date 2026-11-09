@@ -1,11 +1,4 @@
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { loadSettings, saveSettings } from '../settings/io.js';
-import { applySettings, getRuntimeSettingsSnapshot } from '../settings/runtime.js';
-import { buildSettingsContractData } from './settings-contract.js';
-import type { SubstrateConfig } from './runtime-config-contracts.js';
+import { describe, expect, it } from 'vitest';
 import {
   createDefaultDecisionBackendSettings,
   normalizeDecisionBackendSettings,
@@ -31,12 +24,6 @@ function validSettings() {
 }
 
 describe('decisionBackend settings', () => {
-  const roots: string[] = [];
-  afterEach(() => {
-    for (const root of roots) rmSync(root, { recursive: true, force: true });
-    roots.length = 0;
-  });
-
   it('defaults every site to local', () => {
     const defaults = createDefaultDecisionBackendSettings();
     expect(defaults.mode).toBe('local');
@@ -72,37 +59,5 @@ describe('decisionBackend settings', () => {
     ['an unknown key', { extra: true }, /unknown keys: extra/],
   ])('rejects %s', (_label, patch, message) => {
     expect(() => normalizeDecisionBackendSettings({ ...validSettings(), ...patch })).toThrow(message);
-  });
-
-  it('is a structured object field of settings.json', () => {
-    expect(buildSettingsContractData().fields.decisionBackend).toMatchObject({
-      ownerFile: 'settings.json',
-      type: 'object',
-      scope: 'global',
-    });
-  });
-
-  it('round-trips through settings.json, the runtime config and the snapshot', () => {
-    const root = mkdtempSync(join(tmpdir(), 'psfn-settings-decision-backend-'));
-    roots.push(root);
-    saveSettings(root, { decisionBackend: normalizeDecisionBackendSettings(validSettings()) });
-    const loaded = loadSettings(root);
-    expect(loaded.decisionBackend).toEqual(validSettings());
-
-    const config = {} as SubstrateConfig;
-    applySettings(config, loaded);
-    expect(config.decisionBackend).toEqual(validSettings());
-    expect(getRuntimeSettingsSnapshot(config).decisionBackend).toEqual(validSettings());
-    expect(getRuntimeSettingsSnapshot({} as SubstrateConfig).decisionBackend)
-      .toEqual(createDefaultDecisionBackendSettings());
-  });
-
-  it('refuses an invalid block on load', () => {
-    const root = mkdtempSync(join(tmpdir(), 'psfn-settings-decision-backend-invalid-'));
-    roots.push(root);
-    writeFileSync(join(root, 'settings.json'), JSON.stringify({
-      decisionBackend: { ...validSettings(), jev: { ...validSettings().jev, model: '~typesafe/jev-latest' } },
-    }), 'utf-8');
-    expect(() => loadSettings(root)).toThrow(/pinned Jev release/);
   });
 });

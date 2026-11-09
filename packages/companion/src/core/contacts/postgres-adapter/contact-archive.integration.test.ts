@@ -5,9 +5,6 @@ import {
   startPostgresTestHarness,
   type PostgresTestHarness,
 } from '../../../test-support/postgres-test-harness.js';
-import { AdminContactsDataService } from '../../../operator/garden/services/contacts-service.js';
-import type { MemoryStorePort } from '../../../faculties/memory/memory-store-port.js';
-import type { SessionStore } from '../../../persistence/sessions/store.js';
 import { createPostgresContactStore } from '../postgres-adapter.js';
 import type { ContactStorePort } from '../contact-store-port.js';
 import { createBiographySynthesisTargetPort } from '../../../faculties/memory/biographical/synthesis-targets.js';
@@ -167,33 +164,6 @@ describe('contact archive semantics (qgqw.1)', () => {
 
       // Missing contact returns false.
       await expect(store.archiveContact('does-not-exist', 'operator:test')).resolves.toBe(false);
-    } finally {
-      await pool.end();
-    }
-  });
-
-  it('archives through the Garden contact route/action instead of deleting', async () => {
-    const { store, pool } = await freshStore();
-    try {
-      const contact = await store.upsert({
-        displayName: 'Garden Archivable',
-        channels: [{ channel: 'discord', userId: 'discord-garden', privacyLevel: 'invite_only', firstSeen: '', lastSeen: '' }],
-      });
-
-      const service = new AdminContactsDataService({
-        contactStore: store,
-        memoryStore: {} as unknown as MemoryStorePort,
-        sessionStore: {} as unknown as SessionStore,
-      });
-
-      const result = await service.archiveContact(contact.id);
-      expect(result.ok).toBe(true);
-      expect(result.message).toMatch(/archived/i);
-
-      // Route archived (not deleted): the row is still readable.
-      expect((await store.getById(contact.id))?.archivedAt).toBeTruthy();
-      // And it is gone from live resolution.
-      await expect(store.getByChannelIdentity('discord', 'discord-garden')).resolves.toBeUndefined();
     } finally {
       await pool.end();
     }

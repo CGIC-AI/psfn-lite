@@ -3,7 +3,7 @@ import { buildReactionSurfaceContextBlock } from './reaction-surface.js';
 import {
   STANDARD_REACTION_SUBSET,
   type ResolvedReactionSurface,
-} from '../../../../channels/shared/reaction-surface.js';
+} from '../../../../shared/contracts/reaction-surface.js';
 
 describe('buildReactionSurfaceContextBlock (jp36.3.1.2)', () => {
   it('renders nothing when no surface is provided', () => {

@@ -12,7 +12,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SubstrateMessage } from '../../shared/contracts/runtime.js';
 import { resolveAuthorContext } from '../agent/substrate-agent/runtime-context.js';
-import { createAdminPendingContactsService } from '../../operator/garden/services/pending-contacts-service.js';
 import { createTestPostgresContactStore } from '../../test-support/postgres-contact-store.js';
 import type { ContactStorePort } from './contact-store-port.js';
 import {
@@ -118,73 +117,6 @@ describe('contact-tracking approval flow (E3.4)', () => {
     expect(secondContext.canonicalContactKey).toBeUndefined();
     expect(notify).toHaveBeenCalledTimes(1);
     expect((await contactStore.listAll())).toHaveLength(0);
-  });
-
-  it('AC1/AC5: after operator approval the contact is created via the normal upsert path and resolves normally', async () => {
-    await resolveWithGate(makeMessage());
-    const entry = await pendingApprovals.getByIdentity('discord', 'stranger-42');
-
-    const service = createAdminPendingContactsService({ pendingApprovals, contactStore });
-    const result = await service.approvePendingContact(entry!.id);
-    expect(result.ok).toBe(true);
-
-    const contact = await contactStore.getByChannelIdentity('discord', 'stranger-42');
-    expect(contact).toBeDefined();
-    expect(contact?.displayName).toBe('vtubegooner69');
-    // Sprint-10 privacy regression H7: operator approval enrolls via the normal
-    // resolveChannelIdentity upsert, which now mints at the PUBLIC trust floor.
-    // Promotion to 'regular'+ is a separate, explicit operator/tool action.
-    expect(contact?.trustLevel).toBe('public');
-
-    // Queue entry consumed.
-    expect((await service.listPendingContactApprovals()).entries).toHaveLength(0);
-
-    // Subsequent messages resolve normally (canonical contact key bound).
-    const postApproval = await resolveWithGate(makeMessage({ id: 'msg-3', content: 'hello again' }));
-    expect(postApproval.canonicalContactKey).toBe(contact!.id);
-    expect(postApproval.trustLevel).toBe('public');
-    expect(postApproval.relationshipType).toBe('stranger');
-  });
-
-  it('AC5: deny persists — the speaker stays untracked and is not re-proposed until reset', async () => {
-    await resolveWithGate(makeMessage());
-    const entry = await pendingApprovals.getByIdentity('discord', 'stranger-42');
-    const service = createAdminPendingContactsService({ pendingApprovals, contactStore });
-
-    const denied = await service.denyPendingContact(entry!.id);
-    expect(denied.ok).toBe(true);
-    notify.mockClear();
-
-    // Further messages: untracked, no contact, no re-enqueue, no notification.
-    const context = await resolveWithGate(makeMessage({ id: 'msg-4', content: 'ignored profile-wise' }));
-    expect(context.canonicalContactKey).toBeUndefined();
-    expect(await contactStore.getByChannelIdentity('discord', 'stranger-42')).toBeUndefined();
-    expect(notify).not.toHaveBeenCalled();
-    const persisted = await pendingApprovals.getByIdentity('discord', 'stranger-42');
-    expect(persisted?.status).toBe('denied');
-
-    // Operator reset: the record is removed and the next message re-proposes.
-    const reset = await service.resetPendingContactDecision(entry!.id);
-    expect(reset.ok).toBe(true);
-    await resolveWithGate(makeMessage({ id: 'msg-5', content: 'back again' }));
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect((await pendingApprovals.getByIdentity('discord', 'stranger-42'))?.status).toBe('pending');
-  });
-
-  it('AC5: mutations against unknown entries report not-found', async () => {
-    const service = createAdminPendingContactsService({ pendingApprovals, contactStore });
-    expect(await service.approvePendingContact('missing')).toEqual({
-      ok: false,
-      message: 'Pending contact approval not found',
-    });
-    expect(await service.denyPendingContact('missing')).toEqual({
-      ok: false,
-      message: 'Pending contact approval not found',
-    });
-    expect(await service.resetPendingContactDecision('missing')).toEqual({
-      ok: false,
-      message: 'Pending contact approval not found',
-    });
   });
 
   it('AC6: auto rooms behave identically with and without the gate wired', async () => {

@@ -48,14 +48,13 @@ import { createEventBusCostTelemetryPort } from '../../../shared/telemetry/cost-
 import { notePendingPaidDeliverable } from '../../../shared/paid-deliverable-tracking.js';
 import { createActiveEmanationSatellitePresencePort } from '../satellite-adapter-port.js';
 import type { FatigueBudgetEvent } from '../../../shared/contracts/runtime.js';
-import {
-  createOverchargeFatigueEvaluation,
-  DeterministicFatigueBudgetPort,
-  type FatigueBudgetHistoryPort,
-  type FatigueBudgetPort,
-} from '../fatigue/fatigue-budget.js';
-import type { IcpFatigueRegulationReservationPort } from '../fatigue/regulation-reservation.js';
-import type { HumanAttentionPressurePort } from '../fatigue/human-attention-pressure.js';
+// Fatigue is cut (B5b, seam 3.17): the turn runtime has no fatigue ports, so the
+// fatigue fixtures below are inert stand-ins the runtime never reads. The donor
+// typed them with core/agent/fatigue/{fatigue-budget,regulation-reservation,
+// human-attention-pressure}.ts (vendored scaffolding, deleted in B7).
+type FatigueBudgetPort = object;
+type IcpFatigueRegulationReservationPort = object;
+type HumanAttentionPressurePort = object;
 import type {
   TurnAdmissionRuntime,
   TurnExecutionRuntime,
@@ -82,7 +81,6 @@ import {
 } from '../../session/turn-provenance.js';
 import { runWithChargeContext } from '../../../shared/telemetry/run-charge.js';
 import { resolveTaskKind as resolveChannelTaskKind } from './channel-routing-runtime.js';
-import { createInteractiveTerminalMessage } from '../../../app/cli/interactive-terminal-message.js';
 import { createMemoryTool } from '../../../faculties/memory/tools.js';
 import { resolveAuthorizedRetrievalAccessScope } from '../../../faculties/memory/retrieval/access-scope.js';
 import { ParentTurnContinuationBudgetExceededError } from '../turn-limits.js';
@@ -258,112 +256,10 @@ function makePersistenceConfig(dataDir: string): SubstrateConfig {
   };
 }
 
-class InMemoryFatigueBudgetHistory implements FatigueBudgetHistoryPort {
-  readonly events: FatigueBudgetEvent[] = [];
-
-  listFatigueEvents(query: NonNullable<Parameters<FatigueBudgetHistoryPort['listFatigueEvents']>[0]> = {}): FatigueBudgetEvent[] {
-    return this.events.filter(event => (
-      (query.localCompanionId === undefined || event.localCompanionId === query.localCompanionId)
-      && (query.peerContactId === undefined || event.peerContactId === query.peerContactId)
-      && (query.channelId === undefined || event.channelId === query.channelId)
-      && (query.dayKey === undefined || event.dayKey === query.dayKey)
-      && (query.decision === undefined || event.decision === query.decision)
-    )).slice(0, query.limit);
-  }
-
-  recordFatigueEvent(event: FatigueBudgetEvent): void {
-    this.events.push({
-      ...event,
-      triggeringAuthor: { ...event.triggeringAuthor },
-      peer: { ...event.peer },
-      ...(event.details ? { details: { ...event.details } } : {}),
-      ...(event.lineage ? { lineage: { ...event.lineage } } : {}),
-    });
-  }
-}
-
 function createFatigueBudgetHarness() {
-  const history = new InMemoryFatigueBudgetHistory();
-  const fatigueBudget = new DeterministicFatigueBudgetPort(history, {
-    now: () => Date.parse('2026-03-08T12:00:00Z'),
-  });
+  const history: { readonly events: readonly FatigueBudgetEvent[] } = { events: [] };
+  const fatigueBudget: FatigueBudgetPort = Object.freeze({});
   return { fatigueBudget, history };
-}
-
-function seedMachineIntelligenceFatigueSpend(input: {
-  fatigueBudget: FatigueBudgetPort;
-  count: number;
-  channelId?: string;
-  icpCorrelation?: IcpConversationCorrelation;
-  localCompanionId?: string;
-  peerContactId?: string;
-}): void {
-  for (let index = 0; index < input.count; index += 1) {
-    const evaluation = input.fatigueBudget.evaluate({
-      localCompanionId: input.localCompanionId ?? TEST_FLEET_COMPANION_ID,
-      channelId: input.channelId ?? 'ch1',
-      peer: {
-        contactId: input.peerContactId ?? 'contact-mi',
-        channelAuthorId: 'mi-user',
-        displayName: 'Peer MI',
-        isMachineIntelligence: true,
-      },
-      triggeringAuthor: {
-        role: 'machine_intelligence',
-        contactId: input.peerContactId ?? 'contact-mi',
-        channelAuthorId: 'mi-user',
-        displayName: 'Peer MI',
-        isMachineIntelligence: true,
-      },
-      limits: {
-        softLimit: 2,
-        hardLimit: 5,
-        overchargeLimit: 2,
-      },
-      timestampMs: Date.now() + index,
-      ...(input.icpCorrelation ? { correlation: { icpCorrelation: input.icpCorrelation } } : {}),
-    });
-    input.fatigueBudget.recordFinalDecision(evaluation);
-  }
-}
-
-function seedMachineIntelligenceOverchargeSpend(input: {
-  fatigueBudget: FatigueBudgetPort;
-  count: number;
-  channelId?: string;
-  icpCorrelation?: IcpConversationCorrelation;
-  localCompanionId?: string;
-  peerContactId?: string;
-}): void {
-  for (let index = 0; index < input.count; index += 1) {
-    const evaluation = input.fatigueBudget.evaluate({
-      localCompanionId: input.localCompanionId ?? TEST_FLEET_COMPANION_ID,
-      channelId: input.channelId ?? 'ch1',
-      peer: {
-        contactId: input.peerContactId ?? 'contact-mi',
-        channelAuthorId: 'mi-user',
-        displayName: 'Peer MI',
-        isMachineIntelligence: true,
-      },
-      triggeringAuthor: {
-        role: 'machine_intelligence',
-        contactId: input.peerContactId ?? 'contact-mi',
-        channelAuthorId: 'mi-user',
-        displayName: 'Peer MI',
-        isMachineIntelligence: true,
-      },
-      limits: {
-        softLimit: 2,
-        hardLimit: 5,
-        overchargeLimit: 2,
-      },
-      timestampMs: Date.now() + 10 + index,
-      ...(input.icpCorrelation ? { correlation: { icpCorrelation: input.icpCorrelation } } : {}),
-    });
-    input.fatigueBudget.recordFinalDecision(
-      createOverchargeFatigueEvaluation(evaluation, 'overcharge_recent_human_participation'),
-    );
-  }
 }
 
 function machineIntelligenceAuthorContext(
@@ -1898,35 +1794,6 @@ describe('handleMessageForTurn fatigue enforcement', () => {
     expect(runtime.agent.prompt).not.toHaveBeenCalled();
   });
 
-  function reservationsReturning(
-    snapshot: () => { normalSpentBefore: number; relationshipPressure: number },
-  ): IcpFatigueRegulationReservationPort & {
-    reserve: ReturnType<typeof vi.fn>;
-    finalize: ReturnType<typeof vi.fn>;
-    handoff: ReturnType<typeof vi.fn>;
-  } {
-    return {
-      reserve: vi.fn(async () => {
-        const current = snapshot();
-        return {
-          outcome: 'reserved' as const,
-          reservationOutcome: 'pending' as const,
-          normalSpentBefore: current.normalSpentBefore,
-          overchargeSpentBefore: 0,
-          relationshipPressure: current.relationshipPressure,
-          rootNormalSpent: 0,
-          rootOverchargeSpent: 0,
-          contributingReservationCount: 1,
-        };
-      }),
-      readInitiationPressure: vi.fn(),
-      prepareDelivery: vi.fn(async () => undefined),
-      handoff: vi.fn(async () => undefined),
-      finalize: vi.fn(async () => undefined),
-      close: vi.fn(),
-    };
-  }
-
   it('uses the durable completed-turn marker to avoid scheduling post-turn work twice', async () => {
     const { fatigueBudget } = createFatigueBudgetHarness();
     const localCompanionId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
@@ -2180,11 +2047,22 @@ describe('handleMessageForTurn observer eval sidecar seam', () => {
   });
 
   it('classifies genuine interactive console turns as private observations', async () => {
-    const consoleMessage = createInteractiveTerminalMessage({
+    // The message the donor's interactive console builds
+    // (app/cli/interactive-terminal-message.ts:5-23, vendored scaffolding).
+    const consoleMessage: SubstrateMessage = {
       id: 'cli-observer-test',
+      channelId: 'cli:chat',
+      channelType: 'terminal',
+      authorId: 'primary-user',
+      authorName: 'PrimaryUser',
       content: OBSERVER_TEST_MESSAGE_CONTENT,
       timestamp: new Date('2026-03-08T12:00:00Z'),
-    });
+      isDirectMessage: false,
+      routing: {
+        source: 'terminal',
+        channelPrivacy: 'private',
+      },
+    };
     const receivedInput = await captureObserverSidecarInput(consoleMessage);
 
     expect(receivedInput.source).toEqual({

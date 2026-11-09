@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { DisclosureDestination } from '../cogsec/disclosure/index.js';
+import type { DisclosureDestination } from '../cogsec/disclosure/contracts.js';
 import type { FreeTimeReturnPolicy } from './free-time-workspace-resolver.js';
 import {
   returnPolicyToDisclosureDestination,

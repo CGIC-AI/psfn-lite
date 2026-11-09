@@ -14,7 +14,6 @@ import {
   resolveTurnEvidenceDependency,
   SubstrateAgent as RuntimeSubstrateAgent,
 } from './substrate-agent.js';
-import { DEFAULT_SKILL_REUSE_CONFIG } from '../../system/config/skills-config.js';
 import { EventBus } from '../../shared/event-bus.js';
 import type { ContextCoherenceEvent } from '../../shared/contracts/context-coherence.js';
 import type { SessionManager } from '../session/manager.js';
@@ -26,7 +25,7 @@ import {
   setRuntimeChannelEnvelopeLabels,
 } from '../../system/trust/runtime-channel-labels.js';
 import type { ContactStorePort } from '../contacts/contact-store-port.js';
-import type { ChannelPromptDock } from '../../channels/backplane/types.js';
+import type { ChannelPromptDock } from '../../shared/contracts/channel-prompt-port.js';
 import { agentLoopWithScheduler } from './scheduled-agent-loop.js';
 import { isTurnId } from '../turns/id.js';
 import { EmotionState } from '../emotion/state.js';
@@ -45,8 +44,7 @@ import { Scheduler } from '../scheduler/scheduler.js';
 import { wirePostTurnActionRuntime } from '../../app/startup/composition/post-turn-actions.js';
 import { createAgentFacingIcpAutonomyRuntime } from '../icp/agent-facing-autonomy.js';
 import type { CapabilityAccess } from '../../system/capabilities/access.js';
-import { deriveShardCapabilityGrant } from '../../system/capabilities/shard-derivation.js';
-import { buildSelfStatusResult } from '../tools/self-status.js';
+import type { CapabilityToken } from '../../system/capabilities/tokens.js';
 import {
   ExternalCommunicationRateLimiter,
   LifecycleRestartSafeguard,
@@ -54,13 +52,11 @@ import {
 import type { ContactStorePort } from '../contacts/contact-store-port.js';
 import type { IcpInitiationCandidate } from '../icp/initiation-candidate.js';
 import type { IcpInitiationPermit } from '../../shared/contracts/icp-autonomy.js';
-import { DEFERRED_COMPANION_OUTREACH_ACTION_KIND } from '../tools/notify-companion-handoff.js';
 import { createIcpAutonomyCandidateSchedulerMessage } from '../icp/candidate-scheduler-origin.js';
 import { TurnRunReservation } from './substrate-agent/turn-run-reservation.js';
 import { TurnSupportRuntime } from './substrate-agent/turn-support-runtime.js';
 import { PromptComposer } from '../identity/prompt-composer.js';
 import { PromptLayerStore } from '../identity/prompt-store.js';
-import { lifecycleKubernetesSettingsFixture } from '../../test-support/lifecycle-kubernetes-settings.js';
 import { makeContextManifestFixture } from '../../test-support/context-manifest.js';
 import { buildCompletionNotice } from './completion-notices.js';
 import { buildCompletionHandoff } from './completion-handoff.js';
@@ -283,7 +279,6 @@ function makeConfig(overrides?: Partial<SubstrateConfig>): SubstrateConfig {
     defaultContextWindow: 128_000,
     extractionThresholdPct: 30,
     compactionThresholdPct: 70,
-    lifecycleKubernetes: lifecycleKubernetesSettingsFixture(),
     modelRoster: {
       chat: { model: 'deepseek/deepseek-v3.2', provider: 'openrouter', maxTokens: 16384, contextWindow: 128_000 },
       background: { model: 'deepseek/deepseek-v3.2', provider: 'openrouter', maxTokens: 8192 },
@@ -4443,7 +4438,14 @@ describe('SubstrateAgent.handleMessage', () => {
       // lpxg3.3: the quiet reuse loop reads the admitted cache and its
       // owner-file bounds synchronously off the same runtime.
       getCachedAdmittedSkills: vi.fn().mockReturnValue([]),
-      getCachedReuseConfig: vi.fn().mockReturnValue({ ...DEFAULT_SKILL_REUSE_CONFIG }),
+      // Donor DEFAULT_SKILL_REUSE_CONFIG (system/config/skills-config.ts:53-59).
+      getCachedReuseConfig: vi.fn().mockReturnValue({
+        maxCandidates: 3,
+        minRelevanceScore: 0.25,
+        minToolCalls: 3,
+        nudgeEveryNthTurn: 3,
+        outcomeEvidenceWeight: 0.25,
+      }),
     });
 
     await agent.handleMessage(makeMessage());
@@ -7193,14 +7195,21 @@ describe('explicit capability access injection (mus2.1)', () => {
       // to an empty grant — copying config.capabilityTier is insufficient.
       expect(resolveAccess().getGrantedTokens().size).toBe(0);
 
-      const derived = deriveShardCapabilityGrant({
-        companionId: 'companion-parent-1',
-        tier: 'custom',
-        customTokens: ['identity.read', 'world.read', 'shard.spawn'],
+      // An explicit immutable `custom` access over a fixed token set (the
+      // donor built it with the shard derivation, which is scaffolding).
+      const grantedTokens: ReadonlySet<CapabilityToken> = new Set<CapabilityToken>([
+        'identity.read',
+        'shard.spawn',
+        'world.read',
+      ]);
+      const explicitAccess: CapabilityAccess = Object.freeze({
+        getTier: () => 'custom' as const,
+        getGrantedTokens: () => grantedTokens,
+        has: (token: CapabilityToken) => grantedTokens.has(token),
       });
-      agent.setCapabilityAccess(derived.access);
+      agent.setCapabilityAccess(explicitAccess);
 
-      expect(resolveAccess()).toBe(derived.access);
+      expect(resolveAccess()).toBe(explicitAccess);
       expect([...resolveAccess().getGrantedTokens()]).toEqual([
         'identity.read',
         'shard.spawn',

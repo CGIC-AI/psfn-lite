@@ -1,12 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import type { Pool } from 'pg';
-import { mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 import { createPostgresPool } from '../../../persistence/postgres.js';
-import { runBackupCycle } from '../../../persistence/backups/service.js';
-import { verifyPostgresDumpRestore } from '../../../persistence/backups/postgres-restore.js';
 import { createDefaultBiographicalCandidatePolicy } from '../../../system/config/biographical-candidate-policy.js';
 import {
   startPostgresTestHarness,
@@ -1228,126 +1223,6 @@ describe('PostgresBiographicalProfileStore — transactional conflict admission'
       })).toHaveLength(2);
     });
   });
-});
-
-describe('PostgresBiographicalProfileStore — canonical backup and restore', () => {
-  it('restores claim, grant, and lifecycle queue rows through the whole-database backup path', async () => {
-    await withStore(async (store, _pool, databaseUrl) => {
-      if (harness === null) throw new Error('PostgreSQL integration harness is not available');
-      const root = mkdtempSync(join(tmpdir(), 'psfn-biographical-backup-'));
-      try {
-        const claim = await store.writeClaim({
-          subject: contact('v'),
-          kind: 'name',
-          value: { kind: 'name', name: 'Morgan', role: 'primary' },
-          basis: 'explicit',
-          status: 'active',
-          confidence: 1,
-          sources: [source()],
-          now: NOW,
-        });
-        await store.recordGrant({
-          claimDigest: claim.claimDigest,
-          sourceSetDigest: claim.sourceSetDigest,
-          grantedSensitivity: 'public',
-          authorizingActor: 'operator',
-          authorityBasis: 'subject-choice',
-          reason: 'portable publication choice',
-          now: NOW,
-        });
-        await store.enqueueRebuild({
-          claim,
-          reason: 'revision-drift',
-          sourceRef: 'memory:m-1',
-          maxPending: 4,
-          now: NOW,
-        });
-        await store.recordReviewAudit({
-          claimId: claim.id,
-          claimDigest: claim.claimDigest,
-          sourceSetDigest: claim.sourceSetDigest,
-          action: 'regrant',
-          decision: 'allowed',
-          reason: 'grant-recorded',
-          actorAuthorityRef: 'garden-fleet:event-1',
-          grantedSensitivity: 'public',
-          now: NOW,
-        });
-        await store.writeCandidate({
-          automataRunId: 'automata-run-invented-backup',
-          automataAuthorityRef: 'automata:biography-synthesis',
-          policy: createDefaultBiographicalCandidatePolicy(),
-          claim: {
-            id: 'claim-invented-backup-candidate',
-            subject: contact('contact-invented-backup'),
-            kind: 'role',
-            value: {
-              kind: 'role',
-              schemaVersion: 1,
-              roleType: 'creative',
-              title: 'Ceramicist',
-            },
-            basis: 'explicit',
-            confidence: 0.9,
-            sources: [source({
-              ref: 'memory:invented-backup-candidate',
-              sourceType: 'semantic',
-              lifecycleStateAtProjection: 'active',
-            })],
-            validFrom: '2026-01-01T00:00:00.000Z',
-            now: NOW,
-          },
-        });
-        const backup = await runBackupCycle({
-          postgres: {
-            databaseUrl,
-            pgDumpBinary: harness.clientBinaries.pgDumpBinary,
-            pgRestoreBinary: harness.clientBinaries.pgRestoreBinary,
-          },
-          sessionsDir: join(root, 'sessions'),
-          backupRootDir: join(root, 'backups'),
-          maxRotatingBackups: 1,
-          maxWeeklyBackups: 0,
-          maxMonthlyBackups: 0,
-          now: () => NOW.getTime(),
-        });
-        if (backup.postgresDumpPath === undefined) throw new Error('expected Postgres dump');
-        const scratch = await harness.createDatabase();
-        const scratchPool = createPostgresPool(scratch.databaseUrl, {
-          applicationName: 'psfn-biographical-restore-verification',
-          max: 1,
-        });
-        try {
-          await scratchPool.query('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions');
-        } finally {
-          await scratchPool.end();
-        }
-        const verified = await verifyPostgresDumpRestore({
-          dumpPath: backup.postgresDumpPath,
-          scratchDatabaseUrl: scratch.databaseUrl,
-          sourceDatabaseUrl: databaseUrl,
-          criticalTables: [
-            'biographical_claims',
-            'biographical_candidates',
-            'biographical_grants',
-            'biographical_rebuild_queue',
-            'biographical_review_audits',
-          ],
-          psqlBinary: harness.clientBinaries.psqlBinary,
-          pgRestoreBinary: harness.clientBinaries.pgRestoreBinary,
-        });
-        expect(verified.tableCounts).toEqual([
-          { table: 'biographical_claims', restored: 2, source: 2 },
-          { table: 'biographical_candidates', restored: 1, source: 1 },
-          { table: 'biographical_grants', restored: 1, source: 1 },
-          { table: 'biographical_rebuild_queue', restored: 1, source: 1 },
-          { table: 'biographical_review_audits', restored: 1, source: 1 },
-        ]);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    });
-  }, INTEGRATION_TIMEOUT_MS);
 });
 
 describe('PostgresBiographicalProfileStore — parity with in-memory adapter', () => {

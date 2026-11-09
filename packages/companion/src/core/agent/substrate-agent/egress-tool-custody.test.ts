@@ -15,12 +15,6 @@ import { buildEgressToolGuard } from './egress-tool-guard.js';
 import { gateToolWithCapabilities, type CapabilityAccess } from '../../../system/capabilities/gate.js';
 import { withCapabilityRequirement } from '../../../system/capabilities/requirements.js';
 import type { CapabilityToken } from '../../../system/capabilities/tokens.js';
-import { EgressDeliveryRecorder } from '../../cogsec/disclosure/index.js';
-import {
-  egressContentSha256,
-  type EgressDeliveryRecord,
-  type TurnEgressCustodyProof,
-} from '../../cogsec/disclosure/egress-delivery-record.js';
 import type { DisclosureLineage } from '../../cogsec/disclosure/contracts.js';
 import {
   clearDiagnosticLogRingBufferForTests,
@@ -29,19 +23,17 @@ import {
 import { canonicalJsonString } from '../../../shared/utils/json-serialization.js';
 import type { AgentTool } from '../../../boundary/pi-agent/index.js';
 import type { CogSecMode } from '../../../shared/contracts/cogsec-mode.js';
-import type { PreToolHookGate } from '../../../boundary/gateway/pre-tool-hook.js';
 import {
   resetRuntimeChannelEnvelopeLabels,
   setRuntimeChannelEnvelopeLabels,
 } from '../../../system/trust/runtime-channel-labels.js';
 
 const TURN_ID = '01936f2c-4a1b-7c3d-8e5f-0a1b2c3d4e5f';
-const COMPANION_A = '3f2a1c88-5d4e-4a7b-9c3d-1e2f3a4b5c6d';
 const ROOM_CHANNEL = 'discord:guild-1:general';
 
 const CONTACT_ID = 'contact-1';
 
-const PROVEN: TurnEgressCustodyProof = {
+const PROVEN = {
   custodySnapshotRef: `turn:${TURN_ID}`,
   sourceCount: 2,
   hasUnclassifiedSource: false,
@@ -85,11 +77,11 @@ function contactLineage(overrides: Partial<DisclosureLineage> = {}): DisclosureL
 }
 
 function fakeStore() {
-  const rows: EgressDeliveryRecord[] = [];
+  const rows: unknown[] = [];
   return {
     rows,
     port: {
-      record: vi.fn(async (record: EgressDeliveryRecord) => {
+      record: vi.fn(async (record: unknown) => {
         rows.push(record);
         return 'recorded' as const;
       }),
@@ -111,7 +103,7 @@ function makeGuard(input: {
    * The turn's FOLDED custody proof — undefined during generation, because the
    * fold runs after the model's tool loop returns.
    */
-  proof: TurnEgressCustodyProof | undefined;
+  proof: typeof PROVEN | undefined;
   mode: CogSecMode;
   store: ReturnType<typeof fakeStore>;
   turnId?: string | undefined;
@@ -142,12 +134,6 @@ function makeGuard(input: {
     }),
     getCurrentTurnCustodyProof: () => input.proof,
     getActiveTurnId: () => ('turnId' in input ? input.turnId : TURN_ID),
-    egressDeliveryRecorder: new EgressDeliveryRecorder({
-      store: input.store.port,
-      companionId: COMPANION_A,
-      getCogSecMode: () => input.mode,
-      now: () => 1_800_000_000_000,
-    }),
   });
   if (!guard) throw new Error('expected an egress tool guard');
   return guard;

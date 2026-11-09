@@ -59,8 +59,6 @@ import {
   BackgroundWorkHandoffRetryCapacityError,
 } from '../agent/background-work/recovery-contract.js';
 import { sanitizeChannelId } from '../../persistence/sessions/store-file-contracts.js';
-import { CogSecEventStore } from '../cogsec/events.js';
-import { CogSecForensicArchive } from '../cogsec/forensic-archive.js';
 import {
   resolveCogSecEventsPath,
   resolveCogSecForensicArchiveDir,

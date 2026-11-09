@@ -1,18 +1,10 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import type { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { createPostgresPool, runPostgresMigrations } from '../../../persistence/postgres.js';
 import { POSTGRES_AUTOMATA_MIGRATIONS } from '../../../persistence/postgres/migrations.js';
 import { POSTGRES_VECTOR_EXTENSION_MIGRATION } from '../../../persistence/postgres/vector-extension-migration.js';
-import {
-  planPostgresTenantAccess,
-  provisionPostgresTenantAccess,
-} from '../../../persistence/postgres/tenancy.js';
-import { runBackupCycle } from '../../../persistence/backups/service.js';
-import { restorePostgresSchemaSlice } from '../../../persistence/backups/fleet-restore.js';
 import {
   PGVECTOR_POSTGRES_TEST_IMAGE,
   startPostgresTestHarness,
@@ -89,25 +81,6 @@ async function withIndependentStores<T>(
   } finally {
     await Promise.all([firstPool.end(), secondPool.end()]);
   }
-}
-
-async function installVectorExtension(databaseUrl: string): Promise<void> {
-  const owner = createPostgresPool(databaseUrl, {
-    applicationName: 'automata-bus-vector-extension-provisioning',
-    allowExitOnIdle: true,
-    max: 1,
-  });
-  try {
-    await owner.query('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions');
-  } finally {
-    await owner.end();
-  }
-}
-
-function seededRelationCount(relation: typeof AUTOMATA_BUS_POSTGRES_RELATIONS[number]): string {
-  return relation === 'automata_bus_events' || relation === 'automata_bus_current_findings'
-    ? '1'
-    : '0';
 }
 
 function finding(overrides: Partial<AutomataBusEvent> = {}): AutomataBusEvent {
@@ -748,150 +721,5 @@ describe('PostgresAutomataBusStore real Postgres', () => {
         maxSensitivity: 'personal',
       })).resolves.toEqual([finding()]);
     });
-  });
-
-  it('certifies Automata Bus history, projection, and immutable guards after backup restore', async () => {
-    if (!harness) throw new Error('Automata Bus Postgres integration harness is unavailable');
-    const database = await harness.createDatabase();
-    const schema = 'automata_restore_scope';
-    const owner = createPostgresPool(database.databaseUrl, { max: 1 });
-    await owner.query(`CREATE SCHEMA ${schema}`);
-    await owner.end();
-    const source = createPostgresPool(database.databaseUrl, {
-      applicationName: 'automata-bus-backup-source',
-      schema,
-      max: 2,
-    });
-    const root = mkdtempSync(join(tmpdir(), 'psfn-automata-bus-backup-'));
-    const sessionsDir = join(root, 'sessions');
-    mkdirSync(sessionsDir, { recursive: true });
-    try {
-      await runPostgresMigrations(source, [
-        POSTGRES_VECTOR_EXTENSION_MIGRATION,
-        ...AUTOMATA_BUS_POSTGRES_SCHEMA_STATEMENTS,
-      ]);
-      const store = new PostgresAutomataBusStore(source);
-      await store.append({
-        companionId: 'companion-a',
-        event: finding(),
-        audiences: ['eligible-automata'],
-        sensitivity: 'personal',
-      });
-      const backup = await runBackupCycle({
-        postgres: {
-          databaseUrl: database.databaseUrl,
-          schema,
-          pgDumpBinary: harness.clientBinaries.pgDumpBinary,
-          pgRestoreBinary: harness.clientBinaries.pgRestoreBinary,
-        },
-        sessionsDir,
-        backupRootDir: join(root, 'backups'),
-        maxRotatingBackups: 1,
-        maxWeeklyBackups: 0,
-        maxMonthlyBackups: 0,
-        now: () => Date.UTC(2026, 7, 11, 12, 0, 0),
-      });
-      if (!backup.postgresDumpPath) throw new Error('Automata Bus backup did not create a dump');
-      const restored = await harness.createDatabase();
-      // Schema-slice dumps reference the provisioned extension but intentionally
-      // do not own it. Restore into the same production prerequisite shape.
-      await installVectorExtension(restored.databaseUrl);
-      await restorePostgresSchemaSlice({
-        dumpPath: backup.postgresDumpPath,
-        schema,
-        postgres: {
-          databaseUrl: restored.databaseUrl,
-          psqlBinary: harness.clientBinaries.psqlBinary,
-          pgRestoreBinary: harness.clientBinaries.pgRestoreBinary,
-        },
-      });
-      const restoredPool = createPostgresPool(restored.databaseUrl, {
-        applicationName: 'automata-bus-backup-restored',
-        schema,
-        max: 1,
-      });
-      try {
-        await expect(assertAutomataBusPostgresReady(restoredPool)).resolves.toBeUndefined();
-        for (const relation of AUTOMATA_BUS_POSTGRES_RELATIONS) {
-          await expect(restoredPool.query(`SELECT COUNT(*)::text AS count FROM ${relation}`))
-            .resolves.toMatchObject({ rows: [{ count: seededRelationCount(relation) }] });
-        }
-        await expect(restoredPool.query('DELETE FROM automata_bus_events'))
-          .rejects.toThrow(/append-only/u);
-      } finally {
-        await restoredPool.end();
-      }
-    } finally {
-      await source.end();
-      rmSync(root, { recursive: true, force: true });
-    }
-  }, INTEGRATION_TIMEOUT_MS);
-
-  it('grants the backup role read-only access to every Automata Bus relation', async () => {
-    if (!harness) throw new Error('Automata Bus Postgres integration harness is unavailable');
-    const database = await harness.createDatabase();
-    const schema = 'automata_backup_scope';
-    const backupRole = 'automata_bus_backup';
-    const backupPassword = 'automata-backup-test-password';
-    const admin = createPostgresPool(harness.adminDatabaseUrl, { max: 1 });
-    const owner = createPostgresPool(database.databaseUrl, { max: 1 });
-    const tenant = planPostgresTenantAccess({ schema });
-    let runtime: Pool | undefined;
-    let backup: Pool | undefined;
-    try {
-      await admin.query(
-        `CREATE ROLE ${backupRole} LOGIN NOINHERIT PASSWORD '${backupPassword}'`,
-      );
-      await provisionPostgresTenantAccess(owner, {
-        plan: tenant,
-        runtimeLoginRole: 'postgres',
-        backupRole,
-      });
-      // Deployment provisioning owns extension installation; the restricted
-      // runtime migration validates it and must never need CREATE EXTENSION.
-      await owner.query('CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA extensions');
-      runtime = createPostgresPool(database.databaseUrl, {
-        applicationName: 'automata-bus-runtime-role',
-        schema,
-        role: tenant.role,
-        max: 1,
-      });
-      await runPostgresMigrations(runtime, POSTGRES_AUTOMATA_MIGRATIONS, { schema });
-      const runtimeStore = new PostgresAutomataBusStore(runtime);
-      await runtimeStore.append({
-        companionId: 'companion-a',
-        event: finding(),
-        audiences: ['eligible-automata'],
-        sensitivity: 'personal',
-      });
-      await expect(assertAutomataBusPostgresReady(runtime)).resolves.toBeUndefined();
-      await expect(runtime.query(
-        "UPDATE automata_bus_events SET task_id = 'mutated' WHERE event_id = 'finding-1'",
-      )).rejects.toThrow(/append-only/u);
-      await expect(runtime.query('DELETE FROM automata_bus_events'))
-        .rejects.toThrow(/append-only/u);
-      await expect(runtime.query('TRUNCATE automata_bus_events CASCADE'))
-        .rejects.toThrow(/append-only/u);
-      const backupUrl = new URL(database.databaseUrl);
-      backupUrl.username = backupRole;
-      backupUrl.password = backupPassword;
-      backup = createPostgresPool(backupUrl.toString(), {
-        applicationName: 'automata-bus-backup-reader',
-        schema,
-        max: 1,
-      });
-
-      for (const relation of AUTOMATA_BUS_POSTGRES_RELATIONS) {
-        await expect(backup.query(`SELECT COUNT(*)::text AS count FROM ${relation}`))
-          .resolves.toMatchObject({ rows: [{ count: seededRelationCount(relation) }] });
-      }
-      await expect(backup.query('INSERT INTO automata_bus_events DEFAULT VALUES'))
-        .rejects.toThrow(/permission denied/u);
-    } finally {
-      await backup?.end();
-      await runtime?.end();
-      await owner.end();
-      await admin.end();
-    }
   });
 });

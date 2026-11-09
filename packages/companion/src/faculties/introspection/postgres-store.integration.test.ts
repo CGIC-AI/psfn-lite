@@ -1,5 +1,5 @@
 import type { Pool } from 'pg';
-import type { IncomingMessage } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,9 +8,8 @@ import type { LLMProviderPort } from '../../core/agent/contracts.js';
 import { buildTurnRecord } from '../../core/agent/substrate-agent/turn-records.js';
 import { Scheduler } from '../../core/scheduler/scheduler.js';
 import { createPostgresPool } from '../../persistence/postgres.js';
-import type { LLMContext, LLMResponse, TurnID } from '../../shared/contracts/runtime.js';
+import type { LLMContext, LLMResponse, SubstrateMessage, TurnID } from '../../shared/contracts/runtime.js';
 import { EventBus } from '../../shared/event-bus.js';
-import { buildSubstrateMessage } from '../../channels/api/server/session.js';
 import { DEFAULT_INTROSPECTION_AUDIT_CONFIG } from '../../system/config/scheduler-config.js';
 import {
   DEFAULT_POSTGRES_TEST_IMAGE,
@@ -124,18 +123,19 @@ function makeTurnRecord(overrides: {
   const turnId = overrides.turnId ?? '019d2326-d9e1-701d-bcee-250d2cbb0e4e';
   const requestId = overrides.requestId ?? 'request-live-like-1';
   const startedAt = overrides.startedAt ?? 1_773_407_940_000;
-  const message = {
-    ...buildSubstrateMessage({
-      channelId: 'discord:public-room',
-      channelType: 'discord',
-      source: 'discord',
-      content: overrides.content ?? 'Which public project plan should we choose?',
-      authorId: 'public-user',
-      authorName: 'Public User',
-      req: { headers: {} } as IncomingMessage,
-      overrides: {},
-      channelPrivacy: 'public',
-    }),
+  // The message the donor's API channel builds for these inputs
+  // (channels/api/server/session.ts:377-472 buildSubstrateMessage, vendored
+  // scaffolding): no headers or overrides, so routing carries only the source
+  // and the public channel privacy, and a public room is not a DM.
+  const message: SubstrateMessage = {
+    id: `api-${randomUUID()}`,
+    channelId: 'discord:public-room',
+    channelType: 'discord',
+    authorId: 'public-user',
+    authorName: 'Public User',
+    content: overrides.content ?? 'Which public project plan should we choose?',
+    isDirectMessage: false,
+    routing: { source: 'discord', channelPrivacy: 'public' },
     timestamp: new Date(startedAt),
   };
   const decisions = new IntrospectionTurnSensitivityDecisions();

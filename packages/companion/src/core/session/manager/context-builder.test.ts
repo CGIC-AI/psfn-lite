@@ -7,7 +7,6 @@ import {
 } from '../../../primitives/llm/tokens.js';
 import type { LLMProviderPort } from '../../agent/contracts.js';
 import type { SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
-import type { CogSecEvent } from '../../cogsec/events.js';
 import {
   assembleSessionHistoryForContext,
   buildSessionContext,
@@ -72,45 +71,6 @@ function makeSummaryProvider(
       stopReason: 'end_turn',
     }),
     complete,
-  };
-}
-
-function makeCogSecEvent(overrides: Partial<CogSecEvent> = {}): CogSecEvent {
-  return {
-    caseId: 'cogsec_20260701T000000Z_context',
-    type: 'memory_poisoning',
-    severity: 'high',
-    status: 'applied',
-    sourceChannelId: 'discord-channel-1',
-    affectedLogicalSessionIds: ['logical-session-1'],
-    affectedMessageRanges: [{
-      sourceChannelId: 'discord-channel-1',
-      logicalSessionId: 'logical-session-1',
-      startEntryId: 3,
-      endEntryId: 4,
-    }],
-    sealedForensicPayloadRefs: ['cogsec-forensic://cogsec_20260701T000000Z_context/SMOKE_DIRTY_CONTEXT_TEXT.json'],
-    sealedForensicPayloadHashes: [`sha256:${'c'.repeat(64)}`],
-    tombstonedL0RowCount: 2,
-    affectedArtifacts: {
-      memories: {
-        ids: ['memory-dirty'],
-        count: 1,
-      },
-    },
-    actions: ['seal', 'tombstone', 'search_exclude', 'revoke', 'regenerate'],
-    actor: 'operator',
-    createdAt: '2026-07-01T00:00:00.000Z',
-    updatedAt: '2026-07-01T00:00:03.000Z',
-    appliedAt: '2026-07-01T00:00:03.000Z',
-    safeAgentSummary: 'Unsafe instruction-like content was sealed and removed from active cognition.',
-    resultCounters: {
-      tombstonedL0Rows: 2,
-      revokedArtifacts: 1,
-      regeneratedArtifacts: 1,
-    },
-    epochCuts: [],
-    ...overrides,
   };
 }
 

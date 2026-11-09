@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fromAny, fromPartial } from '@total-typescript/shoehorn';
-import type { ImageVisionReviewer } from '../../../primitives/images/types.js';
+import type { ImageVisionReviewer } from '../../../shared/contracts/image-vision-review.js';
 import type { SubstrateMessage } from '../../../shared/contracts/runtime.js';
 import {
   buildTurnUserContent,

@@ -296,11 +296,10 @@ describe('PostgresRuntimeReadiness', () => {
   });
 
   it('keeps covered production stores off raw constructor-owned ready promises', () => {
+    // Lite Step B7: the model-usage, analysis-workbench trace and wiki caretaker
+    // stores were vendored scaffolding and are deleted.
     const coveredSources = [
-      './model-usage-store.ts',
-      './analysis-workbench-trace-store.ts',
       '../../core/eval/observer-sidecar/persistence.ts',
-      '../../faculties/wiki/shared-world-caretaker-store.ts',
       '../../faculties/memory/postgres-store.ts',
     ].map(path => readFileSync(new URL(path, import.meta.url), 'utf8'));
 
@@ -315,36 +314,14 @@ describe('PostgresRuntimeReadiness', () => {
   });
 
   it('puts the generic and authority-owned schema migrators behind the Ready DDL fence', () => {
+    // Lite Step B7: shared-schema.ts and fleet-auth/schema.ts were vendored
+    // scaffolding and are deleted.
     const ddlSources = [
       '../postgres.ts',
-      './shared-schema.ts',
-      './fleet-auth/schema.ts',
     ].map(path => readFileSync(new URL(path, import.meta.url), 'utf8'));
 
     for (const source of ddlSources) {
       expect(source).toContain('assertPostgresRuntimeDdlAllowed(');
     }
-  });
-
-  it('seals gateway and operator PostgreSQL readiness before their listeners advertise Ready', () => {
-    const gatewaySource = readFileSync(
-      new URL('../../app/gateway/main.ts', import.meta.url),
-      'utf8',
-    );
-    const operatorSource = readFileSync(
-      new URL('../../app/operator/main.ts', import.meta.url),
-      'utf8',
-    );
-
-    const gatewaySealIndex = gatewaySource.indexOf('await sealPostgresStoreReadinessBeforeReady()');
-    const gatewayStartIndex = gatewaySource.indexOf('gateway.start()');
-    const operatorSealIndex = operatorSource.indexOf('await sealPostgresStoreReadinessBeforeReady()');
-    const operatorStartIndex = operatorSource.indexOf('await surface.start()');
-    expect(gatewaySealIndex).toBeGreaterThanOrEqual(0);
-    expect(gatewayStartIndex).toBeGreaterThanOrEqual(0);
-    expect(operatorSealIndex).toBeGreaterThanOrEqual(0);
-    expect(operatorStartIndex).toBeGreaterThanOrEqual(0);
-    expect(gatewaySealIndex).toBeLessThan(gatewayStartIndex);
-    expect(operatorSealIndex).toBeLessThan(operatorStartIndex);
   });
 });

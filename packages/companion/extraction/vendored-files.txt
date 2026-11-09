@@ -1,6 +1,11 @@
-# Donor files carried TEMPORARILY (scaffolding the closure or its tests import, test-support, fixtures). Each leaves when its seam is cut (plan Step B); the build must end with none of the scaffolding ones.
+# Donor files carried into packages/companion besides the Step A0 core closure (extraction/closure-files.txt), by kind. Step B7 deleted every `scaffolding`, `cut` and `source-text` file; their rows stay as the record, and tests/conformance/absence.test.ts fails if one comes back or is imported, mocked or read.
+# Kind `scaffolding`: donor scaffolding the closure or its tests imported (vendored temporarily). Deleted in B7.
+# Kind `cut`: a file of the Step A0 closure that a B5 cut moved out of the core (an operator ruling made it scaffolding, or a cut left it with no core importer). Deleted in B7.
+# Kind `source-text`: donor process entrypoints (app/gateway/main.ts, app/operator/main.ts) only read as text by source-scan tests. Deleted in B7.
 # Kind `promoted`: a donor file outside the Step A0 closure that a seam cut kept as core (it is self-contained and serves a kept path); it stays at its donor path and is no longer scaffolding. Unchanged unless a cut in extraction/cuts.tsv edits it (B2: core/cogsec/intake/derived-content.ts imports redirected to the ports; core/cogsec/memory-candidacy.ts split, seam 3.5).
-# Kind `cut`: a file of the Step A0 closure that a B5 cut moved out of the core (an operator ruling made it scaffolding, or a cut left it with no core importer). It is unchanged at its donor path (unless cuts.tsv says otherwise), no longer core, and leaves with the vendored scaffolding in B7.
+# Kinds `test-support` and `asset`: donor test helpers and non-TS fixtures the kept tests use. `test-support-deleted` and `asset-deleted`: ones whose only readers were deleted (B7); src/test-support/integration-timeout-registry.json was never copied (docs/extraction.md, Step A).
+# Kind `seed-deleted`: donor seed config (packages/companion/config) whose only readers were deleted scaffolding (B7). The 8 seeds kept (automata-policy, companions, intake-policy, runtime-prompt-layers, scheduler, settings, subagent-roles, trust-policy) are read by core loaders and are not listed.
+# Counts: asset 23, asset-deleted 23, cut 26, promoted 99, scaffolding 732, seed-deleted 11, source-text 2, test-support 20, test-support-deleted 1.
 # kind	file
 scaffolding	src/app/agent/control-plane.ts
 scaffolding	src/app/agent/icp-autonomy-candidate-dispatcher.ts
@@ -804,27 +809,27 @@ test-support	src/test-support/in-memory-memory-store.ts
 test-support	src/test-support/in-memory-memory-subjects.ts
 test-support	src/test-support/in-memory-rest-silence-store.ts
 test-support	src/test-support/in-memory-transcript-projection.ts
-test-support	src/test-support/lifecycle-kubernetes-settings.ts
+test-support-deleted	src/test-support/lifecycle-kubernetes-settings.ts
 test-support	src/test-support/memory-subject-mutation-contract.ts
 test-support	src/test-support/model-usage-certification-fixtures.ts
 test-support	src/test-support/postgres-contact-store.ts
 test-support	src/test-support/postgres-intention-ports.ts
 test-support	src/test-support/postgres-test-harness.ts
 test-support	src/test-support/viewer-context-it.ts
-asset	src/boundary/gateway/intake/injection-classifier.golden.json
-asset	src/boundary/gateway/intake/test-fixtures/benign-red-square.png
-asset	src/boundary/gateway/intake/test-fixtures/near-white-injection.png
-asset	src/boundary/gateway/intake/test-fixtures/typographic-injection.png
-asset	src/core/cogsec/intake/corpus/README.md
-asset	src/core/cogsec/intake/corpus/fixtures/atlas.jsonl
-asset	src/core/cogsec/intake/corpus/fixtures/evasions.jsonl
-asset	src/core/cogsec/intake/corpus/fixtures/inputs.jsonl
-asset	src/core/cogsec/intake/corpus/fixtures/intents.jsonl
-asset	src/core/cogsec/intake/corpus/fixtures/techniques.jsonl
-asset	src/core/cogsec/intake/corpus/upstream/arcanum-taxonomy.json
-asset	src/core/cogsec/intake/corpus/upstream/atlas-relevance.json
-asset	src/core/cogsec/intake/corpus/upstream/atlas-technique-index.json
-asset	src/core/cogsec/intake/corpus/upstream/manifest.json
+asset-deleted	src/boundary/gateway/intake/injection-classifier.golden.json
+asset-deleted	src/boundary/gateway/intake/test-fixtures/benign-red-square.png
+asset-deleted	src/boundary/gateway/intake/test-fixtures/near-white-injection.png
+asset-deleted	src/boundary/gateway/intake/test-fixtures/typographic-injection.png
+asset-deleted	src/core/cogsec/intake/corpus/README.md
+asset-deleted	src/core/cogsec/intake/corpus/fixtures/atlas.jsonl
+asset-deleted	src/core/cogsec/intake/corpus/fixtures/evasions.jsonl
+asset-deleted	src/core/cogsec/intake/corpus/fixtures/inputs.jsonl
+asset-deleted	src/core/cogsec/intake/corpus/fixtures/intents.jsonl
+asset-deleted	src/core/cogsec/intake/corpus/fixtures/techniques.jsonl
+asset-deleted	src/core/cogsec/intake/corpus/upstream/arcanum-taxonomy.json
+asset-deleted	src/core/cogsec/intake/corpus/upstream/atlas-relevance.json
+asset-deleted	src/core/cogsec/intake/corpus/upstream/atlas-technique-index.json
+asset-deleted	src/core/cogsec/intake/corpus/upstream/manifest.json
 asset	src/core/session/group-chat-harness/goldens/dm-turn-with-memories-custom-profile.golden.txt
 asset	src/core/session/group-chat-harness/goldens/dm-turn-with-memories.golden.txt
 asset	src/core/session/group-chat-harness/goldens/dm-turn.golden.txt
@@ -844,19 +849,19 @@ asset	src/faculties/automata/bus/conformance/v1/reject/stale-lineage-target.json
 asset	src/faculties/automata/bus/conformance/v1/reject/unknown-understood-field.json
 asset	src/faculties/automata/bus/conformance/v1/state/correction-chain.json
 asset	src/faculties/automata/bus/conformance/v1/state/retraction.json
-asset	src/faculties/file-ingest/test-fixtures/injection-singular.md
-asset	src/faculties/file-ingest/test-fixtures/injection.md
-asset	src/faculties/file-ingest/test-fixtures/sample.csv
-asset	src/faculties/file-ingest/test-fixtures/sample.docx
-asset	src/faculties/file-ingest/test-fixtures/sample.md
-asset	src/faculties/file-ingest/test-fixtures/sample.pdf
+asset-deleted	src/faculties/file-ingest/test-fixtures/injection-singular.md
+asset-deleted	src/faculties/file-ingest/test-fixtures/injection.md
+asset-deleted	src/faculties/file-ingest/test-fixtures/sample.csv
+asset-deleted	src/faculties/file-ingest/test-fixtures/sample.docx
+asset-deleted	src/faculties/file-ingest/test-fixtures/sample.md
+asset-deleted	src/faculties/file-ingest/test-fixtures/sample.pdf
 asset	src/system/config/fixtures/automata-policy.pre-biography-owner.json
 asset	src/system/config/fixtures/intake-policy.v5.json
 asset	src/system/config/fixtures/scheduler.pre-bundled-owner.json
-asset	src/test-support/fixtures/external-channel-limits.json
-asset	src/test-support/fixtures/fleet-sso/hub-device-assertion-v1.json
+asset-deleted	src/test-support/fixtures/external-channel-limits.json
+asset-deleted	src/test-support/fixtures/fleet-sso/hub-device-assertion-v1.json
 asset	src/test-support/fixtures/model-usage-certification.json
-asset	src/test-support/integration-timeout-registry.json
+asset-deleted	src/test-support/integration-timeout-registry.json
 promoted	src/app/agent/automata-background-work-lifecycle.ts
 promoted	src/app/agent/scheduler-runtime.ts
 promoted	src/app/agent/startup/free-time-lane.ts
@@ -928,3 +933,14 @@ promoted	src/app/startup/support/safeguard-surfaces.ts
 promoted	src/core/doing-mirror/sources.ts
 promoted	src/core/letters/memory-extraction.ts
 promoted	src/shared/garden-queue-change.ts
+seed-deleted	config/backup.seed.json
+seed-deleted	config/capability-tier.seed.json
+seed-deleted	config/charge-policy.seed.json
+seed-deleted	config/fleet-auth.seed.json
+seed-deleted	config/intake-l1-rules.json
+seed-deleted	config/mcp-servers.seed.json
+seed-deleted	config/models.seed.json
+seed-deleted	config/partner-affect-shadow.seed.json
+seed-deleted	config/places.seed.json
+seed-deleted	config/providers.seed.json
+seed-deleted	config/skills.seed.json

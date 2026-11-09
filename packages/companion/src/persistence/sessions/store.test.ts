@@ -25,8 +25,6 @@ import type {
   TurnRecordRecoveryScanStats,
   TurnRecordStorePort,
 } from './turn-record-store-port.js';
-import { CogSecEventStore } from '../../core/cogsec/events.js';
-import { CogSecForensicArchive } from '../../core/cogsec/forensic-archive.js';
 import { buildCogSecInvalidatedSummaryContent } from '../../core/cogsec/tombstones.js';
 import { buildSessionMetadataWithTurn } from '../../core/session/turn-provenance.js';
 import type { SessionEntry } from '../../core/session/types.js';

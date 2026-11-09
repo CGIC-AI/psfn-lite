@@ -7,10 +7,12 @@ import {
 import {
   accumulateDisclosureSource,
   beginDisclosureAccumulation,
-  type DisclosureDestination,
-  type DisclosureDestinationConstraint,
-  type DisclosureLineage,
-} from '../cogsec/disclosure/index.js';
+} from '../cogsec/disclosure/decision.js';
+import type {
+  DisclosureDestination,
+  DisclosureDestinationConstraint,
+  DisclosureLineage,
+} from '../cogsec/disclosure/contracts.js';
 import type { SessionEntry } from '../session/types.js';
 import type { SensitivityLevel } from '../../system/trust/types.js';
 

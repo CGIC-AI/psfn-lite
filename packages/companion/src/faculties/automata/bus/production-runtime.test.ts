@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { EmbeddingProviderPort } from '../../../shared/contracts/embedding-provider.js';
 import type { AppCache } from '../../../shared/cache/types.js';
-import { loadAutomataPolicySeedDefaults } from '../../../system/config/automata-policy-config.js';
+import { loadAutomataPolicySeedDefaults } from '../../../system/config/inner-life-config.js';
 import type {
   AutomataBusSqlClient,
   AutomataBusSqlPool,

@@ -72,7 +72,7 @@ tests plus the parity test.
 |---|---|
 | `npx vitest run tests/conformance` | 18 passed (17 scenario runs + inventory parity), about 19 s |
 | `pytest tests/test_conformance.py` (real plugin, Hermes `f0187332`) | 17 passed (16 scenario runs + inventory parity), 1 skipped (06, see below), about 33 s |
-| `tests/conformance/absence.test.ts` | 7 passed |
+| `tests/conformance/absence.test.ts` | 10 passed (after extraction Step B7) |
 
 The checks were tested by mutation in both runners. Expectations that must
 fail were added to scenarios 01 and 07: an unseen text, internal context
@@ -84,20 +84,33 @@ orders where it applied, and the mutations were then removed.
 
 `tests/conformance/absence.test.ts` fails if an excluded subsystem appears:
 
-- in package.json, in the lockfile's resolved tree or in node_modules:
-  discord.js, `@discordjs/*`, `@snazzah/davey`, prism-media, opusscript,
-  `@redis/*`, redis, ioredis, `@huggingface/*`, `onnxruntime-*`,
-  pdfjs-dist, winston, `@character-foundry/*`, or the donor
-  (`psfn-framework`);
+- in package.json (dependencies and overrides), in the lockfile's resolved
+  tree or in node_modules: discord.js, `@discordjs/*`, `discord-*`,
+  `@snazzah/davey`, prism-media, opusscript, `@redis/*`, redis, ioredis,
+  pdfjs-dist, `@character-foundry/*`, or the donor (`psfn-framework`);
 - as an import from any TypeScript, JavaScript or Python file: the same
   packages, a path into `psfn-framework`, or the Python modules discord,
-  redis, transformers and onnxruntime;
-- as a product file or directory name, or a declared identifier (TypeScript
-  through the compiler API, Python by `def`, `class` and assignment), whose
-  words include wiki, shard, fleet, charge, gateway, substrate, discord or
-  redis, or the pairs findings bus, automata bus, SubstrateAgent or
-  GatewayServer;
-- as a governed tool or action name.
+  redis, transformers, onnxruntime and winston (the Hermes plugin has none of
+  them);
+- as a file or directory name or a declared identifier in Lite's own code
+  (TypeScript through the compiler API, Python by `def`, `class` and
+  assignment), whose words include wiki, shard, fleet, charge, gateway,
+  cogsec, channels, skill, skills, discord or redis, or the pairs findings
+  bus, gateway server or cog sec;
+- as a governed tool or action name;
+- in `packages/companion`, the extracted donor core: any deleted row of
+  `extraction/vendored-files.txt` (the donor scaffolding cut in extraction
+  Step B7, with its test support, assets and seeds) back on disk, or any file
+  of the package importing, re-exporting, dynamically importing, mocking
+  (`vi.mock`, `doMock`, `importActual` and the rest) or reading through
+  `new URL(..., import.meta.url)` a deleted path.
+
+Operator rulings for the extraction ([extraction](extraction.md)) allow the
+companion's local classifier and logger (`@huggingface/transformers` with
+`onnxruntime-*`, `winston`) and make the Automata Bus and `SubstrateAgent`
+core, so those names are not excluded. The extracted tree keeps donor names
+verbatim, so the name rule covers Lite's own code and the deletion record
+covers `packages/companion`.
 
 Identifiers are split into words, so `LoopUsage` is not "opus" and
 "discharged" is not "charge". Comments that cite donor paths for provenance

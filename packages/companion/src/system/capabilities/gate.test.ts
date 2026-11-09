@@ -1,17 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { fromAny } from '@total-typescript/shoehorn';
 import { Type } from '@sinclair/typebox';
-import {
-  createPreToolHookGate,
-  type PreToolHookGate,
-  type PreToolUseEvaluation,
-  type RedactedPreToolHookAudit,
-} from '../../boundary/gateway/pre-tool-hook.js';
-import { HookMatcher, HookRegistry } from '../../boundary/gateway/hook-registry.js';
-import {
-  listRetiredToolAliases,
-  resolveToolAliasMatchers,
-} from '../../core/agent/tool-surface/registry.js';
+import type {
+  PreToolHookGate,
+  PreToolUseEvaluation,
+  RedactedPreToolHookAudit,
+} from './pre-tool-hook.js';
+import { listRetiredToolAliases } from '../../core/agent/tool-surface/registry.js';
 import type { AgentTool } from '../../boundary/pi-agent/index.js';
 import type { CapabilityTier } from '../config/runtime-config-contracts.js';
 import type { CapabilityToken } from './tokens.js';
@@ -28,15 +23,15 @@ import {
   toolHasDeclaredCapabilityRequirement,
   withCapabilityRequirement,
 } from './requirements.js';
-import { allowShardRequestScopedCapabilityTransport } from '../../faculties/shards/request-scoped-capability-transport.js';
-import { isRecord } from '../../shared/utils/types.js';
 import {
   accumulateDisclosureSource,
   beginDisclosureAccumulation,
+} from '../../core/cogsec/disclosure/decision.js';
+import {
   composeEgressDisclosureDecision,
   deriveDisclosureDestination,
   isDisclosureSocialEgressInvocation,
-} from '../../core/cogsec/disclosure/index.js';
+} from '../../core/cogsec/disclosure/egress-composition.js';
 
 function accessForTier(
   tier: CapabilityTier,
@@ -1102,32 +1097,6 @@ describe('world capability gating', () => {
     await gated.execute('world-control-granted', { action: 'control', affordanceId: 'lr_lights', command: 'on' });
     expect(world.executeSpy).toHaveBeenCalledTimes(1);
   });
-
-  it('lets a shard transport only world control without widening its standing grant', async () => {
-    const world = createTool('world');
-    const access = accessForTier('custom', ['world.read']);
-    const gated = gateToolWithCapabilities(
-      world.tool,
-      () => access,
-      undefined,
-      allowShardRequestScopedCapabilityTransport,
-    );
-
-    await gated.execute('world-control-shard-transport', {
-      action: 'control',
-      affordanceId: 'lr_lights',
-      command: 'on',
-    });
-    expect(world.executeSpy).toHaveBeenCalledOnce();
-    expect(access.has('world.control')).toBe(false);
-    expect([...access.getGrantedTokens()]).toEqual(['world.read']);
-
-    const unknownAction = await gated.execute('world-unknown-action', {
-      action: 'teleport',
-    });
-    expect(world.executeSpy).toHaveBeenCalledOnce();
-    expect(isRecord(unknownAction.details) && unknownAction.details.capabilityDenied).toBe(true);
-  });
 });
 
 describe('egress tool guard (htm9.3)', () => {
@@ -1430,109 +1399,5 @@ describe('pre_tool_use hook enforcement (7ym.3.2)', () => {
     );
     await gated.execute('shell-hook-none', { command: 'ls' });
     expect(shell.executeSpy).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe('pre_tool_use end-to-end wiring (7ym.3)', () => {
-  it('drives a real HookRegistry through the adapter into the gate: block', async () => {
-    const registry = new HookRegistry();
-    const audits: RedactedPreToolHookAudit[] = [];
-    registry.register({
-      mode: 'sync_decision',
-      name: 'no-destructive-shell',
-      sourcePath: 'test',
-      matcher: new HookMatcher(['shell']),
-      handler: async (ctx) => {
-        const command = (ctx.input as { command?: string }).command ?? '';
-        return command.includes('rm -rf')
-          ? { decision: 'block', reason: 'destructive shell command refused' }
-          : undefined;
-      },
-    });
-    const gate = createPreToolHookGate({
-      evaluator: registry,
-      getCorrelation: () => ({ sessionId: 'session-xyz', turnId: 'turn-1' }),
-      resolveAliases: resolveToolAliasMatchers,
-      onDecision: (audit) => audits.push(audit),
-    });
-
-    const shell = createTool('shell');
-    const gated = gateToolWithCapabilities(
-      shell.tool,
-      () => accessForTier('autonomous'),
-      undefined,
-      undefined,
-      () => gate,
-    );
-
-    const denied = await gated.execute('shell-e2e-block', { command: 'rm -rf /' });
-    expect(shell.executeSpy).not.toHaveBeenCalled();
-    expect(fromAny(denied.details).hookBlocked).toBe(true);
-    expect(fromAny(denied.content[0]).text).toContain('destructive shell command refused');
-    // Telemetry captured, redacted (no command contents).
-    expect(audits).toHaveLength(1);
-    expect(audits[0]!.outcome).toBe('block');
-    expect(JSON.stringify(audits[0])).not.toContain('rm -rf');
-
-    // A safe command with the same hook passes through untouched.
-    await gated.execute('shell-e2e-allow', { command: 'ls' });
-    expect(shell.executeSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('fast-paths (no evaluate cost) when the registry has no sync hooks', async () => {
-    const registry = new HookRegistry();
-    const gate = createPreToolHookGate({
-      evaluator: registry,
-      getCorrelation: () => undefined,
-      resolveAliases: resolveToolAliasMatchers,
-      onDecision: () => {},
-    });
-    // No sync hooks registered → adapter returns null → gate skips hook logic.
-    await expect(gate.evaluate({ toolName: 'shell', params: {}, tier: 'autonomous' }))
-      .resolves.toBeNull();
-
-    const shell = createTool('shell');
-    const gated = gateToolWithCapabilities(
-      shell.tool,
-      () => accessForTier('autonomous'),
-      undefined,
-      undefined,
-      () => gate,
-    );
-    await gated.execute('shell-e2e-fastpath', { command: 'ls' });
-    expect(shell.executeSpy).toHaveBeenCalledTimes(1);
-  });
-
-  it('folds the active-turn correlation into the hook context', async () => {
-    const registry = new HookRegistry();
-    let seenSession: string | undefined;
-    registry.register({
-      mode: 'sync_decision',
-      name: 'context-probe',
-      sourcePath: 'test',
-      matcher: new HookMatcher(['shell']),
-      handler: async (ctx) => {
-        seenSession = ctx.sessionId;
-        return { additionalContext: 'noted' };
-      },
-    });
-    const gate = createPreToolHookGate({
-      evaluator: registry,
-      getCorrelation: () => ({ sessionId: 'session-abc' }),
-      resolveAliases: resolveToolAliasMatchers,
-      onDecision: () => {},
-    });
-    const shell = createTool('shell');
-    const gated = gateToolWithCapabilities(
-      shell.tool,
-      () => accessForTier('autonomous'),
-      undefined,
-      undefined,
-      () => gate,
-    );
-    const result = await gated.execute('shell-e2e-context', { command: 'ls' });
-    expect(seenSession).toBe('session-abc');
-    const texts = result.content.map((entry: any) => entry.text);
-    expect(texts.some((text: string) => text.includes('noted'))).toBe(true);
   });
 });

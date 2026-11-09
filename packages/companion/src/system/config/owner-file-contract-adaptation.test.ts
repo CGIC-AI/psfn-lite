@@ -20,32 +20,13 @@ import {
 } from '../../shared/logger.js';
 import { invalidateCachedJsonValue } from './load-or-seed.js';
 import {
-  applyMissingRuntimeSettingsDefaults,
-  resetRuntimeSettingsDefaultAdaptationWarnings,
-} from './settings-owner-backfill.js';
-import {
   adaptSchedulerOwnerToCurrentContract,
   resetSchedulerOwnerAdaptationWarnings,
 } from './scheduler-owner-defaults.js';
-import { loadStartupRuntimeSettingsOwnerFile } from './startup-owner-files.js';
 import { loadSchedulerConfig, SCHEDULER_FILE_NAME } from './scheduler-config.js';
 import { DEFAULT_HUMAN_ESCALATION_CONFIG } from './scheduler-config/human-escalation.js';
-import { SETTINGS_FILE_NAME } from '../settings/contracts.js';
 
 const SEED_DIR = join(process.cwd(), 'config');
-
-/**
- * Every settings.json field this slice made required. `requirePostgresStore-
- * ReadinessRetry` and `requireSharedWorkspaceListBounds` both throw at
- * composition when their field is absent, which is the fail-closed boot the
- * adaptation exists to prevent.
- */
-const REQUIRED_FIELDS_ADDED_THIS_SLICE = [
-  'postgresStoreReadinessRetryAttempts',
-  'postgresStoreReadinessRetryBackoffMs',
-  'sharedWorkspaceListPageSize',
-  'sharedWorkspaceListPageBytes',
-] as const;
 
 const tempDirs: string[] = [];
 
@@ -61,7 +42,6 @@ function readSeed(fileName: string): Record<string, unknown> {
 
 beforeEach(() => {
   clearDiagnosticLogRingBufferForTests();
-  resetRuntimeSettingsDefaultAdaptationWarnings();
   resetSchedulerOwnerAdaptationWarnings();
 });
 
@@ -69,112 +49,6 @@ afterEach(() => {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-describe('settings owner-file contract adaptation', () => {
-  it('resolves the required fields an owner file predates without touching it', () => {
-    const dataDir = makeTempDir('psfn-settings-adaptation-');
-    const ownerPath = join(dataDir, SETTINGS_FILE_NAME);
-    const seed = readSeed('settings.seed.json');
-    const expected: Record<string, unknown> = {};
-    for (const field of REQUIRED_FIELDS_ADDED_THIS_SLICE) {
-      expected[field] = seed[field];
-      delete seed[field];
-    }
-    const ownerBytes = `${JSON.stringify(seed, null, 2)}\n`;
-    writeFileSync(ownerPath, ownerBytes, 'utf8');
-    invalidateCachedJsonValue(ownerPath);
-
-    const loaded = loadStartupRuntimeSettingsOwnerFile({ dataDir, seedDir: SEED_DIR });
-
-    for (const field of REQUIRED_FIELDS_ADDED_THIS_SLICE) {
-      expect(loaded.runtimeSettings[field]).toBe(expected[field]);
-      // The runtime-owned projection is what boot applies to SubstrateConfig.
-      expect(loaded.settingsDomains.runtime[field]).toBe(expected[field]);
-    }
-    // In memory only: the fleet Garden mounts companion data read-only and
-    // every app container runs a read-only root filesystem, so a boot that
-    // rewrote the owner file would trade one crash loop for another.
-    expect(readFileSync(ownerPath, 'utf8')).toBe(ownerBytes);
-  });
-
-  it('warns once, naming every adapted field and no value', () => {
-    const settings = readSeed('settings.seed.json');
-    settings.sessionHistoryBudgetPct = 41;
-    for (const field of REQUIRED_FIELDS_ADDED_THIS_SLICE) delete settings[field];
-
-    const first = applyMissingRuntimeSettingsDefaults(settings, {
-      seedDir: SEED_DIR,
-      sourceLabel: SETTINGS_FILE_NAME,
-    });
-    applyMissingRuntimeSettingsDefaults(settings, {
-      seedDir: SEED_DIR,
-      sourceLabel: SETTINGS_FILE_NAME,
-    });
-
-    // The operator's own value is authoritative; only absent keys are filled.
-    expect(first.sessionHistoryBudgetPct).toBe(41);
-    const warnings = getRecentDiagnosticLogRecords({ limit: 50 })
-      .filter(record => record.component === 'SettingsOwnerBackfill');
-    expect(warnings).toHaveLength(1);
-    const [warning] = warnings;
-    expect(warning?.level).toBe('warn');
-    // Every adapted field is named, and nothing else is: no value reaches the
-    // message, and the ring keeps it whole rather than truncating it away.
-    for (const field of REQUIRED_FIELDS_ADDED_THIS_SLICE) {
-      expect(warning?.message).toContain(field);
-    }
-    expect(warning?.message).not.toContain('[truncated]');
-    expect(warning?.message).toContain('migrate-required-settings-blocks');
-  });
-
-  it('skips the adaptation rather than failing a boot with no seed directory', () => {
-    // Before the adaptation existed, a running process never needed the seed on
-    // disk. A deployment that ships owner files without it must keep booting.
-    const settings = readSeed('settings.seed.json');
-    for (const field of REQUIRED_FIELDS_ADDED_THIS_SLICE) delete settings[field];
-
-    const adapted = applyMissingRuntimeSettingsDefaults(settings, {
-      seedDir: join(makeTempDir('psfn-empty-seed-'), 'absent'),
-      sourceLabel: SETTINGS_FILE_NAME,
-    });
-
-    expect(adapted).toBe(settings);
-    for (const field of REQUIRED_FIELDS_ADDED_THIS_SLICE) {
-      expect(adapted[field]).toBeUndefined();
-    }
-    const warnings = getRecentDiagnosticLogRecords({ limit: 50 })
-      .filter(record => record.component === 'SettingsOwnerBackfill');
-    expect(warnings).toHaveLength(1);
-    expect(warnings[0]?.message).toContain('CONFIG_DIR');
-  });
-
-  it('fails closed on a malformed seed rather than skipping silently', () => {
-    // Only an absent seed is tolerated; a seed that exists and is wrong is a
-    // real contract defect and must still stop the process.
-    const seedDir = makeTempDir('psfn-broken-seed-');
-    writeFileSync(join(seedDir, 'settings.seed.json'), '{ not json', 'utf8');
-
-    expect(() => applyMissingRuntimeSettingsDefaults({}, {
-      seedDir,
-      sourceLabel: SETTINGS_FILE_NAME,
-    })).toThrow();
-  });
-
-  it('leaves a complete owner file untouched and silent', () => {
-    const settings = readSeed('settings.seed.json');
-
-    const adapted = applyMissingRuntimeSettingsDefaults(settings, {
-      seedDir: SEED_DIR,
-      sourceLabel: SETTINGS_FILE_NAME,
-    });
-
-    expect(adapted).toBe(settings);
-    expect(
-      getRecentDiagnosticLogRecords({ limit: 50 })
-        .filter(record => record.component === 'SettingsOwnerBackfill'),
-    ).toHaveLength(0);
-  });
 });
 
 describe('scheduler owner-file contract adaptation', () => {

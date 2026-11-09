@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { loadAutomataPolicySeedDefaults } from '../../../system/config/automata-policy-config.js';
+import { loadAutomataPolicySeedDefaults } from '../../../system/config/inner-life-config.js';
 import { AutomataRunRegistry, InMemoryAutomataRunStore } from '../run-registry.js';
 import type { AutomataBusEvent } from './contract.js';
 import type { AutomataBusProductionRuntime } from './production-runtime.js';

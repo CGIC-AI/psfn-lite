@@ -40,19 +40,9 @@ import {
 } from '../../test-support/in-memory-memory-subjects.js';
 import { MemoryWriter } from './writer.js';
 import { evaluateMemoryPolicy } from '../../system/trust/policy.js';
-import { PostgresCustodyChainReader } from '../../persistence/postgres/custody-chain-reader.js';
 import type { EmbeddingProviderPort } from '../../shared/contracts/embedding-provider.js';
 import { MemoryRetriever } from './retrieval.js';
 import { describeMemorySubjectMutationContract } from '../../test-support/memory-subject-mutation-contract.js';
-import {
-  createPostgresEpisodicStoreFromPool,
-} from './episodic/index.js';
-import {
-  createSubjectAuthorizedEpisodicStore,
-} from './episodic/subject-authorized-store.js';
-import {
-  reattributePostgresMemorySubjects,
-} from '../../persistence/repair/memory-subject-reattribution.js';
 
 const INTEGRATION_TIMEOUT_MS = 120_000;
 const DEFAULT_EMBEDDING = new Float32Array([0.9, 0.1, 0.1, 0.1]);
@@ -642,18 +632,6 @@ describe('postgres memory store integration', () => {
         reasonTag: 'consent.allow_recall_denied',
       });
 
-      // ccgdz.8: the withdrawal is visible on the custody chain of the turn the
-      // memory was derived from, over the real memory columns.
-      const custodyReader = PostgresCustodyChainReader.fromPool(pool);
-      await expect(custodyReader.listDerivedArtifactsForGeneration({
-        turnId: CONSENT_TURN_ID,
-        limit: 10,
-      })).resolves.toEqual([expect.objectContaining({
-        kind: 'memory',
-        consentDenied: true,
-        consentProducerId: 'memory.deletion_proposal',
-        retired: true,
-      })]);
       expect(await proposalStore.listMemoryDeletionAuditEvents(proposed.id)).toEqual([
         expect.objectContaining({ proposalId: proposed.id, eventType: 'proposed', actorRole: 'Companion' }),
         expect.objectContaining({ proposalId: proposed.id, eventType: 'partner_alerted', actorRole: 'Partner' }),
@@ -1699,131 +1677,6 @@ describe('postgres memory store integration', () => {
         authorization: subjectAuthorization('contact-a', 'detail'),
         selector: { kind: 'detail', memoryId: 'startup-backfill-memory' },
       })).total).toBe(1);
-    });
-  }, INTEGRATION_TIMEOUT_MS);
-
-  it('re-attributes post-cutover memories and episodes, then resets the terminal subject checkpoint', async () => {
-    await withMemoryDatabase(async (pool) => {
-      await ensurePostgresSchema(pool, [
-        ...POSTGRES_CONTACT_MIGRATIONS,
-        ...POSTGRES_MEMORY_MIGRATIONS,
-      ]);
-      await pool.query(`
-        INSERT INTO contacts (
-          id, display_name, trust_level, relationship_type,
-          emotional_baseline, first_seen, last_seen
-        ) VALUES
-          ('contact-current', 'Current contact', 'primary', 'partner', '{}'::jsonb, '2026-01-01', '2026-01-01')
-      `);
-
-      // Finish an empty-corpus checkpoint first. The historical row arrives
-      // after that terminal checkpoint, reproducing the pg_dump/cutover gap.
-      await createPostgresMemoryStoreFromPool(pool, 4);
-      await seedMemoryRow(pool, makeMemory({
-        id: 'late-cutover-memory',
-        contactId: 'contact-before-cutover',
-        scopeRef: { kind: 'contact', id: 'contact-before-cutover' },
-      }), [0.9, 0.1, 0.1, 0.1]);
-      await pool.query(`
-        UPDATE l2_memories
-        SET provenance_json = jsonb_build_object(
-          'subjectContactId', 'contact-before-cutover',
-          'subjectContactIds', jsonb_build_array('contact-before-cutover'),
-          'routedContactId', 'contact-before-cutover'
-        )
-        WHERE id = 'late-cutover-memory'
-      `);
-
-      const episodicStore = createPostgresEpisodicStoreFromPool(pool, {
-        now: () => new Date('2026-07-30T12:00:00.000Z'),
-      });
-      await episodicStore.createCompanionAuthoredEpisode({
-        id: 'late-cutover-episode',
-        threadId: 'thread-cutover',
-        channelId: 'api:cutover',
-        title: 'Historical cutover episode',
-        landmark: 'A historical episode imported after the contact cutover.',
-        startedAt: '2026-07-01T10:00:00.000Z',
-        endedAt: '2026-07-01T10:10:00.000Z',
-        participantContactIds: ['contact-before-cutover'],
-        salience: { score: 0.5 },
-        affect: { valence: 0, arousal: 0, dominance: 0.5, labels: ['neutral'] },
-        themes: ['cutover'],
-        spanRefs: [{ spanId: 'span-cutover', sessionId: 'api:cutover' }],
-        artifactRefs: [],
-        provenanceRefs: [],
-      });
-
-      const beforeStore = await createPostgresMemoryStoreFromPool(pool, 4);
-      expect(beforeStore.getStartupMemorySubjectClassificationCoverage?.()).toMatchObject({
-        totalMemoryCount: 1,
-        currentClassificationCount: 0,
-        missingCurrentClassificationCount: 1,
-      });
-      const before = createSubjectAuthorizedMemoryStore(beforeStore, {
-        viewerContactId: 'contact-current',
-      });
-      await expect(before.countActiveMemories()).resolves.toBe(0);
-      await expect(createSubjectAuthorizedEpisodicStore(episodicStore, {
-        viewerContactId: 'contact-current',
-      }).listEpisodes()).resolves.toEqual([]);
-
-      const dryRun = await reattributePostgresMemorySubjects(pool, {
-        mappings: [{ fromContactId: 'contact-before-cutover', toContactId: 'contact-current' }],
-        dryRun: true,
-        embeddingDims: 4,
-        now: new Date('2026-07-30T13:00:00.000Z'),
-      });
-      expect(dryRun).toMatchObject({
-        dryRun: true,
-        plannedMemoryUpdates: 1,
-        plannedEpisodeUpdates: 1,
-        updatedMemories: 0,
-        updatedEpisodes: 0,
-        backfill: null,
-      });
-
-      const applied = await reattributePostgresMemorySubjects(pool, {
-        mappings: [{ fromContactId: 'contact-before-cutover', toContactId: 'contact-current' }],
-        dryRun: false,
-        embeddingDims: 4,
-        now: new Date('2026-07-30T13:00:00.000Z'),
-      });
-      expect(applied).toMatchObject({
-        dryRun: false,
-        plannedMemoryUpdates: 1,
-        plannedEpisodeUpdates: 1,
-        updatedMemories: 1,
-        updatedEpisodes: 1,
-        backfill: {
-          state: 'complete',
-          classifierVersion: MEMORY_SUBJECT_CLASSIFIER_VERSION,
-        },
-      });
-
-      const repairedStore = await createPostgresMemoryStoreFromPool(pool, 4);
-      expect(repairedStore.getStartupMemorySubjectClassificationCoverage?.()).toMatchObject({
-        totalMemoryCount: 1,
-        currentClassificationCount: 1,
-        missingCurrentClassificationCount: 0,
-      });
-      await expect(repairedStore.getMemorySubjectClassification('late-cutover-memory'))
-        .resolves.toMatchObject({
-          status: 'current',
-          subjectClass: 'single_contact',
-          subjectContactIds: ['contact-current'],
-        });
-      await expect(createSubjectAuthorizedMemoryStore(repairedStore, {
-        viewerContactId: 'contact-current',
-      }).countActiveMemories()).resolves.toBe(1);
-      await expect(createSubjectAuthorizedEpisodicStore(episodicStore, {
-        viewerContactId: 'contact-current',
-      }).listEpisodes()).resolves.toEqual([
-        expect.objectContaining({
-          id: 'late-cutover-episode',
-          participantContactIds: ['contact-current'],
-        }),
-      ]);
     });
   }, INTEGRATION_TIMEOUT_MS);
 
