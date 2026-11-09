@@ -11,7 +11,7 @@
  * filesystem tools, Wyoming, Telegram, Home Assistant) are not set.
  */
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   COMPANION_SEED_DIR,
@@ -113,6 +113,25 @@ function settingsScalars(dataDir: string): Record<string, unknown> {
   return Object.fromEntries(Object.entries(raw).filter(([, value]) => value === null || typeof value !== 'object'));
 }
 
+/** The donor's seeded text-emotion model cache (config/settings.seed.json `textEmotionCacheDir`). */
+export const DONOR_TEXT_EMOTION_CACHE_DIR = 'models/transformers';
+
+/**
+ * Where the text-emotion classifier keeps its model. The donor set it in
+ * settings.json (`textEmotionCacheDir`, seeded `models/transformers`;
+ * settings/runtime.ts applyTrimmedSetting) and handed it to transformers.js
+ * as is (core/emotion/text-classifier.ts `env.cacheDir`), so a relative value
+ * resolved against the working directory: the donor repository root, whose
+ * `/models/` it gitignored. A Lite host runs from wherever it is started (the
+ * 2026-11-09 shakedown downloaded the 478 MB model into a source checkout),
+ * so the same setting is read from the owner's settings.json and a relative
+ * value resolves under the data directory. An absolute value is kept.
+ */
+export function textEmotionCacheDir(dataDir: string, value: unknown): string {
+  const chosen = typeof value === 'string' && value.trim() !== '' ? value.trim() : DONOR_TEXT_EMOTION_CACHE_DIR;
+  return isAbsolute(chosen) ? chosen : resolve(dataDir, chosen);
+}
+
 export interface HostModelChoice {
   readonly modelId: string;
   readonly provider: string;
@@ -124,9 +143,11 @@ export interface HostModelChoice {
 
 export function buildSubstrateConfig(config: LiteConfig, input: { readonly databaseUrl: string; readonly model: HostModelChoice }): SubstrateConfig {
   const { model } = input;
+  const settings = settingsScalars(config.dataDir);
   return {
     ...donorCoreDefaults(),
-    ...settingsScalars(config.dataDir),
+    ...settings,
+    textEmotionCacheDir: textEmotionCacheDir(config.dataDir, settings['textEmotionCacheDir']),
     primaryModel: model.modelId,
     primaryProvider: model.provider,
     extractionModel: model.modelId,

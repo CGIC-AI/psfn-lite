@@ -1,9 +1,15 @@
 /**
  * Embedding capability. pi-ai has no embeddings API, so the host chooses
- * explicitly: an OpenAI-compatible `/embeddings` endpoint, or none. Without
- * one every embed call is `unavailable`; memory writes then stay `pending`
- * and the maintenance backfill embeds them once a provider is configured.
- * Nothing is ever embedded with a stand-in vector.
+ * explicitly: an OpenAI-compatible `/embeddings` endpoint, or none. The
+ * extracted companion core needs one: the donor refused to start without an
+ * embedding provider (`faculties/memory/embedding.ts` resolveEmbeddingProviderKind
+ * throws "embeddingProvider is required"), its startup warmup fails closed on
+ * any embed error (`warmupEmbeddingProvider`, docs/memory/l2-typed.md
+ * "Fail-closed warmup"), and every memory write embeds or throws
+ * (`faculties/memory/writer.ts`); there is no pending-embedding path. So the
+ * disabled port answers every embed call `unavailable`, and a host that
+ * configures no provider must supply its own port (the standalone refuses to
+ * start otherwise). Nothing is ever embedded with a stand-in vector.
  */
 import { isRecord, ok, unavailable, type EmbeddingPort, type Result } from './result.ts';
 

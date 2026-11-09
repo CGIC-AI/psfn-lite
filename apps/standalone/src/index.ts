@@ -7,6 +7,7 @@
 export { SEED_FILES, runCli, type CliIo } from './cli.ts';
 export { TRUST_LEVELS, parseLiteConfig, readSecrets, type LiteConfig, type LiteContact, type LiteSecrets } from './config.ts';
 export {
+  EMBEDDING_PROVIDER_REQUIRED,
   HOST_MODEL_ENTRY,
   LITE_CONTACT_CHANNEL,
   OPERATOR_CONTACT,
@@ -16,4 +17,4 @@ export {
   type LiteRuntime,
   type LiteRuntimeOverrides,
 } from './runtime.ts';
-export { buildSubstrateConfig, type HostModelChoice } from './substrate-config.ts';
+export { DONOR_TEXT_EMOTION_CACHE_DIR, buildSubstrateConfig, textEmotionCacheDir, type HostModelChoice } from './substrate-config.ts';
