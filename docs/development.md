@@ -175,5 +175,36 @@ bridge on loopback) over a throwaway pgvector container. Before it reports
 ready, a seed turn of the standalone writes a thread for the Hermes tests
 to find. So the e2e tests need Docker, Node on `PATH` (hence `mise exec`)
 and the repository's `node_modules`. As with the
-TypeScript integration suites, `LITE_SKIP_DOCKER_TESTS=1` skips it explicitly.
+TypeScript integration suites, `LITE_SKIP_DOCKER_TESTS=1` skips it explicitly. The
+host also mounts the light Garden (`garden: true`), and the dashboard
+backend tests reach it through Hermes's own dashboard plugin loader.
+
+## Hermes Desktop half
+
+The light Garden's Desktop half is TypeScript and React in
+`integrations/hermes/desktop/src`. The root `tsconfig.json` (with
+`"jsx": "react-jsx"`) and `eslint .` check it. It is built into one ESM file,
+`integrations/hermes/psfn_lite/desktop/plugin.js`, and the built file is
+committed:
+
+```bash
+mise exec node@24.22.1 npm@11.17.0 -- node integrations/hermes/desktop/build.mjs
+```
+
+Rebuild after every change to the source. `tests/desktop/bundle.test.ts`
+rebuilds the file in memory and fails when the committed file differs. It
+also checks what Desktop's runtime loader requires: only
+`@hermes/plugin-sdk`, `react` and `react/jsx-runtime` are imported, there is
+no JSX, and the id is the plugin's name. `tests/desktop/garden.test.ts`
+renders the screens in jsdom against a stubbed plugin context. Vitest
+aliases `@hermes/plugin-sdk` to `tests/support/hermes-plugin-sdk.ts`.
+`tests/operator/garden.integration.test.ts` checks that every route the
+screens call is served by the real Garden.
+
+The build tool and React are pinned exactly as Hermes Desktop pins them at
+2bd378e (`apps/desktop/package.json`): esbuild 0.28.2, react, react-dom and
+@types/react 19.3.0, jsdom 29.1.1. Never install the built file, or a
+`desktop/` folder, under `~/.hermes` from a test or a tool. Hermes Desktop
+loads it from there (see `integrations/hermes/README.md`, "The light
+Garden").
 

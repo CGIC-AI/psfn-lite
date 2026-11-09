@@ -1,0 +1,445 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import type { AutomataBusFindingEvent } from '../../../faculties/automata/bus/contract.js';
+import type { AutomataBusEffectiveFinding } from '../../../faculties/automata/bus/current-state.js';
+import { InMemoryAutomataRunStore, AutomataRunRegistry } from '../../../faculties/automata/run-registry.js';
+import { loadAutomataPolicySeedDefaults } from '../../../system/config/inner-life-config.js';
+import {
+  AdminAutomataDataService,
+  AdminAutomataNotFoundError,
+  type AdminAutomataBusReadInput,
+  type AdminAutomataBusReadPort,
+  type AdminAutomataLessonReadPort,
+} from './automata-service.js';
+import { NO_AUTOMATA_REDELIVERY } from '../../../test-support/automata-run-redelivery.js';
+
+const findingEvent: AutomataBusFindingEvent = {
+  schemaVersion: 1,
+  eventId: 'event-1',
+  companionId: 'companion-test',
+  sequence: 1,
+  occurredAt: '2026-08-11T12:00:00.000Z',
+  mustUnderstand: [],
+  type: 'finding',
+  context: {
+    automatonClass: 'subagent.bounded',
+    runId: 'run-1',
+    taskId: 'task-1',
+    sessionIds: ['private-session-id'],
+    artifactRefs: ['file:///private/operator/transcript.txt'],
+  },
+  body: {
+    claim: 'The focused check passed.',
+    provenance: 'computed',
+    source: 'private prompt text',
+    confidence: 0.9,
+    evidence: [{
+      kind: 'artifact',
+      reference: 'file:///private/operator/transcript.txt',
+      summary: 'Focused test output.',
+      digest: `sha256:${'a'.repeat(64)}`,
+    }],
+    verification: {
+      status: 'verified',
+      by: 'private-reviewer-id',
+      evidenceRefs: ['file:///private/operator/transcript.txt'],
+    },
+  },
+};
+
+const currentFinding: AutomataBusEffectiveFinding = {
+  eventId: findingEvent.eventId,
+  companionId: findingEvent.companionId,
+  sequence: findingEvent.sequence,
+  occurredAt: findingEvent.occurredAt,
+  context: findingEvent.context,
+  body: findingEvent.body,
+  sourceEventType: 'finding',
+};
+
+async function createRegistry(): Promise<AutomataRunRegistry> {
+  const registry = await AutomataRunRegistry.hydrate({
+    redelivery: NO_AUTOMATA_REDELIVERY,
+    companionId: 'companion-test',
+    policy: loadAutomataPolicySeedDefaults(),
+    store: new InMemoryAutomataRunStore(),
+    nowMs: 1,
+  });
+  await registry.register({
+    runId: 'run-1',
+    automatonClass: 'subagent.bounded',
+    workerId: 'worker-1',
+    taskId: 'task-1',
+    taskLabel: 'Review',
+    taskSummary: 'private prompt text',
+    sessionIds: ['subagent:worker-1'],
+    artifacts: [{
+      kind: 'report',
+      ref: 'file:///private/operator/report.md',
+      custody: 'durable',
+    }],
+    createdAtMs: 2,
+  });
+  return registry;
+}
+
+function busPort(overrides: Partial<Awaited<ReturnType<AdminAutomataBusReadPort['readPage']>>> = {}) {
+  const inputs: AdminAutomataBusReadInput[] = [];
+  const port: AdminAutomataBusReadPort = {
+    async readPage(input) {
+      inputs.push(input);
+      return {
+        companionId: 'companion-test',
+        events: [findingEvent],
+        currentFindings: [currentFinding],
+        dispositions: [],
+        hasMore: false,
+        eventIdMatched: true,
+        health: {
+          condition: 'degraded',
+          freshness: 'stale',
+          observedAt: '2026-08-11T12:01:00.000Z',
+          lastEventAt: findingEvent.occurredAt,
+          indexState: 'degraded',
+          reindexState: 'running',
+          pendingIndexCount: 2,
+          degradationReasons: ['index_lagging'],
+        },
+        ...overrides,
+      };
+    },
+  };
+  return { inputs, port };
+}
+
+describe('AdminAutomataDataService', () => {
+  it('rejects a registry owned by a different companion before serving Garden', async () => {
+    const registry = await AutomataRunRegistry.hydrate({
+      redelivery: NO_AUTOMATA_REDELIVERY,
+      companionId: 'companion-other',
+      policy: loadAutomataPolicySeedDefaults(),
+      store: new InMemoryAutomataRunStore(),
+    });
+
+    expect(() => new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+    })).toThrow('registry companion scope mismatch');
+  });
+
+  it('projects bounded registry and Bus state without disclosing prompt, source, or raw references', async () => {
+    const registry = await createRegistry();
+    const { inputs, port } = busPort();
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      bus: port,
+    });
+
+    const snapshot = await service.getSnapshot({
+      limit: 5,
+      busLimit: 4,
+      busOffset: 8,
+      busClassId: 'subagent.bounded',
+      verificationStatus: 'verified',
+    });
+
+    expect(inputs).toEqual([expect.objectContaining({
+      companionId: 'companion-test',
+      limit: 4,
+      offset: 8,
+      classId: 'subagent.bounded',
+      verificationStatus: 'verified',
+    })]);
+    expect(snapshot.runs).toEqual([expect.objectContaining({
+      taskId: 'task-1',
+      trigger: 'tool-or-post-turn-request',
+      busEligibility: 'eligible',
+      sessionIds: ['subagent:worker-1'],
+      artifactCount: 1,
+      artifactCustody: { discarded: 0, durable: 1, pending: 0 },
+      promotionState: 'not_requested',
+      foldState: 'not_required',
+      retentionState: 'active_protected',
+    })]);
+    expect(snapshot.bus).toMatchObject({
+      available: true,
+      health: { condition: 'degraded', freshness: 'stale' },
+      events: [{
+        context: { sessionCount: 1, artifactCount: 1 },
+        finding: {
+          provenance: 'computed',
+          verificationStatus: 'verified',
+          evidence: [{ referenceDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u) }],
+        },
+      }],
+      currentFindings: [{ finding: { claim: 'The focused check passed.' } }],
+    });
+    const serialized = JSON.stringify(snapshot);
+    expect(serialized).not.toContain('private prompt text');
+    expect(serialized).not.toContain('file:///private');
+    expect(serialized).not.toContain('private-session-id');
+    expect(serialized).not.toContain('private-reviewer-id');
+  });
+
+  it('fails unknown event lookups and cross-companion pages closed', async () => {
+    const registry = await createRegistry();
+    const unknown = busPort({ events: [], currentFindings: [], eventIdMatched: false });
+    const unknownService = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      bus: unknown.port,
+    });
+    await expect(unknownService.getSnapshot({ eventId: 'missing' }))
+      .rejects.toBeInstanceOf(AdminAutomataNotFoundError);
+
+    const crossCompanion = busPort({ companionId: 'companion-other' });
+    const scopedService = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      bus: crossCompanion.port,
+    });
+    const snapshot = await scopedService.getSnapshot();
+    expect(snapshot.bus).toMatchObject({
+      available: false,
+      health: { condition: 'unavailable', degradationReasons: ['read_failed'] },
+      events: [],
+      currentFindings: [],
+    });
+  });
+
+  it('reports an absent Bus port honestly and rejects pages beyond owner policy', async () => {
+    const registry = await createRegistry();
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+    });
+
+    await expect(service.getSnapshot({ limit: 21 })).rejects.toThrow(/between 1 and 20/);
+    await expect(service.getSnapshot({ verificationStatus: 'guessed' })).rejects.toThrow(/Unknown/);
+    expect((await service.getSnapshot()).bus).toMatchObject({
+      available: false,
+      health: { condition: 'unavailable', freshness: 'unknown' },
+    });
+  });
+
+  it('runs reindex through the exact companion port and rejects mismatched receipts', async () => {
+    const registry = await createRegistry();
+    const reindex = vi.fn(async () => ({
+      companionId: 'companion-test',
+      status: 'completed' as const,
+      processed: 2,
+      indexed: 2,
+      lagging: 0,
+    }));
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      reindex: { reindex },
+    });
+
+    await expect(service.reindex()).resolves.toMatchObject({
+      companionId: 'companion-test',
+      processed: 2,
+    });
+    expect(reindex).toHaveBeenCalledWith({ companionId: 'companion-test' });
+
+    const mismatched = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      reindex: {
+        async reindex() {
+          return {
+            companionId: 'companion-other',
+            status: 'completed',
+            processed: 0,
+            indexed: 0,
+            lagging: 0,
+          };
+        },
+      },
+    });
+    await expect(mismatched.reindex()).rejects.toThrow('cross-companion receipt');
+  });
+
+  it('logs Bus and lesson read failures before returning degraded operator state', async () => {
+    const registry = await createRegistry();
+    const logger = { error: vi.fn() };
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      bus: {
+        async readPage() {
+          throw new Error('canonical Bus read unavailable');
+        },
+      },
+      lessons: {
+        async query() {
+          throw new Error('lesson projection unavailable');
+        },
+      },
+      logger,
+    });
+
+    const snapshot = await service.getSnapshot();
+
+    expect(snapshot.bus.health.degradationReasons).toEqual(['read_failed']);
+    expect(snapshot.lessons.degradationReason).toBe('read_failed');
+    expect(logger.error).toHaveBeenCalledWith('Automata Bus operator read failed', {
+      error: 'canonical Bus read unavailable',
+    });
+    expect(logger.error).toHaveBeenCalledWith('Automata lesson operator read failed', {
+      error: 'lesson projection unavailable',
+    });
+  });
+
+  it('exposes the content-safe recurrent lesson projection and governed review handoff', async () => {
+    const registry = await createRegistry();
+    const lessons: AdminAutomataLessonReadPort = {
+      async query(scope) {
+        expect(scope).toEqual({
+          companionId: 'companion-test',
+          audience: 'operator',
+          maxSensitivity: 'confidential',
+        });
+        return {
+          groups: [{
+            groupId: `automata-lesson:v1:${'a'.repeat(64)}`,
+            automatonClass: 'subagent.bounded',
+            promptRevision: 'sha256:prompt-r1',
+            toolName: 'repo',
+            failureCategory: 'missing-instruction',
+            lessonCode: 'read-before-edit',
+            sourceCount: 2,
+            support: 'supported',
+            evidenceQuality: 'verified',
+            sourceFindingIds: ['finding-1', 'finding-2'],
+            evidenceIds: [`sha256:${'b'.repeat(64)}`],
+            sourceTraceTruncated: false,
+            contradiction: { present: false, sourceFindingIds: [] },
+            inferenceOnly: false,
+            interpretation: 'candidate-pattern-not-verified-defect',
+          }],
+          hasMore: false,
+          sourceFindingCount: 2,
+        };
+      },
+    };
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      lessons,
+    });
+
+    expect((await service.getSnapshot()).lessons).toMatchObject({
+      available: true,
+      groups: [{ support: 'supported', evidenceQuality: 'verified', sourceCount: 2 }],
+      proposalReviewPath: '/api/admin/shared-workspace/proposals',
+    });
+  });
+
+  it('degrades healthy Bus state when a wired class keeps leaving no useful handoff', async () => {
+    const registry = await createRegistry();
+    const { port } = busPort({
+      health: {
+        condition: 'healthy',
+        freshness: 'fresh',
+        observedAt: '2026-08-11T12:01:00.000Z',
+        lastEventAt: findingEvent.occurredAt,
+        indexState: 'ready',
+        reindexState: 'current',
+        pendingIndexCount: 0,
+        degradationReasons: [],
+      },
+    });
+    const activityInputs: unknown[] = [];
+    const threshold = loadAutomataPolicySeedDefaults().bus.health.emptyRunThreshold;
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      bus: {
+        ...port,
+        async readClassActivity(input) {
+          activityInputs.push(input);
+          return {
+            companionId: 'companion-test',
+            windowStart: new Date(input.windowStartMs).toISOString(),
+            classes: [{
+              automatonClass: 'memory.extraction',
+              usefulHandoffs: 0,
+              noFindingHandoffs: threshold,
+              workerFindings: 0,
+              lastUsefulAt: null,
+              emptyStreak: threshold,
+            }],
+            handoffRunIds: [],
+          };
+        },
+      },
+    });
+
+    const snapshot = await service.getSnapshot();
+
+    expect(activityInputs).toEqual([expect.objectContaining({ companionId: 'companion-test' })]);
+    expect(snapshot.bus.health).toMatchObject({
+      condition: 'degraded',
+      degradationReasons: ['empty_useful_streak'],
+    });
+    expect(snapshot.coverage).toMatchObject({ available: true, degradationReasons: ['empty_useful_streak'] });
+    expect(snapshot.coverage.classes.find(entry => entry.automatonClass === 'memory.extraction'))
+      .toMatchObject({ health: 'degraded', handoffs: { usefulHandoffs: 0, emptyStreak: threshold } });
+  });
+
+  it('logs an unreadable coverage aggregate and reports coverage unknown, never healthy', async () => {
+    const registry = await createRegistry();
+    const logger = { error: vi.fn() };
+    const { port } = busPort();
+    const service = new AdminAutomataDataService({
+      registry,
+      companionId: 'companion-test',
+      readPolicy: { defaultPageLimit: 5, maxPageLimit: 20 },
+      coveragePolicy: loadAutomataPolicySeedDefaults().bus.health,
+      bus: {
+        ...port,
+        async readClassActivity() {
+          return {
+            companionId: 'companion-other',
+            windowStart: '2026-08-11T12:00:00.000Z',
+            classes: [],
+            handoffRunIds: [],
+          };
+        },
+      },
+      logger,
+    });
+
+    const snapshot = await service.getSnapshot();
+
+    expect(snapshot.coverage.available).toBe(false);
+    expect(snapshot.coverage.classes.find(entry => entry.automatonClass === 'subagent.bounded'))
+      .toMatchObject({ health: 'unknown', handoffs: null });
+    expect(logger.error).toHaveBeenCalledWith('Automata class coverage read failed', {
+      error: 'Automata class activity returned a cross-companion aggregate',
+    });
+  });
+});

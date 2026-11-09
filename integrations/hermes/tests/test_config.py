@@ -12,6 +12,7 @@ VALID = {
     "timeout_seconds": 30,
     "max_context_chars": 9000,
     "automata": None,
+    "garden": None,
 }
 
 
@@ -33,6 +34,10 @@ def test_a_complete_config_parses():
         ({"automata": {}}, "automata is missing required fields: claim_limit"),
         ({"automata": {"claim_limit": 9}}, "claim_limit"),
         ({"automata": {"claim_limit": 2, "max_iterations": 250}}, "automata has unknown fields: max_iterations"),
+        ({"garden": {}}, "garden is missing required fields: url, credential_env, timeout_seconds"),
+        ({"garden": {"url": "http://127.0.0.1:7414/api", "credential_env": "PSFN_LITE_GARDEN_TOKEN", "timeout_seconds": 30}}, "garden.url"),
+        ({"garden": {"url": "http://127.0.0.1:7414", "credential_env": "PSFN_LITE_TOKEN", "timeout_seconds": 30}}, "not the bridge credential"),
+        ({"garden": {"url": "http://127.0.0.1:7414", "credential_env": "PSFN_LITE_GARDEN_TOKEN", "timeout_seconds": 0}}, "garden.timeout_seconds"),
     ],
 )
 def test_a_malformed_config_is_refused_by_field(change, message):
@@ -47,6 +52,14 @@ def test_hosted_automata_are_off_unless_configured():
     del values["automata"]
     with pytest.raises(ConfigError, match="missing required fields: automata"):
         Config.parse(values)
+
+
+def test_the_garden_is_off_unless_configured(monkeypatch):
+    assert Config.parse(VALID).garden is None
+    garden = Config.parse({**VALID, "garden": {"url": "http://127.0.0.1:7414/", "credential_env": "PSFN_LITE_GARDEN_TOKEN", "timeout_seconds": 20}}).garden
+    assert (garden.url, garden.credential_env, garden.timeout_seconds) == ("http://127.0.0.1:7414", "PSFN_LITE_GARDEN_TOKEN", 20.0)
+    monkeypatch.setenv("PSFN_LITE_GARDEN_TOKEN", "g" * 40)
+    assert garden.credential() == "g" * 40
 
 
 def test_a_missing_field_is_named():

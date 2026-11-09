@@ -7,7 +7,7 @@
  * Hermes turn has another surface's work to see.
  *
  * Run: node --import tsx tests/hermes/fixtures/lite-host.ts. It prints one
- * JSON line ({mcpUrl, lifecycleUrl, credentials, hostTurnTimeoutMs}) and runs
+ * JSON line ({mcpUrl, lifecycleUrl, credentials, garden, hostTurnTimeoutMs}) and runs
  * until stdin closes, then closes the runtime and removes exactly its own
  * Postgres container and temporary directories. Credentials are random per
  * run and never written to disk. The donor logger's stdout lines go to stderr.
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
     // that API and pi-messages, explicit-tool-request.ts providerToolChoice), so the plugin's tool-choice middleware is exercised.
     const host = new ConformanceHost(
       { databaseUrl: await harness.createDatabase(), base, companionId: null, credentials: null, sessionKeys: null, ports: null, generation: 0 },
-      { modelApi: 'openai-completions' },
+      { modelApi: 'openai-completions', garden: true },
     );
     const ready = await host.open();
     try {
@@ -46,7 +46,7 @@ async function main(): Promise<void> {
         key: 'seed',
       });
       if (seed.results.some((r) => !r.ok)) throw new Error(`the seed turn failed: ${JSON.stringify(seed.results)}`);
-      protocol(`${JSON.stringify({ mcpUrl: ready.mcpUrl, lifecycleUrl: ready.lifecycleUrl, credentials: ready.credentials, hermesInstallId: HERMES_TEST_INSTALL_ID, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS })}\n`);
+      protocol(`${JSON.stringify({ mcpUrl: ready.mcpUrl, lifecycleUrl: ready.lifecycleUrl, credentials: ready.credentials, garden: ready.garden, hermesInstallId: HERMES_TEST_INSTALL_ID, hostTurnTimeoutMs: HOST_TURN_TIMEOUT_MS })}\n`);
       process.stdin.resume();
       await new Promise<void>((resolve) => process.stdin.once('end', resolve));
     } finally {

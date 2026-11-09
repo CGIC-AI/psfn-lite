@@ -113,6 +113,24 @@ export interface LiteConfig {
       readonly maxIterations: number;
     } | null;
   } | null;
+  /**
+   * The light Garden (docs/extraction.md, seam S8), or null for none: the
+   * operator API the Hermes plugin's Garden proxies to. It listens on its
+   * own port, loopback unless `allowedHosts` opts in to a wider address.
+   * Its bindings use the MCP binding format; every one must name the
+   * primary contact (`operator`), and none may reuse an MCP credential or
+   * principal. A route reads a body of at most `maxBodyBytes` (the donor's
+   * standalone Garden read 64 KiB); the Overview shows the latest
+   * session's last `recentTurnLimit` turns.
+   */
+  readonly garden: {
+    readonly host: string;
+    readonly port: number;
+    readonly allowedHosts: readonly string[] | null;
+    readonly maxBodyBytes: number;
+    readonly recentTurnLimit: number;
+    readonly bindings: readonly unknown[];
+  } | null;
 }
 
 export const TRUST_LEVELS: readonly TrustLevel[] = ['primary', 'trusted', 'regular', 'public'];
@@ -177,7 +195,7 @@ class Reader {
 
 const ROOT_KEYS = ['companionId', 'dataDir', 'workspaceDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'sessionIntegrity', 'mcp', 'lifecycle'];
 /** Settings with a donor default when left out. */
-const OPTIONAL_ROOT_KEYS = ['embedding'];
+const OPTIONAL_ROOT_KEYS = ['embedding', 'garden'];
 /** The donor's embedding provider kinds (faculties/memory/embedding.ts `EmbeddingProviderKind`). */
 export const EMBEDDING_PROVIDER_KINDS = ['transformers', 'ollama', 'api'] as const;
 
@@ -231,9 +249,10 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   const lifecycle = parseLifecycle(root, issues);
   if (lifecycle !== null && mcp === null) issues.push('lifecycle needs mcp: the bridge shares its principal bindings');
   if (mcp !== null && lifecycle === null) issues.push('mcp needs lifecycle: companion tools run only inside host-driven turns');
+  const garden = parseGarden(root, issues);
 
   if (issues.length > 0) return invalid(...issues);
-  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle });
+  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle, garden });
 }
 
 /**
@@ -303,6 +322,20 @@ function parseLifecycle(root: Reader, issues: string[]): LiteConfig['lifecycle']
     hostTurnTimeoutMs: r.integer('hostTurnTimeoutMs', 1_000, DAY_MS),
     hermesInstallId: r.matching('hermesInstallId', HERMES_INSTALL_ID_PATTERN, 'a Hermes install id (32 lowercase hex characters)'),
     automata: parseHostedAutomata(r),
+  };
+}
+
+function parseGarden(root: Reader, issues: string[]): LiteConfig['garden'] {
+  const value = root.value('garden');
+  if (value === undefined || value === null) return null;
+  const r = root.child('garden', ['host', 'port', 'allowedHosts', 'maxBodyBytes', 'recentTurnLimit', 'bindings']);
+  const bindings = r.value('bindings');
+  if ((!Array.isArray(bindings) || bindings.length === 0) && bindings !== undefined) issues.push('garden.bindings must be a non-empty list of principal bindings');
+  return {
+    ...listen(r, issues, 'garden'),
+    maxBodyBytes: r.integer('maxBodyBytes', 1_024, 16 * 1_024 * 1_024),
+    recentTurnLimit: r.integer('recentTurnLimit', 1, 500),
+    bindings: Array.isArray(bindings) ? bindings : [],
   };
 }
 

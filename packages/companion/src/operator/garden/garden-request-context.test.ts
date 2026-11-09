@@ -1,0 +1,521 @@
+import { describe, expect, it, vi } from 'vitest';
+import type {
+  MemorySubjectAdminQuery,
+  MemorySubjectAdminResult,
+  MemorySubjectAuthorizedQuery,
+  MemoryStorePort,
+} from '../../faculties/memory/memory-store-port.js';
+import type { PurrMemory } from '../../faculties/memory/types.js';
+
+const ADMIN_PRIVACY_ZERO = {
+  activeMemoryCount: 0,
+  highSensitivityCount: 0,
+  consentGatedCount: 0,
+  contactLinkedCount: 0,
+  scopedCount: 0,
+  preferenceCount: 0,
+  durablePreferenceCount: 0,
+  sensitivityCounts: {},
+} as const;
+
+function adminAggregateFromMemories(
+  input: MemorySubjectAdminQuery,
+  pageMemories: readonly (PurrMemory & { similarity: number })[],
+): MemorySubjectAdminResult {
+  switch (input.selector.kind) {
+    case 'privacy_summary':
+      return { kind: 'privacy_summary', privacySummary: { ...ADMIN_PRIVACY_ZERO } };
+    case 'admin_stats':
+    case 'stats':
+      return { kind: 'stats', stats: { total: 0, byType: {}, avgSalience: 0 } };
+    default:
+      return {
+        kind: 'memories',
+        memories: [...pageMemories],
+        total: pageMemories.length,
+        withheldBySubjectAuthorizationCount: 4,
+      };
+  }
+}
+import { AdminMemoryDataService } from './services/memory-service.js';
+import type { FleetGardenRequestContext } from './garden-request-context.js';
+import type { MemorySubjectClassification } from '../../shared/contracts/memory-subject.js';
+
+function memory(contactId: string): PurrMemory {
+  return {
+    id: `memory-${contactId}`,
+    text: `safe memory for ${contactId}`,
+    type: 'semantic',
+    importance: 0.5,
+    confidence: 0.9,
+    emotionalValence: 0,
+    salience: 0.5,
+    sourceRef: `test:${contactId}`,
+    extractedAt: 1,
+    lastAccessed: 1,
+    accessCount: 0,
+    tags: [],
+    sensitivity: 'personal',
+    contactId,
+    provenance: { subjectContactId: contactId },
+  };
+}
+
+function context(
+  principalId: string,
+  contactId: string,
+  overrides: Partial<Pick<FleetGardenRequestContext, 'action' | 'subjectRelation' | 'expiresAt'>> & {
+    routeId?: string;
+    area?: 'memory' | 'sessions';
+    pathParams?: Readonly<Record<string, string>>;
+    assurance?: FleetGardenRequestContext['actor']['sessionAssurance'];
+    role?: FleetGardenRequestContext['actor']['role'];
+    accessMode?: FleetGardenRequestContext['actor']['accessMode'];
+    provider?: FleetGardenRequestContext['actor']['provider'];
+  } = {},
+): FleetGardenRequestContext {
+  const area = overrides.area ?? 'memory';
+  const authorization = Object.freeze({
+    action: overrides.action ?? 'memory.read.self',
+    baseRole: 'member' as const,
+    resource: Object.freeze({ scope: 'personal_workspace' as const, area }),
+    subjectRelation: overrides.subjectRelation ?? 'self_or_co_subject',
+    requirements: Object.freeze({
+      assurance: 'oauth' as const,
+      confirmation: 'none' as const,
+      approvals: Object.freeze([]),
+    }),
+    publicAccess: 'never' as const,
+    recoveryAccess: 'forbidden' as const,
+  });
+  return Object.freeze({
+    kind: 'fleet_principal',
+    requestId: `${principalId === 'principal-a' ? 'aaaaaaaa' : 'bbbbbbbb'}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+    decisionId: `${principalId === 'principal-a' ? 'cccccccc' : 'dddddddd'}-dddd-4ddd-8ddd-dddddddddddd`,
+    authorizationEventId: `event-${principalId}`,
+    resolvedAt: '2030-01-01T00:00:00.000Z',
+    versions: Object.freeze({
+      authorityGeneration: 1,
+      globalAuthEpoch: 1,
+      sessionAuthnVersion: 1,
+      sessionAuthzVersion: 1,
+      bindingVersion: 1,
+      grantVersion: 1,
+      policyVersion: 1,
+    }),
+    issuedAt: 1,
+    expiresAt: overrides.expiresAt ?? 2,
+    actor: Object.freeze({
+      kind: 'fleet_principal',
+      principalId,
+      provider: overrides.provider ?? 'discord',
+      providerSubjectId: `provider-${principalId}`,
+      contactId,
+      contactBindingId: `binding-${principalId}`,
+      role: overrides.role ?? 'member',
+      operatorGrantId: `grant-${principalId}`,
+      sessionRecordId: `session-${principalId}`,
+      sessionAssurance: overrides.assurance ?? 'oauth',
+      accessMode: overrides.accessMode ?? 'multi_admin',
+    }),
+    action: overrides.action ?? 'memory.read.self',
+    resource: Object.freeze({
+      routeId: overrides.routeId ?? 'GET /api/admin/memory',
+      scope: 'personal_workspace',
+      area,
+      companionId: '11111111-1111-4111-8111-111111111111',
+      pathParams: Object.freeze({ ...(overrides.pathParams ?? {}) }),
+      query: Object.freeze({}),
+    }),
+    subjectRelation: overrides.subjectRelation ?? 'self_or_co_subject',
+    authorization,
+  });
+}
+
+describe('request-bound Garden principal isolation', () => {
+  it('keeps parallel memory subjects exact without a mutable current-context seam', async () => {
+    const queryAuthorizedMemorySubjects = vi.fn(async (input: MemorySubjectAuthorizedQuery) => {
+      await new Promise(resolve => setImmediate(resolve));
+      const contactId = input.authorization.viewerContactIds[0]!;
+      const memories = [memory(contactId)];
+      return { memories, total: memories.length };
+    });
+    const aggregateAuthorizedMemorySubjects = vi.fn(async (input: MemorySubjectAdminQuery) => {
+      await new Promise(resolve => setImmediate(resolve));
+      const contactId = input.authorization.viewerContactIds[0]!;
+      return adminAggregateFromMemories(input, [{ ...memory(contactId), similarity: 1 }]);
+    });
+    const rawStore = {
+      queryAuthorizedMemorySubjects,
+      aggregateAuthorizedMemorySubjects,
+    } as unknown as MemoryStorePort;
+    rawStore.getMemorySubjectClassification = vi.fn(async memoryId => {
+      const contactId = memoryId.replace(/^memory-/u, '');
+      return {
+        memoryId,
+        subjectClass: 'single_contact',
+        status: 'current',
+        classifierVersion: 1,
+        memoryRevision: 1,
+        evidenceDigest: 'a'.repeat(64),
+        evidence: ['explicit_subject_contact'],
+        subjectContactIds: [contactId],
+        reasonClass: 'explicit_subject_contact',
+        classifiedAt: 1,
+        updatedAt: 1,
+      };
+    });
+    const service = new AdminMemoryDataService({
+      memoryStore: rawStore,
+      fleetMemoryStore: rawStore,
+    });
+    const principalA = context('principal-a', 'contact-a');
+    const principalB = context('principal-b', 'contact-b');
+
+    const [resultA, resultB] = await Promise.all([
+      service.forRequest(principalA).listMemories(),
+      service.forRequest(principalB).listMemories(),
+    ]);
+
+    expect(resultA.memories.map(item => item.contactId)).toEqual(['contact-a']);
+    expect(resultB.memories.map(item => item.contactId)).toEqual(['contact-b']);
+    // Admin listing now flows through the subject-authorized SQL aggregate (a27w.5).
+    expect(aggregateAuthorizedMemorySubjects.mock.calls
+      .filter(([input]) => input.selector.kind === 'admin_page')
+      .map(([input]) => input.authorization.viewerContactIds))
+      .toEqual(expect.arrayContaining([['contact-a'], ['contact-b']]));
+    expect(Object.isFrozen(principalA)).toBe(true);
+    expect(Object.isFrozen(principalA.actor)).toBe(true);
+  });
+
+  it('surfaces subject-authorization withholding only to the owner role', async () => {
+    const aggregateAuthorizedMemorySubjects = vi.fn(async (input: MemorySubjectAdminQuery) => (
+      adminAggregateFromMemories(input, [{ ...memory('contact-a'), similarity: 1 }])
+    ));
+    const rawStore = {
+      aggregateAuthorizedMemorySubjects,
+      queryAuthorizedMemorySubjects: vi.fn(async () => ({
+        memories: [{ ...memory('contact-a'), similarity: 1 }],
+        total: 1,
+      })),
+      getMemorySubjectClassification: vi.fn(async () => ({
+        memoryId: 'memory-contact-a',
+        subjectClass: 'single_contact',
+        status: 'current',
+        classifierVersion: 1,
+        memoryRevision: 1,
+        evidenceDigest: 'a'.repeat(64),
+        evidence: ['explicit_subject_contact'],
+        subjectContactIds: ['contact-a'],
+        reasonClass: 'explicit_subject_contact',
+        classifiedAt: 1,
+        updatedAt: 1,
+      })),
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({
+      memoryStore: rawStore,
+      fleetMemoryStore: rawStore,
+    });
+
+    const member = await service
+      .forRequest(context('principal-a', 'contact-a'))
+      .listMemories();
+    const owner = await service
+      .forRequest(context('principal-a', 'contact-a', { role: 'owner' }))
+      .listMemories();
+
+    expect(member.withheldBySubjectAuthorizationCount).toBeUndefined();
+    expect(owner.withheldBySubjectAuthorizationCount).toBe(4);
+  });
+
+  it('keeps session-wide elevation and non-subject relations fail closed', () => {
+    const rawStore = {
+      queryAuthorizedMemorySubjects: vi.fn(async () => ({ memories: [], total: 0 })),
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+    const reveal = context('principal-a', 'contact-a', { action: 'memory.reveal', subjectRelation: 'self' });
+    expect(() => service.forRequest(reveal).elevateBodyAccess())
+      .toThrow(/audited escalation/u);
+    expect(() => service.forRequest(context('principal-a', 'contact-a', {
+      subjectRelation: 'current_companion',
+    }))).toThrow(/exact request-local subject relation/u);
+  });
+
+  it('does not let an owner role bypass the routine subject SQL projection', async () => {
+    const rawAdminList = vi.fn(() => {
+      throw new Error('owner role must not reach the broad admin list');
+    });
+    const queryAuthorizedMemorySubjects = vi.fn(async () => ({ memories: [], total: 0 }));
+    const aggregateAuthorizedMemorySubjects = vi.fn(async (input: MemorySubjectAdminQuery) => (
+      adminAggregateFromMemories(input, [])
+    ));
+    const rawStore = {
+      listAdminMemories: rawAdminList,
+      queryAuthorizedMemorySubjects,
+      aggregateAuthorizedMemorySubjects,
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+
+    const result = await service.forRequest(context('principal-a', 'contact-a', { role: 'owner' }))
+      .listMemories();
+
+    expect(result.memories).toEqual([]);
+    expect(result.pagination.total).toBe(0);
+    // The owner-role listing is forced through the subject-authorized SQL aggregate
+    // (a27w.5), never the raw admin list which would bypass the subject predicate.
+    expect(aggregateAuthorizedMemorySubjects).toHaveBeenCalledWith(expect.objectContaining({
+      authorization: expect.objectContaining({
+        viewerContactIds: ['contact-a'],
+        // D1 multi-admin projection: every class visible in SQL, with the
+        // high-sensitivity other-human carve-out active until escalation.
+        allowedSubjectClasses: [
+          'single_contact', 'multiple_contacts', 'shared_room', 'companion_private',
+          'unbound_person', 'unattributed', 'ambiguous',
+        ],
+        allowedViewerRelations: ['self', 'co_subject', 'other', 'none'],
+        excludeHighSensitivityOtherRelation: true,
+      }),
+      selector: expect.objectContaining({ kind: 'admin_page' }),
+    }));
+    expect(rawAdminList).not.toHaveBeenCalled();
+  });
+
+  it('fails closed across routine named-memory sensitivities for missing, stale, ambiguous, or non-subject projections', async () => {
+    const sensitivities = ['public', 'personal', 'intimate', 'confidential'] as const;
+    const memories = new Map(sensitivities.map(sensitivity => {
+      const item = {
+        ...memory('contact-a'),
+        id: `memory-${sensitivity}`,
+        sensitivity,
+      };
+      return [item.id, item] as const;
+    }));
+    const baseClassification = {
+      subjectClass: 'single_contact' as const,
+      status: 'current' as const,
+      classifierVersion: 1,
+      memoryRevision: 1,
+      evidenceDigest: 'a'.repeat(64),
+      evidence: ['explicit_subject_contact' as const],
+      subjectContactIds: ['contact-a'],
+      reasonClass: 'explicit_subject_contact',
+      classifiedAt: 1,
+      updatedAt: 1,
+    };
+    const classifications = new Map<string, MemorySubjectClassification>([
+      ['memory-personal', {
+        ...baseClassification,
+        memoryId: 'memory-personal',
+        classifierVersion: 2,
+      }],
+      ['memory-intimate', {
+        ...baseClassification,
+        memoryId: 'memory-intimate',
+        subjectClass: 'ambiguous',
+        reasonClass: 'contradictory_evidence',
+      }],
+      ['memory-confidential', {
+        ...baseClassification,
+        memoryId: 'memory-confidential',
+        subjectContactIds: ['contact-other'],
+      }],
+    ]);
+    const rawStore = {
+      queryAuthorizedMemorySubjects: vi.fn(async (input: MemorySubjectAuthorizedQuery) => {
+        const item = input.selector.kind === 'detail'
+          ? memories.get(input.selector.memoryId)
+          : undefined;
+        return { memories: item ? [item] : [], total: item ? 1 : 0 };
+      }),
+      getMemorySubjectClassification: vi.fn(async memoryId => classifications.get(memoryId)),
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+    const routine = service.forRequest(context('principal-a', 'contact-a'));
+
+    for (const sensitivity of sensitivities) {
+      await expect(routine.getMemoryDetail(`memory-${sensitivity}`))
+        .rejects.toThrow(/subject projection|current subject classification|current proven single-contact subject/u);
+    }
+  });
+
+  it('does not resolve links for a memory outside the signed subject', async () => {
+    const getLinkedMemories = vi.fn(async () => [{
+      id1: 'memory-contact-b',
+      id2: 'memory-contact-c',
+      linkType: 'supports',
+    }]);
+    const rawStore = {
+      queryAuthorizedMemorySubjects: vi.fn(async (input: MemorySubjectAuthorizedQuery) => ({
+        memories: input.selector.kind === 'detail' && input.selector.memoryId === 'memory-contact-a'
+          ? [memory('contact-a')]
+          : [],
+        total: input.selector.kind === 'detail' && input.selector.memoryId === 'memory-contact-a'
+          ? 1
+          : 0,
+      })),
+      getLinkedMemories,
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+
+    await expect(service.forRequest(context('principal-a', 'contact-a'))
+      .getMemoryLinks('memory-contact-b')).resolves.toEqual([]);
+    expect(getLinkedMemories).not.toHaveBeenCalled();
+  });
+
+  it('reveals one current intimate self memory only under a consumed audited escalation', async () => {
+    const intimate = { ...memory('contact-a'), text: 'private body', sensitivity: 'intimate' as const };
+    const classification: MemorySubjectClassification = {
+      memoryId: intimate.id,
+      subjectClass: 'single_contact',
+      status: 'current',
+      classifierVersion: 1,
+      memoryRevision: 3,
+      evidenceDigest: 'a'.repeat(64),
+      evidence: ['explicit_subject_contact'],
+      subjectContactIds: ['contact-a'],
+      reasonClass: 'explicit_subject_contact',
+      classifiedAt: 1,
+      updatedAt: 2,
+    };
+    const queryAuthorizedMemorySubjects = vi.fn(async (input: MemorySubjectAuthorizedQuery) => {
+      if (input.selector.kind !== 'detail' || input.selector.memoryId !== intimate.id
+        || !input.authorization.viewerContactIds.includes('contact-a')
+        || !input.authorization.allowedSubjectClasses.includes('single_contact')) {
+        return { memories: [], total: 0 };
+      }
+      const grant = input.authorization.grantBindings.at(0);
+      if (grant && (grant.memoryRevision !== classification.memoryRevision
+        || grant.classifierVersion !== classification.classifierVersion
+        || grant.evidenceDigest !== classification.evidenceDigest)) {
+        return { memories: [], total: 0 };
+      }
+      return { memories: [intimate], total: 1 };
+    });
+    const rawStore = {
+      queryAuthorizedMemorySubjects,
+      getMemorySubjectClassification: vi.fn(async () => classification),
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+
+    // Routine detail: the body stays redacted and no reveal token of any kind
+    // is attached — escalation happens against the gateway, not this payload.
+    const routine = context('principal-a', 'contact-a');
+    const detail = await service.forRequest(routine).getMemoryDetail(intimate.id);
+    expect(detail?.memory).toMatchObject({ bodyRedacted: true });
+    expect(detail?.memory.text).not.toBe('private body');
+
+    // A reveal without the escalated session assurance fails closed.
+    const unescalated = context('principal-a', 'contact-a', {
+      action: 'memory.reveal',
+      subjectRelation: 'self_or_co_subject',
+      routeId: 'POST /api/admin/memory/:id/reveal',
+      pathParams: { id: intimate.id },
+      expiresAt: Math.floor(Date.now() / 1_000) + 60,
+    });
+    await expect(service.forRequest(unescalated).revealMemory(intimate.id))
+      .rejects.toThrow(/audited escalation grant/u);
+
+    // With the gateway-minted escalated assurance the exact reveal succeeds.
+    const escalated = context('principal-a', 'contact-a', {
+      action: 'memory.reveal',
+      subjectRelation: 'self_or_co_subject',
+      routeId: 'POST /api/admin/memory/:id/reveal',
+      pathParams: { id: intimate.id },
+      assurance: 'escalated',
+      expiresAt: Math.floor(Date.now() / 1_000) + 60,
+    });
+    await expect(service.forRequest(escalated).revealMemory(intimate.id))
+      .resolves.toMatchObject({ memory: { text: 'private body' } });
+
+    // A signed path param that disagrees with the requested id fails closed.
+    const mismatched = context('principal-a', 'contact-a', {
+      action: 'memory.reveal',
+      subjectRelation: 'self_or_co_subject',
+      routeId: 'POST /api/admin/memory/:id/reveal',
+      pathParams: { id: 'memory-other' },
+      assurance: 'escalated',
+      expiresAt: Math.floor(Date.now() / 1_000) + 60,
+    });
+    await expect(service.forRequest(mismatched).revealMemory(intimate.id))
+      .rejects.toThrow(/audited escalation grant/u);
+
+    // A different member principal outside the subject cannot reveal even
+    // when escalated: the subject-authorized store returns no row.
+    await expect(service.forRequest(context('principal-other', 'contact-other', {
+      action: 'memory.reveal',
+      subjectRelation: 'self_or_co_subject',
+      routeId: 'POST /api/admin/memory/:id/reveal',
+      pathParams: { id: intimate.id },
+      assurance: 'escalated',
+      expiresAt: Math.floor(Date.now() / 1_000) + 60,
+    })).revealMemory(intimate.id)).resolves.toBeNull();
+  });
+
+  it('reveals a memory body for the audited ADMIN_TOKEN operator without an SSO grant (jxthv)', async () => {
+    const intimate = { ...memory('contact-a'), text: 'private body', sensitivity: 'intimate' as const };
+    const classification: MemorySubjectClassification = {
+      memoryId: intimate.id,
+      subjectClass: 'single_contact',
+      status: 'current',
+      classifierVersion: 1,
+      memoryRevision: 3,
+      evidenceDigest: 'a'.repeat(64),
+      evidence: ['explicit_subject_contact'],
+      subjectContactIds: ['contact-a'],
+      reasonClass: 'explicit_subject_contact',
+      classifiedAt: 1,
+      updatedAt: 2,
+    };
+    const rawStore = {
+      queryAuthorizedMemorySubjects: vi.fn(async () => ({ memories: [intimate], total: 1 })),
+      getMemorySubjectClassification: vi.fn(async () => classification),
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+    const reveal = (overrides: Parameters<typeof context>[2]) => service.forRequest(
+      context('admin-token-operator', 'admin-token-contact-fixture', {
+        action: 'memory.reveal',
+        subjectRelation: 'self_or_co_subject',
+        routeId: 'POST /api/admin/memory/:id/reveal',
+        pathParams: { id: intimate.id },
+        expiresAt: Math.floor(Date.now() / 1_000) + 60,
+        provider: 'admin_token',
+        role: 'owner',
+        accessMode: 'sole_admin',
+        assurance: 'break_glass',
+        ...overrides,
+      }),
+    ).revealMemory(intimate.id);
+
+    await expect(reveal({})).resolves.toMatchObject({ memory: { text: 'private body' } });
+    // Only the signed door shape counts: a Discord break-glass session or an
+    // admin-token shape outside sole-admin mode still needs a grant.
+    await expect(reveal({ provider: 'discord' })).rejects.toThrow(/audited escalation grant/u);
+    await expect(reveal({ accessMode: 'multi_admin' })).rejects.toThrow(/audited escalation grant/u);
+  });
+
+  it('D1 sole-admin listing keeps every subject class visible without the sensitivity carve-out', async () => {
+    const aggregateAuthorizedMemorySubjects = vi.fn(async (input: MemorySubjectAdminQuery) => (
+      adminAggregateFromMemories(input, [])
+    ));
+    const rawStore = {
+      queryAuthorizedMemorySubjects: vi.fn(async () => ({ memories: [], total: 0 })),
+      aggregateAuthorizedMemorySubjects,
+    } as unknown as MemoryStorePort;
+    const service = new AdminMemoryDataService({ memoryStore: rawStore, fleetMemoryStore: rawStore });
+    await service.forRequest(context('principal-a', 'contact-a', {
+      role: 'admin',
+      accessMode: 'sole_admin',
+    })).listMemories();
+    expect(aggregateAuthorizedMemorySubjects).toHaveBeenCalledWith(expect.objectContaining({
+      authorization: expect.objectContaining({
+        allowedSubjectClasses: [
+          'single_contact', 'multiple_contacts', 'shared_room', 'companion_private',
+          'unbound_person', 'unattributed', 'ambiguous',
+        ],
+        allowedViewerRelations: ['self', 'co_subject', 'other', 'none'],
+      }),
+    }));
+    const authorization = aggregateAuthorizedMemorySubjects.mock.calls[0]![0]!.authorization;
+    expect(authorization.excludeHighSensitivityOtherRelation).toBeUndefined();
+  });
+});

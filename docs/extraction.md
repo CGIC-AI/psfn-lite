@@ -31,6 +31,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | Operator automata rules | Done (Operator automata rules, below): stable worker write keys; hosted automata as Hermes subagents. |
 | Review fixes after Step D | Done (Review fixes after Step D, below): the model-usage recorder port, the promoted donor tests, exactly-once corrections, and the Step D records and provenance. |
 | E operator rulings 2026-11-08/09 | Done (Step E, below): cut tool surfaces pruned from the registry, host-bound session integrity, host approval of memory deletion, the capability tier as an owner file (default `autonomous`), fatigue deferred, model usage in memory. |
+| S8 light Garden | Implemented (S8: the light Garden, below): the donor Garden services, routes and route catalogue re-vendored; the operator surface `packages/operator`; the `psfn_lite` dashboard backend and install tool; the Desktop half `psfn_lite/desktop/plugin.js`. Decision (c) awaits the owner. |
 
 ## Closure (Step A0)
 
@@ -2592,6 +2593,393 @@ Result (`TMPDIR` under a scratch directory in the worktrees folder):
   deleted: 54 files, 1041 tests; matched: 9032; Lite additions: 4 files,
   27 tests", with 34 differences, all of them those tests.
 - A rerun of the nine affected files alone also hit the quota.
+
+## S8: the light Garden (2026-11-09)
+
+The owner asked for a light Garden: a view of the companion that ships in the
+`psfn_lite` Hermes plugin and appears first in the Hermes Desktop sidebar. v1
+reads everything and writes only the core actions. Settings writes update
+the owner files and answer "restart needed"; nothing reloads live. It has
+eight screens:
+
+1. **Overview**: tier, model, heartbeat, open concerns and focus, current
+   emotion, recent turns.
+2. **Memories**: browse, search, detail, redact, delete and restore, and the
+   pending deletion proposals.
+3. **Persona & prompts**: the card, the prompt layers with diff, history and
+   rollback, the values, and the north star.
+4. **People**: contacts, biography claims, and social-graph proposals
+   (approve or reject).
+5. **Sessions**: the session list, and per-turn detail (the prompt, and the
+   memories and tools used).
+6. **Inner life**: concerns (resolve or transition), focus, the EmoSim
+   emotion state, introspection consent, schedules and the heartbeat.
+7. **Automata**: runs, the bus, inspect.
+8. **Settings**: model, tier and scheduler.
+
+Out of scope: chat, CogSec, fleet, wiki, skills, shards, images, charge,
+channels, places, satellites, and the Hermes dashboard tab. The `cuts.tsv`
+rows carry seam `S8`.
+
+### Inventory
+
+The donor's Garden is `src/operator/garden` (an HTTP server, its services
+and route modules, and a Svelte client). Lite keeps the services and route
+modules the eight screens need, at their donor paths. Everything else stays
+cut: the server, transports, auth pages, fleet routing, the client, and the
+services of excluded screens. The `extraction/vendored-files.txt` kind is
+`garden` (57 files). 24 of them were scaffolding rows that B7 deleted; 33
+were never copied.
+
+- **Garden services and routes** (52 files under `src/operator/garden`):
+  - memories: `api-routes-memory.ts`, `services/memory-service.ts`,
+    `memory-body-gate.ts`, `memory-scope-evidence.ts`;
+  - people: `api-routes-graph-proposals.ts`, `api-routes-biographical-review.ts`,
+    `routes/contact-routes.ts`, and the contacts, contact-session-linker,
+    graph-proposals and biographical-review services;
+  - sessions: `routes/session-routes.ts`, `services/session-service.ts`,
+    `session-turn-observability.ts`;
+  - concerns and the scheduler: `routes/concern-routes.ts`,
+    `routes/scheduler-routes.ts`, and the concern and scheduler services;
+  - persona and prompts: `routes/identity-routes.ts`, `routes/prompt-routes.ts`,
+    the identity service and the six prompts-* services,
+    `prompt-operator-layer-authority.ts`, `prompt-structured-content.ts`;
+  - automata: `routes/automata-routes.ts` and the automata services
+    (`automata-service.ts`, `-bus-read-adapter.ts`, `-class-activity-sql.ts`,
+    `-coverage.ts`);
+  - shared plumbing: `garden-request-context.ts`, `garden-companion-scope.ts`,
+    `route-matchers.ts`, `request-body.ts`, `request-url.ts`, `routes/shared.ts`,
+    `routes/types.ts`, `types.ts`, `identity-intake-types.ts`, and
+    `services/types.ts` with its `services/types/*` modules.
+- **`src/channels/backplane/http/primitives.ts`**: `sendJson` and
+  `withBody`, which the routes answer with.
+- **The route authorization catalogue** (`src/boundary/fleet-auth/`
+  `garden-route-authorization.ts`, `garden-route-capabilities.ts`,
+  `garden-route-types.ts`, `role-action-policy.ts`). Every Garden route
+  declares its id against this catalogue. The donor built each standalone
+  request context from the catalogue entry
+  (`server-routes.ts:73-83`, `createStandaloneGardenRequestContext`), and
+  the kept handlers read it: the biography routes check `action`,
+  `baseRole` and `confirmation: explicit`
+  (`api-routes-biographical-review.ts:42-53`). The four modules import only
+  each other and the action vocabulary. The catalogue still classifies the
+  routes of the cut screens. That is inert data: no Lite route declares
+  them, and `compileGardenRouteDeclarations` matches declared routes only.
+
+New Lite files in the extracted tree. Each one stands in for a donor
+module that is cut, at the seam:
+
+- `src/system/config/fleet-auth-vocabulary.ts`: moved verbatim from
+  `fleet-auth-config.ts` (the closed action and role tuples). The rest of
+  that file is the fleet auth owner-file loader, which is cut.
+- `src/operator/garden/request-capability-versions.ts`: a type copy of
+  `request-capability.ts:158-166`, which the kept context union names.
+- `src/operator/garden/admin-scheduler-contract.ts`: a type copy of
+  `admin-contract.ts:111-153`. `admin-contract.ts` is the whole Garden
+  domain contract, which is not vendored.
+
+Inside the vendored files, the cuts delete call paths:
+
+- the fleet request context factories and the fleet service-boundary
+  denial (`garden-request-context.ts`);
+- the fleet memory reveal and its subject-visible notice
+  (`api-routes-memory.ts`); `getCookieValue` moves verbatim from the cut
+  donor HTTP auth module;
+- the subject-visible concern notice (`routes/concern-routes.ts`);
+- card import, because the card importer is cut (operator ruling) and
+  `@character-foundry` is not an allowed package (`identity-service.ts`,
+  `identity-routes.ts`);
+- CogSec remediation (`session-service.ts`, `session-routes.ts`);
+- the barrel re-exports of the services that are not vendored
+  (`services/types.ts`).
+
+The standalone context, which is the only context a Lite Garden builds,
+never took the fleet branches. Its behaviour is the donor's.
+
+Not vendored, and why:
+
+- the Garden settings service (2,007 lines, cut in 3.10/B7): the Settings
+  screen reads and writes the owner files through the donor's own loaders
+  instead (decision b);
+- the dashboard service, which needs model usage, shards, the action pipe
+  and charge: the Overview is built from the stores directly;
+- `local-admin-contract.ts`, the donor's composition of about 60 services:
+  Lite composes the ones it needs (packages/operator, below);
+- `audit-history-service.ts`, which reads the gateway audit port and the
+  charge ledger;
+- the values journal routes, which the donor denies to the operator
+  without privacy break-glass (`api-routes.ts:465-500`). Lite keeps that
+  denial: values are shown as the companion-derived values layer of the
+  prompt stack (`AdminPromptsDataService` `companionValuesLayerProvider`),
+  which is how the donor's persona screen showed them, and the journal
+  stays private.
+
+### Tests and baseline
+
+The S8 selection follows the promoted-selection rule: every donor test whose
+sibling source is a `garden` file, 38 files. They ran in the throwaway donor
+clone with the donor settings and `--maxWorkers=16`:
+
+- runs `s8-a1` and `s8-a2` (profile overrides `lite-s8` and `lite-s8b`):
+  the 36 `operator/garden` and `channels` files, 324 tests, all passed;
+- runs `s8-c1` and `s8-c2`: the 2 catalogue tests added when the catalogue
+  was re-vendored, 15 tests, all passed. They start no container.
+
+`baseline.json` records them under `s8_selection` and takes the files from
+`s8-a2` and `s8-c2`. The baseline is now **845 files, 10,446 tests, all
+passed**. `extraction/tests.tsv` lists the 38 files with selection `s8`.
+
+In Lite, 37 files and 309 tests run and pass. `deleted-tests.tsv` has 26
+rows labelled S8: `routes/concern-routes.test.ts` as a whole file (all five
+of its tests assert the fleet concern notice), and 25 tests of cut paths:
+
+- fleet reveal, 4;
+- the service-boundary denial, 4;
+- the dispatcher's scope wiring, 2;
+- CogSec, 3 route tests and 8 service tests;
+- card import, 2;
+- the testing-harness grants, 2.
+
+`modified-tests.tsv` has 13 rows. Most change imports only:
+
+- the redirected automata seed loader (as in B7);
+- the vocabulary and scheduler-contract type copies;
+- the removed cut imports and their helpers.
+
+Two kept tests lose assertions about cut services. The standalone reveal
+no longer asserts that the cut subject-visible service was not called. The
+fleet fail-closed test no longer asserts three CogSec methods. Their other
+assertions are unchanged.
+
+`tests/conformance/absence.test.ts` now expects more than 760 deleted rows:
+769 remain once the 24 re-vendored rows changed kind.
+
+### Decision (a): memory deletion from the Garden
+
+The donor's model never deletes a memory itself. The memory tool proposes
+the deletion, and only a human decision approves it (E3). Pending in-turn
+proposals that no host turn settled stay pending forever
+(`packages/lifecycle/src/memory-deletion.ts:15-18, 63-78`). The Garden adds
+two operator paths and leaves the in-turn gate as it is:
+
+- **An operator-started delete is approved by construction.** The operator
+  is the primary contact, the human the donor's Operator validation stood
+  for, and they started the delete themselves. No proposal is made:
+  - donor proposals are `proposedBy: 'Companion'` only
+    (`faculties/memory/deletion-proposals.ts:27, 50`), so a Garden delete
+    is not a proposal;
+  - the donor Garden deleted through the memory store
+    (`AdminMemoryDataService.bulkDelete` → `memoryStore.bulkDelete`, a soft
+    delete with a restorable checkpoint, `postgres-store/memory-deletion.ts:315-322`)
+    and recorded a Garden audit entry with actor `operator`;
+  - Lite does the same, one memory at a time:
+    `memoryStore.softDeleteMemory(id, {deletedBy, reason})`. The answer
+    carries the `deleteId`, so the operator can restore it.
+  - Restore goes through the call the memory tool's `action=restore` makes:
+    `memoryStore.undoSoftDelete(deleteId, {restoredBy, actorRole: 'Operator'})`.
+- **The operator decides pending in-turn proposals.** The Memories screen
+  lists `listPendingMemoryDeletionProposals()`. Approve and reject call the
+  proposal store, as the donor's confirmation resolve did
+  (`main.ts:583-602`, the same steps as `HostMemoryDeletionApprovals.approve`):
+  - a `pending_partner_alert` proposal is first marked partner-alerted;
+  - then `approveMemoryDeletionProposal` or `denyMemoryDeletionProposal`
+    runs with the operator's id (the store's deny requires
+    `pending_operator_validation`).
+- **The host stays the integrity source.** A proposal whose host turn is
+  still waiting on Hermes's own approval gate (recorded by
+  `HostMemoryDeletionApprovals`, unexpired, its turn open) is refused with
+  409 `awaiting_host_turn`. The host's human answers that one in Hermes,
+  and the gate is unchanged. The only addition to the port is a read-only
+  `awaiting(proposalId)`.
+
+### Decision (b): Settings writes
+
+Settings shows and changes only what the owner files hold:
+
+- the capability tier (`capability-tier.json`);
+- the scheduler (`scheduler.json`).
+
+A write validates the document with the donor's own validator. It then
+writes the file through the donor's save function: `saveCapabilityTierConfig`
+or `saveSchedulerConfig`, `writeJsonAtomic` with the owner-file mode
+(temporary file and rename). The answer is `{restartRequired: true}`.
+
+Nothing reloads live. The runtime read both files once at start
+(`loadInnerLifeConfig`), as E4 records for the tier, so the change applies
+at the next start.
+
+The model is not an owner file. It is named in the Lite config file
+(`model.provider`, `model.modelId`), together with the secret's variable
+name. Settings shows it read-only; changing the model means editing the
+Lite config and restarting.
+
+### Decision (c): which memories the Garden operator sees
+
+The donor's Garden read memory through the subject-authorized projection
+(`createSubjectAuthorizedMemoryStore`) with one frozen context. Its
+standalone token Garden passed an empty one (`local-admin-contract.ts:766-776`;
+nothing in the donor's `main.ts` sets either context option). An empty
+context hides every memory classified as being about a person, the
+operator's own included. Over the real runtime, the Garden then could not
+find a memory the operator had just told the companion, and redact answered
+"Memory not found".
+
+Lite's Garden operator is the primary contact, the one human and the one
+admin of a single-operator install. So the Garden gets the context the
+donor gave a signed owner on a single-admin deployment
+(`memory-service.ts:189-204` `fleetSubjectAccessContext`, access mode
+`sole_admin`, `subject-authorized-store.ts:44-52`):
+
+- `viewerContactId` is the primary contact;
+- `adminAccessMode: 'sole_admin'`: every subject class and relation is
+  visible to them.
+
+This widens the Garden's memory reads beyond the donor's token Garden. The
+operator also sees intimate or confidential memories about other contacts
+of this companion. It changes no tool, no prompt and no recall path, only
+what the operator's own Garden shows. It is an owner decision recorded as
+an open item; keeping the donor's empty context means the Memories screen
+lists only memories about no one.
+
+### The operator surface: `packages/operator`
+
+A host-neutral package beside `packages/mcp` and `packages/lifecycle`, for
+the same reason they are separate: it is a host adapter over the extracted
+core, mounted by the standalone app and reachable by any host. It reaches
+the core only through `src/companion.ts` and the MCP transport only through
+`src/mcp.ts` (the boundary test lists both), and it has no dependencies.
+It needs nothing of the lifecycle bridge: the host passes it a read-only
+`awaitingHostTurn` check (decision a).
+
+- **Composition** (`garden.ts`). The donor services of the eight screens,
+  each built as `local-admin-contract.ts` built it (each step cites its donor
+  lines), over `CompanionRuntime.garden`. That is a new host seam: the
+  in-process stores the running companion uses, which the donor handed its
+  Garden composition (`cuts.tsv` S8 row). So a Garden write reaches the
+  store the companion reads, never a second copy. The biography review
+  uses the companion's own profile store instead of the second pool the
+  donor opened for it.
+- **Routes**. The donor routes (`/api/admin/...`, `donor-routes.ts`) come
+  from the donor builders, in the donor's order, compiled against the route
+  catalogue. They are dispatched as `server-routes.ts:59-100` did: the
+  request is bound for the response, and the route gets
+  `createStandaloneGardenRequestContext` from its catalogue entry, with the
+  actor `standalone-token:operator`. The Lite routes (`/api/lite/...`,
+  `lite-routes.ts`) cover only what no kept donor route serves:
+  - the Overview and Inner life reads (the dashboard service is cut);
+  - memory delete and restore, and the proposal decisions (decision a);
+  - Settings (decision b).
+  Introspection consent is shown read-only, because its only writer is the
+  companion itself. The values journal routes stay denied as in the donor;
+  the persona screen shows the values layer.
+- **Audit** (`audit.ts`). A port of the donor's `appendGardenEntry` to the
+  same file, `garden-audit-history.jsonl`, with the same record. Every
+  Garden write the donor audited is audited with actor `operator`, and so
+  is every Lite write.
+- **Transport** (`http.ts`). It follows `packages/lifecycle/src/http.ts`:
+  - it binds loopback unless `allowedHosts` names a wider address;
+  - any `Origin` gets 403, and a Host it does not serve gets 403;
+  - a missing or unbound bearer gets 401 with `WWW-Authenticate`, before any
+    body is read;
+  - every answer is `Cache-Control: no-store`;
+  - a body is read up to `maxBodyBytes` (the donor's flat
+    `ADMIN_MAX_BODY_SIZE`).
+- **Config** (`apps/standalone` `garden`, optional). `host`, `port`,
+  `allowedHosts`, `maxBodyBytes`, `recentTurnLimit` and `bindings` in the
+  MCP binding format. Every binding must name the primary contact
+  (`operator`), and no Garden credential or principal may also be an MCP one,
+  so a tool transport credential never opens the Garden. `serve` prints
+  `garden <url>`.
+
+### The plugin backend: `psfn_lite/dashboard`
+
+Hermes's dashboard mounts a user plugin's `dashboard/plugin_api.py` router
+at `/api/plugins/<name>/`, behind its own session token or OAuth and its
+profile scope. It does so only when `plugins.enabled` names the plugin
+(`hermes_cli/web_server_dashboard.py` at 2bd378e). The router is a thin
+proxy with no Garden logic:
+
+- only the two Garden route families pass (`api/admin/...`,
+  `api/lite/...`), and every other path gets 404;
+- the outbound request is built fresh: method, path, query without
+  Hermes's `profile` selector, the JSON body and the Garden bearer. The
+  bearer comes from the profile's `.env` through the profile secret scope
+  (`psfn-lite.json` `garden.credential_env`), so the browser's Origin,
+  cookies and Host never reach Lite, which refuses all three;
+- the answer passes through with its status. No `garden` block gives 404,
+  a missing credential 503 (naming the variable), and an unreachable Lite
+  502.
+
+The plugin is called `psfn_lite` everywhere: the folder, both manifests,
+the MCP server key, `plugins.enabled` and the Desktop half's id.
+`integrations/hermes/install_plugin.py` checks the folder and manifest
+names, never copies `desktop/` or `plugin.js`, and refuses a profile that
+already holds a Desktop half. `plugin.yaml` keeps `provides_middleware`:
+Hermes does not read the key, but it records the middleware the plugin
+registers, and `test_host_contract.py:88` checks it against what is
+registered. Listing the plugin in `plugins.enabled` loads it no second way:
+it is a memory provider, so the general loader skips it
+(`test_host_contract.py`).
+
+### The Desktop half: `psfn_lite/desktop/plugin.js`
+
+The source is `integrations/hermes/desktop/src` (TypeScript and React,
+checked by the root `tsconfig.json` and eslint). esbuild builds it into one
+ESM file whose only imports are `@hermes/plugin-sdk`, `react` and
+`react/jsx-runtime`, the three that Desktop's runtime loader rewrites to its
+live modules (`apps/desktop/src/contrib/runtime-loader.ts` at 2bd378e).
+JSX compiles to `jsx()` calls, so the file holds no JSX. It follows the
+bundled Kanban plugin: routes and the sidebar row through
+`ctx.registerMany`, and data through `ctx.rest` to the plugin's own backend
+namespace.
+
+- **Navigation**. One "Garden" sidebar row and one route per screen. A
+  contributed route is one segment with no parameters, so the paths are
+  `/garden`, `/garden-memories`, `/garden-persona`, `/garden-people`,
+  `/garden-sessions`, `/garden-inner-life`, `/garden-automata` and
+  `/garden-settings`. None is a Desktop app route. Each page has a strip
+  linking the eight.
+- **Pane**. One optional right pane, "Memory deletions", with the pending
+  proposals and the recoverable deletions beside the chat, where a
+  deletion the companion asks for is decided. The Memories screen opens it,
+  and the choice is remembered (`ctx.storage`). Nothing is added to the
+  workspace until the operator asks: the deletion queue is the one Garden
+  view that belongs next to a conversation.
+- **Transcript directives**. `::garden-memory{id="..."}` renders a memory
+  card. `::garden-layer-diff{layer="..."}` renders the last change to a
+  prompt layer as a line diff (the donor's `GET /api/admin/prompts/:id/diff`
+  gives the two versions). The attributes are model output. A memory id
+  must be a UUID and a layer id a plain segment before either becomes part
+  of a path.
+- **Screens and routes**. Every item of the eight screens maps to a route
+  the Garden serves. `tests/operator/garden.integration.test.ts` requests
+  every path the screens build and fails on one no route serves.
+
+| Screen | Reads | Writes |
+|---|---|---|
+| Overview | `GET /api/lite/overview` (tier, model, heartbeat, open concerns, focus, emotion, recent turns) | none |
+| Memories | `GET /api/admin/memory`, `/memory/search`, `/memory/:id`; `GET /api/lite/memory-deletions` | `PATCH /api/admin/memory/:id/patch` (redact); `POST /api/lite/memories/:id/delete`, `/memories/restore`, `/memory-deletions/:id/approve` and `/reject` |
+| Persona & prompts | `GET /api/admin/identity` (card and its history), `/prompts`, `/prompts/:id` (layer history), `/prompts/:id/diff`, `/prompts/constitution` (the values layer), `/prompts/north-star` | `PATCH /api/admin/identity/fields`, `POST /identity/rollback`, `PATCH /prompts/:id`, `POST /prompts/:id/rollback` |
+| People | `GET /api/admin/contacts`, `/biographical-claims`, `/graph-proposals` | `POST /api/admin/graph-proposals/:id/approve` and `/reject` |
+| Sessions | `GET /api/admin/sessions`, `/sessions/:id` (messages and turns), `/sessions/:id/turns/:turnId` (prompt, recalled and written memories, tools) | none |
+| Inner life | `GET /api/admin/concerns`, `/api/lite/inner-life` (focus, emotion, introspection consent, wake window), `/api/admin/scheduler` | `POST /api/admin/concerns/:id/resolve` and `/transition` |
+| Automata | `GET /api/admin/automata` (classes, coverage, runs, the bus; `busRunId` inspects one run's events) | none |
+| Settings | `GET /api/lite/settings` | `PUT /api/lite/settings/tier`, `/settings/scheduler` (restart needed) |
+
+**The built file is committed** rather than built at install. The Hermes
+install is Python and the standard library only (`install_plugin.py`), and
+the owner loads the Desktop half by copying one file. Building at install
+would put Node, npm and the repository's `node_modules` on every machine
+that runs Hermes, and the file Desktop runs would depend on that machine's
+build. The build is deterministic (pinned esbuild, no minifying, no
+timestamp). `tests/desktop/bundle.test.ts` rebuilds it in memory and fails
+when the committed file differs, so a source change cannot ship without
+its build. The absence test also scans the committed file. The
+install tool never copies it, and no test writes it under `~/.hermes`.
+Desktop copies any `plugins/<name>/desktop/plugin.js` it finds in the root
+or a profile into its own `desktop-plugins/` root
+(`apps/desktop/electron/desktop-plugins-root.ts`). So the owner loads it
+themselves (README, "Loading the Desktop half").
 
 ## Measured size
 
