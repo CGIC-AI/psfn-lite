@@ -548,9 +548,20 @@ otherwise:
   home;
 - the `llm_request` middleware (`hermes_cli/middleware.py`
   `apply_llm_request_middleware`, called before every provider request with
-  `turn_id`, `session_id` and `api_mode`): a `{"request": ...}` result
-  replaces the provider kwargs. The plugin uses it for the donor's explicit
-  tool contract;
+  `turn_id`, `session_id`, `api_mode`, `provider` and `base_url`): a
+  `{"request": ...}` result replaces the provider kwargs. The plugin uses it
+  for the donor's explicit tool contract, including the thinking fields of
+  Hermes's DeepSeek and Kimi provider profiles (`extra_body.thinking`,
+  `reasoning_effort`, from `agent/reasoning_effort.py`
+  `thinking_toggle_extras`);
+- Tool Search (`tools/tool_search.py`, on by default at both revisions):
+  MCP tools are deferred behind the `tool_search` / `tool_describe` /
+  `tool_call` bridges. The plugin forces a deferred Lite tool through
+  `tool_call` (`{calls: [{name, arguments}]}` at 2bd378e, one
+  `{name, arguments}` at f0187332), reads the tool's schema from the
+  registry (`tools/registry.py` `get_schema`), and relies on Hermes
+  unwrapping the bridge call before its hooks and dispatch
+  (`agent/tool_executor.py`, `model_tools.py`);
 - hooks delivered through `hermes_cli.lifecycle.invoke_hook` with the
   payloads at that revision:
   - `pre_llm_call`: context returned as `{"context": ...}` is injected into
@@ -588,9 +599,11 @@ otherwise:
   profile's `.env` value, and a multiplexing gateway without a scope fails
   closed (`UnscopedSecretError`);
 - the local CLI sender: platform `cli` with sender `""` at f0187332;
-  platform `local` with sender `uid:<uid>` at 2bd378e, where `hermes chat`
+  platform `cli` with sender `uid:<uid>` at 2bd378e, where `hermes chat`
   goes through the gateway's control socket
-  (`gateway/control_socket.py` `_posix_peer_subject`);
+  (`gateway/control_socket.py` `_posix_peer_subject`) and the gateway maps
+  its `Platform.LOCAL` source to `cli` (`gateway/run_turn_runner.py`
+  `platform_key`);
 - `MemoryProvider` checkpoint API v2, with `MemoryManager.on_pre_compress(...,
   require_checkpoint=True)` propagating the refusal;
 - MCP servers from `config.yaml` `mcp_servers`, with `${VAR}` header
