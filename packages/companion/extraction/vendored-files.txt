@@ -760,7 +760,7 @@ scaffolding	src/system/config/settings-domain-registry.ts
 scaffolding	src/system/config/settings-overlay.ts
 scaffolding	src/system/config/settings-owner-backfill.ts
 scaffolding	src/system/config/startup-owner-files.ts
-scaffolding	src/system/config/subagent-roles-config.ts
+promoted	src/system/config/subagent-roles-config.ts
 scaffolding	src/system/fleet-lifecycle/composition.ts
 scaffolding	src/system/fleet-lifecycle/contracts.ts
 scaffolding	src/system/fleet-lifecycle/digest.ts
@@ -885,3 +885,7 @@ cut	src/core/session/icp-recovery-fatigue-metadata.ts
 cut	src/system/capabilities/runtime.ts
 cut	src/system/config/charge-policy-config.ts
 cut	src/system/config/capability-tier-config.ts
+cut	src/persistence/postgres/retired-fleet-grantees.ts
+cut	src/shared/utils/postgres-credential.ts
+cut	src/shared/contracts/cogsec-persona-conformance.ts
+cut	src/system/capabilities/shard-derivation.ts

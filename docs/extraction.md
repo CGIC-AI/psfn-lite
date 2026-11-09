@@ -24,7 +24,8 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | B2 seam cuts (3.4, 3.5, 3.6) | Done (Seam cuts, below). |
 | B3 seam cuts (3.2, 3.3, 3.12, 3.15) | Done (Seam cuts, below). |
 | B4 seam cut (3.9) | Done (Seam cuts, below). |
-| B5-B7 | Not started. |
+| B5 seam cuts (3.10, 3.17) | Done (Seam cuts, below): no core import of vendored scaffolding remains. |
+| B6-B7 | Not started. |
 
 ## Closure (Step A0)
 
@@ -309,6 +310,23 @@ The 2 edited B2 tests are among the 9,415 matched, and the B4 fixture edit
 touches no test case. No `lite-companion-*` containers and no `/tmp/lc-*`
 directories were left.
 
+Step B5 seam-group runs (`--project companion`): B5a before its test
+deletions: `deleted: 2 files, 70 tests; matched: 9415`, equivalent (the
+deleted fleet-auth and skills tests still passed on the vendored files); B5b:
+718 files / 8,845 tests passed, `deleted: 17 files, 640 tests; matched: 8845`;
+B5c: 713 files / 8,802 tests passed, `deleted: 22 files, 683 tests; matched:
+8802`. All equivalent.
+
+Step B5 result (the plain validation command with a JSON reporter,
+2026-11-09 00:18Z, after root tsc, companion tsc and eslint all exited 0):
+exit 0, **763 files and 9,205 tests, all passed** (`lite` 52 files / 437
+tests, `companion` 711 files / 8,768 tests). Comparison: `deleted: 24 files,
+717 tests; matched: 8768`, `equivalent: every remaining baseline test has its
+baseline status`. That is the baseline's 9,485 tests minus 717 deleted (70
+before B5; B5a 52, B5b 518, B5c 43, B5d 34). The B5 fixture and import edits
+are among the 8,768 matched. No `lite-companion-*` containers and no
+`/tmp/lc-*` directories were left.
+
 ## Deleted and modified tests
 
 Machine-readable list: `packages/companion/extraction/deleted-tests.tsv`
@@ -333,6 +351,13 @@ relaxed.
 | `src/faculties/memory/writer.test.ts` (4), `core-memory/tools.test.ts` (1), `memory/extraction/orchestrator.test.ts` (1), `memory/sleeptime-agent.test.ts` (1) | Each asserts a rejection by a cut candidacy pattern class. The sleeptime test's "keeping safe memory writes" half is the control for that skip, so the test is deleted, not edited. | 3.5 split |
 | `src/persistence/sessions/store-turn-record-session-refs.test.ts` (6; the emptied `sm9l` describe removed), `src/core/session/manager.test.ts` "withholds tombstoned origin content before live cross-channel context assembly", `src/persistence/sessions/store.session-tail.test.ts` "the second fence still lands when a step AFTER the journal rewrite throws" | **Not clean scaffolding deletions.** They assert kept read-side behaviour (tombstone gating in session reads, turn records, wire bodies and the Loom; the session-tail post-rewrite fence) but build their scenario through `applyCogSecTombstones`, which is cut. Lite has no path that writes a CogSec tombstone, so that read guard is unreachable in Lite. The session-tail fence's exception safety on a failing post-rewrite step had no other test; `redactTurn` tests cover the fence bumps only. Recorded as an open question. | 3.6 session ops |
 | `src/core/scheduler/post-turn-lanes.test.ts` "runs the companion sleeptime action under the fleet baton" and "runs episode synthesis under the fleet baton and checkpoints only after private progress" (2) | They assert the cross-companion maintenance lease protocol around the lane (`announceDemand`, `tryAcquire`, `commitCheckpoint`, `release`, the baton yield); the fleet coordinator, its runner and the `fleetMaintenance` runtime option are cut. The other two tests in the file (cadence never infers sleeptime; the task list, including the forwarded fleet stagger) still pass. | 3.9 fleet baton |
+| B5a: `src/system/config/fleet-auth-config.test.ts` (44), `skills-per-companion.test.ts` (6), `subsystem-config.test.ts` "round-trips skills.json without drift" and "preserves skills positive integer validation wording" | Their subjects (`fleet-auth-config.ts`, `skills-config.ts`) are now `cut`. | 3.10 fleet auth, 3.17 skills |
+| B5b: the 11 `src/core/agent/fatigue/*.test.ts` files (113), `turn-execution/icp-fatigue-regulation.test.ts` (1), `core/session/icp-recovery-fatigue-binding.test.ts` (345) | Their subjects are now `cut` (fatigue is types only). | 3.17 fatigue |
+| B5b: `turn-execution-runtime.test.ts`, 27 in `fatigue enforcement` and the `human attention pressure` describe (1) | They assert budget spend, reservation, suppression, overcharge, the fatigue and boundary alerts and recovered pending spend; the runtime runs the donor no-port path. The 7 other `fatigue enforcement` tests still pass and stay. | 3.17 fatigue |
+| B5b: `core/session/icp-delivery-recovery.test.ts` (31) | They assert parsing and binding of `fatigue` / `fatiguePendingSpend` in the recovery codec; those keys are now `excluded`. | 3.17 fatigue |
+| B5c: `system/capabilities/runtime.test.ts` (4), `system/config/{capability-tier-config,capability-tier-per-companion,charge-policy-config,charge-policy-per-companion}.test.ts` (5, 8, 16, 6), `subsystem-config.test.ts` "round-trips capability-tier.json without drift" | Their subjects are now `cut` (charge and tiers are stubs). | 3.17 charge, tiers |
+| B5c: `core/agent/substrate-agent.test.ts`: "uses the exact notify surface for candidates while ordinary turns retain the full catalog", "renders one atomic owner snapshot that agrees with self_status at the same turn boundary", "injected immutable custom access governs the capability seam over the disk runtime and tier defaults" | They need a disk-backed `CapabilityRuntime` (`setCapabilityRuntime`), which is removed. The sibling "explicit custom access works without any disk-backed CapabilityRuntime" stays and passes. | 3.17 tiers |
+| B5d: `persistence/postgres/retired-fleet-grantees.test.ts` (6), `system/capabilities/shard-derivation.test.ts` (28) | Their subjects are now `cut` (closure recompute). | 3.10 recompute, 3.17 shards |
 
 Edited (`modified-tests.tsv`): `turn-execution-runtime.test.ts` "moves system
 context into the prompt system lane instead of assistant history in
@@ -349,6 +374,23 @@ the spread that passed it into the runtime options. Only the two deleted
 baton tests passed it, and the runtime option no longer exists. The two
 remaining tests call `wireLanes()` with no argument, as before; no assertion
 changed.
+
+Fixture edits (B5b, `modified-tests.tsv`): four `icp-delivery-recovery.test.ts`
+tests ("rejects a fatigue-suppressed recovery response with visible content" /
+"with an attachment", "rejects prepared status with a suppressed response",
+"rejects suppressed status with an allowed response") and the `suppressed` row
+of `icp-delivery-projection-store.test.ts` "projects getEntriesBefore through
+%s delivery state". Each fixture lost only its `fatigue` (and, for
+`recoveryWithFatigue()`, `fatiguePendingSpend`) metadata, which the codec now
+rejects before the check under test. The checks they assert (a `suppress`
+fatigue decision or `suppressed` status cannot carry a deliverable response;
+status must match the decision; projection order) are kept core code, and every
+assertion is unchanged.
+
+Import-only edits (B5c): `moa-turn.test.ts` and `turn-execution-runtime.test.ts`
+import `ChargePolicyConfig` from the contract it was re-exported from;
+`substrate-agent.test.ts` and `subsystem-config.test.ts` lost the imports only
+their deleted tests used.
 
 ## Seam cuts
 
@@ -517,6 +559,75 @@ the lease tables. `migrations.test.ts:416` and two Postgres integration tests
 touched here. It belongs to the migration-chain cut (3.11). The vendored
 composition root (`app/agent/scheduler-runtime.ts`, a source-text fixture)
 still passes `fleetMaintenance`. It is not compiled and leaves in B6/B7.
+
+### B5 (3.10, 3.17)
+
+Four sub-batches, each with its own `--project companion` run, comparison,
+commit and push: B5a (wiki, skills, shards, introspection; config fields),
+B5b (fatigue and participation), B5c (charge and capability tiers), B5d (the
+inner-life config loader and the closure recompute). Remaining seam
+statements: 28 before, **0 after** (`remaining-seams.mjs --summary`: `0
+statements into 0 scaffolding files`).
+
+**New record kind `cut`** (`vendored-files.txt`): a Step A0 closure file that
+a B5 cut moved out of the core, because an operator ruling made it scaffolding
+or because no core file imports it any more. It stays unchanged at its donor
+path, no longer counts as core in `remaining-seams.mjs` (which treats it as
+scaffolding) and leaves with the vendored scaffolding in B7. A donor test
+whose subject became `cut` is deleted in the batch that cuts it. 26 files /
+8,339 LOC are now `cut`; core (closure minus `cut`, plus promoted and Lite
+files, non-test `.ts` and imported `.json`) went from 1,122 files / 322,389
+LOC before B5 to 1,110 files / 314,881 LOC.
+
+| Seam | Cut | Behaviour change |
+|---|---|---|
+| 3.17 shards | Promote `faculties/shards/{lineage-contracts,artifact-policy,artifact-return-port,types,output-review}.ts` (byte-identical), with `fold-review.ts` and `result-lineage.ts` already seeds. Move verbatim: `truncateShardContextText` (`context-pack.ts:382-388`) into `faculties/shards/context-text.ts`; `output-review.ts:17` imports it from there. | none. |
+| 3.17 wiki | Type copy `WikiRetrievalContextClass`, `WikiRefreshStatus`, `WikiContextSnapshot` (`active-context.ts:4-39`) into `shared/contracts/wiki-context.ts`. Stub: `faculties/memory/sleeptime-wiki-stage.ts` copies the wiki-pass input/result types (`sleeptime-wiki-pass.ts:146-189`) and adds `createDisabledSleeptimeWikiPass()`, which returns the empty result with `skippedReason: 'disabled'`. Move verbatim: the project-entity helpers (`personal-project-contracts.ts:9,128-141`) into `core/scheduler/project-entity-id.ts`. | The turn's wiki block is empty (the donor's unwired-retrieval path). The sleeptime stage order keeps `wiki_pass`, but the stage does nothing, as in the donor with `sleeptime.wikiPass.enabled` false. The free-time workspace resolver is unchanged. |
+| 3.17 skills | Type copy `TurnToolSummary` (`reflection-nudge.ts:45-60`) and an empty `SkillsRuntime` port into `shared/contracts/skills-runtime-port.ts`. Delete call path: the `ReflectionNudgeTracker` and the skills-config import in `substrate-agent.ts`; `evaluateReflectionNudge` is `() => null`. `skills-config.ts` is `cut`. | none for Lite (no skills runtime): the skills index is empty and the nudge step is skipped, as in the donor with `skillsRuntime` null. A host that wires a skills runtime gets the index but no reuse or revision nudge. |
+| 3.17 introspection, EmoSim/ICP, biography, social graph | Operator KEEP; none needed (all Step A0 seeds). Introspection keeps its donor default: audit off (`scheduler-config/introspection.ts:22-23`, seed `introspectionAudit.enabled: false`). | none. |
+| 3.17 fatigue / participation | Type copy only what `shared/event-bus.ts` and three core sites need: `shared/contracts/participation-types.ts` (`core/participation/types.ts:11-26,95-141,154-156,186-197`) and `shared/contracts/fatigue-event-types.ts` (`human-attention-pressure.ts:7-41`, `room-episode-circuit-breaker.ts:50-64,77-78,80-102`, `social-pot-enforcement.ts:54-62`). Delete call path: the fatigue ports (`fatigueBudget`, `humanAttentionPressure`, `fatigueRegulationReservations`), the evaluation, reservation, spend, finalize and release blocks in `turn-execution-runtime.ts`, and the two alerts in `prompt-assembly.ts`. Stub: the ICP recovery codec marks `fatigue` and `fatiguePendingSpend` `excluded`. 15 files `cut` (`core/agent/fatigue/*` in the closure, `icp-fatigue-regulation.ts`, `core/participation/types.ts`, `icp-recovery-fatigue-{binding,metadata}.ts`). | A turn runs the donor's no-port path: no budget, no MI-turn suppression or overcharge, no `agent.fatigue` events, no fatigue or human-attention prompt alerts (both builders return `''` without their ports). A recorded ICP recovery response that carries fatigue metadata is rejected with `<label> contains unknown fields: fatigue, fatiguePendingSpend` (the donor parsed and bound it); Lite never records one. |
+| 3.17 charge | Stub (inert mode): nothing in the core loads `charge-policy.json`, so `SubstrateConfig.chargePolicy` stays undefined and every core caller takes its donor no-policy branch (`substrate-agent.ts:1944`, `moa-turn.ts:213,432-433`, `run-charge.ts:376-378,443-447,520-523`, `runtime-context-sections/charge.ts:61-69`). `run-charge.ts`, the `charge-policy.ts` contract and the charge prompt section stay core, unchanged. Redirect the three type imports to the contract; delete call path: the durable charge recorder/probe (their only reader was `icp-fatigue-regulation.ts`). `charge-policy-config.ts` is `cut`. | No run-charge quotas, no `Charge quota exceeded` errors, no `agent.charge` events; the charge prompt variables report no budget. The donor seed set quotas per lane (interactive 24, companion_social 24, background 16, maintenance 0, subagent 6, shard 12). A host that sets `config.chargePolicy` itself still gets the donor behaviour. |
+| 3.17 capability tiers | Delete call path: `CapabilityRuntime` (the per-refresh `capability-tier.json` reader) and `setCapabilityRuntime` in `substrate-agent.ts`. `tier-types.ts` and `tiers.ts` stay core; the tier comes from an injected `CapabilityAccess` or `config.capabilityTier` via `normalizeCapabilityTier`, fallback `nursery` (`tiers.ts:88-93`), the donor seed's tier (`capability-tier.seed.json`: `{"tier": "nursery", "customTokens": []}`). `system/capabilities/runtime.ts` and `capability-tier-config.ts` are `cut`. | The tier is fixed by the host; owner edits to `capability-tier.json` (and its `custom` token list) are no longer read. |
+| 3.10 config contract | Type copy into a vendored module augmentation: 83 `SubstrateConfig` fields of cut subsystems (gateway, fleet auth, CogSec screening, kube lifecycle, wiki hydration, shards/satellites/Wyoming, document ingest, images, voice, Discord triggers/Telegram, Garden theme, analysis workbench, web fetch / Home Assistant / Obsidian) and 5 declarations leave `runtime-config-contracts.ts` for `system/config/scaffolding-config-fields.ts` (`declare module './runtime-config-contracts.js'`). None of the 83 has a core reader (1,128 core files scanned). `discordToken` and `discordBotId` stay (`extraction.ts:849` reads `discordBotId`). Inline `FLEET_AUTH_FILE_NAME` in `owner-file-modes.ts`; the 3 fleet-auth config files are `cut`. | none. |
+| 3.10 loader | Port: `system/config/inner-life-config.ts` (Lite file). `loadInnerLifeConfig({ dataDir, companionDataDir?, seedDir?, modelRegistry? })` loads `scheduler.json`, `trust-policy.json`, `subagent-roles.json` (`subagent-roles-config.ts` promoted) and `automata-policy.json` through the donor loaders, and from `settings.json` the 8 inner-life policy keys through their closure normalisers with the donor defaults; `compositionalPolicy`, `observerEvalSidecar` and `emosimProactivity` take the load-config defaults. The automata loader, reviewer-model check and `listEnabledModelRegistrySlotKeys` are copied verbatim except that the registry comes from the host, not `models.json`. | Other `settings.json` keys are ignored; an override of the 3 default-only keys is ignored; the reviewer check needs a host registry and fails closed with the donor message without one. |
+| 3.10 closure recompute | Reachability from the Step A0 seeds over the current core imports (all import kinds, fixpoint). Newly unreachable, now `cut`: `persistence/postgres/retired-fleet-grantees.ts`, `shared/utils/postgres-credential.ts`, `shared/contracts/cogsec-persona-conformance.ts`, `system/capabilities/shard-derivation.ts`. Unreached but kept: the two forked session workers and the quarantine module (spawn edges, Step A0) and the new loader with `subagent-roles-config.ts` (B6 composes them). | none. |
+
+**Loader equivalence probe.** With the shipped seeds copied in as owner files,
+`loadInnerLifeConfig` (registry from the vendored `loadModelsConfig`) was
+compared against the vendored donor pipeline (`createOwnerFileConfigStore`
+loaders, `settings/io.ts` `loadSettings`, then the load-config default where
+a key is absent): deep-equal for `scheduler.json`, `trust-policy.json`,
+`subagent-roles.json`, `automata-policy.json` and all 11 settings values.
+Without a registry it throws the donor message (`automata-policy.json.bus.reviewer.model references slot "gpt-5.4-nano", which is not an enabled models.json registry entry. ...`).
+The probe is not a committed test: it compares against vendored scaffolding
+that B7 deletes, and a new test in the companion project is an addition that
+`compare-baseline.mjs` rejects.
+
+**Exemptions kept from earlier batches.** `faculties/shards/context-text.ts`
+is a Lite file inside a scaffolding directory (the promoted `output-review.ts`
+needs it). The B2 CogSec ports stay as recorded under B2.
+
+**For B6:**
+- The composition must pass `createDisabledSleeptimeWikiPass()` to the
+  sleeptime agent: `SleeptimeMemoryAgent` requires every stage runner
+  (`sleeptime-agent.ts:654`).
+- A host-wired skills runtime would not restore the reflection nudge (its
+  tracker is deleted, `evaluateReflectionNudge` is `() => null`).
+- `loadInnerLifeConfig` covers the policy files only. The scalar
+  `SubstrateConfig` tunables that `settings.json` also carries (extraction
+  and profile-synthesis thresholds, compaction, budgets) are applied by the
+  donor's `DIRECT_DEFINED_CONFIG_SETTINGS`; they belong to the B6 composition.
+- The vendored `app/agent/startup/free-time-lane.ts` still passes
+  `chargePolicy`; it is a source-text fixture and leaves in B6/B7.
+
+**For B7:**
+- Deleting `system/config/scaffolding-config-fields.ts` is the compile proof
+  that no vendored importer of the 83 cut fields survives.
+- Tests that use a `cut` module only as a fixture still pass on the vendored
+  copy and must be rewritten or deleted then: `primitives/llm/client.test.ts`
+  (`new CapabilityRuntime`), `core/agent/substrate-agent.test.ts` and
+  `faculties/shards/manager-capability-launch.test.ts`
+  (`deriveShardCapabilityGrant`).
 
 ## Package changes
 
