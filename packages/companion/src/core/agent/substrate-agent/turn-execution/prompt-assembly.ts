@@ -34,7 +34,6 @@ import { resolveSystemRoleCapabilityMetadata } from '../../../../primitives/llm/
 import type { ContextBudgetTurnCharacteristics } from '../../../../shared/context-budget.js';
 import type {
   CorrelationMetadata,
-  FatigueEnforcementMetadata,
   LLMPromptCacheObservability,
   MessagePromptOverrideMode,
   ObservabilityCallType,
@@ -57,11 +56,6 @@ import type { EmotionAppraisalEntry } from '../../../emotion/appraisal.js';
 import type { TurnRetrievalTelemetryRecord } from '../../../turns/observability.js';
 import { detectTurnObservabilityWarnings } from '../../../turns/observability-warnings.js';
 import type { TurnSnapshot } from '../../../turns/snapshot.js';
-import { buildFatiguePromptAlert } from '../../fatigue/runtime-enforcement.js';
-import {
-  buildHumanAttentionBoundaryAlert,
-  type HumanAttentionPressureEvent,
-} from '../../fatigue/human-attention-pressure.js';
 import type { ResolvedAuthorContext, UserRuntimeProfile } from '../runtime-context.js';
 import { renderBackgroundCompletionsBlock } from '../../completion-notices.js';
 import type { TurnExecutionObservability } from './observability.js';
@@ -254,8 +248,6 @@ export async function assembleTurnPrompt(input: {
   turnSnapshot: TurnSnapshot;
   currentSessionEntryId: number | null;
   memoryManifestSeed: ContextManifestMemorySeed | undefined;
-  fatigue?: FatigueEnforcementMetadata;
-  humanAttentionPressure?: HumanAttentionPressureEvent;
   getRetrievalProvenanceRefs: () => string[];
   getObservedTurnRetrievals: () => TurnRetrievalTelemetryRecord[];
   observability: Pick<TurnExecutionObservability, 'emitObservedTurnStage' | 'emitTurnSnapshotInBackground'>;
@@ -289,8 +281,6 @@ export async function assembleTurnPrompt(input: {
     turnSnapshot,
     currentSessionEntryId,
     memoryManifestSeed,
-    fatigue,
-    humanAttentionPressure,
     getRetrievalProvenanceRefs,
     getObservedTurnRetrievals,
     observability,
@@ -400,11 +390,10 @@ export async function assembleTurnPrompt(input: {
     emotionAppraisalChain,
     conversationScope,
   );
-  const runtimeContextWithFatigue = [
-    runtimeContext,
-    buildFatiguePromptAlert(fatigue),
-    buildHumanAttentionBoundaryAlert(humanAttentionPressure),
-  ].map(section => section.trim()).filter(Boolean).join('\n\n');
+  // Fatigue is cut (operator ruling): the donor's fatigue and human-attention
+  // alerts are '' without their ports, so only the trimmed runtime context
+  // remains (donor prompt-assembly.ts:403-407).
+  const trimmedRuntimeContext = runtimeContext.trim();
   // Per-section dynamic suffix render (E2.5 no-silent-leak invariant): a
   // required section with an unresolved macro fails the turn loudly; an
   // optional section drops with telemetry. No token ever leaks into bytes.
@@ -451,7 +440,7 @@ export async function assembleTurnPrompt(input: {
     },
     {
       id: 'runtime.context' as PromptRuntimeSystemPromptBlockId,
-      content: runtimeContextWithFatigue,
+      content: trimmedRuntimeContext,
     },
     {
       id: 'runtime.scratchpad' as PromptRuntimeSystemPromptBlockId,
@@ -834,7 +823,7 @@ export async function assembleTurnPrompt(input: {
       {
         id: 'runtime_context',
         title: 'Runtime Context',
-        content: runtimeContextWithFatigue,
+        content: trimmedRuntimeContext,
         ...(resolveSectionScope('runtime_context')
           ? { scopeProvenance: resolveSectionScope('runtime_context')! }
           : {}),
@@ -868,7 +857,7 @@ export async function assembleTurnPrompt(input: {
           : {}),
       },
     ]),
-    runtimeContextSections: extractWrappedPromptSections(runtimeContextWithFatigue, resolveSectionScope),
+    runtimeContextSections: extractWrappedPromptSections(trimmedRuntimeContext, resolveSectionScope),
     memoryContextSections: extractWrappedPromptSections(memoryContextBlock, resolveSectionScope),
     finalSystemSections: context.systemPromptSections
       ? [

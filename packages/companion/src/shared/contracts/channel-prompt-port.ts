@@ -17,7 +17,7 @@
 import type { SubstrateMessage } from './runtime.js';
 import type { ResolvedReactionSurface } from './reaction-surface.js';
 import type { ConversationScope } from '../../core/session/conversation-scope.js';
-import type { PrecomputedNoReplyDisposition } from '../../core/participation/types.js';
+import type { PrecomputedNoReplyDisposition } from './participation-types.js';
 
 /**
  * mmo9.6.1: in-process turn-control options threaded alongside a dispatched

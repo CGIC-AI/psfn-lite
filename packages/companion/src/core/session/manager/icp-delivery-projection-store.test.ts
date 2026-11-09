@@ -5,8 +5,6 @@ import {
   CHANNEL as FATIGUE_CHANNEL,
   SOURCE as FATIGUE_SOURCE,
   correlation as fatigueCorrelation,
-  fatigueBudget,
-  fatigueMetadata,
   recoveryResponse as fatigueRecoveryResponse,
 } from '../icp-recovery.test-fixtures.js';
 import { createIcpDeliveryProjectionStore } from './icp-delivery-projection-store.js';
@@ -57,31 +55,6 @@ function buildSuppressedRecoveryResponse() {
     metadata: {
       ...fatigueRecoveryResponse.metadata,
       icpCorrelation: { ...fatigueCorrelation, fatigueDecision: 'suppress' as const },
-      fatigue: {
-        ...fatigueMetadata,
-        decision: 'suppressed_hard_exhausted' as const,
-        modelDisposition: 'suppressed' as const,
-        shouldRecordSpend: false,
-        policyState: 'hard_exhausted' as const,
-        policyBaseState: 'hard_exhausted' as const,
-        overchargeBlockedReasons: ['no_qualifying_overcharge_trigger'] as const,
-        budget: {
-          ...fatigueBudget,
-          spentBefore: 8,
-          remainingBefore: 0,
-          spentAfterProjected: 9,
-          remainingAfterProjected: 0,
-          normalSpentBefore: 8,
-          normalSpentAfterProjected: 9,
-        },
-        socialRegulation: {
-          ...fatigueMetadata.socialRegulation,
-          state: 'suppressed' as const,
-          relationshipPressure: 8,
-          rootNormalSpent: 8,
-          contributingEventCount: 8,
-        },
-      },
     },
   };
 }

@@ -9,7 +9,6 @@ import {
 import { resolveCompanionIdFromConfig } from '../../identity/companion-runtime.js';
 import { createComponentLogger } from '../../../shared/logger.js';
 import { toErrorMessage } from '../../../shared/utils/errors.js';
-import type { CapturedSessionReads } from '../../session/manager/captured-session-owner.js';
 import { cloneMetacognitiveFlags } from '../../self-model/metacognition.js';
 import {
   buildInternalStateSnapshotRef,
@@ -17,13 +16,10 @@ import {
   type InternalState,
 } from '../../self-model/state.js';
 import { extractRelayAcacAxisScores } from '../../emotion/relay-emotion-snapshot.js';
-import type { ChannelMeta } from '../../../system/trust/policy.js';
 import { currentChannelClassificationEpoch } from '../../../system/trust/runtime-classification-epochs.js';
 import type {
   AgentResponse,
   CorrelationMetadata,
-  FatigueEnforcementMetadata,
-  FatiguePendingSpendMetadata,
   MessagePromptOverrideMode,
   ParentTurnContinuationStop,
   SubstrateMessage,
@@ -32,19 +28,8 @@ import type {
 } from '../../../shared/contracts/runtime.js';
 import { isTemporalContextBudgetTurn } from '../../../shared/context-budget.js';
 import { createTurnId, deriveDeterministicTurnId, parseTurnId } from '../../turns/id.js';
-import {
-  parseIcpConversationCorrelation,
-  type IcpConversationCorrelation,
-} from '../../../shared/contracts/icp-autonomy.js';
+import { parseIcpConversationCorrelation } from '../../../shared/contracts/icp-autonomy.js';
 import type { TurnSnapshot } from '../../turns/snapshot.js';
-import type { IcpFatigueReservationOutcome } from '../fatigue/regulation-reservation.js';
-import type { HumanAttentionPressureEvent } from '../fatigue/human-attention-pressure.js';
-import {
-  attachRecordedFatigueEvent,
-  evaluateFatigueForTurn,
-  type FatigueRecentHumanParticipation,
-  type FatigueTurnDecision,
-} from '../fatigue/runtime-enforcement.js';
 import type { ResolvedAuthorContext } from './runtime-context.js';
 import {
   listPendingPaidDeliverables,
@@ -119,23 +104,13 @@ import {
   collectTurnResponseAttachments,
   schedulePostTurnWork,
 } from './turn-execution/post-turn-scheduling.js';
-import {
-  invokeWithCompanionSocialCharge,
-  projectFatiguePendingSpendCorrelation,
-  reserveIcpFatigueRegulation,
-  resumeIcpFatigueRegulation,
-} from './turn-execution/icp-fatigue-regulation.js';
 import { hasVisionTurnInputs } from './vision-attachments.js';
-import type { SessionEntry } from '../../session/types.js';
-import {
-  resolveSessionEntryActorKind,
-  type SessionActorKind,
-} from '../../session/turn-provenance.js';
+import type { SessionActorKind } from '../../session/turn-provenance.js';
 import { parseIcpRecoveryResponse } from '../../session/icp-delivery-recovery.js';
 import { ParentTurnContinuationBudgetExceededError } from '../turn-limits.js';
 import { parseTurnRecordBackgroundWorkHandoff } from '../background-work/types.js';
 import type { ForegroundWorkLease } from '../background-work/supervisor.js';
-import type { PrecomputedNoReplyDisposition } from '../../participation/types.js';
+import type { PrecomputedNoReplyDisposition } from '../../../shared/contracts/participation-types.js';
 import type {
   TurnAdmissionRuntime,
   TurnExecutionRuntime,
@@ -172,210 +147,8 @@ export interface TurnDeliveryLifecycle {
   finalizeDelivery(response: AgentResponse): Promise<void>;
 }
 
-function summarizeFatigue(metadata: FatigueEnforcementMetadata): Record<string, unknown> {
-  return {
-    decision: metadata.decision,
-    modelDisposition: metadata.modelDisposition,
-    alertInjected: metadata.alertInjected,
-    shouldRecordSpend: metadata.shouldRecordSpend,
-    policyState: metadata.policyState,
-    policyBaseState: metadata.policyBaseState,
-    spendDecision: metadata.spendDecision,
-    spendReason: metadata.spendReason,
-    overchargeEligible: metadata.overchargeEligible,
-    overchargePermitted: metadata.overchargePermitted,
-    overchargeReasons: metadata.overchargeReasons,
-    overchargeBlockedReasons: metadata.overchargeBlockedReasons,
-    scope: metadata.scope,
-    budget: metadata.budget,
-    socialRegulation: metadata.socialRegulation,
-  };
-}
-
-function evaluateRuntimeFatigue(input: {
-  runtime: TurnExecutionRuntime;
-  sessionReads: CapturedSessionReads;
-  message: SubstrateMessage;
-  turnSessionIdentity: TurnSessionIdentity;
-  authorContext: ResolvedAuthorContext;
-  channelType: string | undefined;
-  channelMeta: ChannelMeta;
-  taskKind: string | undefined;
-  explicitPeerInvitation: boolean;
-  turnCorrelationBase: CorrelationMetadata;
-  timestampMs: number;
-}): FatigueTurnDecision | null {
-  if (!input.runtime.fatigueBudget) {
-    return null;
-  }
-  const fatiguePolicy = input.runtime.config.chargePolicy?.fatigue;
-  if (!fatiguePolicy) {
-    throw new Error('Fatigue enforcement requires chargePolicy.fatigue when fatigueBudget is wired');
-  }
-  return evaluateFatigueForTurn({
-    fatigueBudget: input.runtime.fatigueBudget,
-    fatiguePolicy,
-    localCompanionId: resolveCompanionIdFromConfig(input.runtime.config),
-    message: input.message,
-    authorContext: input.authorContext,
-    channelId: input.turnSessionIdentity.logicalSessionId,
-    channelType: input.channelType,
-    channelMeta: input.channelMeta,
-    taskKind: input.taskKind,
-    explicitPeerInvitation: input.explicitPeerInvitation,
-    recentHumanParticipation: resolveRecentHumanParticipationForFatigue({
-      sessionReads: input.sessionReads,
-      message: input.message,
-      authorContext: input.authorContext,
-      nowMs: input.timestampMs,
-      windowMs: fatiguePolicy.overcharge.recentHumanParticipationWindowMs,
-    }),
-    timestampMs: input.timestampMs,
-    correlation: input.runtime.withCorrelationPurpose(input.turnCorrelationBase, 'agent.fatigue.evaluate'),
-  });
-}
-
-function evaluateHumanAttentionPressure(input: {
-  runtime: TurnExecutionRuntime;
-  message: SubstrateMessage;
-  turnSessionIdentity: TurnSessionIdentity;
-  authorContext: ResolvedAuthorContext;
-  timestampMs: number;
-  turnId: string;
-}): HumanAttentionPressureEvent | null {
-  if (!input.runtime.humanAttentionPressure || input.authorContext.actorKind !== 'human') {
-    return null;
-  }
-  const contactId = input.authorContext.canonicalContactKey
-    ?? input.authorContext.subjectIdentityKey
-    ?? input.message.authorId.trim();
-  if (!contactId) {
-    return null;
-  }
-  const channelContext = input.message.isDirectMessage === true
-    ? 'direct_message'
-    : input.message.routing?.responseMode === 'respond'
-      ? 'direct_mention'
-      : 'ambient_group_message';
-  return input.runtime.humanAttentionPressure.evaluate({
-    localCompanionId: resolveCompanionIdFromConfig(input.runtime.config),
-    contactId,
-    channelId: input.turnSessionIdentity.sourceChannelId,
-    trustLevel: input.authorContext.trustLevel,
-    relationshipType: input.authorContext.relationshipType ?? 'stranger',
-    channelContext,
-    timestampMs: input.timestampMs,
-    sourceMessageId: input.message.id,
-    turnId: input.turnId,
-  });
-}
-
-function resolveRecentHumanParticipationForFatigue(input: {
-  sessionReads: CapturedSessionReads;
-  message: SubstrateMessage;
-  authorContext: ResolvedAuthorContext;
-  nowMs: number;
-  windowMs: number;
-}): FatigueRecentHumanParticipation {
-  const participants = new Set<string>();
-  let messageCount = 0;
-  let latestHumanTimestampMs: number | undefined;
-  const addHumanMessage = (entry: Pick<SessionEntry, 'authorId' | 'authorName' | 'timestamp'>): void => {
-    if (!Number.isFinite(entry.timestamp) || entry.timestamp > input.nowMs) {
-      return;
-    }
-    const ageMs = input.nowMs - entry.timestamp;
-    if (ageMs < 0 || ageMs > input.windowMs) {
-      return;
-    }
-    messageCount += 1;
-    participants.add(entry.authorId?.trim() || entry.authorName?.trim() || 'unknown-human');
-    latestHumanTimestampMs = latestHumanTimestampMs === undefined
-      ? entry.timestamp
-      : Math.max(latestHumanTimestampMs, entry.timestamp);
-  };
-
-  if (
-    input.authorContext.speakingWithIsMachineIntelligence !== true
-    && input.authorContext.speakerRole !== 'system'
-  ) {
-    addHumanMessage({
-      authorId: input.message.authorId,
-      authorName: input.message.authorName,
-      timestamp: input.nowMs,
-    });
-  }
-
-  for (const entry of input.sessionReads.getRecentMessages(32)) {
-    if (entry.role !== 'user' || resolveSessionEntryActorKind(entry) !== 'human') {
-      continue;
-    }
-    if (entry.authorId && entry.authorId === input.message.authorId) {
-      continue;
-    }
-    addHumanMessage(entry);
-  }
-
-  return {
-    messageCount,
-    participantCount: participants.size,
-    ...(latestHumanTimestampMs !== undefined
-      ? { latestMessageAgeMs: input.nowMs - latestHumanTimestampMs }
-      : {}),
-  };
-}
-
 function resolveSessionActorKind(authorContext: ResolvedAuthorContext): SessionActorKind {
   return authorContext.actorKind;
-}
-
-function emitFatigueDecision(input: {
-  runtime: TurnExecutionRuntime;
-  message: SubstrateMessage;
-  turnCorrelationBase: CorrelationMetadata;
-  fatigueDecision: FatigueTurnDecision;
-  observability: Pick<ReturnType<typeof createTurnExecutionObservability>, 'emitObservedTurnStage'>;
-}): void {
-  const telemetry = summarizeFatigue(input.fatigueDecision.metadata);
-  input.observability.emitObservedTurnStage('fatigue', telemetry);
-  input.runtime.emitTelemetry('agent.fatigue.decision', {
-    channelId: input.message.channelId,
-    ...telemetry,
-    ...input.runtime.withCorrelationPurpose(input.turnCorrelationBase, 'agent.fatigue.decision'),
-  });
-  if (input.fatigueDecision.suppressModel) {
-    log.info('Suppressed machine-intelligence turn at fatigue hard cap', {
-      channelId: input.message.channelId,
-      ...telemetry,
-    });
-  }
-}
-
-function buildSuppressedFatigueResponse(input: {
-  message: SubstrateMessage;
-  startTime: number;
-  completedAt: number;
-  model: string;
-  fatigue: FatigueEnforcementMetadata;
-}): AgentResponse {
-  return {
-    content: '',
-    channelId: input.message.channelId,
-    metadata: {
-      model: input.model,
-      inputTokens: 0,
-      outputTokens: 0,
-      durationMs: input.completedAt - input.startTime,
-      fatigue: input.fatigue,
-      ...(input.message.routing?.icpCorrelation
-        ? {
-            turnId: input.message.routing.icpCorrelation.turnId as TurnID,
-            requestId: input.message.routing.icpCorrelation.requestId,
-            icpCorrelation: input.message.routing.icpCorrelation,
-          }
-        : {}),
-    },
-  };
 }
 
 function buildPrecomputedNoReplyResponse(input: {
@@ -660,8 +433,6 @@ export async function handleMessageForTurn(
     conversationScope,
   } = identityState;
   const inboundIcpOrigin = message.routing?.icpCorrelation;
-  const explicitPeerInvitation = privateIcpCorrelation === null
-    && inboundIcpOrigin?.costOriginStage === 'initiation';
   if (recoveredCorrelation) {
     if (!canonicalContactKey || recoveredCorrelation.peerContactId !== canonicalContactKey) {
       throw new Error('Recovered ICP delivery peer does not match the resolved canonical contact');
@@ -721,12 +492,6 @@ export async function handleMessageForTurn(
   // they fold into. Empty until tool observations are recorded.
   let toolResultCustody: ReadonlyMap<string, TurnToolResultCustodyRecord> = new Map();
   let persistedUserMessageContent: string | undefined;
-  let fatigueDecision: FatigueTurnDecision | null = null;
-  let humanAttentionPressure: HumanAttentionPressureEvent | null = null;
-  let durableFatigueReservation: NonNullable<SubstrateMessage['routing']>['icpCorrelation'] | null = null;
-  let recoveredFatigueReservationOutcome: IcpFatigueReservationOutcome | null = null;
-  let durableDeliveryFinalized = false;
-  let durableRecoveryResponsePersisted = recoveredResponse !== undefined;
   const completedTurnRecordState = { persisted: false };
   const invocationState: AgentInvocationMutableState = {
     turnMessages,
@@ -777,8 +542,6 @@ export async function handleMessageForTurn(
         disposition: precomputedNoReplyDisposition,
       });
       await deliveryLifecycle.finalizeDelivery(noReplyResponse);
-      durableDeliveryFinalized = true;
-      durableRecoveryResponsePersisted = true;
       observability.emitObservedTurnStage('end', {
         durationMs: completedAt - startTime,
         ttftMs: 0,
@@ -827,147 +590,9 @@ export async function handleMessageForTurn(
     }
     const channelType = runtime.resolveChannelType(message);
     if (recoveredResponse?.metadata.fatiguePendingSpend) {
-      if (!message.routing?.icpCorrelation
-        || !runtime.fatigueRegulationReservations
-        || !runtime.config.chargePolicy) {
-        throw new Error('Recovered ICP fatigue spend requires its durable reservation runtime');
-      }
-      recoveredFatigueReservationOutcome = await resumeIcpFatigueRegulation({
-        correlation: message.routing.icpCorrelation,
-        pendingSpend: recoveredResponse.metadata.fatiguePendingSpend,
-        reservationPort: runtime.fatigueRegulationReservations,
-        fatiguePolicy: runtime.config.chargePolicy.fatigue,
-      });
-      durableFatigueReservation = message.routing.icpCorrelation;
-    }
-    fatigueDecision = recoveredResponse
-      ? null
-      : evaluateRuntimeFatigue({
-          runtime,
-          sessionReads,
-          message,
-          turnSessionIdentity,
-          authorContext,
-          channelType,
-          channelMeta,
-          taskKind,
-          explicitPeerInvitation,
-          turnCorrelationBase,
-          timestampMs: startTime,
-        });
-    humanAttentionPressure = recoveredResponse
-      ? null
-      : evaluateHumanAttentionPressure({
-          runtime,
-          message,
-          turnSessionIdentity,
-          authorContext,
-          timestampMs: startTime,
-          turnId,
-        });
-    if (fatigueDecision) {
-      const icpCorrelation = message.routing?.icpCorrelation;
-      if (icpCorrelation) {
-        const finalFatigueDecision = fatigueDecision.metadata.decision === 'suppressed_hard_exhausted'
-          ? 'suppress'
-          : fatigueDecision.metadata.decision === 'overcharge_charged'
-            ? 'allow_overcharge'
-            : 'allow';
-        const evaluatedCorrelation: IcpConversationCorrelation = {
-          ...icpCorrelation,
-          fatigueDecision: finalFatigueDecision,
-          chargeLane: fatigueDecision.metadata.socialRegulation.chargeLane,
-          ...(finalFatigueDecision === 'suppress'
-            ? { fatigueReasonCode: 'fatigue_exhausted' }
-            : {}),
-        };
-        message.routing = {
-          ...message.routing,
-          icpCorrelation: evaluatedCorrelation,
-        };
-        turnCorrelationBase = {
-          ...turnCorrelationBase,
-          icpCorrelation: evaluatedCorrelation,
-          chargeLane: evaluatedCorrelation.chargeLane,
-        };
-      }
-      if (fatigueDecision.shouldRecordSpend && message.routing?.icpCorrelation) {
-        const reconciliation = await reserveIcpFatigueRegulation({
-          correlation: message.routing.icpCorrelation,
-          fatigueDecision,
-          multiCompanion: runtime.config.multiCompanion === true,
-          reservationPort: runtime.fatigueRegulationReservations,
-          fatiguePolicy: runtime.config.chargePolicy!.fatigue,
-        });
-        fatigueDecision = reconciliation.fatigueDecision;
-        durableFatigueReservation = reconciliation.durableReservation;
-        message.routing = {
-          ...message.routing,
-          icpCorrelation: reconciliation.correlation,
-        };
-        turnCorrelationBase = {
-          ...turnCorrelationBase,
-          icpCorrelation: reconciliation.correlation,
-          chargeLane: reconciliation.correlation.chargeLane,
-        };
-      }
-      emitFatigueDecision({
-        runtime,
-        message,
-        turnCorrelationBase,
-        fatigueDecision,
-        observability,
-      });
-    }
-    if (fatigueDecision?.suppressModel) {
-      const completedAt = Date.now();
-      const suppressedResponse = buildSuppressedFatigueResponse({
-        message,
-        startTime,
-        completedAt,
-        model: responseModel,
-        fatigue: fatigueDecision.metadata,
-      });
-      await deliveryLifecycle?.finalizeDelivery(suppressedResponse);
-      observability.emitObservedTurnStage('end', {
-        durationMs: completedAt - startTime,
-        ttftMs: 0,
-        inputTokens: 0,
-        outputTokens: 0,
-        fatigue: summarizeFatigue(fatigueDecision.metadata),
-      });
-      const suppressedTurnRecord = runtime.buildTurnRecord({
-        message,
-        turnSessionIdentity,
-        turnId,
-        requestId,
-        startedAt: startTime,
-        completedAt,
-        userSessionEntryId,
-        assistantSessionEntryId,
-        response: suppressedResponse,
-        turnMessages: [],
-        promptMode,
-        promptText: fullPrompt,
-        trustLevel,
-        speakerRole,
-        canonicalContactKey,
-        retrievalProvenanceRefs: [],
-        turnObservability: {
-          stages: observability.getObservedTurnStages(),
-          retrievals: observability.getObservedTurnRetrievals(),
-          ...(observability.getObservedTurnSnapshot() ? { snapshot: observability.getObservedTurnSnapshot() } : {}),
-        },
-      }, sessionReads);
-      await runtime.eventBus.emit('agent.turn.end', {
-        message,
-        response: suppressedResponse,
-        ...runtime.withCorrelationPurpose(turnCorrelationBase, 'agent.turn.end'),
-      });
-      // Suppression still follows the ordinary completion contract: only
-      // publish the durable completed-turn marker after its awaited end event.
-      await runtime.sessionManager.recordTurn(suppressedTurnRecord);
-      return suppressedResponse;
+      // Fatigue is cut (operator ruling); this is the donor's error when no
+      // durable fatigue reservation runtime is wired.
+      throw new Error('Recovered ICP fatigue spend requires its durable reservation runtime');
     }
     runtime.ensureModel(message);
     responseModel = runtime.agent.state.model.id;
@@ -1037,9 +662,6 @@ export async function handleMessageForTurn(
       durationMs: Math.max(0, performance.now() - contextAssemblyStartedAt),
     });
     turnSnapshot = preTurnState.turnSnapshot;
-    if (fatigueDecision) {
-      turnSnapshot.fatigue = fatigueDecision.metadata;
-    }
     memoryContextBlock = preTurnState.memoryContextBlock;
     wikiContextBlock = preTurnState.wikiContextBlock;
     memoryContextChars = preTurnState.memoryContextChars;
@@ -1083,8 +705,6 @@ export async function handleMessageForTurn(
       turnSnapshot,
       currentSessionEntryId: userSessionEntryId,
       memoryManifestSeed: preTurnState.memoryManifestSeed ?? observability.getMemoryManifestSeed(),
-      ...(fatigueDecision ? { fatigue: fatigueDecision.metadata } : {}),
-      ...(humanAttentionPressure ? { humanAttentionPressure } : {}),
       getRetrievalProvenanceRefs: observability.getRetrievalProvenanceRefs,
       getObservedTurnRetrievals: observability.getObservedTurnRetrievals,
       observability,
@@ -1178,16 +798,7 @@ export async function handleMessageForTurn(
       getLineage: runtime.getCurrentTurnDisclosureLineage,
     }, invokeWithPaidDeliverableTracking);
     assertForegroundWorkOwned(foregroundLease);
-    const invocationResult = recoveredInvocationResult ?? await invokeWithCompanionSocialCharge({
-      chargePolicy: runtime.config.chargePolicy,
-      correlation: turnCorrelationBase,
-      fatigue: fatigueDecision?.metadata,
-      invoke: invokeWithMcpDisclosure,
-      recordChargeEvent: runtime.durableChargeRecorder,
-      probeChargeEvent: runtime.durableChargeProbe,
-      turnId,
-      withCorrelationPurpose: runtime.withCorrelationPurpose,
-    });
+    const invocationResult = recoveredInvocationResult ?? await invokeWithMcpDisclosure();
     assertForegroundWorkOwned(foregroundLease);
     pendingPaidDeliverables = scopedPendingPaidDeliverables;
     turnMessages = invocationResult.turnMessages;
@@ -1632,30 +1243,6 @@ export async function handleMessageForTurn(
     if (runtimeContradictionDiagnostics?.runtimeContradiction) {
       responseDiagnostics.runtimeContradiction = runtimeContradictionDiagnostics.runtimeContradiction;
     }
-    let responseFatigueMetadata = recoveredResponse?.metadata.fatigue ?? fatigueDecision?.metadata;
-    const fatiguePendingSpend: FatiguePendingSpendMetadata | undefined = fatigueDecision?.shouldRecordSpend
-      ? {
-          schemaVersion: 1,
-          timestampMs: fatigueDecision.evaluation.timestampMs,
-          decision: fatigueDecision.evaluation.decision,
-          reason: fatigueDecision.evaluation.reason,
-          amount: fatigueDecision.evaluation.amount,
-          scope: { ...fatigueDecision.evaluation.scope },
-          peer: { ...fatigueDecision.evaluation.peer },
-          triggeringAuthor: { ...fatigueDecision.evaluation.triggeringAuthor },
-          limits: {
-            softLimit: fatigueDecision.evaluation.stateAfter.softLimit,
-            hardLimit: fatigueDecision.evaluation.stateAfter.allowance,
-            overchargeLimit: fatigueDecision.evaluation.stateAfter.overchargeAllowance,
-          },
-          correlation: projectFatiguePendingSpendCorrelation(
-            runtime.withCorrelationPurpose(
-              turnCorrelationBase,
-              'agent.fatigue.record',
-            ),
-          ),
-        }
-      : recoveredResponse?.metadata.fatiguePendingSpend;
     const buildGeneratedResponse = (): AgentResponse => ({
       content: safeResponseText,
       channelId: message.channelId,
@@ -1678,8 +1265,6 @@ export async function handleMessageForTurn(
         ...(turnUsage.toolCalls > 0 ? { toolCallOutcomes } : {}),
         ...(Object.keys(responseDiagnostics).length > 0 ? { diagnostics: responseDiagnostics } : {}),
         ...(broadcastSafetyMeta ? { broadcastSafety: broadcastSafetyMeta } : {}),
-        ...(responseFatigueMetadata ? { fatigue: responseFatigueMetadata } : {}),
-        ...(fatiguePendingSpend ? { fatiguePendingSpend } : {}),
         ...(honorNoReply ? { noReply: noReplyDecision } : {}),
       },
     });
@@ -1692,7 +1277,6 @@ export async function handleMessageForTurn(
         throw new Error('Intentional ICP no-reply requires durable delivery recovery');
       }
       await deliveryLifecycle.finalizeDelivery(buildGeneratedResponse());
-      durableRecoveryResponsePersisted = true;
     }
 
     if (!recoveredResponse && !broadcastSafetyMeta?.approvalRequired && !honorNoReply) {
@@ -1711,60 +1295,8 @@ export async function handleMessageForTurn(
         durableRecoveryResponse,
         runtimeFallbackProvenance,
       );
-      durableRecoveryResponsePersisted = durableRecoveryResponse !== undefined;
     }
 
-    if (fatigueDecision?.shouldRecordSpend) {
-      if (!runtime.fatigueBudget) {
-        throw new Error('Fatigue spend recording requires fatigueBudget');
-      }
-      const fatigueEvent = runtime.fatigueBudget.recordFinalDecision(
-        fatigueDecision.evaluation,
-        {
-          correlation: runtime.withCorrelationPurpose(turnCorrelationBase, 'agent.fatigue.record'),
-          details: {
-            enforcementDecision: fatigueDecision.metadata.decision,
-            policyState: fatigueDecision.metadata.policyState,
-            policyBaseState: fatigueDecision.metadata.policyBaseState,
-            overchargePermitted: fatigueDecision.metadata.overchargePermitted,
-            overchargeReasons: fatigueDecision.metadata.overchargeReasons,
-            socialRegulation: fatigueDecision.metadata.socialRegulation,
-            responseChars: responseText.length,
-            model: responseModel,
-          },
-        },
-      );
-      responseFatigueMetadata = attachRecordedFatigueEvent(fatigueDecision.metadata, fatigueEvent);
-      fatigueDecision = {
-        ...fatigueDecision,
-        metadata: responseFatigueMetadata,
-      };
-      turnSnapshot.fatigue = responseFatigueMetadata;
-      runtime.emitTelemetry('agent.fatigue.recorded', {
-        channelId: message.channelId,
-        amount: fatigueEvent.amount,
-        spentAfter: fatigueEvent.spentAfter,
-        remainingAllowance: fatigueEvent.remainingAllowance,
-        decision: responseFatigueMetadata.decision,
-        ...runtime.withCorrelationPurpose(turnCorrelationBase, 'agent.fatigue.recorded'),
-      });
-    } else if (recoveredResponse?.metadata.fatiguePendingSpend) {
-      if (!runtime.fatigueBudget || !responseFatigueMetadata) {
-        throw new Error('Recovered fatigue spend requires budget runtime and enforcement metadata');
-      }
-      const fatigueEvent = runtime.fatigueBudget.recordPendingSpend(
-        recoveredResponse.metadata.fatiguePendingSpend,
-        {
-          correlation: runtime.withCorrelationPurpose(turnCorrelationBase, 'agent.fatigue.record'),
-          details: {
-            recovery: true,
-            responseChars: responseText.length,
-            model: responseModel,
-          },
-        },
-      );
-      responseFatigueMetadata = attachRecordedFatigueEvent(responseFatigueMetadata, fatigueEvent);
-    }
     const agentResponse: AgentResponse = recoveredResponse
       ? {
           content: safeResponseText,
@@ -1772,38 +1304,11 @@ export async function handleMessageForTurn(
           ...(responseAttachments.length > 0 ? { attachments: responseAttachments } : {}),
           metadata: {
             ...recoveredResponse.metadata,
-            ...(responseFatigueMetadata ? { fatigue: responseFatigueMetadata } : {}),
           },
         }
       : buildGeneratedResponse();
-    if (runtime.fatigueRegulationReservations
-      && message.routing?.icpCorrelation
-      && durableFatigueReservation
-      && responseFatigueMetadata) {
-      await runtime.fatigueRegulationReservations.prepareDelivery({
-        correlation: message.routing.icpCorrelation,
-        fatigue: responseFatigueMetadata,
-        ...(recoveredFatigueReservationOutcome === 'delivered'
-          || recoveredFatigueReservationOutcome === 'no_reply'
-          ? { recoveredOutcome: recoveredFatigueReservationOutcome }
-          : {}),
-      });
-    }
     assertForegroundWorkOwned(foregroundLease);
     await deliveryLifecycle?.finalizeDelivery(agentResponse);
-    durableDeliveryFinalized = true;
-    if (runtime.fatigueRegulationReservations
-      && message.routing?.icpCorrelation
-      && (durableFatigueReservation || recoveredResponse?.metadata.fatiguePendingSpend)
-      && responseFatigueMetadata) {
-      await runtime.fatigueRegulationReservations.finalize({
-        correlation: message.routing.icpCorrelation,
-        outcome: honorNoReply ? 'no_reply' : 'delivered',
-        finalizedAtMs: Date.now(),
-        fatigue: responseFatigueMetadata,
-      });
-      durableFatigueReservation = null;
-    }
 
     const recoveredTurnRecord = recoveredResponse === undefined
       ? null
@@ -1900,36 +1405,6 @@ export async function handleMessageForTurn(
 
     return agentResponse;
   } catch (error) {
-    if (!durableDeliveryFinalized
-      && !durableRecoveryResponsePersisted
-      && durableFatigueReservation
-      && runtime.fatigueRegulationReservations
-      && fatigueDecision) {
-      try {
-        await runtime.fatigueRegulationReservations.finalize({
-          correlation: durableFatigueReservation,
-          outcome: 'failed',
-          finalizedAtMs: Date.now(),
-          fatigue: fatigueDecision.metadata,
-        });
-      } catch (finalizeError) {
-        log.error('Failed to release durable ICP fatigue reservation after turn failure', {
-          turnId,
-          error: toErrorMessage(finalizeError),
-        });
-      }
-    }
-    if (durableFatigueReservation && runtime.fatigueRegulationReservations) {
-      try {
-        await runtime.fatigueRegulationReservations.handoff(durableFatigueReservation);
-      } catch (handoffError) {
-        log.error('Failed to hand off durable ICP fatigue reservation after turn failure', {
-          turnId,
-          error: toErrorMessage(handoffError),
-        });
-      }
-      durableFatigueReservation = null;
-    }
     const err = error instanceof Error ? error : new Error(String(error));
     const continuationStopSnapshot = error instanceof ParentTurnContinuationBudgetExceededError
       ? error.stop

@@ -34,11 +34,6 @@ import {
   requireRecord,
   requireString,
 } from './icp-recovery-metadata-validation.js';
-import {
-  parseFatigue,
-  parsePendingSpend,
-} from './icp-recovery-fatigue-metadata.js';
-import { assertFatigueRecoveryBinding } from './icp-recovery-fatigue-binding.js';
 
 /**
  * Every `ResponseMetadata` field this codec knows about, and whether it is
@@ -71,8 +66,12 @@ export const ICP_RECOVERY_METADATA_KEY_HANDLING:
   toolCallOutcomes: 'parsed',
   diagnostics: 'parsed',
   broadcastSafety: 'parsed',
-  fatigue: 'parsed',
-  fatiguePendingSpend: 'parsed',
+  // Lite extraction (seam 3.17, fatigue cut to types only): no fatigue runtime
+  // records these, so a recovery response carrying them is rejected as
+  // unknown fields (donor: 'parsed' through icp-recovery-fatigue-metadata.ts
+  // and icp-recovery-fatigue-binding.ts).
+  fatigue: 'excluded',
+  fatiguePendingSpend: 'excluded',
 };
 
 const METADATA_KEYS = new Set(
@@ -436,20 +435,6 @@ export function parseIcpRecoveryResponseMetadata(value: unknown, label: string):
     && !matchesLegacyInternalStateSnapshotRef(internalState, internalStateSnapshotRef)) {
     throw new Error(`${label} snapshot reference does not match its internal state`);
   }
-  const fatigue = raw.fatigue === undefined
-    ? undefined
-    : parseFatigue(raw.fatigue, `${label}.fatigue`);
-  const fatiguePendingSpend = raw.fatiguePendingSpend === undefined
-    ? undefined
-    : parsePendingSpend(raw.fatiguePendingSpend, `${label}.fatiguePendingSpend`);
-  assertFatigueRecoveryBinding({
-    fatigue,
-    pendingSpend: fatiguePendingSpend,
-    correlation,
-    turnId,
-    requestId,
-    label,
-  });
   return {
     model,
     inputTokens,
@@ -523,12 +508,6 @@ export function parseIcpRecoveryResponseMetadata(value: unknown, label: string):
             `${label}.broadcastSafety`,
           ),
         }
-      : {}),
-    ...(fatigue !== undefined
-      ? { fatigue }
-      : {}),
-    ...(fatiguePendingSpend !== undefined
-      ? { fatiguePendingSpend }
       : {}),
   };
 }
