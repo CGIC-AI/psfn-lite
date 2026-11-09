@@ -4,28 +4,24 @@
 // Intentional wiring differences:
 // - src/app/agent/main.ts runs in split mode (gateway + isolated agent) and wires gateway-backed providers.
 // Keep core construction through these helpers so behavior stays aligned across split entrypoints.
+//
+// Lite cut (seam 3.11, extraction/cuts.tsv): the Redis session tail, the CogSec
+// session-integrity and projection-drift incident observers, the fatigue
+// ledgers, the shard manager, the analysis workbench and the operator hook
+// runtime are cut. wireShardAndThinkRuntime is now wireSubagentRuntime: the
+// subagent faculty, its fold-review queue and the subagent tool are kept.
 
 import type { RetrievalDecisionPort } from '../../../faculties/memory/retrieval/decision-routing.js';
 import type { CoreSubstrateConfig, SubstrateConfig } from '../../../system/config/runtime-config-contracts.js';
 import type { PlacesRegistryConfig } from '../../../shared/contracts/places-registry.js';
 import type { EventBus } from '../../../shared/event-bus.js';
 import type { AppCache } from '../../../shared/cache/types.js';
-import type { NotificationPort } from '../../../boundary/gateway/notification-port.js';
 import { isRecord } from '../../../shared/utils/types.js';
-import type { CapabilityGrantSnapshot } from '../../../system/capabilities/access.js';
 import { wireRuntimeDiagnosticsEventCapture } from '../../../shared/diagnostics/runtime-diagnostics.js';
 import { createEventBusCostTelemetryPort } from '../../../shared/telemetry/cost-telemetry-port.js';
 import { SessionStore, type SessionIntegrityProvider } from '../../../persistence/sessions/store.js';
 import type { SessionTailCachePort } from '../../../persistence/sessions/session-tail-cache-port.js';
-import { RedisSessionTailCache } from '../../../persistence/sessions/redis-session-tail-cache.js';
-import {
-  buildRedisClientOptions,
-  createRedisClientFactoryFromPackage,
-  resolveRedisConnectionConfigFromEnv,
-} from '../../../shared/cache/redis-cache.js';
 import { SessionManager } from '../../../core/session/manager.js';
-import type { CompressionGuidelineEvolutionPort } from '../../../core/session/compression-guideline-evolution.js';
-import type { PolicyGovernedShardParentIcpDeliveryPort } from '../../../shared/contracts/shard-parent-icp.js';
 import { UserContinuityStore } from '../../../core/session/continuity.js';
 import {
   createDisabledCrossChannelContinuityPort,
@@ -40,20 +36,9 @@ import {
   type EmotionRuntimeWiring,
   type SubstrateAgentOptions,
 } from '../../../core/agent/substrate-agent.js';
-import {
-  DeterministicFatigueBudgetPort,
-  type FatigueBudgetPort,
-} from '../../../core/agent/fatigue/fatigue-budget.js';
-import type { IcpFatigueRegulationReservationPort } from '../../../core/agent/fatigue/regulation-reservation.js';
-import {
-  DeterministicHumanAttentionPressure,
-  type HumanAttentionPressurePort,
-} from '../../../core/agent/fatigue/human-attention-pressure.js';
-import { HumanAttentionPressureLedger } from '../../../core/agent/fatigue/human-attention-ledger.js';
 import type { ObserverEvalSidecarRuntime } from '../../../core/eval/observer-sidecar/types.js';
 import { MemoryRetriever } from '../../../faculties/memory/retrieval.js';
 import type { EpisodicRetrievalStore } from '../../../faculties/memory/retrieval/episodic.js';
-import type { HybridEpisodeSearchPort } from '../../../faculties/memory/retrieval/episode-search.js';
 import {
   MemoryExtractor,
   type MemoryExtractorFormationOptions,
@@ -68,41 +53,20 @@ import type {
 import { createCoreMemoryStorePort } from '../../../faculties/memory/memory-store-port.js';
 import type { ContactStorePort } from '../../../core/contacts/contact-store-port.js';
 import type { ContactTrackingGate } from '../../../core/contacts/tracking-gate.js';
-import { ShardManager } from '../../../faculties/shards/manager.js';
-import { ShardWorkloadRegistry } from '../../../faculties/shards/workload-registry.js';
-import type { ShardWorkloadLifecyclePort } from '../../../system/capabilities/shard-approval-grant-contracts.js';
 import type { AutomataRunRegistry } from '../../../faculties/automata/run-registry.js';
 import type { AutomataSessionClassificationService } from '../../../faculties/automata/session-classification.js';
 import type { AutomataBusWorkerAccess } from '../../../faculties/automata/bus/worker-access.js';
+import type { CapabilityGrantSnapshot } from '../../../system/capabilities/access.js';
 import type { AutomataTerminalLifecyclePort } from '../../../faculties/automata/terminal-lifecycle.js';
-import type { AutomataClassLifecycleRuntime } from '../../../faculties/automata/bus/class-lifecycle.js';
 import { ShardFoldReviewController } from '../../../faculties/shards/fold-review.js';
-import {
-  createShardExecutionPort,
-  type ShardExecutionPort,
-} from '../../../faculties/shards/port.js';
-import { SubagentFaculty } from '../../../faculties/subagents/faculty.js';
+import { SubagentFaculty, type SubagentAuditTrail } from '../../../faculties/subagents/faculty.js';
 import { createSubagentTool } from '../../../faculties/subagents/tools.js';
-import { HookRegistry } from '../../../boundary/gateway/hook-registry.js';
-import {
-  loadWorkspaceHooks,
-  type WorkspaceHookLoadResult,
-} from '../../../boundary/gateway/hook-loader.js';
-import { createAnalysisWorkbenchTool } from '../../../core/tools/analysis-workbench/tools.js';
 import { CoreMemoryStore } from '../../../faculties/core-memory/store.js';
 import { createOrientTool } from '../../../faculties/core-memory/tools.js';
 import { resolveCurrentInternalStateConcernVAD } from '../../../core/intention/concern-grooming.js';
 import { ValuesJournalStore } from '../../../faculties/values/store.js';
 import type { IntrospectionConsentStore } from '../../../faculties/introspection/consent-store.js';
 import type { IntrospectionTurnSensitivityDecisions } from '../../../faculties/introspection/turn-sensitivity.js';
-import { DEFAULT_REPL_CONFIG, type REPLConfig } from '../../../core/tools/analysis-workbench/types.js';
-import type {
-  SandboxExecutionPort,
-  SandboxExecutionPortSeed,
-  SandboxFileRead,
-} from '../../../boundary/sandbox/capabilities/contracts.js';
-import type { Scheduler } from '../../../core/scheduler/scheduler.js';
-import type { CapabilityTier } from '../../../system/config/runtime-config-contracts.js';
 import { loadCharacterCard, composeSystemPrompt } from '../../../core/identity/loader.js';
 import { resolveCompanionIdFromConfig } from '../../../core/identity/companion-runtime.js';
 import type { RuntimeCompanionId } from '../../../shared/routing/companion-id.js';
@@ -112,25 +76,18 @@ import type { ProviderRuntime } from '../../../primitives/llm/provider-runtime.j
 import type { EmbeddingProviderPort } from '../../../shared/contracts/embedding-provider.js';
 import type { PromptRegistryStatePort } from '../../../core/identity/prompt-state-port.js';
 import type { PersonaPreamblePort } from '../../../core/identity/persona-preamble.js';
-import type { ShardAuditTrail } from '../../../faculties/shards/manager.js';
-import type { ApprovalQueuePort } from '../../../system/capabilities/approval-queue-port.js';
-import type { ModuleRegistryMutation } from '../../../system/modules/types.js';
 import type { ToolWiringValidationMode } from '../../../core/agent/tool-wiring-validator.js';
 import type { ConcernStorePort } from '../../../core/intention/concern-store-port.js';
 import {
   migrateLegacyPersistenceLayout,
   resolveBackupsDir,
-  resolveCogSecEventsPath,
   resolveConfiguredCompanionDataDir,
   resolveCoreMemoryPath,
   resolveContinuityDir,
-  resolveFatigueLedgerPath,
-  resolveHumanAttentionLedgerPath,
   resolveLegacyValuesJournalPath,
   resolveMemoryJournalPath,
   resolveNotesDir,
   resolveShardFoldReviewStorePath,
-  resolveShardSessionMemorySyncAuditPath,
   resolveScratchpadMirrorPath,
   resolveSessionsDir,
   resolveValuesJournalPath,
@@ -140,11 +97,6 @@ import { createDefaultPostgresSessionAdapters } from '../../../persistence/sessi
 import { FilesystemAutomataRetentionWriteBarrier } from '../../../persistence/sessions/automata-retention-write-barrier.js';
 import { awaitPostgresStoreReadiness } from '../../../persistence/postgres/runtime-readiness.js';
 import { resolveConfigTenantPoolScope } from '../../../persistence/postgres/tenant-pool-scope.js';
-import { CogSecEventStore } from '../../../core/cogsec/events.js';
-import { createSessionIntegrityIncidentObserver } from '../../../core/cogsec/session-integrity-incident.js';
-import { createProjectionDriftIncidentObserver } from '../../../core/cogsec/projection-drift-incident.js';
-import { createPostgresShardSchemaLifecycle } from '../../../persistence/postgres/shard-schema-lifecycle.js';
-import { FatigueLedger } from '../../../shared/telemetry/fatigue-ledger.js';
 import { createSafeguardAuditTrail } from '../../../system/capabilities/safeguards.js';
 import { createComponentLogger } from '../../../shared/logger.js';
 import { toErrorMessage } from '../../../shared/utils/errors.js';
@@ -183,35 +135,30 @@ interface SessionCompositionBaseOptions {
   /** Runtime-owned backup root for automatic corrupt-handoff quarantine evidence. */
   sessionIntegrityRepairBackupRootDir?: string;
   /**
-   * Injected session tail cache (tests/harnesses). `undefined` builds the
-   * Redis-backed tail from settings.json + env when enabled; explicit `null`
-   * disables it regardless of config.
+   * Injected session tail cache (tests/harnesses/hosts). Lite cut: the Redis
+   * tail is cut, so `undefined` with settings sessionTailCache.enabled refuses
+   * to start (the donor built the Redis tail there); explicit `null` disables
+   * it regardless of config.
    */
   sessionTailCache?: SessionTailCachePort | null;
   /** Exact runtime identity used by retention write barriers in full agent composition. */
   automataRetentionCompanionId?: string;
 }
 
-interface SessionIntegrityOperatorAlertComposition {
-  notifier: NotificationPort;
-  companionName: string;
-}
-
 /**
- * Production composition must make HMAC verification and its operator alert
- * indivisible. Tests and narrowly scoped maintenance harnesses may continue to
- * omit both by leaving `runtimeMode` unset.
+ * Production composition requires HMAC verification. Tests and narrowly
+ * scoped maintenance harnesses may omit it by leaving `runtimeMode` unset.
+ * Lite cut: the donor's indivisible operator integrity alert fed the CogSec
+ * session-integrity incident observer, which is cut, so the alert is gone.
  */
 export type SessionCompositionOptions = SessionCompositionBaseOptions & (
   | {
       runtimeMode: 'production';
       sessionIntegrityProvider: SessionIntegrityProvider;
-      sessionIntegrityOperatorAlert: SessionIntegrityOperatorAlertComposition;
     }
   | {
       runtimeMode?: 'non-production';
       sessionIntegrityProvider?: SessionIntegrityProvider | null;
-      sessionIntegrityOperatorAlert?: SessionIntegrityOperatorAlertComposition;
     }
 );
 
@@ -220,41 +167,23 @@ function assertProductionSessionIntegrityComposition(options: unknown): void {
   if (!options.sessionIntegrityProvider) {
     throw new Error('Production session composition requires a non-null integrity provider');
   }
-  const operatorAlert = options.sessionIntegrityOperatorAlert;
-  if (!isRecord(operatorAlert)
-    || !operatorAlert.notifier
-    || typeof operatorAlert.companionName !== 'string'
-    || !operatorAlert.companionName.trim()) {
-    throw new Error('Production session composition requires an operator integrity alert path');
-  }
 }
 
 /**
- * Build the Redis-backed session tail (psfn-framework-hgw3.5) when
- * settings.json enables it. Fail closed at startup: enabled config with
- * missing/invalid Redis env, a missing companion identity, or an unreachable
- * Redis refuses to start — a silently absent tail would hide the shared-view
- * guarantee. Tail/epoch keys are scoped by COMPANION_ID so multiple
- * companions sharing one Redis (fleet topology) can never read each other's
- * session tails.
+ * Lite cut: the Redis-backed session tail (psfn-framework-hgw3.5) is cut. An
+ * injected tail is used as given; settings.json enabling the tail without one
+ * fails closed at startup, as the donor did when Redis was unavailable.
  */
-async function composeSessionTailCache(
+function composeSessionTailCache(
   config: SubstrateConfig,
   override: SessionTailCachePort | null | undefined,
-): Promise<SessionTailCachePort | null> {
+): SessionTailCachePort | null {
   if (override !== undefined) return override;
   const settings = config.sessionTailCache;
   if (!settings?.enabled) return null;
-  const scope = resolveCompanionIdFromConfig(config);
-  const redisConfig = resolveRedisConnectionConfigFromEnv(process.env);
-  const clientFactory = await createRedisClientFactoryFromPackage();
-  const client = clientFactory(buildRedisClientOptions(redisConfig));
-  await client.connect();
-  return new RedisSessionTailCache({
-    client,
-    maxEntriesPerChannel: settings.maxEntriesPerChannel,
-    scope,
-  });
+  throw new Error(
+    'settings.json sessionTailCache.enabled requires a host-injected session tail cache (the Redis tail is not part of Lite)',
+  );
 }
 
 function createSessionComposition(
@@ -277,20 +206,6 @@ function createSessionComposition(
   if (!conversationalActivityWorkset) {
     throw new Error('PostgreSQL session composition requires a conversational activity workset');
   }
-  // Durable session-integrity incident seam (bead g59z): when a keyring makes
-  // HMAC verification active, a full journal load that surfaces a broken chain
-  // records one operator-only CogSec incident per session in the canonical
-  // cogsec-events.json store that Garden already reads. The provider mints a
-  // fresh store per write (concurrent gateway/Garden writers).
-  const cogSecEventsPath = resolveCogSecEventsPath(companionDataDir);
-  const integrityObserver = options.sessionIntegrityProvider
-    ? createSessionIntegrityIncidentObserver({
-      cogSecEvents: () => new CogSecEventStore(cogSecEventsPath),
-      ...(options.sessionIntegrityOperatorAlert
-        ? { operatorAlert: options.sessionIntegrityOperatorAlert }
-        : {}),
-    })
-    : null;
   const sessionStore = new SessionStore(sessionsDir, {
     integrityProvider: options.sessionIntegrityProvider ?? null,
     sessionArchivePort: sessionAdapters.sessionArchivePort,
@@ -298,7 +213,6 @@ function createSessionComposition(
     turnRecordStore: sessionAdapters.turnRecordStore,
     turnRecordEligibilityFence,
     tailCache: sessionTailCache,
-    integrityObserver,
     ...(options.sessionIntegrityProvider
       ? {
         backgroundWorkHandoffRecoveryDisposition:
@@ -398,16 +312,6 @@ export async function composeSessionRuntimeAsync(
   const tenantScope = resolveConfigTenantPoolScope(options.config);
   const postgresSchema = tenantScope?.schema ?? options.config.postgresSchema?.trim();
   const postgresRole = tenantScope?.role;
-  // Redaction projection-drift incident seam (bead 6oott): a failed
-  // redaction-driven projection write records one operator-only CogSec
-  // incident (session_integrity class, projectiondrift caseId prefix) in the
-  // canonical cogsec-events.json store that Garden already reads. Search is
-  // fail-closed by the durable drift record itself; this is the operator
-  // signal pointing at transcript-projection-repair. Mirrors the g59z
-  // session-integrity observer wiring below.
-  const redactionDriftObserver = createProjectionDriftIncidentObserver({
-    cogSecEvents: () => new CogSecEventStore(resolveCogSecEventsPath(companionDataDir)),
-  });
   const automataRetentionCompanionId = options.automataRetentionCompanionId?.trim()
     || options.config.companionId?.trim();
   if (!automataRetentionCompanionId) {
@@ -421,13 +325,12 @@ export async function composeSessionRuntimeAsync(
     'session_transcripts',
     () => createDefaultPostgresSessionAdapters(databaseUrl, {
       sessionsDir,
-      redactionDriftObserver,
       automataRetentionWriteBarrier: exactSessionWriteBarrier,
       ...(postgresSchema ? { schema: postgresSchema } : {}),
       ...(postgresRole ? { role: postgresRole } : {}),
     }),
   );
-  const sessionTailCache = await composeSessionTailCache(options.config, options.sessionTailCache);
+  const sessionTailCache = composeSessionTailCache(options.config, options.sessionTailCache);
   return createSessionComposition(
     options,
     sessionAdapters,
@@ -497,9 +400,6 @@ export interface SubstrateAgentCompositionOptions {
   config: CoreSubstrateConfig;
   runtimeMode?: ToolWiringValidationMode;
   emotionRuntime?: EmotionRuntimeWiring;
-  fatigueBudget?: FatigueBudgetPort | null;
-  humanAttentionPressure?: HumanAttentionPressurePort | null;
-  fatigueRegulationReservations?: IcpFatigueRegulationReservationPort | null;
   observerEvalSidecar?: ObserverEvalSidecarRuntime | null;
   streamRuntimeOptions?: SubstrateAgentOptions['streamRuntimeOptions'];
   streamTransport?: SubstrateAgentOptions['streamTransport'];
@@ -532,13 +432,6 @@ export function composeSubstrateAgent(options: SubstrateAgentCompositionOptions)
         : {}),
       ...(options.runtimeMode ? { runtimeMode: options.runtimeMode } : {}),
       ...(options.emotionRuntime ? { emotionRuntime: options.emotionRuntime } : {}),
-      ...(options.fatigueBudget ? { fatigueBudget: options.fatigueBudget } : {}),
-      ...(options.humanAttentionPressure
-        ? { humanAttentionPressure: options.humanAttentionPressure }
-        : {}),
-      ...(options.fatigueRegulationReservations
-        ? { fatigueRegulationReservations: options.fatigueRegulationReservations }
-        : {}),
       ...(options.runtime ? { runtime: options.runtime } : {}),
       ...(options.observerEvalSidecar ? { observerEvalSidecar: options.observerEvalSidecar } : {}),
       ...(options.streamRuntimeOptions ? { streamRuntimeOptions: options.streamRuntimeOptions } : {}),
@@ -563,59 +456,6 @@ export function composeSubstrateAgent(options: SubstrateAgentCompositionOptions)
         : {}),
     },
   );
-}
-
-export interface FatigueBudgetComposition {
-  fatigueLedger: FatigueLedger;
-  fatigueBudget: FatigueBudgetPort;
-  humanAttentionLedger: HumanAttentionPressureLedger;
-  humanAttentionPressure: HumanAttentionPressurePort;
-}
-
-export interface FatigueBudgetCompositionOptions {
-  config: SubstrateConfig;
-  eventBus?: EventBus;
-  now?: () => number;
-}
-
-export async function composeFatigueBudgetRuntime(
-  options: FatigueBudgetCompositionOptions,
-): Promise<FatigueBudgetComposition> {
-  const companionDataDir = resolveConfiguredCompanionDataDir(options.config);
-  migrateLegacyPersistenceLayout(companionDataDir);
-  // Bounded, cooperative ledger hydration (psfn-framework-z3e2x): startup
-  // streams both append-only ledgers off the blocking path so timers and admin
-  // work keep advancing on multi-megabyte files.
-  const sharedOptions = {
-    ...(options.now ? { now: options.now } : {}),
-    readLimitSettings: options.config,
-  };
-  const fatigueLedger = await FatigueLedger.open(
-    resolveFatigueLedgerPath(companionDataDir),
-    options.eventBus ?? null,
-    sharedOptions,
-  );
-  const humanAttentionLedger = await HumanAttentionPressureLedger.open(
-    resolveHumanAttentionLedgerPath(companionDataDir),
-    null,
-    options.now ?? Date.now,
-    { readLimitSettings: options.config },
-  );
-  const humanAttentionPolicy = options.config.chargePolicy?.fatigue.humanAttention;
-  if (!humanAttentionPolicy) {
-    throw new Error(
-      'Human attention pressure requires chargePolicy.fatigue.humanAttention',
-    );
-  }
-  return {
-    fatigueLedger,
-    fatigueBudget: new DeterministicFatigueBudgetPort(fatigueLedger, sharedOptions),
-    humanAttentionLedger,
-    humanAttentionPressure: new DeterministicHumanAttentionPressure(
-      humanAttentionLedger,
-      humanAttentionPolicy,
-    ),
-  };
 }
 
 export interface SelfModelRuntimeTarget {
@@ -795,68 +635,36 @@ export function wireMemoryRuntime(options: MemoryRuntimeOptions): MemoryExtracto
   return memoryExtractor;
 }
 
-export interface ToolRuntimeOptions {
+
+export interface SubagentRuntimeOptions {
   agentLoop: SubstrateAgent;
   eventBus: EventBus;
   llmProvider: LLMProviderPort;
-  fileRead?: SandboxFileRead;
   sessionStore: SessionStore;
   embeddingService: EmbeddingProviderPort;
   memoryStore: MemoryStorePort;
-  episodeSearch?: HybridEpisodeSearchPort | null;
   sessionManager: SessionManager;
   config: SubstrateConfig;
   parentSystemPrompt: string;
   companionDataDir?: string;
-  scheduler?: Scheduler | null;
-  replConfig?: REPLConfig;
-  shardAuditTrail?: ShardAuditTrail | null;
   runtimeMode?: ToolWiringValidationMode;
-  getCapabilityTier?: () => CapabilityTier;
+  /** Donor main.ts passes the safeguard audit trail as shardAuditTrail. */
+  auditTrail?: SubagentAuditTrail | null;
   snapshotParentCapabilityGrant: () => CapabilityGrantSnapshot;
-  compositionalPolicy?: SubstrateConfig['compositionalPolicy'];
-  moduleInstallConfirmationQueue?: ApprovalQueuePort | null;
-  onModuleRegistryMutation?: (mutation: ModuleRegistryMutation) => Promise<void> | void;
-  executionPort?: SandboxExecutionPort | SandboxExecutionPortSeed | null;
-  compressionGuidelineEvolution?: CompressionGuidelineEvolutionPort | null;
-  shardParentIcpDelivery: PolicyGovernedShardParentIcpDeliveryPort | null;
-  /**
-   * Lifecycle port for registering shard workloads with the gateway-owned
-   * approval-grant authority. Split production supplies its authenticated
-   * gateway RPC client. Local/test composition may omit it and use the
-   * process-local registry while retaining the same lifecycle contract.
-   */
-  shardWorkloadRegistry?: ShardWorkloadLifecyclePort;
   automataRunRegistry?: AutomataRunRegistry;
   automataSessionClassification?: Pick<AutomataSessionClassificationService, 'classifyAtCreation'>;
   automataBusWorkerAccess?: AutomataBusWorkerAccess | null;
   automataLifecyclePort?: AutomataTerminalLifecyclePort | null;
-  /** Governed Bus lifecycle for the long-horizon shard class. */
-  automataClassLifecycle?: AutomataClassLifecycleRuntime | null;
 }
 
-function requireExplicitShardParentIcpDelivery(
-  options: { shardParentIcpDelivery?: PolicyGovernedShardParentIcpDeliveryPort | null },
-): PolicyGovernedShardParentIcpDeliveryPort | null {
-  if (!Object.hasOwn(options, 'shardParentIcpDelivery')
-    || options.shardParentIcpDelivery === undefined) {
-    throw new Error(
-      'Shard runtime composition requires an explicit policy-governed ordinary ICP delivery port',
-    );
-  }
-  return options.shardParentIcpDelivery;
-}
-
-export function wireShardAndThinkRuntime(options: ToolRuntimeOptions): ShardExecutionPort {
-  const shardParentIcpDelivery = requireExplicitShardParentIcpDelivery(options);
+/**
+ * Lite cut of the donor wireShardAndThinkRuntime (seam 3.11): the shard
+ * manager, its execution port and Postgres schema lifecycle, and the analysis
+ * workbench tool are cut. The fold-review queue, the subagent faculty and the
+ * subagent tool are composed exactly as the donor composed them.
+ */
+export function wireSubagentRuntime(options: SubagentRuntimeOptions): SubagentFaculty {
   const companionDataDir = options.companionDataDir ?? resolveConfiguredCompanionDataDir(options.config);
-  const shardPostgresLifecycle = options.config.multiCompanion === true
-    ? createPostgresShardSchemaLifecycle(
-        options.config.postgresDatabaseUrl?.trim() ?? (() => {
-          throw new Error('Multi-companion shard execution requires config.postgresDatabaseUrl');
-        })(),
-      )
-    : null;
   // htm9.3: shard fold-back memory writes gate at the memory_write sink; the
   // gate is late-bound onto the session manager by composition.
   const foldReviewMemoryWriter = new MemoryWriter(options.memoryStore, options.embeddingService, {
@@ -873,31 +681,6 @@ export function wireShardAndThinkRuntime(options: ToolRuntimeOptions): ShardExec
       sinkGate: options.sessionManager.intakeSinkGate,
     }),
   );
-  const shardManager = new ShardManager({
-    eventBus: options.eventBus,
-    llmProvider: options.llmProvider,
-    sessionStore: options.sessionStore,
-    completionNoticeDelivery: {
-      deliver: input => options.agentLoop.deliverCompletionNotice(input),
-    },
-    sessionManager: options.sessionManager,
-    embeddingService: options.embeddingService,
-    memoryProvider: options.agentLoop.memoryProvider,
-    config: options.config,
-    parentSystemPrompt: options.parentSystemPrompt,
-    toolCatalogProvider: () => options.agentLoop.getToolCatalog(),
-    auditTrail: options.shardAuditTrail ?? undefined,
-    runtimeMode: options.runtimeMode,
-    shardSessionMemorySyncAuditPath: resolveShardSessionMemorySyncAuditPath(companionDataDir),
-    foldReviewController,
-    compressionGuidelineEvolution: options.compressionGuidelineEvolution ?? undefined,
-    shardPostgresLifecycle,
-    shardParentIcpDelivery,
-    snapshotParentCapabilityGrant: options.snapshotParentCapabilityGrant,
-    workloadRegistry: options.shardWorkloadRegistry ?? new ShardWorkloadRegistry(),
-    activeTurnIntakeEnvelopesProvider: () => options.agentLoop.getActiveTurnIntakeEnvelopes(),
-    automataClassLifecycle: options.automataClassLifecycle,
-  });
   const subagentFaculty = new SubagentFaculty({
     eventBus: options.eventBus,
     llmProvider: options.llmProvider,
@@ -910,7 +693,7 @@ export function wireShardAndThinkRuntime(options: ToolRuntimeOptions): ShardExec
     config: options.config,
     parentSystemPrompt: options.parentSystemPrompt,
     toolCatalogProvider: () => options.agentLoop.getToolCatalog(),
-    auditTrail: options.shardAuditTrail ?? undefined,
+    auditTrail: options.auditTrail ?? undefined,
     runtimeMode: options.runtimeMode,
     snapshotParentCapabilityGrant: options.snapshotParentCapabilityGrant,
     // c7d: restricted-class subagent memory candidates stage through the same
@@ -930,66 +713,6 @@ export function wireShardAndThinkRuntime(options: ToolRuntimeOptions): ShardExec
     automataBusWorkerAccess: options.automataBusWorkerAccess,
     automataLifecyclePort: options.automataLifecyclePort,
   });
-  const shardExecutionPort = createShardExecutionPort(shardManager);
   options.agentLoop.registerTool(createSubagentTool(subagentFaculty), 'core');
-
-  options.agentLoop.registerTool(createAnalysisWorkbenchTool({
-    llmProvider: options.llmProvider,
-    fileRead: options.fileRead,
-    ...(options.config.fsReadMaxBytes !== undefined
-      ? { fsReadMaxBytes: options.config.fsReadMaxBytes }
-      : {}),
-    embeddingService: options.embeddingService,
-    memoryStore: options.memoryStore,
-    episodeSearch: options.episodeSearch ?? null,
-    sessionManager: options.sessionManager,
-    scheduler: options.scheduler ?? null,
-    eventBus: options.eventBus,
-    costTelemetry: createEventBusCostTelemetryPort(options.eventBus),
-    getCapabilityTier: options.getCapabilityTier,
-    compositionalPolicy: options.compositionalPolicy,
-    chargePolicy: options.config.chargePolicy,
-    moduleInstallConfirmationQueue: options.moduleInstallConfirmationQueue,
-    onModuleRegistryMutation: options.onModuleRegistryMutation,
-    executionPort: options.executionPort ?? null,
-    config: options.replConfig ?? DEFAULT_REPL_CONFIG,
-    mutationPolicy: {
-      allowRepoMutation: false,
-      allowWorkspaceWrite: false,
-    },
-  }));
-
-  return shardExecutionPort;
-}
-
-export interface OperatorHookRuntimeOptions {
-  eventBus: EventBus;
-  /** The companion's Personal Workspace root (WORKSPACE_PATH). */
-  workspacePath: string;
-}
-
-export interface OperatorHookRuntime {
-  hookRegistry: HookRegistry;
-  hookLoadResult: WorkspaceHookLoadResult;
-}
-
-/**
- * Operator-extensible hook runtime (bead vvf.2): scans
- * `<workspacePath>/hooks/` for HOOK.yaml + handler definitions, registers the
- * valid ones, and attaches the async fire-and-forget lifecycle consumer to
- * the agent-process EventBus. Invalid hook definitions are rejected with a
- * logged reason and never crash startup; an absent hooks directory is a
- * clean no-op. See src/boundary/gateway/hook-registry.ts for the trust model
- * and payload-redaction posture.
- */
-export async function wireOperatorHookRuntime(
-  options: OperatorHookRuntimeOptions,
-): Promise<OperatorHookRuntime> {
-  const hookRegistry = new HookRegistry();
-  const hookLoadResult = await loadWorkspaceHooks({
-    workspacePath: options.workspacePath,
-    registry: hookRegistry,
-  });
-  hookRegistry.attachLifecycleConsumer(options.eventBus);
-  return { hookRegistry, hookLoadResult };
+  return subagentFaculty;
 }
