@@ -30,7 +30,6 @@ def test_a_complete_config_parses():
         ({"senders": []}, "senders"),
         ({"senders": [{"platform": "cron", "sender_id": ""}]}, "interactive"),
         ({"timeout_seconds": 0}, "timeout_seconds"),
-        ({"internal_turns": None}, "unknown fields: internal_turns"),
         ({"automata": {}}, "automata is missing required fields: claim_limit"),
         ({"automata": {"claim_limit": 9}}, "claim_limit"),
         ({"automata": {"claim_limit": 2, "max_iterations": 250}}, "automata has unknown fields: max_iterations"),

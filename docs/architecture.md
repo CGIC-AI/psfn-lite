@@ -43,33 +43,52 @@ subsystems out ([conformance](conformance.md)).
    character card, the operator and other contacts, where the database URL
    and the provider keys live (environment variable names), the model, the
    embedding provider, session-journal integrity (the donor HMAC keyring, or
-   unsigned), and the optional `mcp` and `lifecycle` endpoints. Unknown keys
-   are refused. Secrets are never in the file.
+   unsigned), and the optional `mcp` and `lifecycle` endpoints. The
+   `lifecycle` endpoint names the Hermes install it serves
+   (`hermesInstallId`). Unknown keys are refused. Secrets are never in the
+   file.
 2. It loads the companion's own behaviour from the owner files in
    `dataDir`, with the donor loader (`loadInnerLifeConfig`). `init` seeds
    those files (scheduler, settings, trust policy and the others) from the
-   donor's shipped seeds and keeps files that already exist.
+   donor's shipped seeds and keeps files that already exist. One of them is
+   the capability tier (`capability-tier.json`, donor semantics, read once
+   at start). Lite seeds it as `autonomous`, so the model may spawn
+   automata; `memory.delete` still only proposes (see Hermes, below).
 3. It builds the substrate config the way the donor's `loadAgentConfig` did
    (`substrate-config.ts`): the donor's core defaults, then the scalar
    `settings.json` values, then the host's model, embedding, database and
    paths. Defaults of cut subsystems are not set.
 4. It starts the companion with `startCompanionRuntime`. It passes the Pi
    provider runtime and the embedding provider, a model-usage recorder, the
-   session keyring, an outbound sender (the operator's channel), the path
+   session integrity provider, an outbound sender (the operator's channel), the path
    snapshot (workspace `workspaceDir`, and logs and temp under `dataDir`)
    and, when a lifecycle bridge is configured, the relay's
    `wrapStreamTransport`. When
    `lifecycle.automata` is set, it also passes a `HostedAutomataExecutor`
    (`packages/companion/src/faculties/subagents/host-execution.ts`), so
    spawned automata run as host attempts that the bridge's `automata/*`
-   routes serve.
+   routes serve. When a lifecycle bridge is configured, it passes the
+   memory deletion approval port (`HostMemoryDeletionApprovals`,
+   `packages/lifecycle/src/memory-deletion.ts`). Without one, the donor
+   `memory` tool's delete answers "not configured".
+
+   Session integrity: with `sessionIntegrity: keyring`, every session
+   journal entry carries the donor HMAC chain over the keyring in the
+   environment (`GATEWAY_SESSION_HMAC_KEYS`). The entries of a Hermes
+   conversation (`api:hermes:` channels) are signed with that keyring
+   scoped to the bound Hermes install
+   (`apps/standalone/src/session-integrity.ts`), so a journal written for
+   another install fails verification. With `unsigned`, the journals are
+   the donor's non-production mode: not signed and not verified.
 
    The model-usage recorder (`model-usage.ts`) is required. The core
    records every model and embedding call through it, and the donor
    `LLMClient` refuses every autonomous (non-foreground) call when there is
    none. The host keeps in-memory totals by lane and by provider/model
    (`LiteRuntime.modelUsage()`). They start at zero on every start; the
-   donor's durable usage rows, budgets, alerts and exports are cut.
+   donor's durable usage rows, budgets, alerts and exports are cut. Keeping
+   usage in memory is the operator's decision
+   ([extraction](extraction.md#e6-model-usage-stays-in-memory)).
 5. It provisions the configured contacts in the donor contact store, keyed
    by the host's contact key, and finds them again on every start.
 6. It mounts the MCP transport and the lifecycle bridge on loopback, unless
@@ -162,13 +181,24 @@ credential.
 
 | Route | Body | Answer |
 |---|---|---|
-| `prepare` | `hostInstance`, `idempotencyKey`, `sessionId`, `message` | `{kind: "prepared", turnId, resumed, context}`. `{kind: "replayed"}` when the donor already recorded the key. `{kind: "answered", turnId, reply}` when the donor ended the turn without a model call. |
+| `prepare` | `hostInstance`, `hermesInstallId`, `idempotencyKey`, `sessionId`, `message` | `{kind: "prepared", turnId, resumed, context}`. `{kind: "replayed"}` when the donor already recorded the key. `{kind: "answered", turnId, reply}` when the donor ended the turn without a model call. |
 | `settle` | `hostInstance`, `turnId`, `outcome`: `{kind: "completed", reply}`, `{kind: "interrupted"}` or `{kind: "failed", error: {code, message}}` | `{turnId, status, reply}`: what the donor recorded. A repeated settle gets the same answer. |
-| `checkpoint` | `sessionId`, `turnIds` | `{settled, open}` |
+| `checkpoint` | `hermesInstallId`, `sessionId`, `turnIds` | `{settled, open}` |
+| `memory-deletion/approve` | `hostInstance`, `hermesInstallId`, `proposalId`, `memoryId` | `{proposalId, status: "approved", deleteId}` |
 | `automata/claim` | `hostInstance`, `maxIterations` (the host's per-attempt budget), `limit` | `{attempts: [{attemptId, subagentId, name, attempt, maxAttempts, goal, context, budget, credential, leaseMs, busAccess}]}` |
 | `automata/heartbeat` | `hostInstance`, `attemptCredential` | `{status: "active" \| "cancel_requested", attempt}` |
 | `automata/bus` | `hostInstance`, `attemptCredential`, `arguments` (the child's `automata_bus` call) | `{text, isError}`: core's governed tool result |
 | `automata/report` | `hostInstance`, `attemptCredential`, `outcome`: `{kind: "succeeded", summary, model, apiCalls}`, `{kind: "failed" \| "lost", code}` or `{kind: "cancelled"}` | `{attempt, next: "retry" \| "completed" \| "failed" \| "cancelled"}` |
+
+A `prepare`, `checkpoint` or `memory-deletion/approve` for another Hermes
+install is refused (403 `wrong_install`).
+
+`memory-deletion/approve` approves a pending deletion proposal that the
+donor `memory` tool created inside a host-driven turn. Only a principal
+bound to the primary contact may use it, once per proposal, from the owner
+of the turn that created it while that turn is open, for the same memory,
+and within `hostTurnTimeoutMs`. Otherwise the proposal stays pending
+([extraction](extraction.md#e3-memory-deletion-is-approved-through-the-host)).
 
 The `automata/*` routes exist only when the standalone config sets
 `lifecycle.automata`, and only a principal bound to the primary contact may
@@ -196,6 +226,12 @@ Hermes plugin follows that split:
   `[your own earlier reply]`, `[tool result: name]`,
   `[system note: companion context]`);
 - its `pre_tool_call` gate blocks Lite's MCP tools outside a Lite turn;
+- it sends a companion memory delete to Hermes's human approval gate before
+  the call runs, and after an approved call its `post_tool_call` approves
+  the proposal in Lite; a denial or a timeout blocks the call and keeps the
+  memory;
+- it names the Hermes install (the `install_id` file in the Hermes root,
+  read and never created) on `prepare` and `checkpoint`;
 - it settles every outcome, including the failure paths where Hermes never
   fires `on_session_end`;
 - it refuses compaction until `checkpoint` proves the session's turns;
@@ -214,6 +250,9 @@ There is no PSFN Gateway, satellite, fleet, shared world, shard, charge
 subsystem, wiki, skills, Discord or other channel adapter, CogSec intake
 pipeline, Garden, custody store, backup service or card importer. They were
 cut from the extracted tree in Steps B1-B7, along with the 17 tool surfaces
-whose factories were scaffolding. The absence test keeps them out of the
+whose factories were scaffolding. Step E1 removed those surfaces from the
+tool-surface registry too, with the `shard.long_horizon` automata class.
+Fatigue regulation is cut for the single companion and deferred, not
+dropped ([extraction](extraction.md#e5-fatigue-is-deferred-not-dropped)). The absence test keeps them out of the
 manifest, the lockfile, `node_modules`, every import, Lite's own names, and
 the deletion record of `packages/companion`.
