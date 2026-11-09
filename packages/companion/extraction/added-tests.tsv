@@ -1,0 +1,3 @@
+# Lite test files added to the companion project (not in the donor baseline). compare-baseline.mjs reports them separately; every test in them must pass.
+# file	reason
+src/app/agent/companion-runtime.boot.integration.test.ts	B6 boot proof for the seam 3.11 composition root (docs/extraction.md, B6): a turn through SubstrateAgent.handleMessage, the scheduler heartbeat, the registered lanes and no scaffolding schema, over PostgreSQL with the packages/pi adapters

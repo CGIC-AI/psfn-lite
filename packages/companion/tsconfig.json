@@ -28,9 +28,6 @@
     "dist",
     "**/*.test.ts",
     "**/*.test-fixtures.ts",
-    "src/app/agent/automata-background-work-lifecycle.ts",
-    "src/app/agent/scheduler-runtime.ts",
-    "src/app/agent/startup/free-time-lane.ts",
     "src/app/gateway/main.ts",
     "src/app/operator/main.ts"
   ]
