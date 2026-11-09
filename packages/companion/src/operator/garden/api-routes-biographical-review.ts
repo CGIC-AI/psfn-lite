@@ -1,0 +1,178 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
+import { sendJson } from '../../channels/backplane/http/primitives.js';
+import { parseAdminJsonBody } from './request-body.js';
+import { exactPath, paramWithSuffix, prefixedParamPath } from './route-matchers.js';
+import type { AdminAuditTimelineAppender, AdminBodyReader, AdminApiRoute } from './routes/types.js';
+import { ADMIN_DYNAMIC_JSON_HEADERS, ADMIN_POLLED_QUEUE_JSON_HEADERS } from './routes/shared.js';
+import type { GardenRequestContext } from './garden-request-context.js';
+import { parseRequestUrl } from './request-url.js';
+import {
+  AdminBiographicalReviewService,
+  BiographicalReviewError,
+  type AdminBiographicalClaimFilter,
+  type AdminBiographicalReviewActor,
+} from './services/biographical-review-service.js';
+
+const BIOGRAPHICAL_CLAIM_PREFIX = '/api/admin/biographical-claims/';
+const BIOGRAPHICAL_CLAIM_LIST_PATH = '/api/admin/biographical-claims';
+
+/**
+ * Subject-centered listing filter (o61vb.14). Exactly two canonical identity
+ * parameters are read; every other query parameter is ignored rather than
+ * becoming an unreviewed search surface over the biography store. Narrowing
+ * never widens authority: each returned row still passes the fleet
+ * subject-relation gate in the service.
+ */
+function claimListFilter(req: IncomingMessage): AdminBiographicalClaimFilter {
+  const query = parseRequestUrl(req, BIOGRAPHICAL_CLAIM_LIST_PATH).searchParams;
+  const contactId = query.get('subjectContactId');
+  const companionId = query.get('subjectCompanionId');
+  return {
+    ...(contactId !== null ? { subjectContactId: contactId } : {}),
+    ...(companionId !== null ? { subjectCompanionId: companionId } : {}),
+  };
+}
+
+function isAdminContext(
+  context: GardenRequestContext | undefined,
+  action: 'memory.read' | 'memory.manage',
+): context is Exclude<GardenRequestContext, { kind: 'public' }> {
+  if (context === undefined || context.kind === 'public') return false;
+  if (context.action !== action || context.authorization.action !== action) return false;
+  if (context.authorization.baseRole !== 'admin') return false;
+  if (context.kind === 'fleet_principal') {
+    return context.resource.companionId !== null
+      && (context.actor.role === 'owner' || context.actor.role === 'admin');
+  }
+  return true;
+}
+
+function reviewActor(context: GardenRequestContext | undefined): AdminBiographicalReviewActor | null {
+  if (!isAdminContext(context, 'memory.manage')) return null;
+  if (context.authorization.requirements.confirmation !== 'explicit') return null;
+  return context.kind === 'fleet_principal'
+    ? { kind: 'operator', authorityRef: `garden-fleet:${context.authorizationEventId}` }
+    : { kind: 'operator', authorityRef: 'garden-standalone:operator' };
+}
+
+function reviewErrorStatus(error: BiographicalReviewError): number {
+  if (error.reason === 'malformed') return 400;
+  if (error.reason === 'unauthorized') return 403;
+  if (error.reason === 'claim-not-found' || error.reason === 'grant-not-found') return 404;
+  // A store fault is not the operator's answer to retry differently
+  // (psfn-framework-bs9qz): 4xx here would tell them the claim was judged and
+  // refused, which is precisely what did not happen.
+  if (error.reason === 'portability-failed') return 503;
+  return 409;
+}
+
+function sendReviewError(res: ServerResponse, error: unknown): void {
+  if (error instanceof BiographicalReviewError) {
+    sendJson(res, reviewErrorStatus(error), { error: error.message, reason: error.reason });
+    return;
+  }
+  sendJson(res, 500, { error: 'Biographical review failed' });
+}
+
+export function buildAdminBiographicalReviewRoutes(options: {
+  service: AdminBiographicalReviewService | null;
+  withBody: AdminBodyReader;
+  appendAuditTimelineEntry?: AdminAuditTimelineAppender;
+}): AdminApiRoute[] {
+  const { service, withBody, appendAuditTimelineEntry } = options;
+  return [
+    {
+      method: 'GET',
+      match: exactPath(BIOGRAPHICAL_CLAIM_LIST_PATH),
+      handle: (req, res, _params, context) => {
+        if (!isAdminContext(context, 'memory.read')) {
+          sendJson(res, 403, { error: 'Admin memory-read authority is required' });
+          return;
+        }
+        if (service === null) {
+          sendJson(res, 503, { error: 'Biographical review persistence is unavailable' });
+          return;
+        }
+        service.listClaims(context, claimListFilter(req)).then(
+          result => sendJson(res, 200, result, ADMIN_POLLED_QUEUE_JSON_HEADERS),
+          error => sendReviewError(res, error),
+        );
+      },
+    },
+    {
+      method: 'GET',
+      match: prefixedParamPath(BIOGRAPHICAL_CLAIM_PREFIX, 'claimId', {
+        exclude: path => path.endsWith('/review'),
+      }),
+      handle: (_req, res, { claimId }, context) => {
+        if (!isAdminContext(context, 'memory.read')) {
+          sendJson(res, 403, { error: 'Admin memory-read authority is required' });
+          return;
+        }
+        if (!claimId) {
+          sendJson(res, 400, { error: 'claimId is required' });
+          return;
+        }
+        if (service === null) {
+          sendJson(res, 503, { error: 'Biographical review persistence is unavailable' });
+          return;
+        }
+        service.getClaim(claimId, context).then(
+          result => sendJson(res, 200, result, ADMIN_DYNAMIC_JSON_HEADERS),
+          error => sendReviewError(res, error),
+        );
+      },
+    },
+    {
+      method: 'POST',
+      match: paramWithSuffix(BIOGRAPHICAL_CLAIM_PREFIX, 'claimId', '/review'),
+      handle: (req: IncomingMessage, res: ServerResponse, { claimId }, context) => {
+        const actor = reviewActor(context);
+        if (actor === null) {
+          sendJson(res, 403, { error: 'Explicit admin memory-management authority is required' });
+          return;
+        }
+        if (!claimId) {
+          sendJson(res, 400, { error: 'claimId is required' });
+          return;
+        }
+        if (service === null) {
+          sendJson(res, 503, { error: 'Biographical review persistence is unavailable' });
+          return;
+        }
+        withBody(req, res, body => {
+          const parsed = parseAdminJsonBody(body);
+          if (!parsed.ok) {
+            appendAuditTimelineEntry?.(
+              'memory_mutation',
+              'denied',
+              'Biographical claim review rejected malformed JSON.',
+              [`claimId=${claimId}`],
+              'operator',
+              context,
+            );
+            sendJson(res, 400, { error: parsed.error });
+            return;
+          }
+          service.review(claimId, parsed.value, actor, context).then(
+            result => sendJson(res, 200, result, ADMIN_DYNAMIC_JSON_HEADERS),
+            error => {
+              if (error instanceof BiographicalReviewError && error.reason === 'malformed') {
+                appendAuditTimelineEntry?.(
+                  'memory_mutation',
+                  'denied',
+                  'Biographical claim review rejected a malformed action.',
+                  [`claimId=${claimId}`],
+                  'operator',
+                  context,
+                );
+              }
+              sendReviewError(res, error);
+            },
+          );
+        });
+      },
+    },
+  ];
+}

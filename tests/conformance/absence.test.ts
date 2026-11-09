@@ -343,9 +343,10 @@ describe('the donor scaffolding cut from packages/companion stays gone', () => {
   const deleted = deletedScaffolding(readFileSync(join(REPO, VENDORED_FILES), 'utf8'));
 
   it('no deleted file exists', () => {
-    // The B7 record: 732 scaffolding, 26 cut, 2 source-text, 1 test-support, 23 asset and 11 seed rows.
+    // The B7 record: 732 scaffolding, 26 cut, 2 source-text, 1 test-support, 23 asset and 11 seed rows,
+    // less the 24 scaffolding rows seam S8 re-vendored as kind garden (769 rows).
     // A truncated listing must not pass.
-    expect(deleted.length).toBeGreaterThan(790);
+    expect(deleted.length).toBeGreaterThan(760);
     expect(new Set(deleted).size).toBe(deleted.length);
     expect(deleted.filter((path) => existsSync(join(REPO, COMPANION, path)))).toEqual([]);
   });
