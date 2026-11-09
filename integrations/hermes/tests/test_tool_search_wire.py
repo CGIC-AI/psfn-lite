@@ -190,6 +190,10 @@ def test_a_forced_step_forces_the_bridge_to_the_lite_tool_without_thinking_and_t
     # The "no more tools" step: no tools at all (the donor's buildPiContext), so nothing can be written as a call.
     assert not TOOL_FIELDS & set(last)
     assert last["thinking"] == {"type": "enabled"}  # the next, unforced call thinks again
+    # ...and DeepSeek in thinking mode requires reasoning_content on every earlier tool-call turn (HTTP 400 without it);
+    # the forced call ran without thinking, so Hermes pads it (agent/message_sanitization.py reapply_reasoning_echo).
+    [replayed] = [m for m in last["messages"] if m.get("role") == "assistant" and m.get("tool_calls")]
+    assert isinstance(replayed.get("reasoning_content"), str) and replayed["reasoning_content"]
     assert result["final_response"] == "Your first value is Kindness."
     [settled] = bridge.bodies("settle")
     assert settled["outcome"]["kind"] == "completed" and settled["outcome"]["reply"] == "Your first value is Kindness."

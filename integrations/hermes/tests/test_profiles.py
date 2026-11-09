@@ -218,3 +218,32 @@ def test_a_profile_that_did_not_select_the_plugin_is_left_alone_and_a_misconfigu
         sys.modules[f"{package}.runtime"]._drivers.clear()
     [closed] = fire_in(homes["a"], "pre_tool_call", secrets, tool_name="mcp__github__search", args={}, session_id="x", turn_id="x:t", tool_call_id="c2")
     assert closed["action"] == "block" and "not usable" in closed["message"]
+
+
+@pytest.mark.skipif("not gateway_line()", reason="per-profile MCP tool scopes are the 2bd378e gateway's")
+def test_a_deferred_lite_tool_registered_for_its_profile_is_forced_from_that_profiles_turn(gateway):
+    """Under multiplexing each profile's MCP tools sit in its own registry scope (tools/mcp_tool_registration.py
+    _register_candidates); the forced bridge reads the tool's schema as Hermes's own validator does, from the turn's home."""
+    from hermes_cli.middleware import apply_llm_request_middleware
+    from tools.registry import registry
+
+    homes, bridges = gateway
+    secrets = {CREDENTIAL_ENV: LITE_A}
+    schema = {"type": "object", "properties": {"action": {"type": "string"}}, "required": ["action"]}
+    bridges["a"].first_choice = {"kind": "tool", "name": "orient", "parameters": None}
+    registry.register(name="mcp__psfn_lite__orient", toolset="mcp-psfn_lite", schema={"name": "mcp__psfn_lite__orient", "description": "Orient.", "parameters": schema},
+                      handler=lambda args, **_: "{}", scope=str(homes["a"]))
+    try:
+        load(homes["a"], secrets)
+        fire_in(homes["a"], "pre_llm_call", secrets, **root_turn("sa"))
+        call = {"type": "object", "properties": {"calls": {"type": "array", "items": {"type": "object"}}}, "required": ["calls"]}
+        request = {"model": "m", "messages": [], "tools": [{"type": "function", "function": {"name": "tool_call", "description": "d", "parameters": call}}]}
+        with profile_turn(homes["a"], secrets):
+            forced = apply_llm_request_middleware(request, task_id="task", turn_id="sa:t", api_request_id="r", session_id="sa", platform=CLI["platform"],
+                                                  model="m", provider="p", base_url="http://127.0.0.1:1/v1", api_mode="chat_completions", api_call_count=1).payload
+        [bridge] = forced["tools"]
+        item = bridge["function"]["parameters"]["properties"]["calls"]["items"]
+        assert item["properties"]["name"]["enum"] == ["mcp__psfn_lite__orient"] and item["properties"]["arguments"] == schema
+        assert forced["tool_choice"] == "required"
+    finally:
+        registry.deregister("mcp__psfn_lite__orient", scope=str(homes["a"]))

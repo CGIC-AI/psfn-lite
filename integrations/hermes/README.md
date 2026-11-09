@@ -324,13 +324,15 @@ exact commands, see `docs/development.md`.
   chat-completions server that records each request as it arrives over
   HTTP: the forced step offers only the narrowed `tool_call`, required,
   with thinking disabled; the Lite tool runs; the next step carries no
-  tools.
+  tools, thinks again and replays the tool-call turn with the
+  `reasoning_content` DeepSeek requires.
 - `test_profiles.py` runs two Lite profiles and one non-Lite profile in one
   process, as the 2bd378e gateway does (home override and profile secret
   scope per turn, multiplexing on): hooks, host instance and credential per
   profile, one install id, the CLI's `cli` / `uid:<uid>` sender (read from
-  the gateway's own `platform_key` mapping and its control socket), and a
-  non-Lite profile left alone.
+  the gateway's own `platform_key` mapping and its control socket), a Lite
+  tool in one profile's registry scope forced through the bridge from that
+  profile's turn, and a non-Lite profile left alone.
 - `test_e2e_lite.py` runs Hermes's real MCP client and the plugin against
   a real Lite runtime over a throwaway Postgres
   (`tests/hermes/fixtures/lite-host.ts`, the conformance host). It covers:
