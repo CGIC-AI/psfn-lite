@@ -122,9 +122,9 @@ describe.skipIf(dockerTestsOptedOut('lifecycle host-driven turns'))('host-driven
     expect(prepared.body).toMatchObject({ kind: 'prepared' });
     const turnId = prepared.body['turnId'] as string;
     // The first model call must be exactly one orient call, as the donor's provider client forced it.
-    expect((prepared.body['context'] as { toolChoice: unknown }).toolChoice).toEqual({ kind: 'tool', name: 'orient' });
+    expect((prepared.body['context'] as { toolChoice: unknown }).toolChoice).toEqual({ kind: 'tool', name: 'orient', parameters: null });
     const choice = (hostInstance: string, id: string) => bridge(w, 'tool-choice', operator, { hostInstance, turnId: id });
-    expect((await choice('hermes-1', turnId)).body).toEqual({ toolChoice: { kind: 'tool', name: 'orient' } });
+    expect((await choice('hermes-1', turnId)).body).toEqual({ toolChoice: { kind: 'tool', name: 'orient', parameters: null } });
     expect((await choice('hermes-9', turnId)).status).toBe(403);
     expect((await bridge(w, 'tool-choice', w.credentials['hermes-friend'], { hostInstance: 'hermes-1', turnId })).status).toBe(404);
 

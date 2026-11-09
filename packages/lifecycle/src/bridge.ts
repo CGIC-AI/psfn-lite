@@ -233,11 +233,11 @@ export class HostTurnBridge {
    * with tool_choice, which the host applies to its own model. Only the host
    * instance that prepared the turn asks; an ended turn is not found.
    */
-  toolChoice(principal: string, hostInstance: string, turnId: string): Result<{ readonly toolChoice: HostToolChoice }> {
+  async toolChoice(principal: string, hostInstance: string, turnId: string): Promise<Result<{ readonly toolChoice: HostToolChoice }>> {
     const turn = this.options.relay.open().find((candidate) => candidate.turnId === turnId);
     if (turn === undefined || !this.ownedBy(principal, turn)) return notFound('turn');
     if (turn.owner !== `${principal}/${hostInstance}`) return denied('not_turn_owner', 'only the host instance that prepared the turn asks for its tool choice');
-    return ok({ toolChoice: turn.toolChoice });
+    return ok({ toolChoice: await turn.toolChoice() });
   }
 
   /** A host tool call, run by the donor's loop as the model's tool call of the principal's open turn. */
