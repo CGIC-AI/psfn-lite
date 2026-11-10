@@ -133,10 +133,11 @@ async function run(args: Args, runtime: LiteRuntime, io: CliIo): Promise<number>
 
 /** Runs the companion and the configured transports until Ctrl-C; an external host drives its turns. */
 async function serve(runtime: LiteRuntime, io: CliIo): Promise<number> {
-  const { mcpUrl, lifecycleUrl, gardenUrl } = runtime.transports;
+  const { mcpUrl, lifecycleUrl, gardenUrl, conversationUrl } = runtime.transports;
   if (mcpUrl !== null) io.stdout(`mcp ${mcpUrl}\n`);
   if (lifecycleUrl !== null) io.stdout(`lifecycle ${lifecycleUrl}\n`);
   if (gardenUrl !== null) io.stdout(`garden ${gardenUrl}\n`);
+  if (conversationUrl !== null) io.stdout(`conversation ${conversationUrl}\n`);
   await new Promise<void>((resolve) => {
     const unsubscribe = io.onInterrupt(() => {
       unsubscribe();

@@ -39,6 +39,8 @@ export function liteConfigDocument(dataDir: string, companionId: string) {
     lifecycle: null as Record<string, unknown> | null,
     // Left out (undefined), no light Garden is mounted.
     garden: undefined as Record<string, unknown> | undefined,
+    // Left out (undefined), no conversation transport is mounted.
+    conversation: undefined as Record<string, unknown> | undefined,
   };
 }
 

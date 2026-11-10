@@ -25,6 +25,7 @@ and documents are the spec. That earlier core (`packages/core`,
 | Embeddings | `packages/companion` | The donor's own embedding providers (`src/faculties/memory/embedding.ts`), which the core builds from the substrate config: `transformers` (in-process `@huggingface/transformers`, local and keyless, the default), `ollama` or `api` (docs/extraction.md, "Donor embedding providers restored"). |
 | Tool transport | `packages/mcp` | MCP over streamable HTTP or stdio. It serves the donor tool catalog and binds the caller from the transport credential. |
 | Operator surface | `packages/operator` | The light Garden: the donor Garden routes and services of its eight screens, plus Lite routes for what no kept donor route serves, on a loopback port behind the operator's own bearer ([extraction](extraction.md), "S8: the light Garden"). |
+| Conversation transport | `packages/conversation` | Donor-driven turns of the operator's own conversation over HTTP (`turns`, `interrupt`), and a server-sent stream of what the companion sends on her own, for a host that carries the operator's words to her (a voice pipeline, a chat bridge). Loopback unless opted out, behind its own bearer bound to the primary contact. |
 | Lifecycle bridge | `packages/lifecycle` | Host-driven turns for an external host that runs its own model loop: `prepare`, `settle`, `checkpoint`, and the host tool port the MCP transport hands calls to. |
 | Standalone host | `apps/standalone` | The config document, the CLI (`init`, `once`, `chat`, `serve`) and the composition of the parts above. |
 | Hermes plugin | `integrations/hermes` | A Python Hermes plugin that turns every root Hermes turn into a host-driven Lite turn ([its README](../integrations/hermes/README.md)). It also ships the light Garden: a dashboard backend that proxies to the operator surface, and a Hermes Desktop half built from `integrations/hermes/desktop`. |
@@ -146,6 +147,13 @@ lifecycle bridge still gives it a donor turn:
 5. `checkpoint` reports each named turn as `settled` (in the donor's
    archive) or `open`, so a host can refuse to compact history Lite has not
    recorded.
+
+The conversation transport (`packages/conversation`) carries donor-driven
+turns for another process: `POST /conversation/v1/turns` runs the turn `chat`
+would run, on the operator's terminal channel, one at a time, and
+`/conversation/v1/events` streams the donor's outbound sender from an
+in-memory bounded log a reader can resume. The host supplies only the
+operator's words.
 
 Both kinds are turns of the same donor session when they use the same
 channel. The conformance suite drives the Pi side on the operator's Hermes

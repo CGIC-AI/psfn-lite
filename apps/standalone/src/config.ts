@@ -140,6 +140,27 @@ export interface LiteConfig {
     readonly recentTurnLimit: number;
     readonly bindings: readonly unknown[];
   } | null;
+  /**
+   * The conversation transport (packages/conversation), or null for none:
+   * donor-driven turns of the operator's own conversation over HTTP, and the
+   * stream of what the companion sends on her own, for a host that carries
+   * the operator's words to her (a voice pipeline, a chat bridge). The turns
+   * are the ones `chat` runs, on the same channel. It listens on its own
+   * port, loopback unless `allowedHosts` opts in to a wider address. Its
+   * bindings use the MCP binding format; every one must name the primary
+   * contact (`operator`), and none may reuse an MCP or Garden credential or
+   * principal. A turn reads a body of at most `maxBodyBytes`, and the
+   * outbound log holds the last `outboxCapacity` messages for a host that
+   * connects late or reconnects.
+   */
+  readonly conversation: {
+    readonly host: string;
+    readonly port: number;
+    readonly allowedHosts: readonly string[] | null;
+    readonly maxBodyBytes: number;
+    readonly outboxCapacity: number;
+    readonly bindings: readonly unknown[];
+  } | null;
 }
 
 export const TRUST_LEVELS: readonly TrustLevel[] = ['primary', 'trusted', 'regular', 'public'];
@@ -204,7 +225,7 @@ class Reader {
 
 const ROOT_KEYS = ['companionId', 'dataDir', 'workspaceDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'sessionIntegrity', 'mcp', 'lifecycle'];
 /** Settings with a donor default when left out. */
-const OPTIONAL_ROOT_KEYS = ['embedding', 'garden'];
+const OPTIONAL_ROOT_KEYS = ['embedding', 'garden', 'conversation'];
 /** The donor's embedding provider kinds (faculties/memory/embedding.ts `EmbeddingProviderKind`). */
 export const EMBEDDING_PROVIDER_KINDS = ['transformers', 'ollama', 'api'] as const;
 
@@ -260,9 +281,10 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   if (lifecycle !== null && mcp === null) issues.push('lifecycle needs mcp: the bridge shares its principal bindings');
   if (mcp !== null && lifecycle === null) issues.push('mcp needs lifecycle: companion tools run only inside host-driven turns');
   const garden = parseGarden(root, issues);
+  const conversation = parseConversation(root, issues);
 
   if (issues.length > 0) return invalid(...issues);
-  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle, garden });
+  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle, garden, conversation });
 }
 
 /**
@@ -356,6 +378,20 @@ function parseGarden(root: Reader, issues: string[]): LiteConfig['garden'] {
     ...listen(r, issues, 'garden'),
     maxBodyBytes: r.integer('maxBodyBytes', 1_024, 16 * 1_024 * 1_024),
     recentTurnLimit: r.integer('recentTurnLimit', 1, 500),
+    bindings: Array.isArray(bindings) ? bindings : [],
+  };
+}
+
+function parseConversation(root: Reader, issues: string[]): LiteConfig['conversation'] {
+  const value = root.value('conversation');
+  if (value === undefined || value === null) return null;
+  const r = root.child('conversation', ['host', 'port', 'allowedHosts', 'maxBodyBytes', 'outboxCapacity', 'bindings']);
+  const bindings = r.value('bindings');
+  if ((!Array.isArray(bindings) || bindings.length === 0) && bindings !== undefined) issues.push('conversation.bindings must be a non-empty list of principal bindings');
+  return {
+    ...listen(r, issues, 'conversation'),
+    maxBodyBytes: r.integer('maxBodyBytes', 1_024, 16 * 1_024 * 1_024),
+    outboxCapacity: r.integer('outboxCapacity', 1, 100_000),
     bindings: Array.isArray(bindings) ? bindings : [],
   };
 }

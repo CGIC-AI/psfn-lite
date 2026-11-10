@@ -83,6 +83,7 @@ const MCP_MANIFEST = manifest('packages/mcp');
 const LIFECYCLE_MANIFEST = manifest('packages/lifecycle');
 const PI_MANIFEST = manifest('packages/pi');
 const OPERATOR_MANIFEST = manifest('packages/operator');
+const CONVERSATION_MANIFEST = manifest('packages/conversation');
 const STANDALONE_MANIFEST = manifest('apps/standalone');
 
 const RULES: Readonly<Record<string, HostRules>> = {
@@ -114,6 +115,13 @@ const RULES: Readonly<Record<string, HostRules>> = {
     dependencies: Object.keys(OPERATOR_MANIFEST.dependencies ?? {}),
     dependencySite: null,
   },
+  conversation: {
+    own: 'packages/conversation/src/',
+    entries: { 'packages/mcp/src/index.ts': 'packages/conversation/src/mcp.ts' },
+    companionShim: null,
+    dependencies: Object.keys(CONVERSATION_MANIFEST.dependencies ?? {}),
+    dependencySite: null,
+  },
   standalone: {
     own: 'apps/standalone/src/',
     entries: {
@@ -121,6 +129,7 @@ const RULES: Readonly<Record<string, HostRules>> = {
       'packages/mcp/src/index.ts': 'apps/standalone/src/mcp.ts',
       'packages/lifecycle/src/index.ts': 'apps/standalone/src/lifecycle.ts',
       'packages/operator/src/index.ts': 'apps/standalone/src/operator.ts',
+      'packages/conversation/src/index.ts': 'apps/standalone/src/conversation.ts',
     },
     companionShim: 'apps/standalone/src/companion.ts',
     dependencies: Object.keys(STANDALONE_MANIFEST.dependencies ?? {}),
@@ -133,6 +142,7 @@ const DIRS: Readonly<Record<string, string>> = {
   lifecycle: 'packages/lifecycle/src',
   pi: 'packages/pi/src',
   operator: 'packages/operator/src',
+  conversation: 'packages/conversation/src',
   standalone: 'apps/standalone/src',
 };
 
@@ -144,7 +154,7 @@ describe('host adapter import boundaries', () => {
   });
 
   it('pins every declared dependency exactly, at the root manifest version', () => {
-    for (const pkg of [MCP_MANIFEST, LIFECYCLE_MANIFEST, PI_MANIFEST, OPERATOR_MANIFEST, STANDALONE_MANIFEST]) {
+    for (const pkg of [MCP_MANIFEST, LIFECYCLE_MANIFEST, PI_MANIFEST, OPERATOR_MANIFEST, CONVERSATION_MANIFEST, STANDALONE_MANIFEST]) {
       for (const [name, version] of Object.entries(pkg.dependencies ?? {})) {
         expect(version, `${pkg.name} ${name}`).toMatch(/^\d+\.\d+\.\d+$/);
         expect(ROOT_MANIFEST.dependencies?.[name], `${pkg.name} ${name}`).toBe(version);
@@ -154,6 +164,7 @@ describe('host adapter import boundaries', () => {
     expect(PI_MANIFEST.dependencies).toEqual({ '@earendil-works/pi-ai': '0.84.1' });
     expect(LIFECYCLE_MANIFEST.dependencies).toBeUndefined();
     expect(OPERATOR_MANIFEST.dependencies).toBeUndefined();
+    expect(CONVERSATION_MANIFEST.dependencies).toBeUndefined();
     expect(STANDALONE_MANIFEST.dependencies).toBeUndefined();
   });
 
@@ -165,6 +176,8 @@ describe('host adapter import boundaries', () => {
     ['lifecycle', 'an undeclared package', 'packages/lifecycle/src/x.ts', "import { createServer } from 'express';", 'not a declared dependency'],
     ['operator', 'a companion module outside its shim', 'packages/operator/src/x.ts', "import '../../companion/src/operator/garden/services/memory-service.js';", 'must be reached through packages/operator/src/companion.ts'],
     ['operator', 'the lifecycle bridge', 'packages/operator/src/x.ts', "import '../../lifecycle/src/index.ts';", 'host packages import only public entries'],
+    ['conversation', 'the companion core', 'packages/conversation/src/x.ts', "import '../../companion/src/core/agent/substrate-agent.js';", 'which this package may not import'],
+    ['conversation', 'a deep MCP import', 'packages/conversation/src/x.ts', "import { bearerCredential } from '../../mcp/src/credentials.ts';", 'host packages import only public entries'],
     ['mcp', 'the companion core', 'packages/mcp/src/x.ts', "import '../../companion/src/core/agent/substrate-agent.js';", 'which this package may not import'],
     ['mcp', 'an undeclared look-alike', 'packages/mcp/src/x.ts', "import '@modelcontextprotocol/server-extra';", 'not a declared dependency'],
     ['pi', 'the companion core', 'packages/pi/src/x.ts', "import '../../companion/src/primitives/llm/provider-runtime.js';", 'which this package may not import'],
@@ -183,7 +196,7 @@ describe('host adapter import boundaries', () => {
     expect(files.length).toBeGreaterThan(1000);
     for (const file of files) {
       const { specifiers } = collectSpecifiers(file.path, file.text);
-      const host = specifiers.filter((s) => /(^|\/)(mcp|lifecycle|pi|operator|standalone)\/src\//.test(s) || s.includes('apps/'));
+      const host = specifiers.filter((s) => /(^|\/)(mcp|lifecycle|pi|operator|conversation|standalone)\/src\//.test(s) || s.includes('apps/'));
       expect(host, file.path).toEqual([]);
     }
   });

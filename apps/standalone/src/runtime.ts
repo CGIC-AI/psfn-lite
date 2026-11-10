@@ -59,6 +59,7 @@ import {
 } from './pi.ts';
 import { createModelUsageLedger, type ModelUsageSnapshot } from './model-usage.ts';
 import { composeGardenServices, startGardenServer, type GardenErrorReport, type GardenServer } from './operator.ts';
+import { createConversationOutbox, startConversationServer, type ConversationErrorReport, type ConversationServer } from './conversation.ts';
 import { buildSubstrateConfig } from './substrate-config.ts';
 
 /** The contact key of the configured operator. */
@@ -73,6 +74,7 @@ export type LiteDiagnostic =
   | { readonly kind: 'mcp'; readonly report: McpErrorReport }
   | { readonly kind: 'lifecycle'; readonly report: LifecycleErrorReport }
   | { readonly kind: 'garden'; readonly report: GardenErrorReport }
+  | { readonly kind: 'conversation'; readonly report: ConversationErrorReport }
   | { readonly kind: 'automata'; readonly event: HostedAutomataEvent }
   | { readonly kind: 'host_turn_timeout'; readonly turnId: string };
 
@@ -91,7 +93,7 @@ export interface LiteRuntime {
   readonly contactIds: ReadonlyMap<string, string>;
   /** The host-driven turn bridge; null without a lifecycle config. */
   readonly bridge: HostTurnBridge | null;
-  readonly transports: { readonly mcpUrl: string | null; readonly lifecycleUrl: string | null; readonly gardenUrl: string | null };
+  readonly transports: { readonly mcpUrl: string | null; readonly lifecycleUrl: string | null; readonly gardenUrl: string | null; readonly conversationUrl: string | null };
   /** One operator turn in the operator's terminal conversation, through the donor SubstrateAgent. */
   converse(text: string): Promise<AgentResponse>;
   /** Aborts the operator's running turn (donor SubstrateAgent.abort). */
@@ -162,6 +164,10 @@ export async function createLiteRuntime(input: {
   if (unknownContacts.length > 0) return invalid(...unknownContacts.map((b) => `binding ${b.principal} names an unknown contact ${b.contact}`));
   const gardenBindings = loadGardenBindings(config, env);
   if (!gardenBindings.ok) return gardenBindings;
+  const conversationBindings = loadConversationBindings(config, env);
+  if (!conversationBindings.ok) return conversationBindings;
+  // What the companion sends on her own, from her first moment: the log exists before she starts.
+  const outbox = config.conversation === null ? null : createConversationOutbox({ capacity: config.conversation.outboxCapacity, epoch: createTurnId() });
 
   let sessionIntegrityProvider: StartCompanionRuntimeOptions['sessionIntegrityProvider'] = null;
   if (config.sessionIntegrity.kind === 'keyring') {
@@ -218,6 +224,7 @@ export async function createLiteRuntime(input: {
       outboundSender: {
         send: (channelId, content) => {
           onDiagnostic({ kind: 'outbound', channelId, content });
+          outbox?.publish(channelId, content);
           return Promise.resolve();
         },
       },
@@ -353,28 +360,58 @@ export async function createLiteRuntime(input: {
   }
 
   const operatorContact = contactIds.get(OPERATOR_CONTACT) ?? '';
+  const converse = (text: string): Promise<AgentResponse> =>
+    companion.agentLoop.handleMessage({
+      id: `cli:${createTurnId()}`,
+      channelId: operatorChannelId(config),
+      channelType: 'terminal',
+      authorId: config.operator.userId,
+      authorName: config.operator.displayName,
+      content: text,
+      timestamp: new Date(),
+      isDirectMessage: true,
+      routing: { canonicalContactId: operatorContact },
+    });
+  const interrupt = (): void => {
+    companion.agentLoop.abort();
+  };
+
+  // The conversation transport: the operator's own conversation for a host that carries their words (packages/conversation).
+  let conversationUrl: string | null = null;
+  if (conversationBindings.value !== null && config.conversation !== null && outbox !== null) {
+    const conversation: Result<ConversationServer> = await startConversationServer({
+      port: {
+        converse: async (message) => {
+          const response = await converse(message);
+          return { reply: response.content, channelId: response.channelId };
+        },
+        interrupt,
+      },
+      outbox,
+      identify: conversationBindings.value.identify,
+      listenPort: config.conversation.port,
+      listenHost: config.conversation.host,
+      ...(config.conversation.allowedHosts === null ? {} : { exposeBeyondLoopback: { allowedHosts: config.conversation.allowedHosts } }),
+      maxBodyBytes: config.conversation.maxBodyBytes,
+      onError: (report) => onDiagnostic({ kind: 'conversation', report }),
+    });
+    if (!conversation.ok) {
+      await closeAll();
+      return conversation;
+    }
+    opened.push(conversation.value);
+    conversationUrl = conversation.value.url;
+  }
+
   let closed: Promise<void> | null = null;
   return ok({
     config,
     companion,
     contactIds,
     bridge,
-    transports: { mcpUrl, lifecycleUrl, gardenUrl },
-    converse: (text) =>
-      companion.agentLoop.handleMessage({
-        id: `cli:${createTurnId()}`,
-        channelId: operatorChannelId(config),
-        channelType: 'terminal',
-        authorId: config.operator.userId,
-        authorName: config.operator.displayName,
-        content: text,
-        timestamp: new Date(),
-        isDirectMessage: true,
-        routing: { canonicalContactId: operatorContact },
-      }),
-    interrupt: () => {
-      companion.agentLoop.abort();
-    },
+    transports: { mcpUrl, lifecycleUrl, gardenUrl, conversationUrl },
+    converse,
+    interrupt,
     modelUsage: () => modelUsage.snapshot(),
     close: () => (closed ??= closeAll()),
   });
@@ -395,6 +432,26 @@ function loadGardenBindings(config: LiteConfig, env: Readonly<Record<string, str
   if (config.mcp !== null) {
     const together = loadPrincipalBindings([...config.mcp.bindings, ...config.garden.bindings], env);
     if (!together.ok) return invalid(...prefixed('garden and mcp together', together.error));
+  }
+  return bindings;
+}
+
+/**
+ * The conversation transport's principal bindings. Each is bound to the
+ * primary contact, whose conversation it carries, and none shares a
+ * credential or principal with the MCP transport or the Garden: loading the
+ * lists together refuses a shared one.
+ */
+function loadConversationBindings(config: LiteConfig, env: Readonly<Record<string, string | undefined>>): Result<McpPrincipalBindings | null> {
+  if (config.conversation === null) return ok(null);
+  const bindings = loadPrincipalBindings(config.conversation.bindings, env);
+  if (!bindings.ok) return invalid(...prefixed('conversation', bindings.error));
+  const strangers = bindings.value.bindings.filter((b) => b.contact !== OPERATOR_CONTACT);
+  if (strangers.length > 0) return invalid(...strangers.map((b) => `conversation binding ${b.principal} must name the primary contact ${OPERATOR_CONTACT}, not ${b.contact}`));
+  const others = [...(config.mcp?.bindings ?? []), ...(config.garden?.bindings ?? [])];
+  if (others.length > 0) {
+    const together = loadPrincipalBindings([...others, ...config.conversation.bindings], env);
+    if (!together.ok) return invalid(...prefixed('conversation with mcp and garden', together.error));
   }
   return bindings;
 }

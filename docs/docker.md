@@ -73,6 +73,9 @@ transport listens when `lite.json` configures it.
 | 8788 | `lifecycle` | the Hermes plugin's lifecycle bridge |
 | 8789 | `garden` | the light Garden (the Hermes dashboard proxy) |
 
+The conversation transport (`conversation` in `lite.json`) has no published
+port here; a host on the compose network reaches it by service name.
+
 Inside the container a transport must bind `0.0.0.0` to be reachable through
 the published port, and each transport refuses a non-loopback bind unless
 `allowedHosts` lists the Host names it serves. So every block uses:

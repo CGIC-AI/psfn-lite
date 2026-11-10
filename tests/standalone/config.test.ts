@@ -133,6 +133,26 @@ describe('standalone configuration', () => {
     ]);
   });
 
+  it('reads the conversation transport block strictly, and leaves it off without one', () => {
+    expect(parseLiteConfig(document())).toMatchObject({ ok: true, value: { conversation: null } });
+    const conversation = {
+      host: '127.0.0.1',
+      port: 0,
+      allowedHosts: null,
+      maxBodyBytes: 65_536,
+      outboxCapacity: 64,
+      bindings: [{ principal: 'voice-host', credential: { env: 'CONVERSATION_TOKEN' }, contact: 'operator' }],
+    };
+    const parsed = parseLiteConfig({ ...document(), conversation });
+    if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
+    expect(parsed.value.conversation).toEqual(conversation);
+    expect(issuesOf({ ...document(), conversation: { ...conversation, outboxCapacity: 0, bindings: [], stream: true } })).toEqual([
+      'conversation.stream is not a known setting',
+      'conversation.bindings must be a non-empty list of principal bindings',
+      'conversation.outboxCapacity must be an integer from 1 to 100000',
+    ]);
+  });
+
   it('reads secrets from the named environment variables and names a missing one without its value', () => {
     const parsed = parseLiteConfig({ ...document(), model: { ...document().model, apiKeyEnv: 'LITE_MODEL_KEY' } });
     if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));

@@ -21,7 +21,9 @@ COPY packages ./packages
 
 # The data and workspace roots, owned by the unprivileged user so that named
 # volumes mounted there start out writable.
-RUN mkdir -p /var/lib/psfn-lite/data /var/lib/psfn-lite/workspace \
+# data/models is its own directory so that a volume shared between several
+# companions' containers can be mounted over it (the local model cache).
+RUN mkdir -p /var/lib/psfn-lite/data/models /var/lib/psfn-lite/workspace \
   && chown -R node:node /var/lib/psfn-lite
 USER node
 

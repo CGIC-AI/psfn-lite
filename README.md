@@ -28,6 +28,9 @@ Around it, Lite has host adapters only:
 - `packages/lifecycle`: host-driven turns for a host with its own model
   loop. The donor assembles the context, runs every tool call and archives
   the turn, and the host supplies the model's answers.
+- `packages/conversation`: the operator's own conversation over HTTP, for
+  a host that carries their words to the companion (voice, chat bridges).
+  The companion runs each turn herself.
 - `packages/pi`: the Pi model runtime, and the adapter for a host that
   supplies its own embedding port.
 - `integrations/hermes`: the Hermes plugin, which makes every root Hermes
