@@ -180,13 +180,18 @@ async function turn(req: IncomingMessage, res: ServerResponse, state: ServeState
     return reply(res, 200, { reply: answer.reply, channelId: answer.channelId });
   } catch (error) {
     // A turn the host itself stopped did not fail; it has no reply.
-    if (state.interrupted) return reply(res, 409, { error: 'interrupted' });
+    if (wasInterrupted(state)) return reply(res, 409, { error: 'interrupted' });
     // The failure text is the operator's; the caller learns only that the turn failed.
     options.onError({ route, principal, error: { kind: 'turn_failed', message: error instanceof Error ? error.message : 'non-error thrown' } });
     return reply(res, 502, { error: 'turn_failed' });
   } finally {
     state.running = false;
   }
+}
+
+/** Read through a call: `/interrupt` sets the flag from another request while the turn is awaited. */
+function wasInterrupted(state: ServeState): boolean {
+  return state.interrupted;
 }
 
 function events(req: IncomingMessage, res: ServerResponse, state: ServeState, url: URL): void {
