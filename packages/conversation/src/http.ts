@@ -17,7 +17,9 @@
  * - `POST /turns`      `{ "message": string }` -> `{ "reply", "channelId" }`. One
  *                      turn runs at a time (the donor runs one agent at a time);
  *                      a second one is refused with 409 `turn_in_progress`.
- * - `POST /interrupt`  aborts the running turn -> `{ "interrupted": boolean }`.
+ * - `POST /interrupt`  aborts the running turn -> `{ "interrupted": boolean }`. The
+ *                      aborted turn's own request then ends with 409 `interrupted`,
+ *                      unless the companion still completed it.
  * - `GET  /events`     server-sent events of what the companion sends on her
  *                      own. `?after=<seq>` (or `Last-Event-ID`) with `?epoch=`
  *                      resumes; a `hello` event names the log's epoch and the
@@ -78,7 +80,7 @@ export async function startConversationServer(options: ConversationServerOptions
   }
   if (options.exposeBeyondLoopback?.allowedHosts.length === 0) return invalid('exposeBeyondLoopback needs at least one allowed Host');
   const allowedHosts = options.exposeBeyondLoopback === undefined ? null : new Set(options.exposeBeyondLoopback.allowedHosts.map((h) => h.toLowerCase()));
-  const state: ServeState = { options, allowedHosts, running: false, streams: new Set() };
+  const state: ServeState = { options, allowedHosts, running: false, interrupted: false, streams: new Set() };
 
   const server = createServer((req, res) => {
     void serve(req, res, state);
@@ -103,6 +105,8 @@ interface ServeState {
   readonly options: ConversationServerOptions;
   readonly allowedHosts: ReadonlySet<string> | null;
   running: boolean;
+  /** The running turn was asked to stop through `/interrupt`. */
+  interrupted: boolean;
   /** Ends each open event stream. */
   readonly streams: Set<() => void>;
 }
@@ -131,7 +135,10 @@ async function serve(req: IncomingMessage, res: ServerResponse, state: ServeStat
         return await turn(req, res, state, route, principal);
       case `POST ${CONVERSATION_PATH}/interrupt`: {
         const interrupted = state.running;
-        if (interrupted) options.port.interrupt();
+        if (interrupted) {
+          state.interrupted = true;
+          options.port.interrupt();
+        }
         return reply(res, 200, { interrupted });
       }
       case `GET ${CONVERSATION_PATH}/events`:
@@ -167,10 +174,13 @@ async function turn(req: IncomingMessage, res: ServerResponse, state: ServeState
   if (issues.length > 0 || !isRecord(raw)) return reply(res, 400, { error: 'invalid', issues });
   if (state.running) return reply(res, 409, { error: 'turn_in_progress' });
   state.running = true;
+  state.interrupted = false;
   try {
     const answer = await options.port.converse(raw['message'] as string);
     return reply(res, 200, { reply: answer.reply, channelId: answer.channelId });
   } catch (error) {
+    // A turn the host itself stopped did not fail; it has no reply.
+    if (state.interrupted) return reply(res, 409, { error: 'interrupted' });
     // The failure text is the operator's; the caller learns only that the turn failed.
     options.onError({ route, principal, error: { kind: 'turn_failed', message: error instanceof Error ? error.message : 'non-error thrown' } });
     return reply(res, 502, { error: 'turn_failed' });

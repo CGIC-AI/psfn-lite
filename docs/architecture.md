@@ -150,7 +150,8 @@ lifecycle bridge still gives it a donor turn:
 
 The conversation transport (`packages/conversation`) carries donor-driven
 turns for another process: `POST /conversation/v1/turns` runs the turn `chat`
-would run, on the operator's terminal channel, one at a time, and
+would run, on the operator's terminal channel, one at a time
+(`/conversation/v1/interrupt` aborts it, and its request ends `interrupted`), and
 `/conversation/v1/events` streams the donor's outbound sender from an
 in-memory bounded log a reader can resume. The host supplies only the
 operator's words.

@@ -113,23 +113,27 @@ describe('conversation transport', () => {
   });
 
   it('runs one turn at a time, and interrupts the running one', async () => {
-    let finish: (reply: string) => void = () => undefined;
+    let abort: () => void = () => undefined;
     let interrupts = 0;
-    const { url } = await start({
-      converse: () => new Promise((resolve) => (finish = (reply) => resolve({ reply, channelId: 'terminal:robin' }))),
+    const { url, errors } = await start({
+      converse: (message) =>
+        message === 'a long question'
+          ? new Promise((_resolve, reject) => (abort = () => reject(new Error('This operation was aborted'))))
+          : Promise.resolve({ reply: 'short answer', channelId: 'terminal:robin' }),
       interrupt: () => {
         interrupts += 1;
-        finish('');
+        abort();
       },
     });
     expect((await call(url, 'POST', '/interrupt')).body).toEqual({ interrupted: false });
     const first = call(url, 'POST', '/turns', { body: { message: 'a long question' } });
     await expect.poll(async () => (await call(url, 'POST', '/turns', { body: { message: 'a second one' } })).status).toBe(409);
     expect((await call(url, 'POST', '/interrupt')).body).toEqual({ interrupted: true });
-    expect(await first).toEqual({ status: 200, body: { reply: '', channelId: 'terminal:robin' } });
+    // The stopped turn has no reply and is not a failure; the transport is free again.
+    expect(await first).toEqual({ status: 409, body: { error: 'interrupted' } });
     expect(interrupts).toBe(1);
-    // The transport is free again once the turn ended.
-    finish = () => undefined;
+    expect(errors).toEqual([]);
+    expect(await call(url, 'POST', '/turns', { body: { message: 'a second one' } })).toEqual({ status: 200, body: { reply: 'short answer', channelId: 'terminal:robin' } });
   });
 
   it('reports a failed turn to the operator and tells the caller only that it failed', async () => {
