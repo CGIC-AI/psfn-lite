@@ -1,0 +1,23 @@
+# $HERMES_HOME/config.yaml for the compose project's Hermes (docs/docker.md).
+# The memory, compression, hooks and mcp_servers blocks are the ones the
+# psfn_lite plugin requires (integrations/hermes/README.md, step 4).
+model:
+  # An OpenAI-compatible endpoint; Hermes sends a placeholder key to a keyless one.
+  provider: custom
+  base_url: http://192.0.2.10:8000/v1
+  default: served-model
+memory:
+  provider: psfn_lite
+  memory_enabled: false
+  user_profile_enabled: false
+compression:
+  checkpoint_required: true
+hooks:
+  output_spill:
+    max_chars: 10000
+mcp_servers:
+  psfn_lite:
+    url: http://psfn:8787/mcp
+    headers:
+      Authorization: "Bearer ${PSFN_LITE_TOKEN}"
+    timeout: 30

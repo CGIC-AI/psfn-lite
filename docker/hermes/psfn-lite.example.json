@@ -1,0 +1,15 @@
+{
+  "bridge_url": "http://psfn:8788/lifecycle/v1",
+  "credential_env": "PSFN_LITE_TOKEN",
+  "mcp_server": "psfn_lite",
+  "senders": [
+    {
+      "platform": "cli",
+      "sender_id": "uid:10000"
+    }
+  ],
+  "timeout_seconds": 30,
+  "max_context_chars": 9000,
+  "automata": null,
+  "garden": null
+}

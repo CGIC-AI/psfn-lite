@@ -1,6 +1,7 @@
-# PostgreSQL with pgvector and the standalone host (`serve`), for one companion.
+# PostgreSQL with pgvector and the standalone host (`serve`), for one companion,
+# and optionally Hermes (`--profile hermes`).
 # Setup is in docs/docker.md: secrets come from `.env`, and the config document
-# and character card from the config directory (default ./runtime, gitignored).
+# and character card from the config directory (default ./runtime/lite, gitignored).
 name: psfn-lite
 
 x-psfn: &psfn
@@ -10,7 +11,7 @@ x-psfn: &psfn
   # tini as PID 1 forwards the stop signal and reaps the session-search children.
   init: true
   volumes:
-    - ${PSFN_LITE_CONFIG_DIR:-./runtime}:/etc/psfn-lite:ro
+    - ${PSFN_LITE_CONFIG_DIR:-./runtime/lite}:/etc/psfn-lite:ro
     - psfn-data:/var/lib/psfn-lite/data
     - psfn-workspace:/var/lib/psfn-lite/workspace
 
@@ -62,6 +63,58 @@ services:
       - "127.0.0.1:8787:8787"
       - "127.0.0.1:8788:8788"
       - "127.0.0.1:8789:8789"
+
+  # Optional (`--profile hermes`): Hermes with the psfn_lite plugin, driving the
+  # companion's turns over the compose network. Its home is a host directory
+  # prepared as docs/docker.md describes. The image is Hermes release v0.23.0,
+  # commit 2bd378ed1b8d6bf2192cb26e0a55ff3091e6bd19, a revision the plugin is
+  # tested against.
+  # Hermes connects to the MCP transport once at start, and a failed first
+  # connection is retried only every five minutes. This waits until psfn
+  # listens on both ports, or fails after three minutes.
+  psfn-ready:
+    <<: *psfn
+    profiles: ["hermes"]
+    volumes: []
+    restart: "no"
+    depends_on:
+      - psfn
+    entrypoint: ["node", "-e"]
+    command:
+      - |
+        const net = require('node:net');
+        const targets = [['psfn', 8787], ['psfn', 8788]];
+        const deadline = Date.now() + 180_000;
+        const open = ([host, port]) => new Promise((resolve) => {
+          const socket = net.connect({ host, port, timeout: 2_000 });
+          socket.once('connect', () => { socket.destroy(); resolve(true); });
+          for (const event of ['error', 'timeout']) socket.once(event, () => { socket.destroy(); resolve(false); });
+        });
+        (async () => {
+          for (;;) {
+            if ((await Promise.all(targets.map(open))).every(Boolean)) return;
+            if (Date.now() > deadline) {
+              console.error('psfn did not open its mcp and lifecycle ports within 180 s; see `docker compose logs psfn`');
+              process.exit(1);
+            }
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+          }
+        })();
+
+  hermes:
+    profiles: ["hermes"]
+    image: nousresearch/hermes-agent:v0.23.0@sha256:adb7890916de63245523492be8f68f9d2095fecbec4e2a6dab7960381f0fc002
+    restart: unless-stopped
+    depends_on:
+      psfn-ready:
+        condition: service_completed_successfully
+    command: ["gateway", "run"]
+    environment:
+      # The host user that owns the Hermes home; the image remaps its runtime user to it.
+      HERMES_UID: ${HERMES_UID:-10000}
+      HERMES_GID: ${HERMES_GID:-10000}
+    volumes:
+      - ${PSFN_LITE_HERMES_HOME:-./runtime/hermes}:/opt/data
 
 volumes:
   postgres-data:

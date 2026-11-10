@@ -1,0 +1,77 @@
+{
+  "companionId": "00000000-0000-4000-8000-000000000001",
+  "dataDir": "/var/lib/psfn-lite/data",
+  "workspaceDir": "/var/lib/psfn-lite/workspace",
+  "characterCardPath": "/etc/psfn-lite/character-card.json",
+  "operator": {
+    "userId": "operator",
+    "displayName": "Operator"
+  },
+  "contacts": [],
+  "postgres": {
+    "urlEnv": "PSFN_LITE_DATABASE_URL"
+  },
+  "model": {
+    "provider": "house-server",
+    "modelId": "served-model",
+    "apiKeyEnv": null,
+    "maxOutputTokens": 4096,
+    "endpoint": {
+      "baseUrl": "http://192.0.2.10:8000/v1",
+      "contextWindow": 32768
+    }
+  },
+  "sessionIntegrity": {
+    "kind": "keyring"
+  },
+  "mcp": {
+    "host": "0.0.0.0",
+    "port": 8787,
+    "allowedHosts": [
+      "psfn",
+      "127.0.0.1",
+      "localhost"
+    ],
+    "bindings": [
+      {
+        "principal": "hermes-operator",
+        "contact": "operator",
+        "credential": {
+          "env": "PSFN_LITE_TOKEN"
+        }
+      }
+    ]
+  },
+  "lifecycle": {
+    "host": "0.0.0.0",
+    "port": 8788,
+    "allowedHosts": [
+      "psfn",
+      "127.0.0.1",
+      "localhost"
+    ],
+    "hostTurnTimeoutMs": 600000,
+    "hermesInstallId": "00000000000000000000000000000000",
+    "automata": null
+  },
+  "garden": {
+    "host": "0.0.0.0",
+    "port": 8789,
+    "allowedHosts": [
+      "psfn",
+      "127.0.0.1",
+      "localhost"
+    ],
+    "maxBodyBytes": 65536,
+    "recentTurnLimit": 12,
+    "bindings": [
+      {
+        "principal": "garden-operator",
+        "contact": "operator",
+        "credential": {
+          "env": "PSFN_LITE_GARDEN_TOKEN"
+        }
+      }
+    ]
+  }
+}
