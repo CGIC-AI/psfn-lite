@@ -46,6 +46,7 @@ Lite.
 | `integrations/hermes/desktop/*`, `integrations/hermes/psfn_lite/desktop/plugin.js` | written for Lite against the Hermes Desktop plugin SDK at 2bd378e: the light Garden in Hermes Desktop, and its committed build (seam S8). It reads and writes the donor Garden routes and the Lite routes; it holds no donor code. The donor Garden client (the Svelte app in the donor repository's `admin-ui/`) is not vendored. |
 | `tests/*`, `integrations/hermes/tests/*` | written for Lite: tests of the host adapters, the conformance suite and the Hermes plugin tests. `tests/support/postgres-harness.ts` follows donor `src/test-support/postgres-test-harness.ts`: a pinned pgvector image, tmpfs data, a label, a random port, and removal of exactly its own container. |
 | `scripts/bench/footprint.ts` | written for Lite: the install-footprint measurement ([footprint](footprint.md)). |
+| `Dockerfile`, `compose.yaml`, `docker/*` | written for Lite: the standalone host and its PostgreSQL as a Compose project ([docker](docker.md)). The pgvector image is the one `tests/support/postgres-harness.ts` pins. |
 
 ## The extracted core (`packages/companion`)
 

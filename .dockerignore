@@ -1,0 +1,14 @@
+# The image is built from an allowlist of COPY lines; this keeps the build
+# context small and keeps local state and secrets out of it.
+*
+!package.json
+!package-lock.json
+!.npmrc
+!tsconfig.json
+!apps/
+!packages/
+**/node_modules/
+**/dist/
+**/*.test.ts
+**/.env
+**/.env.*

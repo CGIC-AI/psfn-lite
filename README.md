@@ -42,6 +42,7 @@ delivery. The companion keeps privacy, authorship and continuity authority.
 - [Architecture](docs/architecture.md)
 - [Lite charter](docs/charter.md)
 - [Development and validation](docs/development.md)
+- [Running with Docker Compose](docs/docker.md)
 - [Source provenance](docs/provenance.md)
 - [Companion tool inventory](docs/tool-inventory.md)
 - [Continuity conformance](docs/conformance.md)
