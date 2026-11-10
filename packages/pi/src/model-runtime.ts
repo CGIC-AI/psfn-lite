@@ -8,6 +8,8 @@ import { invalid, ok, type Result } from './result.ts';
 import {
   builtinProviders,
   createModels,
+  createProvider,
+  openAICompletionsApi,
   type Api,
   type AssistantMessage,
   type AssistantMessageEvent,
@@ -67,6 +69,71 @@ export function createCatalogModelRuntime(input: {
   if (provider === undefined) return invalid(`unknown model provider ${input.provider}`);
   const model = provider.getModels().find((candidate) => candidate.id === input.modelId);
   if (model === undefined) return invalid(`provider ${input.provider} has no model ${input.modelId}`);
+  const models = createModels({ authContext: NO_AMBIENT_CREDENTIALS });
+  models.setProvider(provider);
+  return createPiModelRuntime({ models, model, apiKey: input.apiKey, maxOutputTokens: input.maxOutputTokens });
+}
+
+/**
+ * The bearer sent to an endpoint configured without a key. An OpenAI-style
+ * client always sends one (pi-ai refuses a request without it), and a keyless
+ * server ignores it. It is not a credential.
+ */
+export const KEYLESS_ENDPOINT_BEARER = 'unused';
+
+/**
+ * A runtime over one model of an OpenAI-compatible chat-completions endpoint
+ * the catalog does not list (a self-hosted server). The provider id is the
+ * host's name for the endpoint and must not be a catalog provider's, so an
+ * endpoint can never stand in for one. Only this provider is registered and,
+ * as with the catalog runtime, no ambient credential is consulted: the bearer
+ * is the explicit `apiKey`, or KEYLESS_ENDPOINT_BEARER when the operator
+ * configured none.
+ */
+export function createEndpointModelRuntime(input: {
+  readonly provider: string;
+  readonly modelId: string;
+  readonly baseUrl: string;
+  readonly apiKey: string | null;
+  readonly maxOutputTokens: number;
+  readonly contextWindow: number;
+}): Result<PiModelRuntime> {
+  const issues: string[] = [];
+  if (builtinProviders().some((candidate) => candidate.id === input.provider)) issues.push(`model provider ${input.provider} is a catalog provider; an endpoint needs its own provider name`);
+  if (input.provider.trim() === '') issues.push('an endpoint needs a provider name');
+  if (input.modelId.trim() === '') issues.push('an endpoint needs a model id');
+  if (!/^https?:\/\/\S+$/.test(input.baseUrl)) issues.push('an endpoint baseUrl must be an http(s) URL');
+  if (!Number.isInteger(input.contextWindow) || input.contextWindow < 1) issues.push('an endpoint contextWindow must be a positive integer');
+  if (!Number.isInteger(input.maxOutputTokens) || input.maxOutputTokens < 1) issues.push('maxOutputTokens must be a positive integer');
+  if (issues.length > 0) return invalid(...issues);
+  const model: Model<'openai-completions'> = {
+    id: input.modelId,
+    name: input.modelId,
+    api: 'openai-completions',
+    provider: input.provider,
+    baseUrl: input.baseUrl,
+    reasoning: false,
+    input: ['text'],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: input.contextWindow,
+    maxTokens: input.maxOutputTokens,
+  };
+  const keyless = input.apiKey === null;
+  const provider = createProvider({
+    id: input.provider,
+    baseUrl: input.baseUrl,
+    auth: {
+      apiKey: {
+        name: `${input.provider} endpoint key`,
+        resolve: ({ credential }) => {
+          if (credential?.key !== undefined && credential.key !== '') return Promise.resolve({ auth: { apiKey: credential.key }, source: 'host config' });
+          return Promise.resolve(keyless ? { auth: { apiKey: KEYLESS_ENDPOINT_BEARER }, source: 'keyless endpoint' } : undefined);
+        },
+      },
+    },
+    models: [model],
+    api: openAICompletionsApi(),
+  });
   const models = createModels({ authContext: NO_AMBIENT_CREDENTIALS });
   models.setProvider(provider);
   return createPiModelRuntime({ models, model, apiKey: input.apiKey, maxOutputTokens: input.maxOutputTokens });

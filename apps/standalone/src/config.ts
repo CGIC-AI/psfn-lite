@@ -44,6 +44,15 @@ export interface LiteConfig {
     /** The variable holding the provider key; null sends none (keyless providers only). */
     readonly apiKeyEnv: string | null;
     readonly maxOutputTokens: number;
+    /**
+     * Null for a model of the Pi catalog (`provider` and `modelId` name it).
+     * Otherwise an OpenAI-compatible chat-completions endpoint the catalog
+     * does not list, such as a self-hosted server: `provider` is then the
+     * operator's own name for it (never a catalog provider's), `modelId` the
+     * model the endpoint serves, and `contextWindow` that model's context
+     * length in tokens. With `apiKeyEnv` null the endpoint is keyless.
+     */
+    readonly endpoint: { readonly baseUrl: string; readonly contextWindow: number } | null;
   };
   /**
    * The embedding provider: one of the donor's kinds
@@ -232,12 +241,13 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   }
 
   const postgres = { urlEnv: root.child('postgres', ['urlEnv']).envName('urlEnv') };
-  const md = root.child('model', ['provider', 'modelId', 'apiKeyEnv', 'maxOutputTokens']);
+  const md = root.child('model', ['provider', 'modelId', 'apiKeyEnv', 'maxOutputTokens'], ['endpoint']);
   const model = {
     provider: md.string('provider'),
     modelId: md.string('modelId'),
     apiKeyEnv: md.value('apiKeyEnv') === null ? null : md.envName('apiKeyEnv'),
     maxOutputTokens: md.integer('maxOutputTokens', 1, 1_000_000),
+    endpoint: parseModelEndpoint(md),
   };
 
   const embedding = parseEmbedding(root, dataDir);
@@ -294,6 +304,17 @@ function parseEmbedding(root: Reader, dataDir: string): LiteConfig['embedding'] 
   }
   if (raw !== undefined) root.issues.push(`embedding.provider.kind must be one of ${EMBEDDING_PROVIDER_KINDS.join(', ')}`);
   return { model, dimensions, provider: { kind: 'transformers', cacheDir: defaultCacheDir } };
+}
+
+/** The model's endpoint block, or null without one (a catalog model). */
+function parseModelEndpoint(model: Reader): LiteConfig['model']['endpoint'] {
+  const raw = model.value('endpoint');
+  if (raw === undefined || raw === null) return null;
+  const ep = model.child('endpoint', ['baseUrl', 'contextWindow']);
+  return {
+    baseUrl: ep.matching('baseUrl', /^https?:\/\/\S+$/, 'an http(s) URL'),
+    contextWindow: ep.integer('contextWindow', 1, 100_000_000),
+  };
 }
 
 function listen(reader: Reader, issues: string[], at: string): { host: string; port: number; allowedHosts: readonly string[] | null } {

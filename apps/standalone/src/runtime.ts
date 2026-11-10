@@ -53,6 +53,7 @@ import {
   companionModelRegistryEntryOf,
   companionProviderRuntimeOf,
   createCatalogModelRuntime,
+  createEndpointModelRuntime,
   type EmbeddingPort,
   type PiModelRuntime,
 } from './pi.ts';
@@ -106,6 +107,16 @@ export function operatorChannelId(config: LiteConfig): string {
 
 function buildModel(config: LiteConfig, secrets: LiteSecrets, overrides: LiteRuntimeOverrides): Result<PiModelRuntime> {
   if (overrides.model !== undefined) return ok(overrides.model);
+  if (config.model.endpoint !== null) {
+    return createEndpointModelRuntime({
+      provider: config.model.provider,
+      modelId: config.model.modelId,
+      baseUrl: config.model.endpoint.baseUrl,
+      apiKey: secrets.modelApiKey,
+      maxOutputTokens: config.model.maxOutputTokens,
+      contextWindow: config.model.endpoint.contextWindow,
+    });
+  }
   return createCatalogModelRuntime({
     provider: config.model.provider,
     modelId: config.model.modelId,

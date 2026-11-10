@@ -62,6 +62,20 @@ describe('standalone configuration', () => {
     );
   });
 
+  it('reads a model endpoint strictly, and names a catalog model without one', () => {
+    const catalog = parseLiteConfig(document());
+    expect(catalog.ok && catalog.value.model.endpoint).toBeNull();
+    const model = { provider: 'house-server', modelId: 'served-model', apiKeyEnv: null, maxOutputTokens: 1024 };
+    const parsed = parseLiteConfig({ ...document(), model: { ...model, endpoint: { baseUrl: 'http://192.0.2.10:8000/v1', contextWindow: 32768 } } });
+    expect(parsed.ok && parsed.value.model).toEqual({ ...model, endpoint: { baseUrl: 'http://192.0.2.10:8000/v1', contextWindow: 32768 } });
+    expect(issuesOf({ ...document(), model: { ...model, endpoint: { baseUrl: '192.0.2.10:8000', contextWindow: 0, apiKey: 'inline' } } })).toEqual([
+      'model.endpoint.apiKey is not a known setting',
+      'model.endpoint.baseUrl must be an http(s) URL',
+      'model.endpoint.contextWindow must be an integer from 1 to 100000000',
+    ]);
+    expect(issuesOf({ ...document(), model: { ...model, endpoint: 'http://192.0.2.10:8000/v1' } })).toEqual(['model.endpoint must be an object']);
+  });
+
   it('keeps the companion workspace out of the data directory, as the donor keeps it out of its state roots', () => {
     const overlap = 'workspaceDir must not be dataDir or inside it, nor contain it';
     expect(issuesOf({ ...document(), workspaceDir: '/srv/lite/data' })).toEqual([overlap]);
