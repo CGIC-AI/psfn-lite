@@ -131,7 +131,7 @@ export class ConformanceHost {
     if (!config.ok) throw new Error(JSON.stringify(config.error));
     const runtime = await createLiteRuntime({
       config: config.value,
-      secrets: { databaseUrl: this.state.databaseUrl, modelApiKey: null },
+      secrets: { databaseUrl: this.state.databaseUrl, modelApiKey: null, textEmotionApiKey: null },
       env,
       onDiagnostic: () => undefined,
       overrides: {

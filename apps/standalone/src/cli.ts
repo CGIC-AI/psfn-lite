@@ -5,6 +5,8 @@
  *   once  --config <file> --text <message>    one operator turn [--json]
  *   chat  --config <file>                     interactive operator turns; the companion's scheduler runs meanwhile
  *   serve --config <file>                     run the companion and the configured transports until Ctrl-C
+ *   models --config <file>                    run the shared model service (embeddings, text emotion) until Ctrl-C;
+ *                                             its config is the model service's own (model-service.ts), not a companion's
  *
  * In chat, Ctrl-C aborts the running turn (donor SubstrateAgent.abort); Ctrl-C
  * while idle, or end of input, closes the runtime. Exit codes: 0 success, 1
@@ -14,9 +16,10 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { COMPANION_SEED_DIR } from './companion.ts';
+import { COMPANION_SEED_DIR, TEXT_EMOTION_DTYPE_VALUES, TextEmotionClassifier, TransformersEmbeddingProvider, type TextEmotionDType } from './companion.ts';
 import { parseLiteConfig, readSecrets, type LiteConfig, type LiteSecrets } from './config.ts';
 import { invalid, ok, type HostError, type Result } from './mcp.ts';
+import { parseModelServiceConfig, startModelService, type ModelService, type ModelServiceConfig, type ModelServicePorts } from './model-service.ts';
 import { HOST_MODEL_ENTRY, createLiteRuntime, type LiteDiagnostic, type LiteRuntime, type LiteRuntimeOverrides } from './runtime.ts';
 
 export interface CliIo {
@@ -30,8 +33,8 @@ export interface CliIo {
   readonly onInterrupt: (handler: () => void) => () => void;
 }
 
-const USAGE = 'usage: lite-standalone <init|once|chat|serve> --config <file> [--text <message>] [--json]';
-const COMMANDS = ['init', 'once', 'chat', 'serve'] as const;
+const USAGE = 'usage: lite-standalone <init|once|chat|serve|models> --config <file> [--text <message>] [--json]';
+const COMMANDS = ['init', 'once', 'chat', 'serve', 'models'] as const;
 type Command = (typeof COMMANDS)[number];
 
 /** The companion's shipped owner-file seeds (packages/companion/config), copied as `<name>.json`. */
@@ -54,12 +57,13 @@ interface Args {
   readonly json: boolean;
 }
 
-export async function runCli(argv: readonly string[], io: CliIo, overrides: LiteRuntimeOverrides = {}): Promise<number> {
+export async function runCli(argv: readonly string[], io: CliIo, overrides: LiteRuntimeOverrides = {}, modelPorts?: ModelServicePorts): Promise<number> {
   const args = parseArgs(argv);
   if (!args.ok) {
     io.stderr(`${args.error}\n${USAGE}\n`);
     return 2;
   }
+  if (args.value.command === 'models') return models(args.value.config, io, modelPorts);
   const loaded = await loadConfig(args.value.config, io, args.value.command !== 'init');
   if (!loaded.ok) {
     io.stderr(`configuration refused:\n${formatError(loaded.error)}\n`);
@@ -128,6 +132,8 @@ async function run(args: Args, runtime: LiteRuntime, io: CliIo): Promise<number>
       return chat(runtime, io);
     case 'serve':
       return serve(runtime, io);
+    case 'models':
+      return 0;
   }
 }
 
@@ -144,6 +150,64 @@ async function serve(runtime: LiteRuntime, io: CliIo): Promise<number> {
       resolve();
     });
   });
+  return 0;
+}
+
+/** The companion core's own model classes, as a companion would load them in-process. */
+function localModelPorts(config: ModelServiceConfig): Result<ModelServicePorts> {
+  if (!(TEXT_EMOTION_DTYPE_VALUES as readonly string[]).includes(config.textEmotion.dtype)) return invalid(`textEmotion.dtype must be one of ${TEXT_EMOTION_DTYPE_VALUES.join(', ')}`);
+  const embedder = new TransformersEmbeddingProvider({ model: config.embedding.model, dims: config.embedding.dimensions, cacheDir: config.cacheDir });
+  const classifier = new TextEmotionClassifier({ model: config.textEmotion.model, cacheDir: config.cacheDir, dtype: config.textEmotion.dtype as TextEmotionDType });
+  return ok({ embed: (texts) => embedder.embedBatch(texts), classify: (text) => classifier.classify(text) });
+}
+
+/** Loads both models (a model that cannot load stops the start), then serves them until the interrupt. */
+async function models(configPath: string, io: CliIo, supplied: ModelServicePorts | undefined): Promise<number> {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await io.readFile(configPath));
+  } catch {
+    io.stderr(`configuration refused:\n  cannot read ${configPath} as JSON\n`);
+    return 2;
+  }
+  const config = parseModelServiceConfig(raw);
+  if (!config.ok) {
+    io.stderr(`configuration refused:\n${formatError(config.error)}\n`);
+    return 2;
+  }
+  const token = io.env[config.value.tokenEnv];
+  if (token === undefined || token.trim() === '') {
+    io.stderr(`configuration refused:\n  environment variable ${config.value.tokenEnv} is not set\n`);
+    return 2;
+  }
+  const ports = supplied === undefined ? localModelPorts(config.value) : ok(supplied);
+  if (!ports.ok) {
+    io.stderr(`configuration refused:\n${formatError(ports.error)}\n`);
+    return 2;
+  }
+  let service: ModelService;
+  try {
+    const [vector] = await ports.value.embed(['model service start']);
+    if (vector?.length !== config.value.embedding.dimensions) throw new Error(`the embedding model returns ${vector?.length ?? 0} dimensions, not the configured ${config.value.embedding.dimensions}`);
+    await ports.value.classify('model service start');
+    service = await startModelService({
+      config: config.value,
+      token,
+      ports: ports.value,
+      onError: (route, error) => io.stderr(`[models] ${route} failed: ${error instanceof Error ? error.message : String(error)}\n`),
+    });
+  } catch (error) {
+    io.stderr(`the model service could not start: ${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  io.stdout(`models ${service.url}\n`);
+  await new Promise<void>((resolve) => {
+    const unsubscribe = io.onInterrupt(() => {
+      unsubscribe();
+      resolve();
+    });
+  });
+  await service.close();
   return 0;
 }
 

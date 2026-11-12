@@ -79,6 +79,19 @@ export interface LiteConfig {
       | { readonly kind: 'api'; readonly url: string; readonly apiKeyEnv: string | null };
   };
   /**
+   * Where the companion's text-emotion classifier runs, or null for the
+   * donor's seeded default: the model named in settings.json, loaded into
+   * this process. `api` asks a model service instead (the standalone
+   * `models` command): the companion posts `{model, input}` to `url` and
+   * loads no classifier of its own. `apiKeyEnv` names the variable holding
+   * the service's bearer token; null sends none. A service that refuses or
+   * fails makes the classification fail; nothing is classified locally instead.
+   */
+  readonly textEmotion: {
+    readonly model: string;
+    readonly provider: { readonly kind: 'api'; readonly url: string; readonly apiKeyEnv: string | null };
+  } | null;
+  /**
    * Session journal integrity: `keyring` signs every journal entry with the
    * donor's HMAC keyring, read from the donor's keyring environment variables
    * (docs/extraction.md, seam 3.8); `unsigned` keeps journals unsigned.
@@ -225,7 +238,7 @@ class Reader {
 
 const ROOT_KEYS = ['companionId', 'dataDir', 'workspaceDir', 'characterCardPath', 'operator', 'contacts', 'postgres', 'model', 'sessionIntegrity', 'mcp', 'lifecycle'];
 /** Settings with a donor default when left out. */
-const OPTIONAL_ROOT_KEYS = ['embedding', 'garden', 'conversation'];
+const OPTIONAL_ROOT_KEYS = ['embedding', 'textEmotion', 'garden', 'conversation'];
 /** The donor's embedding provider kinds (faculties/memory/embedding.ts `EmbeddingProviderKind`). */
 export const EMBEDDING_PROVIDER_KINDS = ['transformers', 'ollama', 'api'] as const;
 
@@ -272,6 +285,7 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   };
 
   const embedding = parseEmbedding(root, dataDir);
+  const textEmotion = parseTextEmotion(root);
 
   const si = root.child('sessionIntegrity', ['kind']);
   const sessionIntegrity = { kind: si.oneOf('kind', ['keyring', 'unsigned'] as const) };
@@ -284,7 +298,7 @@ export function parseLiteConfig(raw: unknown): Result<LiteConfig> {
   const conversation = parseConversation(root, issues);
 
   if (issues.length > 0) return invalid(...issues);
-  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, sessionIntegrity, mcp, lifecycle, garden, conversation });
+  return ok({ companionId, dataDir, workspaceDir, characterCardPath, operator, contacts, postgres, model, embedding, textEmotion, sessionIntegrity, mcp, lifecycle, garden, conversation });
 }
 
 /**
@@ -336,6 +350,20 @@ function parseModelEndpoint(model: Reader): LiteConfig['model']['endpoint'] {
   return {
     baseUrl: ep.matching('baseUrl', /^https?:\/\/\S+$/, 'an http(s) URL'),
     contextWindow: ep.integer('contextWindow', 1, 100_000_000),
+  };
+}
+
+function parseTextEmotion(root: Reader): LiteConfig['textEmotion'] {
+  if (root.value('textEmotion') === undefined) return null;
+  const te = root.child('textEmotion', ['model', 'provider']);
+  const pr = te.child('provider', ['kind', 'url', 'apiKeyEnv']);
+  return {
+    model: te.string('model'),
+    provider: {
+      kind: pr.oneOf('kind', ['api'] as const),
+      url: pr.matching('url', /^https?:\/\//, 'an http(s) URL'),
+      apiKeyEnv: pr.value('apiKeyEnv') === null ? null : pr.envName('apiKeyEnv'),
+    },
   };
 }
 
@@ -410,6 +438,8 @@ function parseHostedAutomata(lifecycle: Reader): NonNullable<LiteConfig['lifecyc
 export interface LiteSecrets {
   readonly databaseUrl: string;
   readonly modelApiKey: string | null;
+  /** The model service's bearer token for `textEmotion.provider.kind: "api"`, or null when none is named. */
+  readonly textEmotionApiKey: string | null;
 }
 
 export function readSecrets(config: LiteConfig, env: Readonly<Record<string, string | undefined>>): Result<LiteSecrets> {
@@ -423,7 +453,8 @@ export function readSecrets(config: LiteConfig, env: Readonly<Record<string, str
   const modelApiKey = config.model.apiKeyEnv === null ? null : read(config.model.apiKeyEnv);
   // The donor's api provider reads its key itself, from the environment the runtime starts with (substrate-config.ts); a named one must be set.
   if (config.embedding.provider.kind === 'api' && config.embedding.provider.apiKeyEnv !== null) read(config.embedding.provider.apiKeyEnv);
-  return issues.length > 0 ? invalid(...issues) : ok({ databaseUrl, modelApiKey });
+  const textEmotionApiKey = config.textEmotion === null || config.textEmotion.provider.apiKeyEnv === null ? null : read(config.textEmotion.provider.apiKeyEnv);
+  return issues.length > 0 ? invalid(...issues) : ok({ databaseUrl, modelApiKey, textEmotionApiKey });
 }
 
 function overlaps(a: string, b: string): boolean {

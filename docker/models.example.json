@@ -1,0 +1,9 @@
+{
+  "host": "0.0.0.0",
+  "port": 8791,
+  "cacheDir": "/var/lib/psfn-lite/data/models/transformers",
+  "tokenEnv": "LITE_MODELS_TOKEN",
+  "maxBodyBytes": 1048576,
+  "embedding": { "model": "Xenova/all-MiniLM-L6-v2", "dimensions": 384 },
+  "textEmotion": { "model": "SamLowe/roberta-base-go_emotions-onnx", "dtype": "fp32" }
+}

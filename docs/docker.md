@@ -147,6 +147,41 @@ The Hermes dashboard, and so the light Garden's dashboard backend, is not
 started. The image starts it when `HERMES_DASHBOARD` is set, and it refuses
 a non-loopback bind without an auth provider.
 
+## One model service for several companions
+
+Every companion loads two local models into its own process: the embedding
+model and the text-emotion classifier. A host that runs several companions
+can hold them once instead. The `models` command serves both over HTTP:
+
+```sh
+LITE_MODELS_TOKEN=... node --import tsx apps/standalone/src/main.ts models --config docker/models.example.json
+```
+
+`docker/models.example.json` is its whole configuration: where to listen, the
+model cache, the two models, and the variable holding the bearer token every
+caller must present. It loads both models before it listens and stops if
+either cannot load. A companion uses it through two blocks in its own config:
+
+```json
+"embedding": {
+  "model": "Xenova/all-MiniLM-L6-v2",
+  "dimensions": 384,
+  "provider": { "kind": "api", "url": "http://models:8791/v1/embeddings", "apiKeyEnv": "EMBEDDING_API_KEY" }
+},
+"textEmotion": {
+  "model": "SamLowe/roberta-base-go_emotions-onnx",
+  "provider": { "kind": "api", "url": "http://models:8791/v1/text-emotion", "apiKeyEnv": "LITE_MODELS_TOKEN" }
+}
+```
+
+The service runs the same model code a companion runs in-process, so vectors
+and labels are unchanged. It refuses a request that names another model than
+the one it serves. A companion configured this way does not fall back to a
+local model: if the service is unreachable or refuses, the companion does not
+start, and a later failure fails that classification or embedding. The
+service sees the text it is asked to embed or classify; keep it on a network
+only the companions can reach.
+
 ## State
 
 Three named volumes hold the state: `postgres-data` (the database),

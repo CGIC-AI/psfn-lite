@@ -17,3 +17,11 @@ export {
   type LiteRuntimeOverrides,
 } from './runtime.ts';
 export { DONOR_TEXT_EMOTION_CACHE_DIR, buildSubstrateConfig, embeddingSettings, textEmotionCacheDir, type HostModelChoice } from './substrate-config.ts';
+export {
+  parseModelServiceConfig,
+  remoteTextEmotionPipeline,
+  startModelService,
+  type ModelService,
+  type ModelServiceConfig,
+  type ModelServicePorts,
+} from './model-service.ts';

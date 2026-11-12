@@ -108,7 +108,7 @@ describe('embedding providers', () => {
     expect(cacheDirOf(provider as TransformersEmbeddingProvider)).toBe(join(DATA_DIR, 'models', 'transformers'));
     expect(inside(process.cwd(), cacheDirOf(provider as TransformersEmbeddingProvider) ?? '')).toBe(false);
     // No key of any kind is read: the default runs with an empty environment.
-    expect(readSecrets(config, { [DATABASE_URL_ENV]: 'postgres://x' })).toEqual({ ok: true, value: { databaseUrl: 'postgres://x', modelApiKey: null } });
+    expect(readSecrets(config, { [DATABASE_URL_ENV]: 'postgres://x' })).toEqual({ ok: true, value: { databaseUrl: 'postgres://x', modelApiKey: null, textEmotionApiKey: null } });
   });
 
   it('transformers: a relative cache directory resolves under the data directory, an absolute one is kept', () => {

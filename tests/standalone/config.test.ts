@@ -158,7 +158,7 @@ describe('standalone configuration', () => {
     if (!parsed.ok) throw new Error(JSON.stringify(parsed.error));
     expect(readSecrets(parsed.value, { [DATABASE_URL_ENV]: 'postgres://x', LITE_MODEL_KEY: 'k' })).toEqual({
       ok: true,
-      value: { databaseUrl: 'postgres://x', modelApiKey: 'k' },
+      value: { databaseUrl: 'postgres://x', modelApiKey: 'k', textEmotionApiKey: null },
     });
     const missing = readSecrets(parsed.value, { [DATABASE_URL_ENV]: 'postgres://user:hunter2@db/lite' });
     expect(missing).toEqual({ ok: false, error: expect.objectContaining({ kind: 'invalid', issues: ['environment variable LITE_MODEL_KEY is not set'] }) as unknown });

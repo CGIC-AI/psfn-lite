@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import {
   COMPANION_SEED_DIR,
   HostedAutomataExecutor,
+  TextEmotionClassifier,
   createSessionHmacBoundaryService,
   createTurnId,
   loadInnerLifeConfig,
@@ -60,6 +61,7 @@ import {
 import { createModelUsageLedger, type ModelUsageSnapshot } from './model-usage.ts';
 import { composeGardenServices, startGardenServer, type GardenErrorReport, type GardenServer } from './operator.ts';
 import { createConversationOutbox, startConversationServer, type ConversationErrorReport, type ConversationServer } from './conversation.ts';
+import { remoteTextEmotionPipeline } from './model-service.ts';
 import { buildSubstrateConfig } from './substrate-config.ts';
 
 /** The contact key of the configured operator. */
@@ -141,6 +143,20 @@ function hostEmbeddingProvider(config: LiteConfig, overrides: LiteRuntimeOverrid
   return { embeddingProvider: companionEmbeddingProviderOf(overrides.embeddings, identity) as EmbeddingRuntimeProvider };
 }
 
+/**
+ * The classifier the companion starts with: a host-supplied one, a remote one
+ * for `textEmotion.provider.kind: "api"` (the donor's classifier class over a
+ * pipeline that asks the model service), or none, which leaves the donor to
+ * load the settings.json model into this process.
+ */
+function textEmotionClassifierOf(config: LiteConfig, secrets: LiteSecrets, overrides: LiteRuntimeOverrides): { textEmotionClassifier?: StartCompanionRuntimeOptions['textEmotionClassifier'] } {
+  if (overrides.textEmotionClassifier !== undefined) return { textEmotionClassifier: overrides.textEmotionClassifier };
+  if (config.textEmotion === null) return {};
+  const pipelineFactory = remoteTextEmotionPipeline({ url: config.textEmotion.provider.url, token: secrets.textEmotionApiKey });
+  // The dtype selects local model weights; a remote classifier has none, so the donor's seeded value stands in.
+  return { textEmotionClassifier: new TextEmotionClassifier({ model: config.textEmotion.model, dtype: 'fp32', pipelineFactory }) };
+}
+
 export async function createLiteRuntime(input: {
   readonly config: LiteConfig;
   readonly secrets: LiteSecrets;
@@ -219,7 +235,7 @@ export async function createLiteRuntime(input: {
       providerRuntime: companionProviderRuntimeOf(model.value) as unknown as ProviderRuntime,
       modelUsageRecorder: modelUsage,
       ...hostEmbeddingProvider(config, overrides),
-      ...(overrides.textEmotionClassifier === undefined ? {} : { textEmotionClassifier: overrides.textEmotionClassifier }),
+      ...textEmotionClassifierOf(config, secrets, overrides),
       sessionIntegrityProvider,
       outboundSender: {
         send: (channelId, content) => {

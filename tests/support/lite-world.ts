@@ -106,7 +106,7 @@ export function useLiteWorld() {
     const diagnostics: LiteDiagnostic[] = [];
     const runtime = await createLiteRuntime({
       config: config.value,
-      secrets: { databaseUrl: install.env[DATABASE_URL_ENV] ?? '', modelApiKey: null },
+      secrets: { databaseUrl: install.env[DATABASE_URL_ENV] ?? '', modelApiKey: null, textEmotionApiKey: null },
       env: install.env,
       onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
       overrides,

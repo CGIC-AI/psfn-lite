@@ -29,10 +29,18 @@ export type { JournalEntry } from '../../../packages/companion/src/core/session/
 export type { ProviderRuntime } from '../../../packages/companion/src/primitives/llm/provider-runtime.js';
 export {
   DEFAULT_TRANSFORMERS_EMBEDDING_CONFIG,
+  TransformersEmbeddingProvider,
   resolveProjectTransformersCacheDir,
   type EmbeddingProviderKind,
   type EmbeddingRuntimeProvider,
 } from '../../../packages/companion/src/faculties/memory/embedding.js';
+export {
+  TEXT_EMOTION_DTYPE_VALUES,
+  TextEmotionClassifier,
+  type TextEmotionClassification,
+  type TextEmotionPipelineFactory,
+} from '../../../packages/companion/src/core/emotion/text-classifier.js';
+export type { TextEmotionDType } from '../../../packages/companion/src/shared/contracts/runtime-base.js';
 export { envCredential } from '../../../packages/companion/src/shared/contracts/credential-contracts.js';
 export type { ModelUsageEventInput, ModelUsageRecorder } from '../../../packages/companion/src/shared/telemetry/model-usage.js';
 export type { SubstrateMessage, AgentResponse } from '../../../packages/companion/src/shared/contracts/runtime-base.js';
