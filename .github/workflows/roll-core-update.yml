@@ -1,0 +1,230 @@
+name: Roll @cgic/psfn-core Update
+
+on:
+  repository_dispatch:
+    types:
+      - core-released
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Exact @cgic/psfn-core semver version to install (leave blank for latest on npm)'
+        required: false
+        default: ''
+        type: string
+      dry_run:
+        description: 'Run verification without pushing commits, PRs, or releases'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '*/30 * * * *'
+
+permissions: {}
+
+concurrency:
+  group: roll-core-update
+  cancel-in-progress: false
+
+env:
+  NODE_VERSION: 24.22.1
+
+jobs:
+  roll-core:
+    name: Roll @cgic/psfn-core into psfn-lite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Resolve and validate target version
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_VERSION: ${{ github.event.client_payload.version }}
+          DISPATCH_SHA: ${{ github.event.client_payload.sha }}
+          DISPATCH_TAG: ${{ github.event.client_payload.tag }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [[ "$EVENT_NAME" == "repository_dispatch" ]]; then
+            VERSION="$DISPATCH_VERSION"
+            CORE_SHA="$DISPATCH_SHA"
+            CORE_TAG="$DISPATCH_TAG"
+            DRY_RUN="false"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && -n "$INPUT_VERSION" ]]; then
+            VERSION="$INPUT_VERSION"
+            CORE_SHA=""
+            CORE_TAG="core-v${INPUT_VERSION}"
+            DRY_RUN="${INPUT_DRY_RUN:-false}"
+          else
+            VERSION="$(npm view @cgic/psfn-core version 2>/dev/null || true)"
+            if [[ -z "$VERSION" || "$VERSION" == *-stage ]]; then
+              echo "@cgic/psfn-core has no released version on npm yet (${VERSION:-none}); skipping."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "@cgic/psfn-core latest (${VERSION}) is a prerelease; skipping automatic poll."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            CORE_SHA=""
+            CORE_TAG="core-v${VERSION}"
+            DRY_RUN="${INPUT_DRY_RUN:-false}"
+          fi
+
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid @cgic/psfn-core semver version: ${VERSION}"
+            exit 1
+          fi
+
+          CURRENT="$(node -p "JSON.parse(require('node:fs').readFileSync('package.json', 'utf8')).dependencies['@cgic/psfn-core'] ?? ''")"
+          echo "Current @cgic/psfn-core: ${CURRENT}, target: ${VERSION}"
+          SKIP="false"
+          if [[ "$CURRENT" == "$VERSION" ]]; then
+            echo "Already pinned to @cgic/psfn-core@${VERSION}."
+            SKIP="true"
+          fi
+
+          {
+            echo "skip=${SKIP}"
+            echo "version=${VERSION}"
+            echo "core_sha=${CORE_SHA}"
+            echo "core_tag=${CORE_TAG}"
+            echo "dry_run=${DRY_RUN}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install @cgic/psfn-core exact version
+        if: steps.target.outputs.skip != 'true'
+        env:
+          TARGET_VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          for attempt in {1..15}; do
+            if npm view "@cgic/psfn-core@${TARGET_VERSION}" version >/dev/null 2>&1; then
+              break
+            fi
+            if [[ "$attempt" -eq 15 ]]; then
+              echo "::error::@cgic/psfn-core@${TARGET_VERSION} did not appear on npmjs.org after 15 attempts"
+              exit 1
+            fi
+            echo "Waiting for @cgic/psfn-core@${TARGET_VERSION} propagation (attempt ${attempt}/15)..."
+            sleep 20
+          done
+          npm install --engine-strict=false --save-exact "@cgic/psfn-core@${TARGET_VERSION}"
+
+      - name: Run Lite verification suite
+        if: steps.target.outputs.skip != 'true'
+        id: verify
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          STATUS="passed"
+          FAILED_STEP=""
+
+          if ! npm run typecheck; then
+            STATUS="failed"
+            FAILED_STEP="typecheck"
+          elif ! npm run lint; then
+            STATUS="failed"
+            FAILED_STEP="lint"
+          elif ! npm test; then
+            STATUS="failed"
+            FAILED_STEP="test"
+          fi
+
+          {
+            echo "status=${STATUS}"
+            echo "failed_step=${FAILED_STEP}"
+          } >> "$GITHUB_OUTPUT"
+          if [[ "$STATUS" != "passed" ]]; then
+            exit 1
+          fi
+
+      - name: Publish release or open shim-update PR
+        if: steps.target.outputs.skip != 'true' && steps.target.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_VERSION: ${{ steps.target.outputs.version }}
+          CORE_SHA: ${{ steps.target.outputs.core_sha }}
+          CORE_TAG: ${{ steps.target.outputs.core_tag }}
+          VERIFY_STATUS: ${{ steps.verify.outputs.status }}
+          FAILED_STEP: ${{ steps.verify.outputs.failed_step }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh auth setup-git
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="roll/core-v${TARGET_VERSION}"
+          git checkout -b "$BRANCH"
+          git add package.json package-lock.json
+
+          if git diff --cached --quiet; then
+            echo "No lockfile or manifest changes to commit."
+            exit 0
+          fi
+
+          if [[ "$VERIFY_STATUS" == "passed" ]]; then
+            git commit -m "chore(core): roll @cgic/psfn-core to ${TARGET_VERSION}"
+            if git push origin "HEAD:main"; then
+              TAG="v${TARGET_VERSION}"
+              if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+                git tag -a "$TAG" -m "PSFN Lite ${TAG} (@cgic/psfn-core@${TARGET_VERSION})"
+                git push origin "$TAG"
+              fi
+              NOTES="$(cat <<EOF
+          Automated roll-down of \`@cgic/psfn-core@${TARGET_VERSION}\` from \`CGIC-AI/psfn-framework\` (${CORE_TAG}${CORE_SHA:+, commit \`${CORE_SHA}\`}).
+
+          All Lite checks (\`typecheck\`, \`lint\`, \`test\`) passed in [workflow run](${RUN_URL}).
+          EOF
+          )"
+              gh release create "$TAG" --title "PSFN Lite ${TAG}" --notes "$NOTES" || true
+            else
+              git push --force-with-lease origin "HEAD:${BRANCH}"
+              PR_BODY="$(cat <<EOF
+          Automated roll-down of \`@cgic/psfn-core@${TARGET_VERSION}\` from \`CGIC-AI/psfn-framework\` (${CORE_TAG}).
+
+          All Lite checks (\`typecheck\`, \`lint\`, \`test\`) passed in [workflow run](${RUN_URL}).
+
+          Direct push to \`main\` was rejected by branch protection; merge this PR and tag \`v${TARGET_VERSION}\` to cut the release.
+          EOF
+          )"
+              PR_URL="$(gh pr create --base main --head "$BRANCH" --title "chore(core): roll @cgic/psfn-core to ${TARGET_VERSION}" --body "$PR_BODY")"
+              gh pr merge --auto --rebase "$PR_URL" || true
+            fi
+          else
+            git commit -m "chore(core): attempt roll to @cgic/psfn-core@${TARGET_VERSION} (failed ${FAILED_STEP})"
+            git push --force-with-lease origin "HEAD:${BRANCH}"
+            PR_BODY="$(cat <<EOF
+          Automated roll-down of \`@cgic/psfn-core@${TARGET_VERSION}\` failed during \`${FAILED_STEP}\`.
+
+          - Workflow run: ${RUN_URL}
+          - Source release: \`CGIC-AI/psfn-framework\` \`${CORE_TAG}\` ${CORE_SHA}
+
+          ### Where to adapt host shims
+
+          All \`@cgic/psfn-core\` imports in \`psfn-lite\` pass through three single-file shims:
+          1. \`apps/standalone/src/companion.ts\`
+          2. \`packages/lifecycle/src/companion.ts\`
+          3. \`packages/operator/src/companion.ts\`
+
+          Update those shims (and any changed conformance fixtures) on this branch until \`npm run typecheck && npm run lint && npm test\` pass.
+          EOF
+          )"
+            gh pr create --draft --base main --head "$BRANCH" --title "chore(core): roll @cgic/psfn-core to ${TARGET_VERSION} (needs shim update)" --body "$PR_BODY" || true
+            exit 1
+          fi

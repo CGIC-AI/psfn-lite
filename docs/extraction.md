@@ -1970,7 +1970,7 @@ baseline test has its baseline status". The Hermes plugin suite: 69 passed.
 
 ## Shakedown fixes (2026-11-09, Lite with Hermes, round r1)
 
-The round (`lite-hermes-artie-20261109-r1`, evidence outside the
+The round (`lite-hermes-companion-20261109-r1`, evidence outside the
 repository) found four Lite defects and one out-of-scope case. No donor
 file changed; the `cuts.tsv` rows `S1` to `S4` record the host-side
 changes. `S5` restores the donor's embedding providers, a divergence
@@ -2219,7 +2219,7 @@ skipped at 2bd378e. No test container or temporary data directory was left.
 
 ## Shakedown fixes (2026-11-09, Lite with Hermes, round r2)
 
-Round `lite-hermes-artie-20261109-r2` ran Lite at `a0dd368` with the live
+Round `lite-hermes-companion-20261109-r2` ran Lite at `a0dd368` with the live
 Hermes `2bd378e` (evidence outside the repository: its `ROUND-NOTES.md` and
 `comparison-table.md`). S3 did not take effect there: 18 of 23 harness cases
 were ok. Four findings, all in the Hermes plugin; no donor file and no Lite
@@ -2370,7 +2370,7 @@ left.
 
 ## Shakedown fixes (2026-11-09, Lite with Hermes, round r3)
 
-Round `lite-hermes-artie-20261109-r3` ran Lite at `a0a8840` with the live
+Round `lite-hermes-companion-20261109-r3` ran Lite at `a0a8840` with the live
 Hermes `2bd378e` and DeepSeek `deepseek-flash` as Hermes's model (evidence
 outside the repository: its `ROUND-NOTES.md` and `comparison-table.md`).
 20 of 23 core cases were ok on the first run, and the live DeepSeek API

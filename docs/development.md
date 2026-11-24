@@ -1,8 +1,9 @@
 # Development and validation contract
 
-The product is the extracted donor core (`packages/companion`) and Lite's host
-adapters (see [architecture](architecture.md)). Beads contains the executable
-work plan. Do not mistake this document for a task tracker.
+The product is Lite's host adapters over the versioned `@cgic/psfn-core` package
+published from `CGIC-AI/psfn-framework` (see [architecture](architecture.md)).
+Beads contains the executable work plan. Do not mistake this document for a
+task tracker.
 
 ## Bootstrap commands
 
@@ -58,22 +59,16 @@ durability. Scope expensive validation to actual risk and changed behavior.
 ## Validation commands
 
 ```bash
-mise exec node@24.22.1 npm@11.17.0 -- npx tsc --noEmit -p tsconfig.json
-mise exec node@24.22.1 npm@11.17.0 -- npx tsc --noEmit -p packages/companion/tsconfig.json
-mise exec node@24.22.1 npm@11.17.0 -- npx eslint .
-mise exec node@24.22.1 npm@11.17.0 -- npx vitest run
+mise exec node@24.22.1 npm@11.17.0 -- npm run typecheck
+mise exec node@24.22.1 npm@11.17.0 -- npm run lint
+mise exec node@24.22.1 npm@11.17.0 -- npm test
 ```
 
-`packages/companion` is the extracted donor core (see [extraction](extraction.md)).
-It keeps the donor's compiler options in its own `tsconfig.json`, so the root
-typecheck and eslint exclude it and the second command typechecks it. `npx vitest
-run` runs two projects: `lite` and `companion` (the extracted donor tests, with the
-donor's test settings). To check the companion tests against the donor baseline:
-
-```bash
-mise exec node@24.22.1 npm@11.17.0 -- npx vitest run --project companion --reporter=json --outputFile=/tmp/companion-report.json
-mise exec node@24.22.1 -- node packages/companion/extraction/compare-baseline.mjs /tmp/companion-report.json
-```
+The companion core is consumed from the pinned `@cgic/psfn-core` package (rather
+than a vendored `packages/companion/` directory); its own unit and package-boundary
+tests run in `CGIC-AI/psfn-framework` before release, and Lite validates all
+host adapters, lifecycle/MCP/Garden integration suites, boundary rules, and
+continuity conformance against the pinned package.
 
 The donor Postgres-harness tests need Docker. Each run gets its own harness
 profile and temp directory, and removes exactly its own containers. The temp

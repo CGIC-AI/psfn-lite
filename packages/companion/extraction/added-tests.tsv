@@ -1,6 +1,0 @@
-# Lite test files added to the companion project (not in the donor baseline). compare-baseline.mjs reports them separately; every test in them must pass.
-# file	reason
-src/app/agent/companion-runtime.boot.integration.test.ts	B6 boot proof for the seam 3.11 composition root (docs/extraction.md, B6): a turn through SubstrateAgent.handleMessage, the scheduler heartbeat, the registered lanes and no scaffolding schema, over PostgreSQL with the packages/pi adapters
-src/faculties/automata/bus/worker-write-keys.test.ts	Operator automata rule 1 (docs/extraction.md, operator automata rules): worker Bus writes are exactly-once across attempts through a stable write key; the donor minted random event ids
-src/faculties/automata/bus/worker-write-keys.integration.test.ts	Operator automata rule 1 over the real PostgreSQL Bus store across a process restart and a second attempt of the task
-src/faculties/subagents/host-execution.test.ts	Operator automata rules 2-4 (docs/extraction.md, operator automata rules): per-attempt budget and terminal attempt cap, per-task exclusivity with concurrent tasks, host-executed attempts under a core-bound per-attempt credential, through the real SubagentFaculty

@@ -22,7 +22,7 @@ import {
   TransformersEmbeddingProvider,
   createEmbeddingProviderFromConfig,
   resolveEmbeddingProviderProvenanceFromConfig,
-} from '../../packages/companion/src/faculties/memory/embedding.ts';
+} from '@cgic/psfn-core';
 import { DATABASE_URL_ENV, liteConfigDocument } from '../support/lite-install.ts';
 
 // The donor's default factories read their seeds from CONFIG_DIR, which the runtime points at the shipped seeds (runtime.ts).

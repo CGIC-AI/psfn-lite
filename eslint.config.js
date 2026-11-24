@@ -28,8 +28,6 @@ export default [
     '.agents/**',
     '.claude/**',
     '.codex/**',
-    // Extracted donor tree: own tsconfig and the donor's compiler settings (docs/development.md).
-    'packages/companion/**',
     // Generated from integrations/hermes/desktop/src by its build.mjs; tests/desktop/bundle.test.ts checks it.
     'integrations/hermes/psfn_lite/desktop/plugin.js',
   ]),

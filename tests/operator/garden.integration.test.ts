@@ -277,7 +277,7 @@ describe.skipIf(dockerTestsOptedOut('light Garden'))('the light Garden', () => {
     const written = await garden(w, 'PUT', '/api/lite/settings/tier', { body: { tier: 'apprentice', customTokens: [] } });
     expect(written.status, JSON.stringify(written.body)).toBe(200);
     expect(written.body).toMatchObject({ restartRequired: true, tier: { tier: 'apprentice' } });
-    expect(JSON.parse(await readFile(tierPath, 'utf8'))).toEqual({ tier: 'apprentice', customTokens: [] });
+    expect(JSON.parse(await readFile(tierPath, 'utf8'))).toEqual({ tier: 'apprentice', customTokens: [], disabledTools: [] });
 
     const scheduler = (await garden(w, 'GET', '/api/lite/settings')).body['scheduler'];
     const saved = await garden(w, 'PUT', '/api/lite/settings/scheduler', { body: scheduler });

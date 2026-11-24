@@ -40,7 +40,7 @@ async function main(): Promise<void> {
     try {
       const seed = await host.piTurn({
         say: 'please start on the seed packets',
-        calls: [{ tool: 'orient', action: 'create_concern', args: { text: SEED_THREAD, contactId: ready.vars['contact.operator'], sensitivity: 'personal' } }],
+        calls: [{ tool: 'concerns', action: 'create', args: { text: SEED_THREAD, contactId: ready.vars['contact.operator'], sensitivity: 'personal' } }],
         reply: 'Started.',
         vars: {},
         key: 'seed',

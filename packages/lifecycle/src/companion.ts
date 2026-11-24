@@ -1,37 +1,32 @@
 /**
- * The single place the lifecycle bridge reaches the extracted companion core
- * (packages/companion). Every bridge module imports donor types and values from
- * here, so the boundary test can list exactly which donor modules a host
- * adapter depends on.
+ * The single place the lifecycle bridge reaches `@cgic/psfn-core`. Every bridge
+ * module imports companion core types and values from here, governed by
+ * `tests/boundary/host-imports.test.ts`.
  */
-export type { SubstrateStreamTransport } from '../../companion/src/core/agent/stream-adapter.js';
-export type { LLMProviderStreamOptions } from '../../companion/src/core/agent/contracts.js';
-export type {
-  AgentResponse,
-  LLMContext,
-  LLMResponse,
-  StreamCallbacks,
-  SubstrateMessage,
-  ToolCall,
-} from '../../companion/src/shared/contracts/runtime-base.js';
-export type { TurnRecord } from '../../companion/src/shared/contracts/runtime.js';
-export { NonRecoverableFallbackError } from '../../companion/src/primitives/llm/fallback.js';
-export { resolveExplicitToolContract } from '../../companion/src/primitives/llm/explicit-tool-request.js';
-export { buildExactToolArgumentsModelSchema } from '../../companion/src/primitives/llm/explicit-tool-arguments.js';
-export { createTurnId } from '../../companion/src/core/turns/id.js';
-export { externalMemorySessionId } from '../../companion/src/shared/contracts/external-memory.js';
-export { getRequestContext } from '../../companion/src/primitives/llm/request-context.js';
-export type {
-  MemoryDeletionApprovalPort,
-  MemoryDeletionApprovalRequest,
-  MemoryDeletionApprovalResult,
-  MemoryDeletionProposalStorePort,
-} from '../../companion/src/faculties/memory/deletion-proposals.js';
 export {
+  NonRecoverableFallbackError,
+  resolveExplicitToolContract,
+  buildExactToolArgumentsModelSchema,
+  createTurnId,
+  externalMemorySessionId,
+  getRequestContext,
   HostedAutomataExecutor,
+  type SubstrateStreamTransport,
+  type LLMProviderStreamOptions,
+  type AgentResponse,
+  type LLMContext,
+  type LLMResponse,
+  type StreamCallbacks,
+  type SubstrateMessage,
+  type ToolCall,
+  type TurnRecord,
+  type MemoryDeletionApprovalPort,
+  type MemoryDeletionApprovalRequest,
+  type MemoryDeletionApprovalResult,
+  type MemoryDeletionProposalStorePort,
   type HostedAttemptClaim,
   type HostedAttemptRefusal,
   type HostedAttemptReport,
   type HostedAutomataPolicy,
   type HostedResult,
-} from '../../companion/src/faculties/subagents/host-execution.js';
+} from '@cgic/psfn-core/lifecycle';

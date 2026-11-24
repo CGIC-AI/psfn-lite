@@ -1,11 +1,10 @@
 /**
  * Host adapter import boundaries. The host packages (MCP transport,
- * lifecycle bridge, Pi adapters, standalone app) depend inward: each reaches
- * another host package only through that package's public entry, re-exported
- * by one shim module, and the extracted companion core only through its own
- * `companion.ts` shim (any donor module, but from that one file). Bare
- * imports are `node:` builtins or declared, exactly pinned dependencies. The
- * companion core imports no host package.
+ * lifecycle bridge, Pi adapters, operator Garden, standalone app) depend
+ * inward: each reaches another host package only through that package's public
+ * entry, re-exported by one shim module, and the `@cgic/psfn-core` package only
+ * through its own `companion.ts` shim. Bare imports are `node:` builtins or
+ * declared, exactly pinned dependencies.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import { join, posix, relative, sep } from 'node:path';
@@ -13,7 +12,7 @@ import { describe, expect, it } from 'vitest';
 import { collectSpecifiers } from './import-checker.ts';
 
 const ROOT = join(import.meta.dirname, '..', '..');
-const COMPANION_SRC = 'packages/companion/src/';
+const CORE_PACKAGE = '@cgic/psfn-core';
 
 interface Source {
   /** Relative to the repository root, POSIX form. */
@@ -26,12 +25,16 @@ interface HostRules {
   readonly own: string;
   /** Other host packages' public entries the package may reach, each through exactly one shim module. */
   readonly entries: Readonly<Record<string, string>>;
-  /** The one module that may import companion core modules; null when the package may not. */
+  /** The one module that may import `@cgic/psfn-core`; null when the package may not. */
   readonly companionShim: string | null;
   /** Declared bare-specifier dependencies (subpaths of a declared package are allowed). */
   readonly dependencies: readonly string[];
   /** The only module that may import the declared dependencies; null when any own module may. */
   readonly dependencySite: string | null;
+}
+
+function isCorePackageSpecifier(specifier: string): boolean {
+  return specifier === CORE_PACKAGE || specifier.startsWith(`${CORE_PACKAGE}/`);
 }
 
 function checkHostImports(files: readonly Source[], rules: HostRules): string[] {
@@ -45,9 +48,6 @@ function checkHostImports(files: readonly Source[], rules: HostRules): string[] 
         const shim = rules.entries[target];
         if (shim !== undefined) {
           if (file.path !== shim) violations.push(`${file.path}: ${specifier} must be reached through ${shim}`);
-        } else if (target.startsWith(COMPANION_SRC)) {
-          if (rules.companionShim === null) violations.push(`${file.path}: ${specifier} reaches the companion core, which this package may not import`);
-          else if (file.path !== rules.companionShim) violations.push(`${file.path}: ${specifier} must be reached through ${rules.companionShim}`);
         } else if (!target.startsWith(rules.own)) {
           violations.push(`${file.path}: ${specifier} reaches ${target}; host packages import only public entries`);
         } else if (!target.endsWith('.ts')) {
@@ -55,6 +55,12 @@ function checkHostImports(files: readonly Source[], rules: HostRules): string[] 
         }
       } else if (specifier.startsWith('node:')) {
         continue;
+      } else if (isCorePackageSpecifier(specifier)) {
+        if (rules.companionShim === null) {
+          violations.push(`${file.path}: ${specifier} reaches the companion core, which this package may not import`);
+        } else if (file.path !== rules.companionShim) {
+          violations.push(`${file.path}: ${specifier} must be reached through ${rules.companionShim}`);
+        }
       } else {
         const declared = rules.dependencies.some((dependency) => specifier === dependency || specifier.startsWith(`${dependency}/`));
         if (!declared) violations.push(`${file.path}: ${specifier} is not a declared dependency`);
@@ -155,22 +161,23 @@ describe('host adapter import boundaries', () => {
     expect(LIFECYCLE_MANIFEST.dependencies).toBeUndefined();
     expect(OPERATOR_MANIFEST.dependencies).toBeUndefined();
     expect(STANDALONE_MANIFEST.dependencies).toBeUndefined();
+    expect(ROOT_MANIFEST.dependencies?.[CORE_PACKAGE]).toBeDefined();
   });
 
   it.each([
-    ['lifecycle', 'a companion module outside its shim', 'packages/lifecycle/src/x.ts', "import { createTurnId } from '../../companion/src/core/turns/id.js';", 'must be reached through packages/lifecycle/src/companion.ts'],
+    ['lifecycle', 'a companion module outside its shim', 'packages/lifecycle/src/x.ts', "import { createTurnId } from '@cgic/psfn-core/lifecycle';", 'must be reached through packages/lifecycle/src/companion.ts'],
     ['lifecycle', 'a deep MCP import', 'packages/lifecycle/src/x.ts', "import { bearerCredential } from '../../mcp/src/credentials.ts';", 'host packages import only public entries'],
     ['lifecycle', 'the MCP entry outside its shim', 'packages/lifecycle/src/x.ts', "import { publicError } from '../../mcp/src/index.ts';", 'must be reached through packages/lifecycle/src/mcp.ts'],
     ['lifecycle', 'the Pi adapters', 'packages/lifecycle/src/x.ts', "import '../../pi/src/index.ts';", 'host packages import only public entries'],
     ['lifecycle', 'an undeclared package', 'packages/lifecycle/src/x.ts', "import { createServer } from 'express';", 'not a declared dependency'],
-    ['operator', 'a companion module outside its shim', 'packages/operator/src/x.ts', "import '../../companion/src/operator/garden/services/memory-service.js';", 'must be reached through packages/operator/src/companion.ts'],
+    ['operator', 'a companion module outside its shim', 'packages/operator/src/x.ts', "import { AdminMemoryDataService } from '@cgic/psfn-core/operator';", 'must be reached through packages/operator/src/companion.ts'],
     ['operator', 'the lifecycle bridge', 'packages/operator/src/x.ts', "import '../../lifecycle/src/index.ts';", 'host packages import only public entries'],
-    ['mcp', 'the companion core', 'packages/mcp/src/x.ts', "import '../../companion/src/core/agent/substrate-agent.js';", 'which this package may not import'],
+    ['mcp', 'the companion core', 'packages/mcp/src/x.ts', "import { startCompanionRuntime } from '@cgic/psfn-core';", 'which this package may not import'],
     ['mcp', 'an undeclared look-alike', 'packages/mcp/src/x.ts', "import '@modelcontextprotocol/server-extra';", 'not a declared dependency'],
-    ['pi', 'the companion core', 'packages/pi/src/x.ts', "import '../../companion/src/primitives/llm/provider-runtime.js';", 'which this package may not import'],
+    ['pi', 'the companion core', 'packages/pi/src/x.ts', "import type { ProviderRuntime } from '@cgic/psfn-core/ports';", 'which this package may not import'],
     ['pi', 'Pi outside its one import site', 'packages/pi/src/model-runtime.ts', "import { createModels } from '@earendil-works/pi-ai';", 'may be imported only by packages/pi/src/pi.ts'],
     ['pi', 'a non-literal dynamic import', 'packages/pi/src/pi.ts', 'export const load = (name: string) => import(name);', 'string literal'],
-    ['standalone', 'a companion module outside its shim', 'apps/standalone/src/x.ts', "import '../../../packages/companion/src/app/agent/companion-runtime.js';", 'must be reached through apps/standalone/src/companion.ts'],
+    ['standalone', 'a companion module outside its shim', 'apps/standalone/src/x.ts', "import { startCompanionRuntime } from '@cgic/psfn-core';", 'must be reached through apps/standalone/src/companion.ts'],
     ['standalone', 'a deep Pi import', 'apps/standalone/src/x.ts', "import '../../../packages/pi/src/model-runtime.ts';", 'host packages import only public entries'],
     ['standalone', 'the Pi runtime directly', 'apps/standalone/src/x.ts', "import { createModels } from '@earendil-works/pi-ai';", 'not a declared dependency'],
   ])('rejects in %s: %s', (name, _label, path, text, expected) => {
@@ -178,13 +185,11 @@ describe('host adapter import boundaries', () => {
     expect(violations.some((v) => v.includes(expected)), violations.join('\n')).toBe(true);
   });
 
-  it('keeps the companion core free of any reference to a host package', () => {
-    const files = sources('packages/companion/src');
-    expect(files.length).toBeGreaterThan(1000);
-    for (const file of files) {
-      const { specifiers } = collectSpecifiers(file.path, file.text);
-      const host = specifiers.filter((s) => /(^|\/)(mcp|lifecycle|pi|operator|standalone)\/src\//.test(s) || s.includes('apps/'));
-      expect(host, file.path).toEqual([]);
-    }
+  it('keeps the installed @cgic/psfn-core package free of any reference to Lite host packages', () => {
+    const corePkg = manifest('node_modules/@cgic/psfn-core');
+    expect(corePkg.name).toBe(CORE_PACKAGE);
+    const deps = Object.keys(corePkg.dependencies ?? {});
+    expect(deps).not.toContain('@modelcontextprotocol/server');
+    expect(deps).not.toContain('psfn-lite');
   });
 });

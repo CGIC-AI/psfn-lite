@@ -45,7 +45,7 @@ TOOL_CALL_BRIDGE = "tool_call"
 
 #: Providers that refuse a forced tool choice while thinking is on, matched by Hermes provider id or by the
 #: base URL's host, and how a forced request turns thinking off on their chat-completions wire. DeepSeek answers
-#: 400 "Thinking mode does not support this tool_choice" (shakedown lite-hermes-artie-20261109-r2); Kimi Code is the
+#: 400 "Thinking mode does not support this tool_choice" (shakedown lite-hermes-companion-20261109-r2); Kimi Code is the
 #: donor's own case (models.ts:61-67). Both take Hermes's thinking toggle (agent/reasoning_effort.py
 #: thinking_toggle_extras: ``extra_body.thinking`` and a top-level ``reasoning_effort``; the disabled form is
 #: ``{"thinking": {"type": "disabled"}}`` with no effort). The hosts are the ones Hermes itself treats as these
