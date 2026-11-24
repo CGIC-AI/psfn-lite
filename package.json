@@ -35,7 +35,7 @@
     "vitest": "4.1.12"
   },
   "dependencies": {
-    "@cgic/psfn-core": "0.1.0",
+    "@cgic/psfn-core": "0.1.1",
     "@earendil-works/pi-agent-core": "0.84.1",
     "@earendil-works/pi-ai": "0.84.1",
     "@huggingface/transformers": "4.2.0",
