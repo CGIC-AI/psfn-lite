@@ -63,7 +63,9 @@ describe.skipIf(dockerTestsOptedOut('lifecycle host-driven turns'))('host-driven
     const context = prepared.body['context'] as { systemPrompt: string; messages: { role: string; text: string }[]; tools: string[] };
     expect(context.systemPrompt).toContain(COMPANION_NAME);
     expect(context.messages.filter((m) => m.role === 'user').at(-1)?.text).toContain(HOST_MESSAGE);
-    expect(context.tools).toContain('orient');
+    expect(context.tools).toContain('execute');
+    expect(context.tools).toContain('tool_search');
+    expect(context.tools).toContain('response_control');
     // No explicit tool request: the host's model chooses.
     expect((prepared.body['context'] as { toolChoice: unknown }).toolChoice).toBeNull();
 
@@ -72,7 +74,7 @@ describe.skipIf(dockerTestsOptedOut('lifecycle host-driven turns'))('host-driven
     try {
       const listed = await client.listTools();
       const names = listed.tools.map((t) => t.name);
-      for (const name of ['tool_search', 'toolset', 'orient', 'memory', 'scratchpad', 'contact', 'journal']) expect(names).toContain(name);
+      for (const name of ['execute', 'tool_search', 'toolset', 'orient', 'concerns', 'memory', 'scratchpad', 'contact', 'journal']) expect(names).toContain(name);
 
       // A tool call inside the open turn is run by the donor loop.
       const called = await client.callTool({ name: 'orient', arguments: { action: 'values_list' } });

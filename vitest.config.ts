@@ -20,12 +20,10 @@ export default defineConfig({
             'tests/**/*.test.ts',
             'scripts/**/*.test.ts',
           ],
-          // The extracted donor tree runs as its own project with the donor's test settings.
-          exclude: ['packages/companion/**', '**/node_modules/**'],
+          exclude: ['**/node_modules/**'],
           testTimeout: 10_000,
         },
       },
-      './packages/companion/vitest.config.ts',
     ],
   },
 });

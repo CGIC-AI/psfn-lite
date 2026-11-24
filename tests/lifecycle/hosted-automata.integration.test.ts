@@ -12,7 +12,7 @@
 import { describe, expect, it } from 'vitest';
 import { dockerTestsOptedOut } from '../support/postgres-harness.ts';
 import type { Script } from '../support/faux-model.ts';
-import { runWithRequestContext } from '../../packages/companion/src/primitives/llm/request-context.js';
+import { runWithRequestContext } from '@cgic/psfn-core/lifecycle';
 import { bridge, useBridgeWorld } from './bridge-world.ts';
 
 const POLICY = { maxAttempts: 2, leaseMs: 60_000, maxIterations: 250 };

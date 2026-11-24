@@ -26,7 +26,7 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, posix, relative, sep } from 'node:path';
 import ts from 'typescript';
 import { describe, expect, it } from 'vitest';
-import { CANONICAL_FIRST_PARTY_TOOL_SURFACES } from '../../packages/companion/src/core/agent/tool-surface/registry.js';
+import { COMPANION_CORE_TOOL_SURFACES } from '@cgic/psfn-core';
 import { collectSpecifiers } from '../boundary/import-checker.ts';
 import { excludedName } from './excluded-names.ts';
 
@@ -115,7 +115,6 @@ export function pythonNames(text: string): string[] {
 const EXCLUDED_PYTHON_MODULES = /^(discord|redis|aioredis|transformers|onnxruntime|pdfjs|winston|psfn_framework)(\.|$)/;
 
 const COMPANION = 'packages/companion/';
-const VENDORED_FILES = `${COMPANION}extraction/vendored-files.txt`;
 /** vendored-files.txt kinds deleted in Step B7 (`promoted`, `test-support` and `asset` rows stay). */
 const DELETED_KINDS = new Set(['scaffolding', 'cut', 'source-text', 'test-support-deleted', 'asset-deleted', 'seed-deleted']);
 
@@ -329,34 +328,31 @@ describe('excluded subsystems are absent from Lite', () => {
 
   it('no companion tool Lite serves is one of them', () => {
     // The live catalog the MCP transport serves is checked the same way by the inventory test of conformance.integration.test.ts.
-    const served = CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name);
+    const served = COMPANION_CORE_TOOL_SURFACES.map((t) => t.name);
     expect(served.length).toBeGreaterThanOrEqual(15);
+    expect(served).toContain('execute');
+    expect(served).toContain('orient');
+    expect(served).toContain('concerns');
     expect(served.filter((n) => excludedName(n) !== null)).toEqual([]);
   });
 
-  it('the donor registry no longer lists the tool surfaces whose factories were scaffolding', () => {
-    // Native host tools (Pi, Hermes) do this work; the donor rebuilt them only for its own deployment (docs/extraction.md, Step E1).
-    const registry = new Set(CANONICAL_FIRST_PARTY_TOOL_SURFACES.map((t) => t.name));
+  it('the companion core tool registry excludes host scaffolding tools', () => {
+    const registry = new Set(COMPANION_CORE_TOOL_SURFACES.map((t) => t.name));
     expect(CUT_TOOL_SURFACES.filter((n) => registry.has(n))).toEqual([]);
   });
 });
 
-describe('the donor scaffolding cut from packages/companion stays gone', () => {
-  const deleted = deletedScaffolding(readFileSync(join(REPO, VENDORED_FILES), 'utf8'));
-
-  it('no deleted file exists', () => {
-    // The B7 record: 732 scaffolding, 26 cut, 2 source-text, 1 test-support, 23 asset and 11 seed rows,
-    // less the 24 scaffolding rows seam S8 re-vendored as kind garden (769 rows).
-    // A truncated listing must not pass.
-    expect(deleted.length).toBeGreaterThan(760);
-    expect(new Set(deleted).size).toBe(deleted.length);
-    expect(deleted.filter((path) => existsSync(join(REPO, COMPANION, path)))).toEqual([]);
+describe('vendored packages/companion is replaced by @cgic/psfn-core', () => {
+  it('has no vendored packages/companion tree on disk', () => {
+    expect(existsSync(join(REPO, COMPANION))).toBe(false);
   });
 
-  it('no companion file imports, mocks or reads one', () => {
-    const companionFiles = codeFiles.filter((f) => f.startsWith(COMPANION));
-    expect(companionFiles.length).toBeGreaterThan(1000);
-    const files = companionFiles.map((path) => ({ path, text: readFileSync(join(REPO, path), 'utf8') }));
-    expect(deletedReferences(files, new Set(deleted))).toEqual([]);
+  it('declares zero excluded packages inside installed @cgic/psfn-core', () => {
+    const coreManifest = JSON.parse(
+      readFileSync(join(REPO, 'node_modules', '@cgic', 'psfn-core', 'package.json'), 'utf8'),
+    ) as { dependencies?: Record<string, string> };
+    const deps = Object.keys(coreManifest.dependencies ?? {});
+    expect(deps.length).toBe(8);
+    expect(deps.filter(excludedPackage)).toEqual([]);
   });
 });

@@ -4,15 +4,14 @@ A persistent companion core you can embed, extracted from
 [PSFN Framework](https://github.com/CGIC-AI/psfn-framework), with a standalone
 host on Pi and a native Hermes integration.
 
-The companion is the donor's own core, extracted path-preserving into
-`packages/companion` from `psfn-framework` at
-`e6a9546051f4e92bf7218b133b4523ac53a797c0`. Only the recorded seam cuts
-were made ([extraction record](docs/extraction.md)), and the extracted donor
-tests reproduce the donor baseline, less the recorded deletions of tests of
-cut scaffolding. It owns one companion's identity and
-continuity: prompt layers and persona, values and North Star, sessions,
-contacts and trust, memory, episodes, journals, emotion and self-model,
-concerns, scheduler and free time, letters, and bounded subagents.
+The companion core is consumed as the versioned `@cgic/psfn-core` package published
+from [PSFN Framework](https://github.com/CGIC-AI/psfn-framework) (no vendored
+`packages/companion/` fork). When `@cgic/psfn-core` cuts a release, the
+`roll-core-update` workflow rolls the pinned dependency forward, verifies the
+Lite suite, and cuts a matching Lite release. The core owns one companion's
+identity and continuity: prompt layers and persona, values and North Star,
+sessions, contacts and trust, memory, episodes, journals, emotion and
+self-model, concerns, scheduler and free time, and bounded subagents.
 
 Around it, Lite has host adapters only:
 

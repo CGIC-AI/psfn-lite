@@ -8,9 +8,11 @@
  */
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { CANONICAL_TOOL_SURFACE_DESCRIPTIONS } from '../../packages/companion/src/core/agent/tool-surface/descriptions.js';
-import { AUTOMATA_BUS_TOOL_ACTIONS } from '../../packages/companion/src/faculties/automata/bus/worker-access-contracts.js';
-import { automataBusToolParametersForActions } from '../../packages/companion/src/faculties/automata/bus/worker-access-operation.js';
+import {
+  AUTOMATA_BUS_TOOL_ACTIONS,
+  CANONICAL_TOOL_SURFACE_DESCRIPTIONS,
+  automataBusToolParametersForActions,
+} from '@cgic/psfn-core';
 
 const SCHEMA = new URL('../../integrations/hermes/psfn_lite/automata_bus_tool.json', import.meta.url);
 

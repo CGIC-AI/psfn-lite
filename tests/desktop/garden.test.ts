@@ -108,7 +108,7 @@ describe('the Garden screens', () => {
   it('Overview shows the companion, its model and tier, and that a restart is due', async () => {
     const { garden } = stubRest({
       'GET /api/lite/overview': {
-        companionId: 'companion', model: { provider: 'deepseek', modelId: 'deepseek-chat' }, tier: { tier: 'apprentice' }, restartRequired: true,
+        companionId: 'lumen', model: { provider: 'deepseek', modelId: 'deepseek-chat' }, tier: { tier: 'apprentice' }, restartRequired: true,
         heartbeat: { tasks: [{ id: 't1', name: 'memory maintenance', state: 'idle', lastOutcome: 'ok' }], reflections: [] },
         openConcerns: [{ id: 'k1', text: 'Water the seedlings', priority: 'normal', status: 'active', createdAt: 'today' }],
         latestSession: null, recentTurns: [{ role: 'user', content: 'hello there', timestamp: 1_762_000_000_000 }],
@@ -225,7 +225,7 @@ describe('the Garden screens', () => {
 
   it('Persona edits a card field and a prompt layer, and shows a layer’s last change', async () => {
     const { garden, writes } = stubRest({
-      'GET /api/admin/identity': { card: { data: { name: 'companion', description: 'A gardener.', personality: '', scenario: '', first_mes: '', mes_example: '' } }, version: 3, history: [{ version: 2, timestamp: 'yesterday', updatedBy: 'operator' }] },
+      'GET /api/admin/identity': { card: { data: { name: 'Lumen', description: 'A gardener.', personality: '', scenario: '', first_mes: '', mes_example: '' } }, version: 3, history: [{ version: 2, timestamp: 'yesterday', updatedBy: 'operator' }] },
       'GET /api/admin/prompts/constitution': { companionLayer: { title: 'Companion-Derived Values Layer', content: 'Tend what grows.' } },
       'GET /api/admin/prompts/north-star': { items: [{ id: 'n1', title: 'Grow food', content: 'Keep the garden alive.', enabled: true, scope: 'companion' }], preview: { text: '' } },
       'GET /api/admin/prompts/layer-a': { layer: {}, layerHistory: [{ version: 1, timestamp: 'monday', updatedBy: 'operator', reason: 'first' }] },

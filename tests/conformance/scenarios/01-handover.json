@@ -11,7 +11,7 @@
       "calls": [
         { "tool": "memory", "action": "write", "args": { "text": "Robin has a sister named Ana who visits on Saturday", "type": "semantic", "sensitivity": "personal" }, "expect": { "has": ["Memory created"] }, "capture": { "memoryId": "id: ([0-9a-f-]{36})" } },
         { "tool": "orient", "action": "append", "args": { "block": "human", "text": "Robin has a sister named Ana" }, "expect": { "has": ["Appended to human orientation"] } },
-        { "tool": "orient", "action": "create_concern", "args": { "text": "Robin feels nervous about the Saturday visit" }, "expect": { "has": ["\"created\": true"] } },
+        { "tool": "concerns", "action": "create", "args": { "text": "Robin feels nervous about the Saturday visit" }, "expect": { "has": ["\"created\": true"] } },
         { "tool": "scratchpad", "action": "add", "args": { "content": "Plan a calm Saturday with Robin" }, "expect": { "has": ["Scratchpad entry added"] } },
         { "tool": "journal", "action": "write", "args": { "path": "saturday.md", "content": "Ana arrives on Saturday morning." }, "expect": { "has": ["Journal note created: saturday.md"] } }
       ],
@@ -25,7 +25,7 @@
       "say": "what were we talking about?",
       "calls": [
         { "tool": "memory", "action": "search", "args": { "query": "Ana Saturday" }, "expect": { "has": ["{{memoryId}}", "Robin has a sister named Ana who visits on Saturday"] } },
-        { "tool": "orient", "action": "list_concerns", "args": {}, "expect": { "has": ["Robin feels nervous about the Saturday visit"] } },
+        { "tool": "concerns", "action": "list", "args": {}, "expect": { "has": ["Robin feels nervous about the Saturday visit"] } },
         { "tool": "scratchpad", "action": "list", "args": {}, "expect": { "has": ["Plan a calm Saturday with Robin"] } },
         { "tool": "journal", "action": "read", "args": { "path": "saturday.md" }, "expect": { "has": ["Ana arrives on Saturday morning."] } },
         { "tool": "session", "action": "list", "args": {}, "expect": { "has": ["\"count\": 1"] } }
