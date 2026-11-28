@@ -8,11 +8,19 @@ size. The plan it follows is the read-only extraction plan (closure, seams,
 batches B1-B7); the donor's code, docs and history are the spec.
 
 - Donor: `psfn-framework` at `e6a9546051f4e92bf7218b133b4523ac53a797c0`.
-- Extracted tree: `packages/companion` (package `lite-companion`), laid out as
-  `packages/companion/src/<donor src path>` so relative imports are unchanged.
-- Machine-readable records: `packages/companion/baseline.json` and
-  `packages/companion/extraction/` (closure, levels, seams, test selection,
-  excluded tests, vendored files, deleted tests, comparison script).
+- Extracted tree (until `1e90250`): `packages/companion` (package
+  `lite-companion`), laid out as `packages/companion/src/<donor src path>` so
+  relative imports were unchanged.
+- Machine-readable records (until `1e90250`): `packages/companion/baseline.json`
+  and `packages/companion/extraction/` (closure, levels, seams, test
+  selection, excluded tests, vendored files, deleted tests, comparison
+  script). Read them at `d611e36`, the last commit that holds them, for
+  example `git show d611e36:packages/companion/extraction/cuts.tsv`.
+- Since `1e90250` the core is the pinned package `@cgic/psfn-core`, built by
+  psfn-framework from its own `src/` (0.1.1: tag `core-v0.1.1`, commit
+  `51195a85921af8a4f8f39404f12a90b61a08d6a4`). The paths below under
+  `packages/companion` describe the vendored tree as it was; this record is
+  not updated for the package.
 
 ## Status
 
@@ -31,7 +39,7 @@ batches B1-B7); the donor's code, docs and history are the spec.
 | Operator automata rules | Done (Operator automata rules, below): stable worker write keys; hosted automata as Hermes subagents. |
 | Review fixes after Step D | Done (Review fixes after Step D, below): the model-usage recorder port, the promoted donor tests, exactly-once corrections, and the Step D records and provenance. |
 | E operator rulings 2026-11-08/09 | Done (Step E, below): cut tool surfaces pruned from the registry, host-bound session integrity, host approval of memory deletion, the capability tier as an owner file (default `autonomous`), fatigue deferred, model usage in memory. |
-| S8 light Garden | Implemented (S8: the light Garden, below): the donor Garden services, routes and route catalogue re-vendored; the operator surface `packages/operator`; the `psfn_lite` dashboard backend and install tool; the Desktop half `psfn_lite/desktop/plugin.js`. Decision (c) awaits the owner. |
+| S8 light Garden | Implemented (S8: the light Garden, below; merged as `d611e36`): the donor Garden services, routes and route catalogue re-vendored; the operator surface `packages/operator`; the `psfn_lite` dashboard backend and install tool; the Desktop half `psfn_lite/desktop/plugin.js`. Since `1e90250` the Garden services come from `@cgic/psfn-core/operator`, through `packages/operator/src/companion.ts`. Decision (c) awaits the owner. |
 
 ## Closure (Step A0)
 

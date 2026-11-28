@@ -357,8 +357,10 @@ This keeps `plugins/psfn_lite` free of a Desktop half, so
 The alternative is Desktop's paired layout. Put the file at
 `<profile home>/plugins/psfn_lite/desktop/plugin.js`, and Desktop copies it
 to `desktop-plugins/psfn_lite/` with a marker that names the source. Desktop
-removes that copy itself once the source file is gone. While the file is
-there, `install_plugin.py` refuses that profile.
+removes that copy itself once the source file is gone. Desktop loads a
+copy with that marker switched off, as it does every half of an agent
+plugin, so turn it on in Capabilities ▸ Plugins. While the file is there,
+`install_plugin.py` refuses that profile.
 
 Desktop shows a "Garden" entry in the sidebar, with one page per screen. It
 also shows a "Memory deletions" side pane when the Memories screen opens it,

@@ -30,7 +30,7 @@ export interface SessionRow {
   lastActivityAt: number;
 }
 
-/** The donor's session list (AdminSessionListData, packages/companion/src/operator/garden/services/types/sessions.ts:29). */
+/** The donor's session list (AdminSessionListData from @cgic/psfn-core/operator; psfn-framework core-v0.1.1 src/operator/garden/services/types/sessions.ts:43). */
 export interface SessionList {
   channels: SessionRow[];
 }

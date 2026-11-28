@@ -22,21 +22,25 @@ TURN = "sess-1:task:aa"
 ORIENT_STEP = {"kind": "tool", "name": "orient", "parameters": None}
 
 
-def _openai_tools():
-    return [{"type": "function", "function": {"name": name, "description": name, "parameters": {"type": "object"}}} for name in (ORIENT, MEMORY, "terminal")]
+OFFERED = (ORIENT, MEMORY, "terminal")
 
 
-def _transport_request(api_mode):
+def _openai_tools(offered=OFFERED):
+    return [{"type": "function", "function": {"name": name, "description": name, "parameters": {"type": "object"}}} for name in offered]
+
+
+def _transport_request(api_mode, offered=OFFERED):
     from agent.transports import get_transport
 
     return get_transport(api_mode).build_kwargs(model="gpt-5.5", messages=[{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}],
-                                                tools=_openai_tools(), instructions="s")
+                                                tools=_openai_tools(offered), instructions="s")
 
 
 # The provider requests as Hermes's own builders make them, before its llm_request middleware runs
 # (agent/chat_completion_helpers.py: the API-mode kwargs are built first, then the middleware).
-def chat_request():
-    return _transport_request("chat_completions")
+def chat_request(offered=OFFERED):
+    """A chat-completions request offering the tools named in ``offered``."""
+    return _transport_request("chat_completions", offered)
 
 
 def codex_request():
