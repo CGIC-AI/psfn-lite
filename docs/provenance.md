@@ -54,11 +54,12 @@ Lite.
 
 Lite imports the core only through the package's entry points: `.`,
 `./lifecycle`, `./operator`, `./ports` and `./seeds`. `./operator` carries
-the light Garden's donor services, route builders, request context and
-owner-file loaders, re-exported from the framework's `src/operator/garden`,
-`src/boundary/fleet-auth` and `src/channels/backplane/http`; Lite reaches it
-only through `packages/operator/src/companion.ts`. Source cites in Lite code
-name the framework path at `core-v0.1.1`. The core's own unit and
+the light Garden's donor services, route builders, request context, stores
+and owner-file loaders, re-exported from the framework's own `src/` (most
+from `src/operator/garden`); Lite reaches it only through
+`packages/operator/src/companion.ts`. A donor cite in Lite code names a
+donor path at `e6a9546` unless it names `core-v0.1.1`; a few still name the
+vendored tree (psfn-lite-iga). The core's own unit and
 package-boundary tests run in psfn-framework before release; Lite runs its
 host-adapter, Garden, lifecycle, MCP and conformance suites against the
 pinned package ([development](development.md)).
