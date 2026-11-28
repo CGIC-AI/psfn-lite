@@ -260,10 +260,11 @@ def test_an_explicit_tool_request_is_held_to_the_donor_contract_and_the_turn_com
 
     session, turn_id = "e2e-explicit", "e2e-explicit:t"
     begin(session, turn_id, "Call the concerns tool to list my concerns, then tell me the first one.")
-    forced = model_call(chat_request(), turn_id=turn_id, session=session).payload
+    # The request offers what Hermes's MCP client registered from Lite, as the agent loop's request would.
+    forced = model_call(chat_request(operator), turn_id=turn_id, session=session).payload
     assert names(forced["tools"]) == [f"mcp__{SERVER}__concerns"] and forced["tool_choice"] == "required"
     assert SEED_THREAD in call_tool("concerns", "list", session=session, turn_id=turn_id)
-    after = model_call(chat_request(), turn_id=turn_id, session=session).payload
+    after = model_call(chat_request(operator), turn_id=turn_id, session=session).payload
     assert not {"tools", "tool_choice", "parallel_tool_calls"} & set(after)  # the donor's "no more tools": no tools at all
     finish(session, turn_id, reply="Your first concern is the seed packets.")
     assert plugin_module("runtime").driver().ledger.pending() == []
